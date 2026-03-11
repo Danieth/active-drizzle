@@ -55,7 +55,7 @@ export class User extends ApplicationRecord {
 
   @beforeSave()
   normalizeEmail() {
-    (this as any).email = (this as any).email?.toLowerCase()
+    this.email = this.email?.toLowerCase()
   }
 }
 ```

@@ -21,7 +21,7 @@ import { ApplicationRecord, model, validate } from 'active-drizzle'
 export class User extends ApplicationRecord {
   @validate()
   validateEmail() {
-    const email = (this as any).email as string
+    const email = this.email as string
     if (!email?.includes('@')) {
       this.errors.add('email', 'must be a valid email address')
     }
@@ -29,7 +29,7 @@ export class User extends ApplicationRecord {
 
   @validate()
   validateAge() {
-    const age = (this as any).age as number
+    const age = this.age as number
     if (age !== null && age < 0) {
       this.errors.add('age', 'must be non-negative')
     }
@@ -67,8 +67,8 @@ import { serverValidate } from 'active-drizzle'
 export class User extends ApplicationRecord {
   @serverValidate()
   async validateEmailUnique() {
-    const existing = await User.findBy({ email: (this as any).email })
-    if (existing && existing.id !== (this as any).id) {
+    const existing = await User.findBy({ email: this.email })
+    if (existing && existing.id !== this.id) {
       this.errors.add('email', 'is already taken')
     }
   }
@@ -107,8 +107,8 @@ Run a validation only under certain conditions:
 ```ts
 @validate('statusChanged')
 ensureTransitionAllowed() {
-  const from = (this as any).statusWas()
-  const to   = (this as any).status
+  const from = this.statusWas()
+  const to   = this.status
   const allowed = { pending: ['paid'], paid: ['shipped', 'cancelled'] }
   if (from && !allowed[from]?.includes(to)) {
     this.errors.add('status', `cannot transition from ${from} to ${to}`)

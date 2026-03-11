@@ -111,16 +111,16 @@ product.wasChanged('price')  // → false
 @beforeSave('priceChanged')   // only runs if priceCents changed
 async notifyPriceChange() {
   await PriceAlert.trigger({
-    productId: (this as any).id,
-    oldPrice:  (this as any).priceWas(),
-    newPrice:  (this as any).priceCents,
+    productId: this.id,
+    oldPrice:  this.priceWas(),
+    newPrice:  this.priceCents,
   })
 }
 
 @afterUpdate('statusChanged')
 async logStatusTransition() {
   const { status: [from, to] } = this.previousChanges()
-  await AuditLog.create({ entity: 'Product', id: (this as any).id, from, to })
+  await AuditLog.create({ entity: 'Product', id: this.id, from, to })
 }
 ```
 

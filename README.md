@@ -233,7 +233,6 @@ WARN   Campaign.model.ts — no bidirectional belongsTo found on Asset
 - **oRPC router** — type-safe procedures with Zod validation schemas
 - **LLM docs** — `.active-drizzle/schema.md` for AI-assisted development
 
----
 
 ## Architecture
 

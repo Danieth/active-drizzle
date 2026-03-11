@@ -33,7 +33,7 @@ import { afterCommit } from 'active-drizzle'
 export class Order extends ApplicationRecord {
   @afterCommit()
   async sendConfirmationEmail() {
-    await EmailService.send((this as any).userId, 'order-confirmed')
+    await EmailService.send(this.userId, 'order-confirmed')
   }
 }
 ```
@@ -82,7 +82,7 @@ export class Order extends ApplicationRecord {
   @transactional
   async placeOrder(items: { productId: number; qty: number }[]) {
     // Everything here runs in a transaction
-    const order = await Order.create({ userId: (this as any).userId, totalCents: 0 })
+    const order = await Order.create({ userId: this.userId, totalCents: 0 })
     let total = 0
 
     for (const item of items) {
