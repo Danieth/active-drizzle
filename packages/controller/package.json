@@ -1,6 +1,6 @@
 {
   "name": "@active-drizzle/controller",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Rails-style controllers for active-drizzle — oRPC procedures + REST routes from model definitions",
   "type": "module",
   "exports": {
