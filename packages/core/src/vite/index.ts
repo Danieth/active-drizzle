@@ -338,6 +338,11 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
 
       const hookFiles = generateReactHooks(ctrlMeta, projectMeta, outDir)
       for (const f of hookFiles) {
+        // _client.ts is user-owned — only write if it doesn't exist yet
+        if (f.skipIfExists) {
+          const { existsSync } = await import('node:fs')
+          if (existsSync(f.filePath)) continue
+        }
         const changed = writeIfChanged(f.filePath, f.content)
         if (changed) hookCount++
       }

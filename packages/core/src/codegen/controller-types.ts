@@ -44,6 +44,19 @@ export interface CtrlActionMeta {
   method: string
   httpMethod: string
   path?: string
+  /**
+   * TypeScript type text of the method's first parameter.
+   * Extracted from ts-morph — used to type the `.with()` caller and the
+   * `useMutation` / `useQuery` input in `.use()`.
+   * null when the method has no parameters or the type couldn't be inferred.
+   */
+  inputType: string | null
+  /**
+   * Unwrapped return type text (Promise<T> → T).
+   * Used to type the return value of `.with()` callers.
+   * null when the return type couldn't be extracted.
+   */
+  outputType: string | null
 }
 
 export interface CtrlMeta {

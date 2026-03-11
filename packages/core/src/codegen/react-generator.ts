@@ -1,432 +1,482 @@
 /**
  * React hook code generator.
  *
- * For each controller in CtrlProjectMeta, generates:
+ * For each controller, generates a `{ControllerName}.gen.ts` file containing:
  *
- *   use{Model}.gen.ts  — typed React Query hooks, cache keys, and a ClientModel
- *                        subclass that is fully type-safe in two dimensions:
+ *   ControllerClass object with two access patterns:
  *
- *   1. READ safety  — TAttrs is derived from the Drizzle schema columns PLUS any
- *                     associations the controller eager-loads via `include: [...]`.
- *                     Enum columns are typed with string-literal unions (not raw
- *                     integers) because Attr.enum translates values at the ORM layer.
+ *   .use(scopes)  — returns an object of hook-calling functions for use inside
+ *                   React components. GET @actions become useQuery wrappers;
+ *                   everything else (CRUD mutations, @mutation, POST/PATCH/DELETE
+ *                   @actions) becomes useMutation wrappers.
  *
- *   2. WRITE safety — TWrite is a Pick<TAttrs, permittedFields> derived from the
- *                     controller's `create` and `update` permit lists. Calling
- *                     `.set({ id: 99 })` or `.set({ createdAt: new Date() })` is a
- *                     compile-time error — those fields are not in the permit list.
+ *   .with(scopes) — returns an object of plain async functions for use outside
+ *                   React: server-side calls, event handlers, tests. The same
+ *                   typed input/output as .use() but no React dependency.
  *
- *   3. INCLUDE types — When a controller says `get: { include: ['creator'] }`, the
- *                      generator looks up the 'creator' association on the model,
- *                      finds its target model (e.g. User), and imports + references
- *                      `UserAttrs` in the generated CampaignAttrs interface. This
- *                      means `campaign.creator?.email` is fully typed.
+ * For CRUD/singleton controllers, also generates the typed read/write shapes:
+ *   {Model}Attrs  — all columns + eager-loaded association types
+ *   {Model}Write  — Pick<Attrs, permit list>
+ *   {Model}Client — immutable ClientModel subclass with enum predicates
+ *
+ * For plain (model-free) controllers, only @action methods are generated — no
+ * ClientModel, no attrs, no cache keys.
+ *
+ * Additionally generates:
+ *   _client.ts  — one-time client wiring stub (never overwritten if it exists)
+ *   index.ts    — barrel re-exporting all controller gen files
  */
-import { join } from 'path'
+import { join, relative } from 'path'
+import { existsSync } from 'fs'
 import pluralize from 'pluralize'
-import type { CtrlProjectMeta, CtrlMeta } from './controller-types.js'
-import type { ProjectMeta, ModelMeta, AssociationMeta, ColumnMeta } from './types.js'
+import type { CtrlProjectMeta, CtrlMeta, CtrlActionMeta } from './controller-types.js'
+import type { ProjectMeta, ModelMeta, ColumnMeta } from './types.js'
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+export interface GeneratedReactFile {
+  filePath: string
+  content: string
+  /** When true, skip writing if the file already exists (user-owned) */
+  skipIfExists?: boolean
+}
 
 export function generateReactHooks(
   ctrlProject: CtrlProjectMeta,
   projectMeta: ProjectMeta | null,
   outputDir: string,
-): Array<{ filePath: string; content: string }> {
-  const files: Array<{ filePath: string; content: string }> = []
+): GeneratedReactFile[] {
+  const files: GeneratedReactFile[] = []
 
   for (const ctrl of ctrlProject.controllers) {
-    if (ctrl.kind === 'plain' || !ctrl.modelClass) continue
+    const model = ctrl.modelClass
+      ? (projectMeta?.models.find(m => m.className === ctrl.modelClass) ?? null)
+      : null
 
-    const model = projectMeta?.models.find(m => m.className === ctrl.modelClass) ?? null
-    const content = generateHookFile(ctrl, model, projectMeta, outputDir)
+    const content = generateControllerFile(ctrl, model, projectMeta, outputDir)
+    const fileName = `${toFileName(ctrl.className)}.gen.ts`
 
-    files.push({
-      filePath: join(outputDir, `use${ctrl.modelClass}.gen.ts`),
-      content,
-    })
+    files.push({ filePath: join(outputDir, fileName), content })
   }
+
+  // Barrel index — always regenerated
+  files.push({
+    filePath: join(outputDir, 'index.ts'),
+    content: generateBarrel(ctrlProject, outputDir),
+  })
+
+  // Client stub — only written once
+  files.push({
+    filePath: join(outputDir, '_client.ts'),
+    content: generateClientStub(),
+    skipIfExists: true,
+  })
 
   return files
 }
 
-// ── Main file generator ───────────────────────────────────────────────────────
+// ── Per-controller file ───────────────────────────────────────────────────────
 
-function generateHookFile(
+function generateControllerFile(
   ctrl: CtrlMeta,
   model: ModelMeta | null,
   projectMeta: ProjectMeta | null,
-  _outputDir: string,
+  outputDir: string,
 ): string {
-  const modelName  = ctrl.modelClass!
-  const hookName   = `use${modelName}s`
-  const resourceName = ctrl.basePath.split('/').pop()?.replace(/:[^/]*/g, '').replace(/\/+$/, '')
-    ?? pluralize(lcFirst(modelName))
-
-  // ── Columns from schema ───────────────────────────────────────────────────
-  const columns: ColumnMeta[] = model && projectMeta
-    ? (projectMeta.schema.tables[model.tableName]?.columns ?? [])
-    : []
-
-  // ── Enum map: propertyName → string-literal union (e.g. "'draft' | 'active'") ──
-  const enumByProp = new Map<string, string>()
-  if (model) {
-    for (const e of model.enums) {
-      const union = Object.keys(e.values).map(k => `'${k}'`).join(' | ')
-      enumByProp.set(e.propertyName, union)
-    }
-  }
-
-  // ── Scope fields (from @scope decorators) ────────────────────────────────
-  const scopeFields = ctrl.scopes.map(s => s.field)
-  const scopeType   = scopeFields.length > 0
-    ? `{ ${scopeFields.map(f => `${f}: number`).join('; ')} }`
-    : 'Record<string, never>'
-
-  // ── Collect all includes across every CRUD operation ─────────────────────
-  // Union of get + index includes so TAttrs covers all possible server shapes.
-  const allIncludes = new Set<string>([
-    ...(ctrl.crudConfig?.get?.include ?? []),
-    ...(ctrl.crudConfig?.index?.include ?? []),
-  ])
-
-  // ── Resolve each include to its target model ─────────────────────────────
-  // For `include: ['creator']`:
-  //   1. find `creator` in model.associations
-  //   2. get resolvedTable → 'users'
-  //   3. find the ModelMeta with tableName === 'users' → className 'User'
-  //   4. emit `import type { UserAttrs } from './useUser.gen'`
-  //   5. emit `creator?: UserAttrs` in CampaignAttrs
-  //
-  // For hasMany the shape is an array: `posts?: PostAttrs[]`
-  const assocImports: Array<{ assocName: string; attrsType: string; isArray: boolean }> = []
-
-  for (const includeName of allIncludes) {
-    const assoc = model?.associations.find(a => a.propertyName === includeName) ?? null
-    if (!assoc) {
-      assocImports.push({ assocName: includeName, attrsType: 'Record<string, any>', isArray: false })
-      continue
-    }
-
-    const targetModelClass = resolveAssocModel(assoc, projectMeta)
-    const isArray = assoc.kind === 'hasMany' || assoc.kind === 'habtm'
-
-    if (targetModelClass) {
-      assocImports.push({
-        assocName:  includeName,
-        attrsType:  `${targetModelClass}Attrs`,
-        isArray,
-      })
-    } else {
-      assocImports.push({ assocName: includeName, attrsType: 'Record<string, any>', isArray })
-    }
-  }
-
-  // Distinct model classes that need an import (exclude self)
-  const externalAttrsTypes = [...new Set(
-    assocImports
-      .map(a => a.attrsType)
-      .filter(t => t !== 'Record<string, any>' && t !== `${modelName}Attrs`),
-  )]
-
-  // ── Permit lists → TWrite ─────────────────────────────────────────────────
-  const createPermit = ctrl.crudConfig?.create?.permit ?? []
-  const updatePermit = ctrl.crudConfig?.update?.permit ?? []
-  const writableFields = [...new Set([...createPermit, ...updatePermit])]
-
-  // ── Lines buffer ──────────────────────────────────────────────────────────
   const L: string[] = []
 
   L.push('// AUTO-GENERATED — DO NOT EDIT')
   L.push('// Source: active-drizzle react codegen')
   L.push('')
-  L.push(`import { createModelHook, createSearchHook, modelCacheKeys, ClientModel } from '@active-drizzle/react'`)
-  L.push(`import type { SearchState } from '@active-drizzle/react'`)
 
-  // Cross-model association imports
-  for (const attrsType of externalAttrsTypes) {
-    const srcModel = attrsType.replace(/Attrs$/, '')
-    L.push(`import type { ${attrsType} } from './use${srcModel}.gen'`)
+  const isPlain = ctrl.kind === 'plain'
+
+  // ── Imports ──────────────────────────────────────────────────────────────
+  const needsQuery    = hasGetActions(ctrl) || ctrl.kind === 'crud'
+  const needsMutation = hasMutationActions(ctrl) || ctrl.mutations.length > 0 || ctrl.kind === 'crud' || ctrl.kind === 'singleton'
+
+  const rqImports: string[] = []
+  if (needsQuery) rqImports.push('useQuery', 'useInfiniteQuery')
+  if (needsMutation) rqImports.push('useMutation')
+
+  if (rqImports.length) {
+    L.push(`import { ${[...new Set(rqImports)].join(', ')} } from '@tanstack/react-query'`)
+  }
+
+  if (!isPlain) {
+    L.push(`import { ClientModel, modelCacheKeys } from '@active-drizzle/react'`)
+    L.push(`import type { SearchState } from '@active-drizzle/react'`)
+  }
+
+  L.push(`import { client } from './_client'`)
+
+  // Cross-model association imports (for includes)
+  if (!isPlain && model && projectMeta) {
+    const allIncludes = new Set([
+      ...(ctrl.crudConfig?.get?.include ?? []),
+      ...(ctrl.crudConfig?.index?.include ?? []),
+    ])
+    const assocImports = resolveAssocImports(allIncludes, model, projectMeta)
+    for (const { attrsType } of assocImports.filter(a => a.attrsType !== 'Record<string, any>')) {
+      const srcModel = attrsType.replace(/Attrs$/, '')
+      if (srcModel !== ctrl.modelClass) {
+        L.push(`import type { ${attrsType} } from './${toFileName(`${srcModel}Controller`)}.gen'`)
+      }
+    }
   }
 
   L.push('')
-  L.push('// Replace with your actual oRPC client:')
-  L.push("// import { client } from '../lib/orpc-client'")
-  L.push('')
 
-  // ── TAttrs interface ──────────────────────────────────────────────────────
-  L.push('/**')
-  L.push(' * All fields the backend may return for this model.')
-  L.push(' * Columns are typed from the Drizzle schema; enum columns use string labels')
-  L.push(' * (not raw integers) because Attr.enum translates at the ORM layer.')
-  if (allIncludes.size) {
-    L.push(` * Association fields (marked optional) come from include: [${[...allIncludes].map(i => `'${i}'`).join(', ')}].`)
-  }
-  L.push(' */')
-  L.push(`export interface ${modelName}Attrs {`)
+  // ── Model types (CRUD/singleton only) ────────────────────────────────────
+  if (!isPlain && model && projectMeta) {
+    const modelName = ctrl.modelClass!
+    const columns   = projectMeta.schema.tables[model.tableName]?.columns ?? []
 
-  if (columns.length > 0) {
-    for (const col of columns) {
-      const tsType = columnToClientType(col, enumByProp)
-      L.push(`  ${col.name}${col.nullable ? '?' : ''}: ${tsType}`)
-    }
-  } else {
-    // No schema metadata available — minimal placeholder
-    L.push('  id: number')
-    L.push('  [key: string]: any')
-  }
-
-  // Eager-loaded association fields
-  if (assocImports.length) {
-    L.push('')
-    L.push('  // Eager-loaded associations (from controller include config)')
-    for (const ai of assocImports) {
-      const shape = ai.isArray ? `${ai.attrsType}[]` : ai.attrsType
-      L.push(`  ${ai.assocName}?: ${shape}`)
-    }
-  }
-
-  L.push('}')
-  L.push('')
-
-  // ── TWrite type ───────────────────────────────────────────────────────────
-  if (writableFields.length > 0) {
-    L.push('/**')
-    L.push(' * Only the fields the backend accepts for create/update.')
-    L.push(' * Derived from the controller permit list — attempting to `.set()` any')
-    L.push(' * other field (id, createdAt, scope fields, etc.) is a compile-time error.')
-    L.push(' */')
-    L.push(`export type ${modelName}Write = Pick<${modelName}Attrs, ${writableFields.map(f => `'${f}'`).join(' | ')}>`)
-    L.push('')
-  } else {
-    // No permit list — write type is empty (read-only model)
-    L.push(`export type ${modelName}Write = Record<string, never>`)
-    L.push('')
-  }
-
-  // ── ClientModel subclass ──────────────────────────────────────────────────
-  L.push(`export class ${modelName}Client extends ClientModel<${modelName}Attrs, ${modelName}Write> {`)
-
-  // Declare all columns so TypeScript sees them (they're set via Object.assign in constructor)
-  if (columns.length > 0) {
-    L.push('  // Column declarations — TypeScript visibility for Object.assign in constructor')
-    for (const col of columns) {
-      const tsType = columnToClientType(col, enumByProp)
-      L.push(`  declare ${col.name}${col.nullable ? '?' : ''}: ${tsType}`)
-    }
-  } else {
-    L.push('  declare id: number')
-  }
-
-  // Declare association fields
-  if (assocImports.length) {
-    L.push('')
-    L.push('  // Association declarations')
-    for (const ai of assocImports) {
-      const shape = ai.isArray ? `${ai.attrsType}[]` : ai.attrsType
-      L.push(`  declare ${ai.assocName}?: ${shape}`)
-    }
-  }
-
-  // Enum predicate methods
-  if (model?.enums.length) {
-    L.push('')
-    L.push('  // Enum predicates')
+    const enumByProp = new Map<string, string>()
     for (const e of model.enums) {
-      for (const label of Object.keys(e.values)) {
-        L.push(`  ${lcFirst(e.propertyName)}Is${capitalize(label)}() { return this.${e.propertyName} === '${label}' }`)
+      enumByProp.set(e.propertyName, Object.keys(e.values).map(k => `'${k}'`).join(' | '))
+    }
+
+    const allIncludes = new Set([
+      ...(ctrl.crudConfig?.get?.include ?? []),
+      ...(ctrl.crudConfig?.index?.include ?? []),
+    ])
+    const assocImports = resolveAssocImports(allIncludes, model, projectMeta)
+
+    // TAttrs
+    L.push(`/** All fields the backend may return — columns + eager-loaded associations. */`)
+    L.push(`export interface ${modelName}Attrs {`)
+    if (columns.length > 0) {
+      for (const col of columns) {
+        const ts = columnToClientType(col, enumByProp)
+        L.push(`  ${col.name}${col.nullable ? '?' : ''}: ${ts}`)
+      }
+    } else {
+      L.push('  id: number')
+      L.push('  [key: string]: any')
+    }
+    if (assocImports.length) {
+      L.push('')
+      L.push('  // Eager-loaded associations')
+      for (const ai of assocImports) {
+        const shape = ai.isArray ? `${ai.attrsType}[]` : ai.attrsType
+        L.push(`  ${ai.assocName}?: ${shape}`)
       }
     }
-  }
+    L.push('}')
+    L.push('')
 
-  L.push('}')
-  L.push('')
+    // TWrite
+    const createPermit = ctrl.crudConfig?.create?.permit ?? []
+    const updatePermit = ctrl.crudConfig?.update?.permit ?? ctrl.crudConfig?.create?.permit ?? []
+    const writableFields = [...new Set([...createPermit, ...updatePermit])]
 
-  // ── Search state interface ────────────────────────────────────────────────
-  const paramScopes  = ctrl.crudConfig?.index?.paramScopes ?? []
-  const sortables    = ctrl.crudConfig?.index?.sortable ?? []
+    if (writableFields.length > 0) {
+      L.push(`/** Only permit-listed fields — attempting .set() with any other key is a compile error. */`)
+      L.push(`export type ${modelName}Write = Pick<${modelName}Attrs, ${writableFields.map(f => `'${f}'`).join(' | ')}>`)
+    } else {
+      L.push(`export type ${modelName}Write = Record<string, never>`)
+    }
+    L.push('')
 
-  L.push(`export interface ${modelName}SearchState extends SearchState {`)
-  for (const ps of paramScopes) {
-    L.push(`  ${ps}?: string`)
-  }
-  L.push('}')
-  L.push('')
-
-  // ── Cache keys ────────────────────────────────────────────────────────────
-  L.push(`export const ${lcFirst(modelName)}Keys = modelCacheKeys<${scopeType}>('${resourceName}')`)
-  L.push('')
-
-  // ── Hook factory ──────────────────────────────────────────────────────────
-  if (ctrl.kind === 'crud') {
-    L.push(`export const ${hookName} = createModelHook<${modelName}Client, ${scopeType}>({`)
-    L.push(`  keys: ${lcFirst(modelName)}Keys,`)
-    L.push(`  // Wire to your oRPC client (replace the throw stubs):`)
-    L.push(`  indexFn:   async (scopes, params)    => { throw new Error('Configure oRPC client') },`)
-    L.push(`  getFn:     async (id, scopes)         => { throw new Error('Configure oRPC client') },`)
-    L.push(`  createFn:  async (scopes, data)       => { throw new Error('Configure oRPC client') },`)
-    L.push(`  updateFn:  async (id, scopes, data)   => { throw new Error('Configure oRPC client') },`)
-    L.push(`  destroyFn: async (id, scopes)         => { throw new Error('Configure oRPC client') },`)
-    if (ctrl.mutations.length > 0) {
-      L.push(`  mutationFns: {`)
-      for (const mut of ctrl.mutations) {
-        const args = mut.bulk ? 'ids, scopes, data' : 'id, scopes, data'
-        L.push(`    ${mut.method}: async (${args}) => { throw new Error('Configure oRPC client') },`)
+    // ClientModel subclass
+    L.push(`export class ${modelName}Client extends ClientModel<${modelName}Attrs, ${modelName}Write> {`)
+    if (columns.length > 0) {
+      for (const col of columns) {
+        const ts = columnToClientType(col, enumByProp)
+        L.push(`  declare ${col.name}${col.nullable ? '?' : ''}: ${ts}`)
       }
-      L.push(`  },`)
+    } else {
+      L.push('  declare id: number')
     }
-    L.push(`})`)
-    L.push('')
-  } else if (ctrl.kind === 'singleton') {
-    L.push(`export const ${hookName} = createSingletonHook<${modelName}Client, ${scopeType}>({`)
-    L.push(`  keys: ${lcFirst(modelName)}Keys,`)
-    L.push(`  getFn:    async (scopes)       => { throw new Error('Configure oRPC client') },`)
-    L.push(`  updateFn: async (scopes, data) => { throw new Error('Configure oRPC client') },`)
-    if (ctrl.mutations.length > 0) {
-      L.push(`  mutationFns: {`)
-      for (const mut of ctrl.mutations) {
-        L.push(`    ${mut.method}: async (scopes, data) => { throw new Error('Configure oRPC client') },`)
+    if (assocImports.length) {
+      L.push('')
+      for (const ai of assocImports) {
+        const shape = ai.isArray ? `${ai.attrsType}[]` : ai.attrsType
+        L.push(`  declare ${ai.assocName}?: ${shape}`)
       }
-      L.push(`  },`)
     }
-    L.push(`})`)
-    L.push('')
-  }
-
-  // ── Search hook ───────────────────────────────────────────────────────────
-  if (ctrl.kind === 'crud' && ctrl.crudConfig?.index) {
-    const idx         = ctrl.crudConfig.index
-    const defaultScopes = idx.defaultScopes ?? []
-    const defaultSort   = idx.defaultSort
-
-    L.push(`export const use${modelName}Search = createSearchHook<${modelName}SearchState>({`)
-    if (defaultScopes.length) L.push(`  scopes: ${JSON.stringify(defaultScopes)},`)
-    if (defaultSort) {
-      L.push(`  sort: { field: '${defaultSort.field}', dir: '${defaultSort.dir ?? 'asc'}' },`)
-    }
-    L.push(`  page: 0,`)
-    L.push(`  perPage: ${idx.perPage ?? 25},`)
-    L.push(`})`)
-    L.push('')
-  }
-
-  // ── Form config (TanStack Form compatible) ────────────────────────────────
-  if (ctrl.kind === 'crud' && createPermit.length > 0) {
-    L.push(`/**`)
-    L.push(` * Default values and enum options for TanStack Form.`)
-    L.push(` * Pass to useForm({ ...${lcFirst(modelName)}FormConfig, onSubmit: ... })`)
-    L.push(` */`)
-    L.push(`export const ${lcFirst(modelName)}FormConfig = {`)
-    L.push(`  defaultValues: {`)
-    for (const field of createPermit) {
-      const col = columns.find(c => c.name === field) ?? null
-      L.push(`    ${field}: ${colDefaultValue(col, enumByProp.get(field))},`)
-    }
-    L.push(`  } satisfies Partial<${modelName}Write>,`)
-
-    const enumPermitFields = createPermit.filter(f => enumByProp.has(f))
-    if (enumPermitFields.length > 0) {
-      L.push(`  enumOptions: {`)
-      for (const field of enumPermitFields) {
-        const enumVal = model?.enums.find(e => e.propertyName === field)
-        if (enumVal) {
-          const options = Object.keys(enumVal.values).map(k => ({ value: k, label: capitalize(k) }))
-          L.push(`    ${field}: ${JSON.stringify(options)} as const,`)
+    if (model.enums.length) {
+      L.push('')
+      for (const e of model.enums) {
+        for (const label of Object.keys(e.values)) {
+          L.push(`  ${lcFirst(e.propertyName)}Is${capitalize(label)}() { return this.${e.propertyName} === '${label}' }`)
         }
       }
-      L.push(`  },`)
     }
+    L.push('}')
+    L.push('')
 
-    L.push(`} as const`)
+    // Search state
+    const paramScopes = ctrl.crudConfig?.index?.paramScopes ?? []
+    L.push(`export interface ${modelName}SearchState extends SearchState {`)
+    for (const ps of paramScopes) L.push(`  ${ps}?: string`)
+    L.push('}')
+    L.push('')
+
+    // Cache keys
+    const scopeFields = ctrl.scopes.map(s => s.field)
+    const scopeType   = scopeType_fromFields(scopeFields)
+    const resourceName = ctrl.basePath.split('/').pop()?.replace(/:[^/]*/g, '').replace(/\/+$/, '')
+      ?? pluralize(lcFirst(ctrl.modelClass!))
+    L.push(`export const ${lcFirst(ctrl.modelClass!)}Keys = modelCacheKeys<${scopeType}>('${resourceName}')`)
     L.push('')
   }
+
+  // ── Controller object ─────────────────────────────────────────────────────
+  const exportName  = ctrl.className
+  const scopeFields = ctrl.scopes.map(s => s.field)
+  const scopeType   = scopeType_fromFields(scopeFields)
+  const scopeParam  = `scopes: ${scopeType}`
+  const clientKey   = toClientKey(ctrl)
+
+  L.push(`export const ${exportName} = {`)
+
+  // ── .use() ────────────────────────────────────────────────────────────────
+  L.push(`  /**`)
+  L.push(`   * Call inside a React component to get hook-returning functions.`)
+  L.push(`   * Destructure once: const ctrl = ${exportName}.use(scopes)`)
+  L.push(`   */`)
+  L.push(`  use: (${scopeParam}) => ({`)
+  emitUse(L, ctrl, clientKey)
+  L.push(`  }),`)
+  L.push('')
+
+  // ── .with() ───────────────────────────────────────────────────────────────
+  L.push(`  /**`)
+  L.push(`   * Call outside React for direct async calls — event handlers, SSR, tests.`)
+  L.push(`   */`)
+  L.push(`  with: (${scopeParam}) => ({`)
+  emitWith(L, ctrl, clientKey)
+  L.push(`  }),`)
+  L.push(`}`)
+  L.push('')
 
   return L.join('\n')
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── .use() body ───────────────────────────────────────────────────────────────
 
-/**
- * Given an AssociationMeta, find the target model class name.
- * Strategy:
- *  1. Look for a ModelMeta whose tableName matches the resolved table.
- *  2. Fall back to singularize + capitalize the table name.
- */
-function resolveAssocModel(
-  assoc: AssociationMeta,
-  projectMeta: ProjectMeta | null,
-): string | null {
-  const table = assoc.resolvedTable
-  if (!table) return null
+function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string): void {
+  const modelName  = ctrl.modelClass
+  const scopeSpread = ctrl.scopes.length > 0 ? '...scopes, ' : ''
 
-  // Direct match in known models
-  const model = projectMeta?.models.find(m => m.tableName === table)
-  if (model) return model.className
+  if (ctrl.kind === 'crud' && modelName) {
+    // CRUD queries
+    L.push(`    /** Paginated list query. Pass search state from use${modelName}Search(). */`)
+    L.push(`    index: (params?: ${modelName}SearchState) => useQuery({`)
+    L.push(`      queryKey: ${lcFirst(modelName)}Keys.list(scopes, params),`)
+    L.push(`      queryFn:  () => client.${clientKey}.index({ ${scopeSpread}...params }),`)
+    L.push(`    }),`)
+    L.push(`    /** Infinite-scroll list query. */`)
+    L.push(`    infiniteIndex: (params?: Omit<${modelName}SearchState, 'page'>) => useInfiniteQuery({`)
+    L.push(`      queryKey:       ${lcFirst(modelName)}Keys.list(scopes, params),`)
+    L.push(`      queryFn:        ({ pageParam = 0 }) => client.${clientKey}.index({ ${scopeSpread}...params, page: pageParam as number }),`)
+    L.push(`      initialPageParam: 0,`)
+    L.push(`      getNextPageParam: (last: any) => last?.pagination?.hasMore ? (last.pagination.page + 1) : undefined,`)
+    L.push(`    }),`)
+    L.push(`    /** Single-record query. Pass null/undefined to skip fetching. */`)
+    L.push(`    get: (id: number | string | null | undefined) => useQuery({`)
+    L.push(`      queryKey: ${lcFirst(modelName)}Keys.detail(id ?? 0, scopes),`)
+    L.push(`      queryFn:  () => client.${clientKey}.get({ ${scopeSpread}id }),`)
+    L.push(`      enabled:  id != null,`)
+    L.push(`    }),`)
+    // CRUD mutations
+    L.push(`    create:  () => useMutation({ mutationFn: (data: ${modelName}Write) => client.${clientKey}.create({ ${scopeSpread}data }) }),`)
+    L.push(`    update:  () => useMutation({ mutationFn: ({ id, ...data }: { id: number | string } & Partial<${modelName}Write>) => client.${clientKey}.update({ ${scopeSpread}id, data }) }),`)
+    L.push(`    destroy: () => useMutation({ mutationFn: (id: number | string) => client.${clientKey}.destroy({ ${scopeSpread}id }) }),`)
+  }
 
-  // Heuristic: singularize the table name and capitalize
-  try {
-    return capitalize(pluralize.singular(table))
-  } catch {
-    return capitalize(table.replace(/s$/, ''))
+  if (ctrl.kind === 'singleton' && modelName) {
+    L.push(`    get:    () => useQuery({ queryKey: ${lcFirst(modelName)}Keys.singleton(scopes), queryFn: () => client.${clientKey}.get({ ${scopeSpread} }) }),`)
+    L.push(`    update: () => useMutation({ mutationFn: (data: ${modelName}Write) => client.${clientKey}.update({ ${scopeSpread}data }) }),`)
+  }
+
+  // @mutation — always useMutation
+  for (const mut of ctrl.mutations) {
+    if (mut.bulk) {
+      L.push(`    ${mut.method}: () => useMutation({ mutationFn: (ids: (number | string)[]) => client.${clientKey}.${mut.method}({ ${scopeSpread}ids }) }),`)
+    } else {
+      L.push(`    ${mut.method}: () => useMutation({ mutationFn: (id: number | string) => client.${clientKey}.${mut.method}({ ${scopeSpread}id }) }),`)
+    }
+  }
+
+  // @action — GET → useQuery, everything else → useMutation
+  for (const act of ctrl.actions) {
+    const actionKey = toActionClientKey(act, clientKey)
+    if (act.httpMethod === 'GET') {
+      const qk = `[...${lcFirst(modelName ?? 'controller')}Keys?.root(scopes) ?? [], '${act.method}']`
+      L.push(`    ${act.method}: () => useQuery({ queryKey: ${qk}, queryFn: () => client.${actionKey}({ ${scopeSpread} }) }),`)
+    } else {
+      const inputArg = act.inputType ? `(data: ${act.inputType})` : `(data?: Record<string, unknown>)`
+      L.push(`    ${act.method}: () => useMutation({ mutationFn: ${inputArg} => client.${actionKey}({ ${scopeSpread}data }) }),`)
+    }
   }
 }
 
-/**
- * Convert a schema ColumnMeta to a TypeScript type string.
- * Enum columns use their string-label union (from Attr.enum) rather than the
- * raw integer type that Drizzle sees in the schema.
+// ── .with() body ──────────────────────────────────────────────────────────────
+
+function emitWith(L: string[], ctrl: CtrlMeta, clientKey: string): void {
+  const modelName  = ctrl.modelClass
+  const scopeSpread = ctrl.scopes.length > 0 ? '...scopes, ' : ''
+
+  if (ctrl.kind === 'crud' && modelName) {
+    L.push(`    index:   (params?: ${modelName}SearchState) => client.${clientKey}.index({ ${scopeSpread}...params }),`)
+    L.push(`    get:     (id: number | string) => client.${clientKey}.get({ ${scopeSpread}id }),`)
+    L.push(`    create:  (data: ${modelName}Write) => client.${clientKey}.create({ ${scopeSpread}data }),`)
+    L.push(`    update:  (id: number | string, data: Partial<${modelName}Write>) => client.${clientKey}.update({ ${scopeSpread}id, data }),`)
+    L.push(`    destroy: (id: number | string) => client.${clientKey}.destroy({ ${scopeSpread}id }),`)
+  }
+
+  if (ctrl.kind === 'singleton' && modelName) {
+    L.push(`    get:    () => client.${clientKey}.get({ ${scopeSpread} }),`)
+    L.push(`    update: (data: ${modelName}Write) => client.${clientKey}.update({ ${scopeSpread}data }),`)
+  }
+
+  // @mutation
+  for (const mut of ctrl.mutations) {
+    if (mut.bulk) {
+      L.push(`    ${mut.method}: (ids: (number | string)[]) => client.${clientKey}.${mut.method}({ ${scopeSpread}ids }),`)
+    } else {
+      L.push(`    ${mut.method}: (id: number | string) => client.${clientKey}.${mut.method}({ ${scopeSpread}id }),`)
+    }
+  }
+
+  // @action
+  for (const act of ctrl.actions) {
+    const actionKey = toActionClientKey(act, clientKey)
+    if (act.inputType) {
+      L.push(`    ${act.method}: (data: ${act.inputType}) => client.${actionKey}({ ${scopeSpread}data }),`)
+    } else {
+      L.push(`    ${act.method}: (data?: Record<string, unknown>) => client.${actionKey}({ ${scopeSpread}...data }),`)
+    }
+  }
+}
+
+// ── Barrel index ──────────────────────────────────────────────────────────────
+
+function generateBarrel(ctrlProject: CtrlProjectMeta, _outputDir: string): string {
+  const L: string[] = ['// AUTO-GENERATED — DO NOT EDIT', '']
+  for (const ctrl of ctrlProject.controllers) {
+    L.push(`export * from './${toFileName(ctrl.className)}.gen'`)
+  }
+  return L.join('\n') + '\n'
+}
+
+// ── _client.ts stub ───────────────────────────────────────────────────────────
+
+function generateClientStub(): string {
+  return `/**
+ * Configure your oRPC client here.
+ *
+ * This file is written once and never overwritten by codegen.
+ *
+ * Example setup with @orpc/client:
+ *
+ *   import { createORPCClient } from '@orpc/client'
+ *   import { RPCLink } from '@orpc/client/fetch'
+ *   import type { AppRouter } from '../server/_routes.gen'
+ *
+ *   export const client = createORPCClient<AppRouter>(
+ *     new RPCLink({ url: '/api/rpc' })
+ *   )
+ *
+ * The type of AppRouter is inferred from _routes.gen.ts (generated alongside
+ * your controller files by the active-drizzle Vite plugin).
  */
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const client: any = null
+`
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/** Convert controller class name to file name segment, e.g. CampaignController → campaign */
+function toFileName(className: string): string {
+  return lcFirst(className.replace(/Controller$/, ''))
+}
+
+/**
+ * Derive the dotted client key for a controller's CRUD procedures.
+ * CampaignController → client.campaigns
+ * TeamSettingsController → client.teamSettings
+ */
+function toClientKey(ctrl: CtrlMeta): string {
+  const base = ctrl.className.replace(/Controller$/, '')
+  if (ctrl.kind === 'crud' && ctrl.modelClass) {
+    return pluralize(lcFirst(ctrl.modelClass))
+  }
+  return lcFirst(base)
+}
+
+/**
+ * Derive the dotted client key for an @action procedure.
+ * e.g. UploadController.getUploadUrl → client.upload.getUploadUrl
+ */
+function toActionClientKey(act: CtrlActionMeta, baseKey: string): string {
+  return `${baseKey}.${act.method}`
+}
+
+function hasGetActions(ctrl: CtrlMeta): boolean {
+  return ctrl.actions.some(a => a.httpMethod === 'GET')
+}
+
+function hasMutationActions(ctrl: CtrlMeta): boolean {
+  return ctrl.actions.some(a => a.httpMethod !== 'GET')
+}
+
+function scopeType_fromFields(fields: string[]): string {
+  if (fields.length === 0) return 'Record<string, never>'
+  return `{ ${fields.map(f => `${f}: number`).join('; ')} }`
+}
+
+interface AssocImport { assocName: string; attrsType: string; isArray: boolean }
+
+function resolveAssocImports(
+  includes: Set<string>,
+  model: ModelMeta,
+  projectMeta: ProjectMeta,
+): AssocImport[] {
+  return [...includes].map(name => {
+    const assoc = model.associations.find(a => a.propertyName === name)
+    if (!assoc) return { assocName: name, attrsType: 'Record<string, any>', isArray: false }
+
+    const targetModel = projectMeta.models.find(m => m.tableName === assoc.resolvedTable)
+    const attrsType = targetModel
+      ? `${targetModel.className}Attrs`
+      : capitalize(pluralize.singular(assoc.resolvedTable ?? name)) + 'Attrs'
+
+    const isArray = assoc.kind === 'hasMany' || assoc.kind === 'habtm'
+    return { assocName: name, attrsType, isArray }
+  })
+}
+
 function columnToClientType(col: ColumnMeta, enumByProp: Map<string, string>): string {
-  // Attr.enum overrides the raw schema type
   const enumUnion = enumByProp.get(col.name)
   if (enumUnion) return col.isArray ? `(${enumUnion})[]` : enumUnion
-
-  // pgEnum (native Postgres enum column)
   if (col.pgEnumValues?.length) {
     const union = col.pgEnumValues.map(v => `'${v}'`).join(' | ')
     return col.isArray ? `(${union})[]` : union
   }
-
   const map: Record<string, string> = {
     integer: 'number', smallint: 'number', bigint: 'number',
     serial: 'number', smallserial: 'number', bigserial: 'number',
     real: 'number', doublePrecision: 'number', decimal: 'string', numeric: 'string',
     text: 'string', varchar: 'string', char: 'string', uuid: 'string', citext: 'string',
     boolean: 'boolean',
-    date: 'string', timestamp: 'string', timestamptz: 'string',
-    time: 'string', interval: 'string',
+    date: 'string', timestamp: 'string', timestamptz: 'string', time: 'string', interval: 'string',
     json: 'unknown', jsonb: 'unknown',
     bytea: 'Buffer',
     inet: 'string', cidr: 'string', macaddr: 'string', macaddr8: 'string',
-    tsvector: 'string', tsquery: 'string',
-    bit: 'string', varbit: 'string',
+    tsvector: 'string', tsquery: 'string', bit: 'string', varbit: 'string',
     xml: 'string', money: 'string', oid: 'number',
     vector: 'number[]',
     point: '{ x: number; y: number }',
   }
-
   const base = map[col.type] ?? 'unknown'
   return col.isArray ? `${base}[]` : base
 }
 
-function colDefaultValue(col: ColumnMeta | null, enumUnion?: string): string {
-  if (!col) return 'undefined'
-  if (enumUnion) {
-    // First enum label as default
-    const first = enumUnion.split('|')[0]?.trim().replace(/'/g, '')
-    return first ? `'${first}'` : 'undefined'
-  }
-  if (col.type === 'boolean') return 'false'
-  if (['integer', 'smallint', 'bigint', 'serial', 'smallserial', 'bigserial',
-       'real', 'doublePrecision'].includes(col.type)) return 'undefined'
-  if (['text', 'varchar', 'char', 'uuid', 'citext'].includes(col.type)) return "''"
-  if (['json', 'jsonb'].includes(col.type)) return 'null'
-  return 'undefined'
-}
-
-function lcFirst(s: string): string {
-  return s.charAt(0).toLowerCase() + s.slice(1)
-}
-
-function capitalize(s: string): string {
-  return s.charAt(0).toUpperCase() + s.slice(1)
-}
+function lcFirst(s: string): string { return s.charAt(0).toLowerCase() + s.slice(1) }
+function capitalize(s: string): string { return s.charAt(0).toUpperCase() + s.slice(1) }

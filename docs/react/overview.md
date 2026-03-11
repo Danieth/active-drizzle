@@ -1,6 +1,6 @@
 # React Query Integration
 
-`@active-drizzle/react` ships **React Query hook factories and a type-safe client model**. There are no UI components — bring your own design system. The package gives you the data layer; you own the presentation.
+`@active-drizzle/react` is a pure React Query data layer — no UI components, no design system opinions. The Vite plugin generates a typed controller object per controller file, plus a barrel index and a one-time client wiring stub.
 
 ## Installation
 
@@ -10,69 +10,149 @@ npm install @active-drizzle/react @tanstack/react-query
 
 ## What Gets Generated
 
-The Vite plugin emits a `use{Model}.gen.ts` file for every controller. Each file contains:
+For every controller file, codegen emits a `{controller}.gen.ts` with:
 
 | Export | What it is |
 |--------|-----------|
 | `{Model}Attrs` | Full read shape — columns + eager-loaded associations |
 | `{Model}Write` | Write shape — only `permit`-listed fields |
-| `{Model}Client` | Immutable `ClientModel` subclass with typed predicates |
+| `{Model}Client` | Immutable `ClientModel` subclass with enum predicates |
 | `{Model}SearchState` | Search/filter state interface |
 | `{model}Keys` | Scoped cache key factory |
-| `use{Model}s` | TanStack Query hook factory (CRUD or singleton) |
-| `use{Model}Search` | Search state hook |
-| `{model}FormConfig` | Default values + enum options for TanStack Form |
+| `{ControllerName}` | The controller object with `.use()` and `.with()` |
 
-## Using Generated Hooks
+Plus two shared files:
+
+| File | What it is |
+|------|-----------|
+| `_generated/index.ts` | Barrel re-exporting all controllers (always regenerated) |
+| `_generated/_client.ts` | oRPC client wiring stub (written once, never overwritten) |
+
+## The Two Access Patterns
+
+Every controller exports an object with two methods:
+
+```typescript
+import { CampaignController, UploadController } from '../_generated'
+
+// .use(scopes) — call inside React components, returns hook results
+const ctrl = CampaignController.use({ teamId })
+const { data }   = ctrl.index(search.state)   // useQuery
+const create     = ctrl.create()               // useMutation
+const launch     = ctrl.launch()               // useMutation (@mutation)
+const stats      = ctrl.stats()                // useQuery (@action GET)
+const recalc     = ctrl.recalculate()          // useMutation (@action POST)
+
+// .with(scopes) — direct async calls outside React
+const result = await CampaignController.with({ teamId }).create({ name: 'New' })
+const url    = await UploadController.with({}).getUploadUrl({ filename: 'img.png', contentType: 'image/png' })
+```
+
+**Destructure once** — `CampaignController.use({ teamId })` returns a plain object (no hooks inside). The hook calls happen when you call `.index()`, `.create()` etc. on the returned object.
+
+## CRUD Controller
 
 ```typescript
 // src/pages/campaigns.tsx
-import { useCampaigns, useCampaignSearch } from '../models/_generated/useCampaign.gen'
+import { CampaignController } from '../_generated'
 
 function CampaignsPage({ teamId }: { teamId: number }) {
-  const search = useCampaignSearch()
-  const campaigns = useCampaigns(teamId)
+  const ctrl = CampaignController.use({ teamId })
 
-  const { data, isFetching } = campaigns.index(search.state)
-  const createMutation = campaigns.create()
+  const { data, isLoading } = ctrl.index({ scopes: ['active'], sort: { field: 'createdAt', dir: 'desc' } })
+  const create = ctrl.create()
+  const launch = ctrl.launch()  // @mutation
 
   return (
     <div>
-      <input
-        value={search.state.q}
-        onChange={e => search.set({ q: e.target.value })}
-        placeholder="Search campaigns..."
-      />
-
-      {data?.pages.flatMap(p => p.items).map(c => (
+      {data?.items.map(c => (
         <div key={c.id}>
           <h3>{c.name}</h3>
-          {/* status is typed: 'draft' | 'active' | 'paused' | 'completed' */}
+          {/* c.status is 'draft' | 'active' | 'paused' | 'completed' */}
           {c.statusIsActive() && <span>Live</span>}
-          {/* creator typed from UserAttrs (include: ['creator'] in controller) */}
+          {/* c.creator is typed as UserAttrs from include: ['creator'] */}
           <span>by {c.creator?.name}</span>
+
+          {c.statusIsDraft() && (
+            <button onClick={() => launch.mutate(c.id)}>Launch</button>
+          )}
         </div>
       ))}
+
+      <button
+        onClick={() => create.mutate({ name: 'New Campaign', status: 'draft' })}
+        disabled={create.isPending}
+      >
+        New Campaign
+      </button>
     </div>
   )
 }
+```
+
+## Plain (Model-Free) Controller
+
+Plain controllers have no CRUD — only `@action` methods. They still get `.use()` and `.with()`, and all `@before`/`@after` hooks apply. This is the right pattern for S3 uploads, Clerk invites, background job triggers, etc.
+
+```typescript
+// src/controllers/Upload.ctrl.ts
+@controller('/upload')
+export class UploadController extends ActiveController<AppContext> {
+  @before()
+  async requireAuth() {
+    if (!this.context.user) throw new Unauthorized()
+  }
+
+  @action('POST', '/presign')
+  async getUploadUrl(input: { filename: string; contentType: string }) {
+    const key = `uploads/${crypto.randomUUID()}/${input.filename}`
+    const uploadUrl = await getSignedUrl(s3, new PutObjectCommand({ Bucket: bucket, Key: key, ContentType: input.contentType }), { expiresIn: 600 })
+    return { uploadUrl, key, publicUrl: `https://cdn.example.com/${key}` }
+  }
+}
+```
+
+Generated usage:
+
+```typescript
+import { UploadController } from '../_generated'
+
+function UploadButton() {
+  const upload = UploadController.use({}).getUploadUrl()  // useMutation
+
+  const handleFile = async (file: File) => {
+    const { uploadUrl, key } = await upload.mutateAsync({
+      filename: file.name,
+      contentType: file.type,
+    })
+    await fetch(uploadUrl, { method: 'PUT', body: file })
+    // then create the asset record...
+  }
+
+  return <input type="file" onChange={e => handleFile(e.target.files![0])} />
+}
+
+// Or outside React entirely:
+const { uploadUrl } = await UploadController.with({}).getUploadUrl({
+  filename: 'report.pdf',
+  contentType: 'application/pdf',
+})
 ```
 
 ## Form Integration (TanStack Form)
 
 ```tsx
 import { useForm } from '@tanstack/react-form'
-import { campaignFormConfig } from '../models/_generated/useCampaign.gen'
+import { campaignFormConfig, CampaignController } from '../_generated'
 
 function CreateCampaignForm({ teamId, onSuccess }) {
-  const campaigns = useCampaigns(teamId)
-  const createMutation = campaigns.create()
+  const create = CampaignController.with({ teamId }).create  // direct call
 
   const form = useForm({
-    ...campaignFormConfig,  // typed defaultValues + enum options
+    ...campaignFormConfig,
     onSubmit: async ({ value }) => {
-      // value is typed as CampaignWrite — only permit-listed fields
-      await createMutation.mutateAsync(value)
+      // value is typed as CampaignWrite — permit-listed fields only
+      await create(value)
       onSuccess()
     },
   })
@@ -82,7 +162,6 @@ function CreateCampaignForm({ teamId, onSuccess }) {
       <form.Field name="name" children={(f) => (
         <input value={f.state.value} onChange={e => f.handleChange(e.target.value)} />
       )} />
-
       <form.Field name="status" children={(f) => (
         <select value={f.state.value} onChange={e => f.handleChange(e.target.value)}>
           {campaignFormConfig.enumOptions.status.map(o => (
@@ -90,50 +169,25 @@ function CreateCampaignForm({ teamId, onSuccess }) {
           ))}
         </select>
       )} />
-
-      <button type="submit" disabled={createMutation.isPending}>Create</button>
+      <button type="submit">Create</button>
     </form>
   )
 }
 ```
 
-## Type Safety at Every Layer
+## Wiring the oRPC Client (one time)
 
-The generated code enforces backend rules at the TypeScript layer:
-
-```typescript
-const c = CampaignClient.from(serverPayload)
-
-c.set({ name: 'New' })        // ✓ in permit list
-c.set({ id: 99 })             // ✗ compile error — not in permit list
-c.set({ teamId: 5 })          // ✗ compile error — scope field, backend rejects it
-c.creator?.email              // ✓ typed from UserAttrs (via include)
-```
-
-See [ClientModel & Type Safety](/react/client-model) for the full explanation.
-
-## Wiring the oRPC Client
-
-The generated hook stubs throw at runtime until you replace them with real oRPC client calls. The pattern looks like:
+Edit `_generated/_client.ts` once. Every generated file imports from it automatically:
 
 ```typescript
-// src/lib/hooks/useCampaigns.ts — your customised wrapper
-import { createModelHook, campaignKeys, CampaignClient } from '../models/_generated/useCampaign.gen'
-import { client } from '../lib/orpc-client'
+// _generated/_client.ts
+import { createORPCClient } from '@orpc/client'
+import { RPCLink } from '@orpc/client/fetch'
+import type { AppRouter } from '../server/_routes.gen'
 
-export const useCampaigns = (teamId: number) =>
-  createModelHook<CampaignClient, { teamId: number }>({
-    keys: campaignKeys,
-    indexFn:   (scopes, params) => client.campaigns.index({ ...scopes, ...params }),
-    getFn:     (id, scopes)     => client.campaigns.get({ id, ...scopes }),
-    createFn:  (scopes, data)   => client.campaigns.create({ ...scopes, ...data }),
-    updateFn:  (id, scopes, data) => client.campaigns.update({ id, ...scopes, ...data }),
-    destroyFn: (id, scopes)     => client.campaigns.destroy({ id, ...scopes }),
-    mutationFns: {
-      launch: (id, scopes) => client.campaigns.launch({ id, ...scopes }),
-      pause:  (id, scopes) => client.campaigns.pause({ id, ...scopes }),
-    },
-  })
+export const client = createORPCClient<AppRouter>(
+  new RPCLink({ url: '/api/rpc' })
+)
 ```
 
-The oRPC client is fully typed from `_routes.gen.ts` — the argument shapes and return types are inferred end-to-end.
+The `AppRouter` type comes from `_routes.gen.ts` — generated alongside your controllers. The client is fully typed end-to-end from controller → procedure → hook.

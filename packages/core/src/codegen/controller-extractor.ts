@@ -128,10 +128,30 @@ function extractController(cls: ClassDeclaration, filePath: string): CtrlMeta | 
     const args = actDec.getArguments()
     const httpMethod = args.length > 0 ? stripQuotes(args[0]!.getText()) : 'POST'
     const path = args.length > 1 ? stripQuotes(args[1]!.getText()) : undefined
+
+    // Extract input type from first parameter type annotation
+    const params = method.getParameters()
+    let inputType: string | null = null
+    if (params.length > 0) {
+      const typeNode = params[0]!.getTypeNode()
+      inputType = typeNode ? typeNode.getText() : null
+    }
+
+    // Extract output type — unwrap Promise<T> → T
+    let outputType: string | null = null
+    const retTypeNode = method.getReturnTypeNode()
+    if (retTypeNode) {
+      const retText = retTypeNode.getText()
+      const promiseMatch = retText.match(/^Promise<(.+)>$/s)
+      outputType = promiseMatch ? promiseMatch[1]!.trim() : retText
+    }
+
     actions.push({
       method: methodName,
       httpMethod,
       ...(path !== undefined ? { path } : {}),
+      inputType,
+      outputType,
     })
   }
 
