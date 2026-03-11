@@ -1,0 +1,38 @@
+# Build output
+dist/
+coverage/
+
+# Docs build
+docs/.vitepress/dist
+docs/.vitepress/cache
+
+# Dependencies
+node_modules/
+
+# Generated codegen files (users generate these locally)
+**/*.model.gen.d.ts
+**/*.model.gen.ts
+_registry.gen.ts
+_globals.gen.d.ts
+.active-drizzle/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Lockfiles — keep package-lock.json, ignore bun.lock (not the primary package manager)
+bun.lock
+
+# Project-specific dev notes
+REMAINING.md
+active-drizzle-spec.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/settings.json
+.idea/
+*.local

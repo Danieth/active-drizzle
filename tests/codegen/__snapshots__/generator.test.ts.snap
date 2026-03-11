@@ -1,0 +1,169 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`generator — snapshot tests > Asset model gen matches snapshot 1`] = `
+"// AUTO-GENERATED — do not edit manually
+import type { Relation, IncludeArg, MapInclude } from 'active-drizzle'
+
+declare module './Asset.model' {
+  interface Asset {
+    readonly _associations: AssetAssociations;
+    business: Promise<BusinessRecord>
+    campaigns: Relation<CampaignRecord, CampaignAssociations>
+    isJpg(): boolean
+    toJpg(): AssetRecord
+    isPng(): boolean
+    toPng(): AssetRecord
+    isGif(): boolean
+    toGif(): AssetRecord
+    isMp4(): boolean
+    toMp4(): AssetRecord
+    isMp3(): boolean
+    toMp3(): AssetRecord
+    readonly assetType: {jpg:116,png:125,gif:111,mp4:202,mp3:305}
+    isImages(): boolean
+    isVideos(): boolean
+    assetTypeChanged(): boolean
+    assetTypeWas(): number | null
+    assetTypeChange(): [number | null, number | null] | null
+    titleChanged(): boolean
+    titleWas(): string | null
+    titleChange(): [string | null, string | null] | null
+    businessIdChanged(): boolean
+    businessIdWas(): number
+    businessIdChange(): [number, number] | null
+    createdAtChanged(): boolean
+    createdAtWas(): Date
+    createdAtChange(): [Date, Date] | null
+    updatedAtChanged(): boolean
+    updatedAtWas(): Date
+    updatedAtChange(): [Date, Date] | null
+    isChanged(): boolean
+    changedFields(): string[]
+    changes: Record<string, [unknown, unknown]>
+    previousChanges: Record<string, [unknown, unknown]>
+    restoreAttributes(): void
+    assetFormat(): string | null
+  }
+  namespace Asset {
+    function all(): Relation<AssetRecord, AssetAssociations>
+    function where(condition?: AssetWhere): Relation<AssetRecord, AssetAssociations>
+    function includes<TArg extends IncludeArg<AssetAssociations>, TArgs extends IncludeArg<AssetAssociations>[]>(arg: TArg, ...args: TArgs): Relation<AssetRecord & MapInclude<AssetAssociations, TArg> & MapInclude<AssetAssociations, TArgs[number]>, AssetAssociations>
+    function first(): Promise<AssetRecord | null>
+    function find(id: number | string): Promise<AssetRecord>
+    const recent: Relation<AssetRecord, AssetAssociations>
+    function since(date: Date): Relation<AssetRecord, AssetAssociations>
+    const images: Relation<AssetRecord, AssetAssociations>
+    const videos: Relation<AssetRecord, AssetAssociations>
+    const assetType: { jpg: 116; png: 125; gif: 111; mp4: 202; mp3: 305 }
+    class Client {
+      id: number;
+      assetType?: number | null;
+      title?: string | null;
+      businessId: number;
+      createdAt: Date;
+      updatedAt: Date;
+      business: Business.Client;
+      campaigns: Campaign.Client[];
+      assetFormat(): string | null
+      constructor(payload?: Record<string, any>)
+      toJSON(): Record<string, unknown>
+      isChanged(): boolean
+      restoreAttributes(): void
+      validate(path?: string): Record<string, string[]>
+    }
+  }
+}
+
+export type AssetRecord = InstanceType<typeof import('./Asset.model').Asset>
+
+// --- Advanced Type Sorcery ---
+export interface AssetAssociations {
+  business: BusinessRecord;
+  campaigns: CampaignRecord[];
+}
+
+export interface AssetWhere {
+  [key: string]: unknown
+  id?: (number) | (number)[] | null | Relation
+  assetType?: ('jpg' | 'png' | 'gif' | 'mp4' | 'mp3' | number) | ('jpg' | 'png' | 'gif' | 'mp4' | 'mp3' | number)[] | null | Relation
+  title?: (string) | (string)[] | null | Relation
+  businessId?: (number) | (number)[] | null | Relation
+  createdAt?: (Date) | (Date)[] | null | Relation
+  updatedAt?: (Date) | (Date)[] | null | Relation
+}
+
+export interface AssetCreate {
+  id: number;
+  assetType?: 'jpg' | 'png' | 'gif' | 'mp4' | 'mp3' | null;
+  title?: string | null;
+  businessId: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export type AssetUpdate = Partial<AssetCreate> & { id: number };
+"
+`;
+
+exports[`generator — snapshot tests > Asset model gen matches snapshot 2`] = `
+"// AUTO-GENERATED — do not edit manually
+import { Asset as _Asset } from './Asset.model.js'
+import { Business as _Business } from './Business.model.js'
+import { Campaign as _Campaign } from './Campaign.model.js'
+
+class AssetClient {
+  private _initial: any;
+  constructor(payload: Record<string, any> = {}) {
+    this.id = payload.id ?? null;
+    this.assetType = payload.assetType ?? null;
+    this.title = payload.title ?? null;
+    this.businessId = payload.businessId ?? null;
+    this.createdAt = payload.createdAt ?? null;
+    this.updatedAt = payload.updatedAt ?? null;
+    this.business = payload.business ? new ((_Business as any).Client)(payload.business) : null;
+    this.campaigns = (payload.campaigns || []).map((i: any) => new ((_Campaign as any).Client)(i));
+    this._initial = JSON.parse(JSON.stringify(this.toJSON()));
+  }
+
+  assetFormat(): string | null {
+    
+            if (this.isImages()) return 'image'
+            if (this.isVideos()) return 'video'
+            return null
+          
+  }
+  toJSON(): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    out.id = (this as any).id;
+    out.assetType = (this as any).assetType;
+    out.title = (this as any).title;
+    out.businessId = (this as any).businessId;
+    out.createdAt = (this as any).createdAt;
+    out.updatedAt = (this as any).updatedAt;
+    return out;
+  }
+
+  isChanged(): boolean {
+    return JSON.stringify(this.toJSON()) !== JSON.stringify(this._initial);
+  }
+
+  restoreAttributes(): void {
+    Object.assign(this, JSON.parse(JSON.stringify(this._initial)));
+  }
+
+  validate(path = ''): Record<string, string[]> {
+    let errors: Record<string, string[]> = {};
+    if ((this as any).business) {
+      errors = { ...errors, ...(this as any).business.validate(path ? \`\${path}.business\` : 'business') };
+    }
+    ((this as any).campaigns as any[] || []).forEach((item: any, i: number) => {
+      errors = { ...errors, ...item.validate(path ? \`\${path}.campaigns.\${i}\` : \`campaigns.\${i}\`) };
+    });
+    return errors;
+  }
+}
+
+// Attach so that new Asset.Client(payload) works at runtime
+;(_Asset as any).Client = AssetClient
+"
+`;
