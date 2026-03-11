@@ -22,5 +22,14 @@ export default defineConfig({
     poolOptions: { forks: { maxForks: 1 } },
     testTimeout: 300_000,
     hookTimeout: 90_000,
+
+    coverage: {
+      provider: 'v8',
+      all: true,
+      include: ['src/**/*.ts'],
+      exclude: ['src/**/*.d.ts', 'src/index.ts'],
+      reporter: ['text', 'text-summary', 'json-summary'],
+      reportsDirectory: './coverage',
+    },
   },
 })

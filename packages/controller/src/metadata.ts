@@ -41,20 +41,59 @@ export interface IndexConfig {
 }
 
 export interface WriteConfig {
-  permit?: string[]
+  /**
+   * Allowed fields for mass assignment.
+   * Can also be a function `(ctx, ctrl) => string[]` for role-based field permissions.
+   *
+   * @example
+   * permit: (_ctx, ctrl) => ctrl.state.canAdmin
+   *   ? ['name', 'budget', 'status']
+   *   : ['name']
+   */
+  permit?: string[] | ((ctx: any, ctrl: any) => string[])
   restrict?: string[]
-  autoSet?: Record<string, (ctx: any) => any>
+  /**
+   * Fields that are always set from context/state, bypassing user input.
+   * The callback receives `(ctx, ctrl)` — use `ctrl.state` to access resolved entities.
+   *
+   * @example
+   * autoSet: {
+   *   organizationId: (_ctx, ctrl) => ctrl.state.org.id,
+   *   createdById:    (ctx) => ctx.userId,
+   * }
+   */
+  autoSet?: Record<string, (ctx: any, ctrl?: any) => any>
 }
 
 export interface CrudConfig {
   index?: IndexConfig
+  /**
+   * Dynamically scope all CRUD queries using resolved controller state.
+   * Called once after @before hooks run, applied to `this.relation`.
+   *
+   * Use this instead of (or in addition to) @scope when the scope value
+   * comes from loaded state (e.g., `this.state.org.id`) rather than a URL param.
+   *
+   * @example
+   * @crud(Asset, {
+   *   scopeBy: (ctrl) => ({ organizationId: ctrl.state.org.id }),
+   * })
+   */
+  scopeBy?: (ctrl: any) => Record<string, any>
   create?: WriteConfig
   update?: Omit<WriteConfig, 'autoSet'>
   get?: { include?: string[] }
 }
 
 export interface SingletonConfig {
-  findBy: (ctx: any) => Record<string, any>
+  /**
+   * Returns the where clause used to find the singleton record.
+   * Receives `(ctx, ctrl)` — use `ctrl.state` to access resolved entities.
+   *
+   * @example
+   * findBy: (_ctx, ctrl) => ({ organizationId: ctrl.state.org.id })
+   */
+  findBy: (ctx: any, ctrl?: any) => Record<string, any>
   findOrCreate?: boolean
   defaultValues?: Record<string, any>
   update?: Omit<WriteConfig, 'autoSet'>

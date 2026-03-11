@@ -404,13 +404,35 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   }
 
   /**
-   * Finds the first record matching `attrs`, or creates it.
-   * Raises if validation fails on create.
+   * Finds the first record matching `conditions`, or creates it.
+   * When creating, merges `conditions` with optional `defaults`.
+   *
+   * Race-safe: retries the SELECT on unique-constraint violations so that
+   * concurrent requests for the same record converge to a single row.
+   *
+   * @example
+   * const org = await Organization.findOrCreateBy(
+   *   { clerkOrgId: 'org_abc' },
+   *   { name: 'Unknown', timezone: 'UTC' }
+   * )
    */
-  public async findOrCreateBy(attrs: Record<string, any>): Promise<TModel> {
-    const found = await this.where(attrs).first()
+  public async findOrCreateBy(
+    conditions: Record<string, any>,
+    defaults: Record<string, any> = {},
+  ): Promise<TModel> {
+    const found = await this.where(conditions).first()
     if (found) return found
-    return (this._ctor as any).create(attrs) as TModel
+    try {
+      return await (this._ctor as any).create({ ...defaults, ...conditions }) as TModel
+    } catch (e: any) {
+      // Race condition: another concurrent request created the record first.
+      // Unique-constraint violation codes: Postgres = '23505', SQLite = 'SQLITE_CONSTRAINT_UNIQUE'
+      if (e.code === '23505' || e.code === 'SQLITE_CONSTRAINT_UNIQUE' || e.message?.includes('duplicate key')) {
+        const retried = await this.where(conditions).first()
+        if (retried) return retried
+      }
+      throw e
+    }
   }
 
   /**

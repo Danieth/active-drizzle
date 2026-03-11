@@ -1,5 +1,47 @@
 import { defineConfig } from 'vitepress'
 
+const modelSidebar = [
+  {
+    text: 'Models',
+    collapsed: false,
+    items: [
+      { text: 'Overview', link: '/models/overview' },
+      { text: 'Attributes & Enums', link: '/models/attributes' },
+      { text: 'Associations', link: '/models/associations' },
+      { text: 'STI', link: '/models/sti' },
+      { text: 'Custom Primary Keys', link: '/models/custom-pk' },
+    ],
+  },
+  {
+    text: 'Querying',
+    collapsed: false,
+    items: [
+      { text: 'Basics', link: '/querying/basics' },
+      { text: 'Scopes', link: '/querying/scopes' },
+      { text: 'Aggregates & Counting', link: '/querying/aggregates' },
+      { text: 'Pluck & Pick', link: '/querying/pluck' },
+    ],
+  },
+  {
+    text: 'Writing Data',
+    collapsed: false,
+    items: [
+      { text: 'Create, Update, Destroy', link: '/mutations/overview' },
+      { text: 'Validations', link: '/hooks/validations' },
+      { text: 'Transactions', link: '/mutations/transactions' },
+      { text: 'Nested Attributes', link: '/mutations/nested-attributes' },
+    ],
+  },
+  {
+    text: 'Behavior',
+    collapsed: false,
+    items: [
+      { text: 'Lifecycle Callbacks', link: '/hooks/lifecycle' },
+      { text: 'Dirty Tracking', link: '/hooks/dirty-tracking' },
+    ],
+  },
+]
+
 export default defineConfig({
   title: 'ActiveDrizzle',
   description: 'Rails-style ActiveRecord for Drizzle ORM — with full TypeScript codegen',
@@ -35,82 +77,11 @@ export default defineConfig({
         },
       ],
 
-      '/models/': [
-        {
-          text: 'Models',
-          items: [
-            { text: 'Overview', link: '/models/overview' },
-            { text: 'Attributes & Enums', link: '/models/attributes' },
-            { text: 'Associations', link: '/models/associations' },
-            { text: 'STI', link: '/models/sti' },
-            { text: 'Custom Primary Keys', link: '/models/custom-pk' },
-          ],
-        },
-        {
-          text: 'Querying',
-          items: [
-            { text: 'Basics', link: '/querying/basics' },
-            { text: 'Scopes', link: '/querying/scopes' },
-            { text: 'Aggregates & Counting', link: '/querying/aggregates' },
-            { text: 'Pluck & Pick', link: '/querying/pluck' },
-          ],
-        },
-        {
-          text: 'Writing Data',
-          items: [
-            { text: 'Create, Update, Destroy', link: '/mutations/overview' },
-            { text: 'Validations', link: '/hooks/validations' },
-            { text: 'Transactions', link: '/mutations/transactions' },
-            { text: 'Nested Attributes', link: '/mutations/nested-attributes' },
-          ],
-        },
-        {
-          text: 'Behavior',
-          items: [
-            { text: 'Lifecycle Callbacks', link: '/hooks/lifecycle' },
-            { text: 'Dirty Tracking', link: '/hooks/dirty-tracking' },
-          ],
-        },
-      ],
-
-      // Legacy redirects — keep these sections accessible directly
-      '/querying/': [
-        {
-          text: 'Querying',
-          collapsed: false,
-          items: [
-            { text: '← Back to Models', link: '/models/overview' },
-            { text: 'Basics', link: '/querying/basics' },
-            { text: 'Scopes', link: '/querying/scopes' },
-            { text: 'Aggregates & Counting', link: '/querying/aggregates' },
-            { text: 'Pluck & Pick', link: '/querying/pluck' },
-          ],
-        },
-      ],
-      '/mutations/': [
-        {
-          text: 'Writing Data',
-          collapsed: false,
-          items: [
-            { text: '← Back to Models', link: '/models/overview' },
-            { text: 'Create, Update, Destroy', link: '/mutations/overview' },
-            { text: 'Transactions', link: '/mutations/transactions' },
-            { text: 'Nested Attributes', link: '/mutations/nested-attributes' },
-          ],
-        },
-      ],
-      '/hooks/': [
-        {
-          text: 'Behavior',
-          collapsed: false,
-          items: [
-            { text: '← Back to Models', link: '/models/overview' },
-            { text: 'Lifecycle Callbacks', link: '/hooks/lifecycle' },
-            { text: 'Validations', link: '/hooks/validations' },
-            { text: 'Dirty Tracking', link: '/hooks/dirty-tracking' },
-          ],
-        },
-      ],
+      // Shared sidebar for Models, Querying, Writing Data, Behavior — always visible
+      '/models/': modelSidebar,
+      '/querying/': modelSidebar,
+      '/mutations/': modelSidebar,
+      '/hooks/': modelSidebar,
 
       '/controllers/': [
         {
@@ -124,6 +95,7 @@ export default defineConfig({
             { text: 'Actions & Endpoints', link: '/controllers/actions' },
             { text: 'Lifecycle Hooks', link: '/controllers/decorators#before-after' },
             { text: 'Error Handling', link: '/controllers/error-handling' },
+            { text: 'Multi-Tenant Controllers', link: '/controllers/multi-tenant' },
           ],
         },
       ],

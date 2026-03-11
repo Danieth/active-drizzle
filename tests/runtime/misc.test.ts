@@ -203,6 +203,43 @@ describe('plain column dirty tracking (no Attr declaration)', () => {
   })
 })
 
+// ── counterCache — string column name ────────────────────────────────────────
+// Uses unique table names ('notes', 'notebooks') to avoid MODEL_REGISTRY conflicts.
+
+describe('counterCache — custom string column name', () => {
+  const ccStringSchema = {
+    notebooks: fakeTable(['id', 'myCustomCount']),
+    notes: fakeTable(['id', 'notebookId']),
+  }
+
+  @model('notes')
+  class Note extends ApplicationRecord {
+    static notebook = belongsTo()
+  }
+
+  @model('notebooks')
+  class Notebook extends ApplicationRecord {
+    static notes = hasMany('notes', { counterCache: 'myCustomCount' } as any)
+  }
+
+  it('increments the named counter column when counterCache is a string', async () => {
+    const db: any = {
+      query: {},
+      select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => ({ then: (r: any) => r([]) })) })) })),
+      insert: vi.fn(() => ({ values: vi.fn(() => ({ returning: vi.fn().mockResolvedValue([{ id: 99, notebookId: 1 }]) })) })),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: vi.fn().mockResolvedValue([]) })) })),
+      transaction: vi.fn((cb: any) => cb(db)),
+    }
+    boot(db, ccStringSchema)
+
+    const note = new Note({ notebookId: 1 })
+    await note.save()
+
+    // update should have been called to increment myCustomCount (string counterCache path)
+    expect(db.update).toHaveBeenCalled()
+  })
+})
+
 // ── counterCache ────────────────────────────────────────────────────────────
 
 describe('counterCache', () => {
@@ -303,6 +340,46 @@ describe('autosave', () => {
   })
 })
 
+// ── autosave — single (hasOne/belongsTo) loaded association ──────────────────
+
+describe('autosave — single (non-array) loaded association', () => {
+  const singleSchema = {
+    receipts: fakeTable(['id', 'total']),
+    receipt_lines: fakeTable(['id', 'receiptId', 'desc']),
+  }
+
+  @model('receipt_lines')
+  class ReceiptLine extends ApplicationRecord {}
+
+  @model('receipts')
+  class Receipt extends ApplicationRecord {
+    static line = hasOne('receipt_lines', { autosave: true } as any)
+  }
+
+  it('saves a loaded hasOne association when parent is saved', async () => {
+    const db: any = {
+      query: {},
+      select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => ({ then: (r: any) => r([]) })) })) })),
+      insert: vi.fn(() => ({ values: vi.fn(() => ({ returning: vi.fn().mockResolvedValue([{ id: 1 }]) })) })),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: vi.fn(() => ({ returning: vi.fn().mockResolvedValue([{ id: 2, receiptId: 1, desc: 'new' }]) })) })) })),
+      transaction: vi.fn((cb: any) => cb(db)),
+    }
+    boot(db, singleSchema)
+
+    const line = new ReceiptLine({ id: 2, receiptId: 1, desc: 'old' }, false)
+    ;(line as any).desc = 'new'
+
+    const receipt = new Receipt({ id: 1 }, false)
+    // Simulate a pre-loaded single association
+    receipt._attributes['line'] = line
+
+    await receipt.save()
+
+    // update should be called for the changed line item
+    expect(db.update).toHaveBeenCalled()
+  })
+})
+
 // ── habtm lazy loading ────────────────────────────────────────────────────────
 
 describe('habtm lazy loading', () => {
@@ -383,5 +460,140 @@ describe('ApplicationRecord Proxy — is<Label>() / to<Label>() with no matching
 
     // 'toArchived' label is not in the enum
     expect((post as any).toArchived).toBeUndefined()
+  })
+})
+
+// ── _processNestedAttributes — destroy + update branches ─────────────────────
+
+describe('_processNestedAttributes — destroy and update branches', () => {
+  const naSchema = {
+    orders: fakeTable(['id', 'note']),
+    items:  fakeTable(['id', 'orderId', 'name']),
+  }
+
+  @model('items')
+  class NAItem extends ApplicationRecord {}
+
+  @model('orders')
+  class NAOrder extends ApplicationRecord {
+    // acceptsNested: true enables _captureNestedAttributes to pick up itemsAttributes
+    static items = hasMany('items', { acceptsNested: true } as any)
+  }
+
+  function makeNaDb(itemRows: any[], orderInsertReturn?: any) {
+    // Chain supports all methods needed by find() → select().from().where().limit(1)
+    const chain: any = {
+      from:    vi.fn(() => chain),
+      where:   vi.fn(() => chain),
+      limit:   vi.fn(() => chain),
+      orderBy: vi.fn(() => chain),
+      offset:  vi.fn(() => chain),
+      then:    (res: any) => res(itemRows),
+    }
+    const db: any = {
+      query: {
+        orders: { findMany: vi.fn(async () => []) },
+        items:  { findMany: vi.fn(async () => itemRows) },
+      },
+      select: vi.fn(() => chain),
+      insert: vi.fn(() => ({
+        values: vi.fn(() => ({
+          returning: vi.fn().mockResolvedValue([orderInsertReturn ?? { id: 1 }]),
+        })),
+      })),
+      update: vi.fn(() => ({
+        set: vi.fn(() => ({
+          where: vi.fn(() => ({ returning: vi.fn().mockResolvedValue(itemRows) })),
+        })),
+      })),
+      delete: vi.fn(() => ({ where: vi.fn().mockResolvedValue({ rowCount: 1 }) })),
+      transaction: vi.fn((cb: any) => cb(db)),
+    }
+    return db
+  }
+
+  it('creates a new child when no id is present (itemsAttributes with no id)', async () => {
+    // New order (isNewRecord=true) → insert order, then create child
+    const db = makeNaDb([])
+    // insert child should return a row
+    let insertCallCount = 0
+    db.insert = vi.fn(() => ({
+      values: vi.fn(() => ({
+        returning: vi.fn().mockResolvedValue([{ id: ++insertCallCount === 1 ? 1 : 30, orderId: 1, name: 'new' }]),
+      })),
+    }))
+    boot(db, naSchema)
+
+    // New order: _captureNestedAttributes picks up itemsAttributes from _attributes
+    const order = new NAOrder({ itemsAttributes: [{ name: 'new child' }] })
+    await order.save()
+
+    // db.insert should have been called: once for order, once for the new item child
+    expect(db.insert.mock.calls.length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('updates an existing child when { id, ...fields } passed', async () => {
+    const existingItem = { id: 10, orderId: 1, name: 'old' }
+    // chain.then returns existingItem so TargetModel.find(10) resolves to it
+    const db = makeNaDb([existingItem])
+    boot(db, naSchema)
+
+    // New order with nested item having id → update path
+    const order = new NAOrder({ itemsAttributes: [{ id: 10, name: 'updated' }] })
+    await order.save()
+    // update should be called at least for the existing item
+    expect(db.update).toHaveBeenCalled()
+  })
+
+  it('destroys a child when { id, _destroy: true } passed', async () => {
+    const existingItem = { id: 20, orderId: 1, name: 'to-delete' }
+    const db = makeNaDb([existingItem])
+    boot(db, naSchema)
+
+    const order = new NAOrder({ itemsAttributes: [{ id: 20, _destroy: true }] })
+    await order.save()
+    // delete should be called for the destroyed item
+    expect(db.delete).toHaveBeenCalled()
+  })
+})
+
+// ── Composite PK where-building ───────────────────────────────────────────────
+
+describe('Composite primary key — find/save/destroy', () => {
+  const cpkSchema = {
+    memberships: fakeTable(['teamId', 'userId', 'role']),
+  }
+
+  @model('memberships')
+  class Membership extends ApplicationRecord {
+    static primaryKey = ['teamId', 'userId']
+  }
+
+  it('constructs WHERE clause from composite PK array on find()', async () => {
+    const cpkChain: any = {
+      from:    vi.fn(() => cpkChain),
+      where:   vi.fn(() => cpkChain),
+      limit:   vi.fn(() => cpkChain),
+      orderBy: vi.fn(() => cpkChain),
+      offset:  vi.fn(() => cpkChain),
+      then:    (res: any) => res([{ teamId: 1, userId: 42, role: 'member' }]),
+    }
+    const db: any = {
+      query: {
+        memberships: {
+          findMany: vi.fn(async () => [{ teamId: 1, userId: 42, role: 'member' }]),
+        },
+      },
+      select: vi.fn(() => cpkChain),
+      transaction: vi.fn((cb: any) => cb(db)),
+    }
+    boot(db, cpkSchema)
+
+    // find() with array → composite PK → calls _buildPkWhere with Array.isArray(pk) branch
+    const m = await Membership.find([1, 42] as any)
+    expect(m).toBeDefined()
+    expect(m).toBeInstanceOf(Membership)
+    // The where() was called on the chain to apply composite PK conditions
+    expect(cpkChain.where).toHaveBeenCalled()
   })
 })

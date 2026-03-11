@@ -146,8 +146,10 @@ export async function defaultCreate(
   ctx: any,
   /** Scope fields (from URL params) — always set, not governed by permit list. */
   scopeOverrides: Record<string, any> = {},
+  /** Controller instance — passed to permit/autoSet functions that accept it. */
+  ctrl?: any,
 ): Promise<any> {
-  const permitted = buildPermittedData(rawInput, config.create, ctx, model)
+  const permitted = buildPermittedData(rawInput, config.create, ctx, model, ctrl)
   // Scope overrides are applied AFTER permit — they cannot be excluded or overridden
   const record = await model.create({ ...permitted, ...scopeOverrides })
   // ApplicationRecord.create returns the instance even if save failed.
@@ -164,10 +166,12 @@ export async function defaultUpdate(
   config: CrudConfig,
   id: number | string,
   rawInput: Record<string, any>,
+  /** Controller instance — passed to permit functions that accept it. */
+  ctrl?: any,
 ): Promise<any> {
   const record = await relation.where({ id }).first()
   if (!record) throw new NotFound(model.name)
-  const permitted = buildPermittedData(rawInput, config.update, null, model)
+  const permitted = buildPermittedData(rawInput, config.update, null, model, ctrl)
   for (const [k, v] of Object.entries(permitted)) {
     (record as any)[k] = v
   }
@@ -193,15 +197,23 @@ const ALWAYS_EXCLUDED = ['id', 'createdAt', 'updatedAt', 'created_at', 'updated_
 
 function buildPermittedData(
   input: Record<string, any>,
-  writeConfig: { permit?: string[]; restrict?: string[]; autoSet?: Record<string, (ctx: any) => any> } | undefined,
+  writeConfig: {
+    permit?: string[] | ((ctx: any, ctrl: any) => string[])
+    restrict?: string[]
+    autoSet?: Record<string, (ctx: any, ctrl?: any) => any>
+  } | undefined,
   ctx: any,
   model: any,
+  ctrl?: any,
 ): Record<string, any> {
   const { permit, restrict, autoSet } = writeConfig ?? {}
 
+  // permit can be a static list or a dynamic function (e.g., for role-based field access)
+  const resolvedPermit = typeof permit === 'function' ? permit(ctx, ctrl) : permit
+
   let allowed: Set<string>
-  if (permit) {
-    allowed = new Set(permit)
+  if (resolvedPermit) {
+    allowed = new Set(resolvedPermit)
   } else {
     allowed = new Set(Object.keys(input))
     for (const k of ALWAYS_EXCLUDED) allowed.delete(k)
@@ -215,7 +227,7 @@ function buildPermittedData(
 
   if (autoSet && ctx) {
     for (const [k, fn] of Object.entries(autoSet)) {
-      out[k] = fn(ctx)
+      out[k] = fn(ctx, ctrl)
     }
   }
 

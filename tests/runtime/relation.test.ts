@@ -1,71 +1,71 @@
 /**
- * Relation tests — smart hash where(), sub-queries, order(), inBatches(),
- * destroyAll(), toSubquery(), and Attr.set() integration in queries.
+ * Relation tests — comprehensive coverage of all query-builder methods.
  *
- * Uses the same mock DB pattern as hooks.test.ts.
+ * Covers: where/order/limit/offset, load, first/firstBang, last/lastBang, take,
+ * count, sum, average, minimum, maximum, tally, exists/any/many/one/empty,
+ * none, pluck, pick, ids, findOrInitializeBy, findOrCreateBy, updateAll,
+ * destroyAll, inBatches, findEach, toSubquery, withLock, loadAsync, clone.
  */
 
-import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest'
 import { Relation } from '../../src/runtime/relation.js'
 import { ApplicationRecord } from '../../src/runtime/application-record.js'
 import { boot } from '../../src/runtime/boot.js'
 import { Attr } from '../../src/runtime/attr.js'
 import { model } from '../../src/runtime/decorators.js'
-import { eq, and } from 'drizzle-orm'
+import { belongsTo } from '../../src/runtime/markers.js'
+import { RecordNotFound } from '../../src/runtime/boot.js'
+import { eq } from 'drizzle-orm'
 
-// ── Mock DB ────────────────────────────────────────────────────────────────
+// ── Mock DB helpers ──────────────────────────────────────────────────────────
 
-// Builds a mock DB where each query layer captures what was passed to it.
-function makeCaptureDb(rows: any[] = []) {
-  // Track calls for assertions
-  const captured: { select?: any; where?: any; from?: any; orderBy?: any; limit?: any; offset?: any; insert?: any; update?: any; delete?: any } = {}
+/**
+ * Creates a mock DB that:
+ *   - db.query[table].findMany → returns findManyRows
+ *   - db.select() chains → thenable that resolves to selectRows
+ *   - db.update()/delete()/insert() mocks
+ */
+function makeFlexibleDb(opts: {
+  findManyRows?: any[]
+  selectRows?: any[]
+  insertRows?: any[]
+} = {}) {
+  const findManyRows = opts.findManyRows ?? []
+  const selectRows   = opts.selectRows   ?? []
+  const insertRows   = opts.insertRows   ?? [{ id: 1 }]
 
-  // findMany mock (used by buildQuery via db.query[tableName].findMany)
-  const findMany = vi.fn(async (config: any) => {
-    captured.select = config
-    return rows
-  })
+  const findMany = vi.fn(async () => findManyRows)
 
-  const returningMock = vi.fn().mockResolvedValue(rows.length > 0 ? [rows[0]] : [{ id: 99 }])
-  const whereMock = vi.fn().mockReturnValue({ returning: returningMock })
-  const setMock = vi.fn().mockReturnValue({ where: whereMock })
-
-  // For db.select().from(table).where().orderBy().limit().offset()
   const chainMock: any = {
-    from: vi.fn(() => chainMock),
-    where: vi.fn((c) => { captured.where = c; return chainMock }),
-    orderBy: vi.fn((...args: any[]) => { captured.orderBy = args; return chainMock }),
-    limit: vi.fn((l) => { captured.limit = l; return chainMock }),
-    offset: vi.fn((o) => { captured.offset = o; return chainMock }),
-    then: (res: any) => res(rows),
-    // Make it awaitable (Promise-like)
+    from:    vi.fn(() => chainMock),
+    where:   vi.fn(() => chainMock),
+    limit:   vi.fn(() => chainMock),
+    offset:  vi.fn(() => chainMock),
+    orderBy: vi.fn(() => chainMock),
+    groupBy: vi.fn(() => chainMock),
+    for:     vi.fn(() => chainMock),
+    then:    (res: any) => res(selectRows),
   }
-  // Make chainMock thenable
-  Object.defineProperty(chainMock, Symbol.toStringTag, { value: 'Promise' })
 
   const selectMock = vi.fn(() => chainMock)
-  const deleteMock = vi.fn(() => ({ where: vi.fn().mockResolvedValue({ rowCount: rows.length }) }))
-  const updateMock = vi.fn(() => ({ set: setMock }))
+  const deleteMock = vi.fn(() => ({ where: vi.fn().mockResolvedValue({ rowCount: findManyRows.length }) }))
+  const updateSetMock  = vi.fn(() => ({ where: vi.fn().mockResolvedValue({ rowCount: 2 }) }))
+  const updateMock = vi.fn(() => ({ set: updateSetMock }))
+  const returningMock  = vi.fn().mockResolvedValue(insertRows)
   const insertMock = vi.fn(() => ({ values: vi.fn(() => ({ returning: returningMock })) }))
 
-  return {
-    db: {
-      query: { posts: { findMany } },
-      select: selectMock,
-      delete: deleteMock,
-      update: updateMock,
-      insert: insertMock,
-    } as any,
-    findMany,
-    selectMock,
-    deleteMock,
-    updateMock,
-    captured,
-    returningMock,
+  const db: any = {
+    query: { posts: { findMany } },
+    select: selectMock,
+    delete: deleteMock,
+    update: updateMock,
+    insert: insertMock,
+    transaction: vi.fn(async (cb: any) => cb(db)),
   }
+
+  return { db, findMany, selectMock, deleteMock, updateMock, updateSetMock, insertMock, chainMock }
 }
 
-// Minimal fake column objects — enough for eq()/inArray() to not throw
 function fakeTable(cols: string[]): Record<string, any> {
   const t: Record<string, any> = {}
   for (const c of cols) t[c] = { columnName: c, _name: c }
@@ -73,29 +73,37 @@ function fakeTable(cols: string[]): Record<string, any> {
 }
 
 const schema = {
-  posts: fakeTable(['id', 'title', 'status', 'teamId']),
+  posts:   fakeTable(['id', 'title', 'status', 'teamId', 'score', 'price']),
+  authors: fakeTable(['id', 'name', 'reputation']),
 }
 
-// ── Setup ──────────────────────────────────────────────────────────────────
+// ── Models ───────────────────────────────────────────────────────────────────
+
+@model('authors')
+class Author extends ApplicationRecord {
+  static reputation = Attr.enum({ novice: 0, expert: 1 } as const)
+}
 
 @model('posts')
 class Post extends ApplicationRecord {
   static status = Attr.enum({ draft: 0, sent: 1, failed: 2 } as const)
   static title  = Attr.string()
+  static author = belongsTo('authors')
 }
 
-let mockDb: ReturnType<typeof makeCaptureDb>
+let defaultDb: ReturnType<typeof makeFlexibleDb>
 
 beforeAll(() => {
-  mockDb = makeCaptureDb([{ id: 1, title: 'hello', status: 0 }])
-  boot(mockDb.db, schema)
+  defaultDb = makeFlexibleDb({ findManyRows: [{ id: 1, title: 'hello', status: 0 }] })
+  boot(defaultDb.db, schema)
 })
 
-beforeEach(() => {
-  vi.clearAllMocks()
-})
+beforeEach(() => vi.clearAllMocks())
+afterEach(() => vi.clearAllMocks())
 
-// ── where() hash conditions ────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. where() hash conditions
+// ─────────────────────────────────────────────────────────────────────────────
 
 describe('Relation.where() — hash conditions', () => {
   it('simple equality: eq(col, rawValue)', () => {
@@ -105,27 +113,22 @@ describe('Relation.where() — hash conditions', () => {
   })
 
   it('applies Attr.set() transform for enum labels', () => {
-    // Build the relation and inspect _where directly
     const rel = new Relation(Post)
     rel.where({ status: 'sent' })
     expect(rel['_where']).toHaveLength(1)
-    // The single expression should NOT be the raw hash { status: 'sent' }
-    // It should be a drizzle SQL object (produced by eq())
     const expr = rel['_where'][0] as any
     expect(expr).not.toMatchObject({ status: 'sent' })
-    // And the JSON serialisation should contain the integer 1 (Attr.set('sent') = 1)
     expect(JSON.stringify(expr)).toContain('1')
   })
 
   it('array value → inArray with Attr.set() per element', async () => {
     let capturedConfig: any
-    mockDb.db.query.posts.findMany = vi.fn(async (cfg: any) => {
+    defaultDb.db.query.posts.findMany = vi.fn(async (cfg: any) => {
       capturedConfig = cfg
       return []
     })
     await new Relation(Post).where({ status: ['draft', 'sent'] }).load()
     expect(capturedConfig.where).toBeDefined()
-    // Stringify the SQL expression — it should include the transformed integers 0 and 1
     const sqlStr = JSON.stringify(capturedConfig.where)
     expect(sqlStr).toContain('0')
     expect(sqlStr).toContain('1')
@@ -135,9 +138,7 @@ describe('Relation.where() — hash conditions', () => {
     const rel = new Relation(Post)
     rel.where({ teamId: null })
     expect(rel['_where']).toHaveLength(1)
-    // isNull produces a "IS NULL" SQL node
-    const expr = rel['_where'][0] as any
-    const sql = JSON.stringify(expr).toLowerCase()
+    const sql = JSON.stringify(rel['_where'][0]).toLowerCase()
     expect(sql).toContain('null')
   })
 
@@ -167,7 +168,9 @@ describe('Relation.where() — hash conditions', () => {
   })
 })
 
-// ── order() ────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. order()
+// ─────────────────────────────────────────────────────────────────────────────
 
 describe('Relation.order()', () => {
   it('accepts (field, "desc") and builds desc() expression', () => {
@@ -193,9 +196,16 @@ describe('Relation.order()', () => {
     rel.order(expr)
     expect(rel['_order'][0]).toBe(expr)
   })
+
+  it('chains multiple order() calls', () => {
+    const rel = new Relation(Post).order('status', 'asc').order('title', 'desc')
+    expect(rel['_order']).toHaveLength(2)
+  })
 })
 
-// ── limit / offset ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. limit / offset
+// ─────────────────────────────────────────────────────────────────────────────
 
 describe('Relation.limit() / offset()', () => {
   it('stores limit and offset', () => {
@@ -205,95 +215,807 @@ describe('Relation.limit() / offset()', () => {
   })
 })
 
-// ── toSubquery ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. load() / all()
+// ─────────────────────────────────────────────────────────────────────────────
 
-describe('Relation.toSubquery()', () => {
-  it('builds a Drizzle sub-query selecting the given column', () => {
-    const rel = new Relation(Post).where({ status: 'draft' })
-    // toSubquery() calls getExecutor().select(...).from(table).where(...)
-    // We just verify it doesn't throw and returns something
-    expect(() => rel.toSubquery('id')).not.toThrow()
-    rel.toSubquery('id')
-    expect(mockDb.selectMock).toHaveBeenCalled()
+describe('Relation.load()', () => {
+  it('calls db.query[tableName].findMany and returns model instances', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [{ id: 1, title: 'A', status: 0 }, { id: 2, title: 'B', status: 1 }] })
+    boot(mock.db, schema)
+
+    const posts = await new Relation(Post).load()
+    expect(posts).toHaveLength(2)
+    expect(posts[0]).toBeInstanceOf(Post)
+    expect(mock.findMany).toHaveBeenCalled()
   })
 
-  it('throws when column does not exist', () => {
-    const rel = new Relation(Post)
-    expect(() => rel.toSubquery('nonexistent')).toThrow(/not found/)
+  it('returns empty array when no rows match', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [] })
+    boot(mock.db, schema)
+
+    const posts = await new Relation(Post).load()
+    expect(posts).toEqual([])
+  })
+
+  it('Relation is thenable — can be awaited directly', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [{ id: 1, title: 'T', status: 0 }] })
+    boot(mock.db, schema)
+
+    const posts: Post[] = await new Relation(Post) as any
+    expect(posts).toHaveLength(1)
   })
 })
 
-// ── destroyAll ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. first() / firstBang()
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.first() / firstBang()', () => {
+  it('first() returns the first record', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [{ id: 1, title: 'first', status: 0 }] })
+    boot(mock.db, schema)
+
+    const post = await new Relation(Post).first()
+    expect(post).toBeInstanceOf(Post)
+    expect((post as any).id).toBe(1)
+  })
+
+  it('first() returns null when no rows', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [] })
+    boot(mock.db, schema)
+
+    const post = await new Relation(Post).first()
+    expect(post).toBeNull()
+  })
+
+  it('firstBang() returns the record when found', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [{ id: 5, title: 'exists', status: 1 }] })
+    boot(mock.db, schema)
+
+    const post = await new Relation(Post).firstBang()
+    expect(post).toBeInstanceOf(Post)
+  })
+
+  it('firstBang() throws RecordNotFound when empty', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [] })
+    boot(mock.db, schema)
+
+    await expect(new Relation(Post).firstBang()).rejects.toThrow(RecordNotFound)
+  })
+
+  it('first() sets _limit = 1 on the cloned relation', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [] })
+    boot(mock.db, schema)
+    let capturedConfig: any
+    mock.db.query.posts.findMany = vi.fn(async (cfg: any) => { capturedConfig = cfg; return [] })
+
+    await new Relation(Post).first()
+    expect(capturedConfig?.limit).toBe(1)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. last() / lastBang()
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.last() / lastBang()', () => {
+  it('last() with no args returns the last record (desc id)', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [{ id: 99, title: 'last', status: 0 }] })
+    boot(mock.db, schema)
+
+    const post = await new Relation(Post).last()
+    expect(post).toBeInstanceOf(Post)
+    expect((post as any).id).toBe(99)
+  })
+
+  it('last() returns null when no rows', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [] })
+    boot(mock.db, schema)
+
+    const post = await new Relation(Post).last()
+    expect(post).toBeNull()
+  })
+
+  it('last(n) returns an array of n records', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [{ id: 1, status: 0 }, { id: 2, status: 0 }, { id: 3, status: 0 }] })
+    boot(mock.db, schema)
+
+    const posts = await new Relation(Post).last(3) as Post[]
+    expect(Array.isArray(posts)).toBe(true)
+    expect(posts).toHaveLength(3)
+  })
+
+  it('last() reverses an existing order', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [] })
+    boot(mock.db, schema)
+    let capturedConfig: any
+    mock.db.query.posts.findMany = vi.fn(async (cfg: any) => { capturedConfig = cfg; return [] })
+
+    await new Relation(Post).order('title', 'asc').last()
+    // order should have been reversed
+    expect(capturedConfig?.orderBy).toBeDefined()
+  })
+
+  it('lastBang() throws when empty', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [] })
+    boot(mock.db, schema)
+
+    await expect(new Relation(Post).lastBang()).rejects.toThrow(RecordNotFound)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. take()
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.take()', () => {
+  it('take() with no args returns a single record', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [{ id: 1, status: 0 }] })
+    boot(mock.db, schema)
+
+    const post = await new Relation(Post).take()
+    expect(post).toBeInstanceOf(Post)
+  })
+
+  it('take() with no args returns null when empty', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [] })
+    boot(mock.db, schema)
+
+    const post = await new Relation(Post).take()
+    expect(post).toBeNull()
+  })
+
+  it('take(n) returns an array of n records', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [{ id: 1, status: 0 }, { id: 2, status: 0 }] })
+    boot(mock.db, schema)
+
+    const posts = await new Relation(Post).take(2) as Post[]
+    expect(Array.isArray(posts)).toBe(true)
+    expect(posts).toHaveLength(2)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. count()
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.count()', () => {
+  it('returns count from db.select()', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ n: 42 }] })
+    boot(mock.db, schema)
+
+    const n = await new Relation(Post).count()
+    expect(n).toBe(42)
+    expect(mock.selectMock).toHaveBeenCalled()
+  })
+
+  it('returns 0 when no rows', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ n: null }] })
+    boot(mock.db, schema)
+
+    const n = await new Relation(Post).count()
+    expect(n).toBe(0)
+  })
+
+  it('count() on a none() relation returns 0 without hitting the DB', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+
+    const n = await new Relation(Post).none().count()
+    expect(n).toBe(0)
+    expect(mock.selectMock).not.toHaveBeenCalled()
+  })
+
+  it('applies where clauses to the count query', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ n: 5 }] })
+    boot(mock.db, schema)
+
+    const n = await new Relation(Post).where({ status: 'draft' }).count()
+    expect(n).toBe(5)
+    expect(mock.chainMock.where).toHaveBeenCalled()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. sum() / average() / minimum() / maximum()
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.sum() / average() / minimum() / maximum()', () => {
+  it('sum() returns the sum as a number', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ n: 1500 }] })
+    boot(mock.db, schema)
+
+    const total = await new Relation(Post).sum('score')
+    expect(total).toBe(1500)
+  })
+
+  it('sum() returns 0 on none() relation', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    const total = await new Relation(Post).none().sum('score')
+    expect(total).toBe(0)
+  })
+
+  it('sum() throws when column not found', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    await expect(new Relation(Post).sum('nonexistent')).rejects.toThrow(/not found/)
+  })
+
+  it('average() returns the average', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ n: '7.5' }] })
+    boot(mock.db, schema)
+
+    const avg = await new Relation(Post).average('score')
+    expect(avg).toBe(7.5)
+  })
+
+  it('average() returns null when no rows', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ n: null }] })
+    boot(mock.db, schema)
+
+    const avg = await new Relation(Post).average('score')
+    expect(avg).toBeNull()
+  })
+
+  it('average() returns null on none() relation', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    expect(await new Relation(Post).none().average('score')).toBeNull()
+  })
+
+  it('minimum() returns the min value', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ n: 3 }] })
+    boot(mock.db, schema)
+
+    const min = await new Relation(Post).minimum('score')
+    expect(min).toBe(3)
+  })
+
+  it('minimum() returns null on none()', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    expect(await new Relation(Post).none().minimum('score')).toBeNull()
+  })
+
+  it('minimum() throws when column not found', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    await expect(new Relation(Post).minimum('noField')).rejects.toThrow(/not found/)
+  })
+
+  it('maximum() returns the max value', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ n: 99 }] })
+    boot(mock.db, schema)
+
+    const max = await new Relation(Post).maximum('score')
+    expect(max).toBe(99)
+  })
+
+  it('maximum() returns null on none()', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    expect(await new Relation(Post).none().maximum('score')).toBeNull()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. tally()
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.tally()', () => {
+  it('returns a Record mapping labels to counts', async () => {
+    // status 0 = 'draft', status 1 = 'sent'
+    const mock = makeFlexibleDb({ selectRows: [{ val: 0, n: 5 }, { val: 1, n: 3 }] })
+    boot(mock.db, schema)
+
+    const counts = await new Relation(Post).tally('status')
+    expect(counts).toEqual({ draft: 5, sent: 3 })
+  })
+
+  it('tally() on a plain string column', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ val: 'US', n: 10 }, { val: 'UK', n: 4 }] })
+    boot(mock.db, schema)
+
+    const counts = await new Relation(Post).tally('title')
+    expect(counts).toEqual({ US: 10, UK: 4 })
+  })
+
+  it('tally() returns {} on none() relation', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    const counts = await new Relation(Post).none().tally('status')
+    expect(counts).toEqual({})
+  })
+
+  it('tally() throws when column not found', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    await expect(new Relation(Post).tally('badColumn')).rejects.toThrow(/not found/)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. exists() / any() / many() / one() / empty()
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.exists() / any() / many() / one() / empty()', () => {
+  it('exists() returns true when rows exist', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ one: 1 }] })
+    boot(mock.db, schema)
+    expect(await new Relation(Post).exists()).toBe(true)
+  })
+
+  it('exists() returns false when no rows', async () => {
+    const mock = makeFlexibleDb({ selectRows: [] })
+    boot(mock.db, schema)
+    expect(await new Relation(Post).exists()).toBe(false)
+  })
+
+  it('exists() returns false on none() relation', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    expect(await new Relation(Post).none().exists()).toBe(false)
+  })
+
+  it('exists() accepts additional conditions', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ one: 1 }] })
+    boot(mock.db, schema)
+    expect(await new Relation(Post).exists({ status: 'draft' })).toBe(true)
+  })
+
+  it('any() is an alias for exists()', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ one: 1 }] })
+    boot(mock.db, schema)
+    expect(await new Relation(Post).any()).toBe(true)
+  })
+
+  it('many() returns true when count > 1', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ n: 5 }] })
+    boot(mock.db, schema)
+    expect(await new Relation(Post).many()).toBe(true)
+  })
+
+  it('many() returns false when count is 1', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ n: 1 }] })
+    boot(mock.db, schema)
+    expect(await new Relation(Post).many()).toBe(false)
+  })
+
+  it('one() returns true when count is exactly 1', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ n: 1 }] })
+    boot(mock.db, schema)
+    expect(await new Relation(Post).one()).toBe(true)
+  })
+
+  it('one() returns false when count is 0 or > 1', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ n: 0 }] })
+    boot(mock.db, schema)
+    expect(await new Relation(Post).one()).toBe(false)
+  })
+
+  it('empty() returns true when no records exist', async () => {
+    const mock = makeFlexibleDb({ selectRows: [] })
+    boot(mock.db, schema)
+    expect(await new Relation(Post).empty()).toBe(true)
+  })
+
+  it('empty() returns false when records exist', async () => {
+    const mock = makeFlexibleDb({ selectRows: [{ one: 1 }] })
+    boot(mock.db, schema)
+    expect(await new Relation(Post).empty()).toBe(false)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. none()
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.none()', () => {
+  it('load() on none() returns [] without hitting the DB', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [{ id: 1 }] })
+    boot(mock.db, schema)
+
+    const posts = await new Relation(Post).none().load()
+    expect(posts).toEqual([])
+    expect(mock.findMany).not.toHaveBeenCalled()
+  })
+
+  it('first() on none() returns null', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [{ id: 1 }] })
+    boot(mock.db, schema)
+    const post = await new Relation(Post).none().first()
+    expect(post).toBeNull()
+  })
+
+  it('count() on none() returns 0', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    expect(await new Relation(Post).none().count()).toBe(0)
+    expect(mock.selectMock).not.toHaveBeenCalled()
+  })
+
+  it('pluck() on none() returns []', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    const ids = await new Relation(Post).none().pluck('id')
+    expect(ids).toEqual([])
+  })
+
+  it('none() is chainable with where/order/limit', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [{ id: 1 }] })
+    boot(mock.db, schema)
+    const rel = new Relation(Post).none().where({ status: 'draft' }).limit(5).order('title')
+    const posts = await rel.load()
+    expect(posts).toEqual([])
+    expect(mock.findMany).not.toHaveBeenCalled()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. pluck() — flat fields
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.pluck() — flat fields', () => {
+  it('single field → flat array of values', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    // Flat pluck uses db.select()
+    mock.chainMock.then = (res: any) => res([{ id: 1 }, { id: 2 }, { id: 3 }])
+
+    const ids = await new Relation(Post).pluck('id')
+    expect(ids).toEqual([1, 2, 3])
+    expect(mock.selectMock).toHaveBeenCalled()
+  })
+
+  it('multiple fields → array of objects', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    mock.chainMock.then = (res: any) => res([
+      { id: 1, title: 'A' },
+      { id: 2, title: 'B' },
+    ])
+
+    const results = await new Relation(Post).pluck('id', 'title')
+    expect(results).toEqual([{ id: 1, title: 'A' }, { id: 2, title: 'B' }])
+  })
+
+  it('applies Attr.get transform for enum fields', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    // status is Attr.enum — stored as integer, returned as label
+    mock.chainMock.then = (res: any) => res([{ status: 0 }, { status: 1 }])
+
+    const labels = await new Relation(Post).pluck('status')
+    expect(labels).toEqual(['draft', 'sent'])
+  })
+
+  it('pluck() on none() returns []', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    const result = await new Relation(Post).none().pluck('id')
+    expect(result).toEqual([])
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. pick()
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.pick()', () => {
+  it('pick(single) returns the first record\'s value', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    mock.chainMock.then = (res: any) => res([{ id: 42 }])
+
+    const id = await new Relation(Post).pick('id')
+    expect(id).toBe(42)
+  })
+
+  it('pick(multiple) returns the first record as an object', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    mock.chainMock.then = (res: any) => res([{ id: 1, title: 'First' }])
+
+    const result = await new Relation(Post).pick('id', 'title')
+    expect(result).toEqual({ id: 1, title: 'First' })
+  })
+
+  it('pick() returns null when no rows', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    mock.chainMock.then = (res: any) => res([])
+
+    const result = await new Relation(Post).pick('id')
+    expect(result).toBeNull()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. ids()
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.ids()', () => {
+  it('returns all primary key values', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    mock.chainMock.then = (res: any) => res([{ id: 1 }, { id: 2 }, { id: 5 }])
+
+    const ids = await new Relation(Post).ids()
+    expect(ids).toEqual([1, 2, 5])
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. updateAll()
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.updateAll()', () => {
+  it('calls db.update(table).set(attrs).where(conditions)', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+
+    await new Relation(Post).where({ status: 'draft' }).updateAll({ status: 'sent' })
+    expect(mock.updateMock).toHaveBeenCalled()
+    expect(mock.updateSetMock).toHaveBeenCalled()
+  })
+
+  it('applies Attr.set transforms when building the update', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+
+    let capturedSet: any
+    mock.db.update = vi.fn(() => ({
+      set: vi.fn((s: any) => {
+        capturedSet = s
+        return { where: vi.fn().mockResolvedValue({ rowCount: 1 }) }
+      }),
+    }))
+
+    await new Relation(Post).updateAll({ status: 'sent' })
+    // status: 'sent' → integer 1 via Attr.set
+    expect(capturedSet).toBeDefined()
+    // The value should be the integer 1, not the string 'sent'
+    expect(Object.values(capturedSet)).toContain(1)
+  })
+
+  it('updateAll() without where clause updates all rows', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+
+    await new Relation(Post).updateAll({ status: 'failed' })
+    expect(mock.updateMock).toHaveBeenCalled()
+    // where clause should NOT be applied when there's no _where
+    const setFn = mock.db.update.mock.results[0]?.value?.set
+    expect(setFn).toBeDefined()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 17. destroyAll()
+// ─────────────────────────────────────────────────────────────────────────────
 
 describe('Relation.destroyAll()', () => {
   it('calls db.delete(table) with where clause', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+
     const rel = new Relation(Post).where({ status: 'draft' })
     await rel.destroyAll()
-    expect(mockDb.deleteMock).toHaveBeenCalled()
+    expect(mock.deleteMock).toHaveBeenCalled()
+  })
+
+  it('destroyAll() without conditions deletes all rows', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    await new Relation(Post).destroyAll()
+    expect(mock.deleteMock).toHaveBeenCalled()
   })
 })
 
-// ── inBatches ──────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// 18. inBatches()
+// ─────────────────────────────────────────────────────────────────────────────
 
 describe('Relation.inBatches()', () => {
-  it('calls callback once per full batch then stops on partial', async () => {
-    // Each call to findMany: first returns 3 rows (< batchSize 5), so should stop after 1 batch
-    mockDb.db.query.posts.findMany = vi.fn(async () => [
-      { id: 1 }, { id: 2 }, { id: 3 },
-    ])
+  it('calls callback once per batch until empty', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
 
-    const callbackCount = vi.fn()
-    await new Relation(Post).inBatches(5, async (_batch) => {
-      callbackCount()
-    })
-
-    expect(callbackCount).toHaveBeenCalledTimes(1)
-  })
-
-  it('stops when findMany returns empty array', async () => {
-    mockDb.db.query.posts.findMany = vi.fn(async () => [])
-    const callbackCount = vi.fn()
-    await new Relation(Post).inBatches(10, async () => { callbackCount() })
-    expect(callbackCount).not.toHaveBeenCalled()
-  })
-
-  it('iterates across multiple full batches then stops', async () => {
-    // Return exactly batchSize each of first 2 calls, then 0
     let call = 0
-    mockDb.db.query.posts.findMany = vi.fn(async () => {
+    mock.db.query.posts.findMany = vi.fn(async () => {
       call++
-      if (call <= 2) return [{ id: call * 10 }, { id: call * 10 + 1 }]  // 2 rows = batchSize
+      if (call <= 2) return [{ id: call * 10 }, { id: call * 10 + 1 }]
       return []
     })
 
-    const callbackCount = vi.fn()
-    await new Relation(Post).inBatches(2, async () => { callbackCount() })
-    expect(callbackCount).toHaveBeenCalledTimes(2)
+    const batchCount = vi.fn()
+    await new Relation(Post).inBatches(2, async () => { batchCount() })
+    expect(batchCount).toHaveBeenCalledTimes(2)
+  })
+
+  it('stops when findMany returns partial batch', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    mock.db.query.posts.findMany = vi.fn(async () => [{ id: 1 }, { id: 2 }, { id: 3 }])
+
+    const calls = vi.fn()
+    await new Relation(Post).inBatches(5, async () => { calls() })
+    expect(calls).toHaveBeenCalledTimes(1)
+  })
+
+  it('never calls callback when empty', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [] })
+    boot(mock.db, schema)
+
+    const calls = vi.fn()
+    await new Relation(Post).inBatches(10, async () => { calls() })
+    expect(calls).not.toHaveBeenCalled()
   })
 })
 
-// ── Relation sub-query in where ────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// 19. findEach()
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.findEach()', () => {
+  it('calls callback for each individual record', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+
+    // inBatches calls batch.load() to check row count (call 1),
+    // then findEach's callback calls batch.load() again (call 2).
+    // Both calls return the same rows; rows.length < batchSize breaks the loop.
+    let call = 0
+    mock.db.query.posts.findMany = vi.fn(async () => {
+      call++
+      if (call <= 2) return [{ id: 1, status: 0 }, { id: 2, status: 1 }]
+      return []
+    })
+
+    const seen: number[] = []
+    await new Relation(Post).findEach(10, async (post) => {
+      seen.push((post as any).id)
+    })
+
+    expect(seen).toEqual([1, 2])
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 20. findOrInitializeBy() / findOrCreateBy()
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.findOrInitializeBy()', () => {
+  it('returns the existing record if found', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [{ id: 5, title: 'existing', status: 0 }] })
+    boot(mock.db, schema)
+
+    const post = await new Relation(Post).findOrInitializeBy({ title: 'existing' })
+    expect(post).toBeInstanceOf(Post)
+    expect((post as any).isNewRecord).toBe(false)
+  })
+
+  it('returns a new unsaved instance when not found', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [] })
+    boot(mock.db, schema)
+
+    const post = await new Relation(Post).findOrInitializeBy({ title: 'new one' })
+    expect(post).toBeInstanceOf(Post)
+    expect((post as any).isNewRecord).toBe(true)
+  })
+})
+
+describe('Relation.findOrCreateBy()', () => {
+  it('returns existing record if found', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [{ id: 10, title: 'existing', status: 0 }] })
+    boot(mock.db, schema)
+
+    const post = await new Relation(Post).findOrCreateBy({ title: 'existing' })
+    expect(post).toBeInstanceOf(Post)
+    expect(mock.insertMock).not.toHaveBeenCalled()
+  })
+
+  it('creates and returns a new record when not found', async () => {
+    const mock = makeFlexibleDb({
+      findManyRows: [],
+      insertRows: [{ id: 99, title: 'new one', status: 0 }],
+    })
+    boot(mock.db, schema)
+
+    const post = await new Relation(Post).findOrCreateBy({ title: 'new one' })
+    expect(post).toBeInstanceOf(Post)
+    expect(mock.insertMock).toHaveBeenCalled()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 21. toSubquery()
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.toSubquery()', () => {
+  it('builds a subquery without throwing', () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+
+    expect(() => new Relation(Post).where({ status: 'draft' }).toSubquery('id')).not.toThrow()
+    expect(mock.selectMock).toHaveBeenCalled()
+  })
+
+  it('defaults to selecting "id" column', () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+
+    expect(() => new Relation(Post).toSubquery()).not.toThrow()
+    expect(mock.selectMock).toHaveBeenCalled()
+  })
+
+  it('throws when the column does not exist in the schema', () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    expect(() => new Relation(Post).toSubquery('nonexistent')).toThrow(/not found/)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 22. withLock()
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.withLock()', () => {
+  it('calls the callback within a transaction', async () => {
+    const mock = makeFlexibleDb({ findManyRows: [{ id: 1, status: 0 }] })
+    boot(mock.db, schema)
+
+    let callbackFired = false
+    await new Relation(Post).where({ id: 1 }).withLock(async (_rel) => {
+      callbackFired = true
+      return null
+    })
+
+    expect(callbackFired).toBe(true)
+    expect(mock.db.transaction).toHaveBeenCalled()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 23. Relation.loadAsync() — fire-and-collect
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.loadAsync()', () => {
+  it('returns the relation itself for chaining', () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+
+    const rel = new Relation(Post)
+    const result = rel.loadAsync()
+    expect(result).toBe(rel)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 24. Relation as subquery value in where()
+// ─────────────────────────────────────────────────────────────────────────────
 
 describe('Relation as value in where() → sub-query', () => {
   it('passes inArray(col, subquery) when a Relation is the value', () => {
-    @model('posts')
+    @model('teams')
     class Team extends ApplicationRecord {}
-    // Make teams table available in schema
     schema['teams' as any] = fakeTable(['id', 'postId'])
-    boot(mockDb.db, schema)
+    boot(defaultDb.db, schema)
 
     const subRelation = new Relation(Post).where({ status: 'draft' })
     const teamRel = new Relation(Team)
-    // This should call inArray with the subquery
     teamRel.where({ id: subRelation })
     expect(teamRel['_where']).toHaveLength(1)
-    // The expression should be an inArray / IN expression
     const expr = JSON.stringify(teamRel['_where'][0]).toLowerCase()
     expect(expr).toContain('in')
   })
 })
 
-// ── _clone immutability ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// 25. _clone() immutability
+// ─────────────────────────────────────────────────────────────────────────────
 
 describe('Relation._clone()', () => {
   it('produces an independent copy that does not mutate the original', () => {
@@ -303,5 +1025,133 @@ describe('Relation._clone()', () => {
     cloned.where({ teamId: 1 })
     expect(original['_limit']).toBe(5)
     expect(original['_where']).toHaveLength(1)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 26. RecordNotFound from boot.ts
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('RecordNotFound', () => {
+  it('constructs with model name and id', () => {
+    const err = new RecordNotFound('User', 42)
+    expect(err.message).toBe('User with id=42 not found')
+    expect(err.model).toBe('User')
+    expect(err.id).toBe(42)
+    expect(err.name).toBe('RecordNotFound')
+    expect(err).toBeInstanceOf(Error)
+  })
+
+  it('serializes complex id values with JSON.stringify', () => {
+    const err = new RecordNotFound('Post', { teamId: 1, id: 5 })
+    expect(err.message).toContain('teamId')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 27. pluck() — nested (dotted) paths
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Relation.pluck() — nested dotted paths', () => {
+  beforeAll(() => {
+    // Re-boot with both tables in schema
+    const nestedMock = makeFlexibleDb({ findManyRows: [] })
+    boot(nestedMock.db, schema)
+  })
+
+  it('single nested path → flat array of values', async () => {
+    const rows = [
+      { id: 1, author: { name: 'Alice' } },
+      { id: 2, author: { name: 'Bob' } },
+    ]
+    const mock = makeFlexibleDb()
+    mock.db.query.posts = { findMany: vi.fn(async () => rows) }
+    boot(mock.db, schema)
+
+    const names = await new Relation(Post).pluck('author.name')
+    expect(names).toEqual(['Alice', 'Bob'])
+  })
+
+  it('mixed flat + nested → array of objects with dotted keys', async () => {
+    const rows = [
+      { id: 1, status: 0, author: { name: 'Alice' } },
+      { id: 2, status: 1, author: { name: 'Bob' } },
+    ]
+    const mock = makeFlexibleDb()
+    mock.db.query.posts = { findMany: vi.fn(async () => rows) }
+    boot(mock.db, schema)
+
+    const results = await new Relation(Post).pluck('id', 'author.name')
+    expect(results).toEqual([
+      { id: 1, 'author.name': 'Alice' },
+      { id: 2, 'author.name': 'Bob' },
+    ])
+  })
+
+  it('applies Attr.get transform on the nested field', async () => {
+    // Author.reputation is Attr.enum: 0 → 'novice', 1 → 'expert'
+    const rows = [
+      { author: { reputation: 0 } },
+      { author: { reputation: 1 } },
+    ]
+    const mock = makeFlexibleDb()
+    mock.db.query.posts = { findMany: vi.fn(async () => rows) }
+    boot(mock.db, schema)
+
+    const reps = await new Relation(Post).pluck('author.reputation')
+    expect(reps).toEqual(['novice', 'expert'])
+  })
+
+  it('null association → undefined value in result (optional chaining)', async () => {
+    const rows = [
+      { id: 1, author: null },
+      { id: 2, author: { name: 'Bob' } },
+    ]
+    const mock = makeFlexibleDb()
+    mock.db.query.posts = { findMany: vi.fn(async () => rows) }
+    boot(mock.db, schema)
+
+    const names = await new Relation(Post).pluck('author.name')
+    // null?.name returns undefined (optional chaining semantics)
+    expect(names[0]).toBeUndefined()
+    expect(names[1]).toBe('Bob')
+  })
+
+  it('nested pluck passes limit and offset to findMany', async () => {
+    let capturedConfig: any
+    const mock = makeFlexibleDb()
+    mock.db.query.posts = {
+      findMany: vi.fn(async (cfg: any) => { capturedConfig = cfg; return [] }),
+    }
+    boot(mock.db, schema)
+
+    await new Relation(Post).limit(5).offset(10).pluck('author.name')
+    expect(capturedConfig?.limit).toBe(5)
+    expect(capturedConfig?.offset).toBe(10)
+  })
+
+  it('nested pluck returns [] on none() relation', async () => {
+    const mock = makeFlexibleDb()
+    boot(mock.db, schema)
+    const result = await new Relation(Post).none().pluck('author.name')
+    expect(result).toEqual([])
+  })
+
+  it('resolves association target by inferred plural name (no explicit table on marker)', async () => {
+    // When belongsTo() has no explicit table, _lookupAssocTarget falls back to
+    // inferring the table from the property name (lines 848-855 in relation.ts)
+    @model('posts')
+    class PostNoTable extends ApplicationRecord {
+      // belongsTo() with no table arg → marker.table is undefined → inferential path
+      static author = belongsTo()
+    }
+
+    const rows = [{ id: 1, author: { name: 'Alice' } }]
+    const mock = makeFlexibleDb()
+    mock.db.query['posts'] = { findMany: vi.fn(async () => rows) }
+    boot(mock.db, { ...schema })
+
+    const names = await new Relation(PostNoTable).pluck('author.name')
+    expect(names).toEqual(['Alice'])
   })
 })

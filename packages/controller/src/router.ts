@@ -67,10 +67,11 @@ export function buildRouter<TContext = Record<string, any>>(
     record?: any,
   ): any {
     const inst = new ControllerClass()
-    inst['context'] = context
-    inst['params']  = params
-    inst['input']   = params   // alias
+    inst['context']  = context
+    inst['params']   = params
+    inst['input']    = params   // alias
     inst['relation'] = startRelation
+    inst['state']    = {}
     if (record !== undefined) inst['record'] = record
     return inst
   }
@@ -103,10 +104,24 @@ export function buildRouter<TContext = Record<string, any>>(
     actionName: string,
     handler: (ctrl: any) => Promise<any>,
     record?: any,
+    /**
+     * Optional scopeBy function from @crud config.
+     * Applied to ctrl.relation AFTER @before hooks run so that resolved
+     * state (e.g., this.state.org) is available when computing the scope.
+     */
+    scopeByFn?: (ctrl: any) => Record<string, any>,
   ): Promise<any> {
     const ctrl = makeController(context, params, relation, record)
     try {
       await ctrl._runBeforeHooks(actionName)
+
+      // Apply scopeBy after before hooks so this.state is fully populated.
+      // This updates ctrl.relation in-place — all default handlers use ctrl.relation.
+      if (scopeByFn) {
+        const extra = scopeByFn(ctrl)
+        ctrl['relation'] = ctrl['relation'].where(extra)
+      }
+
       const result = await handler(ctrl)
       await ctrl._runAfterHooks(actionName)
       return result
@@ -163,8 +178,11 @@ export function buildRouter<TContext = Record<string, any>>(
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'index',
         async (ctrl) => {
           if (typeof ctrl.index === 'function') return ctrl.index()
-          return defaultIndex(rel, model, config, input as any)
-        })
+          return defaultIndex(ctrl.relation, model, config, input as any)
+        },
+        undefined,
+        config.scopeBy,
+      )
     })
     routes.push({ method: 'GET', path: basePath, procedure: 'index', action: 'index' })
 
@@ -176,8 +194,11 @@ export function buildRouter<TContext = Record<string, any>>(
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'get',
         async (ctrl) => {
           if (typeof ctrl.get === 'function') return ctrl.get()
-          return defaultGet(rel, model, config, (input as any).id)
-        })
+          return defaultGet(ctrl.relation, model, config, (input as any).id)
+        },
+        undefined,
+        config.scopeBy,
+      )
     })
     routes.push({ method: 'GET', path: `${basePath}/:id`, procedure: 'get', action: 'get' })
 
@@ -189,11 +210,15 @@ export function buildRouter<TContext = Record<string, any>>(
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'create',
         async (ctrl) => {
           if (typeof ctrl.create === 'function') return ctrl.create()
-          // Scope fields (from URL params) are always injected, bypassing permit list
+          // Scope fields (from URL params) are always injected, bypassing permit list.
+          // scopeBy fields are handled via autoSet; they're derived from state, not URL params.
           const scopeOverrides: Record<string, any> = {}
           for (const s of scopes) scopeOverrides[s.field] = (input as any)[s.paramName]
-          return defaultCreate(rel, model, config, (input as any).data ?? {}, context, scopeOverrides)
-        })
+          return defaultCreate(ctrl.relation, model, config, (input as any).data ?? {}, context, scopeOverrides, ctrl)
+        },
+        undefined,
+        config.scopeBy,
+      )
     })
     routes.push({ method: 'POST', path: basePath, procedure: 'create', action: 'create' })
 
@@ -205,8 +230,11 @@ export function buildRouter<TContext = Record<string, any>>(
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'update',
         async (ctrl) => {
           if (typeof ctrl.update === 'function') return ctrl.update()
-          return defaultUpdate(rel, model, config, (input as any).id, (input as any).data)
-        })
+          return defaultUpdate(ctrl.relation, model, config, (input as any).id, (input as any).data, ctrl)
+        },
+        undefined,
+        config.scopeBy,
+      )
     })
     routes.push({ method: 'PATCH', path: `${basePath}/:id`, procedure: 'update', action: 'update' })
 
@@ -218,9 +246,12 @@ export function buildRouter<TContext = Record<string, any>>(
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'destroy',
         async (ctrl) => {
           if (typeof ctrl.destroy === 'function') return ctrl.destroy()
-          await defaultDestroy(rel, model, (input as any).id)
+          await defaultDestroy(ctrl.relation, model, (input as any).id)
           return { success: true }
-        })
+        },
+        undefined,
+        config.scopeBy,
+      )
     })
     routes.push({ method: 'DELETE', path: `${basePath}/:id`, procedure: 'destroy', action: 'destroy' })
 
@@ -232,9 +263,15 @@ export function buildRouter<TContext = Record<string, any>>(
           z.object({ ...scopeSchema, ids: z.array(z.number().int().positive()) })
         ).handler(async ({ input, context }) => {
           const rel = buildScopedRelation(model, input as any)
-          const records = await rel.where({ id: (input as any).ids }).load()
           return dispatch(ControllerClass, context as TContext, input as any, rel, mut.method,
-            (ctrl) => ctrl[mut.method](records))
+            async (ctrl) => {
+              // Load records from the scopeBy-applied relation for cross-tenant safety
+              const records = await ctrl.relation.where({ id: (input as any).ids }).load()
+              return ctrl[mut.method](records)
+            },
+            undefined,
+            config.scopeBy,
+          )
         })
         routes.push({ method: 'POST', path: `${basePath}/${kebab}`, procedure: mut.method, action: mut.method })
       } else {
@@ -242,11 +279,15 @@ export function buildRouter<TContext = Record<string, any>>(
           z.object({ ...scopeSchema, id: z.number().int().positive(), data: z.record(z.string(), z.any()).optional() })
         ).handler(async ({ input, context }) => wrapErrors(async () => {
           const rel = buildScopedRelation(model, input as any)
+          // Pre-load record from URL-scoped relation so this.record is available in @before hooks.
+          // scopeBy adds defence-in-depth: it's applied to ctrl.relation inside dispatch,
+          // ensuring further queries within the action are fully scoped.
           const record = await rel.where({ id: (input as any).id }).first()
           if (!record) throw new NotFound(model.name)
           return dispatch(ControllerClass, context as TContext, input as any, rel, mut.method,
             (ctrl) => ctrl[mut.method](record, (input as any).data),
             record,
+            config.scopeBy,
           )
         }))
         routes.push({ method: 'POST', path: `${basePath}/:id/${kebab}`, procedure: mut.method, action: mut.method })
@@ -267,7 +308,8 @@ export function buildRouter<TContext = Record<string, any>>(
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'get',
         async (ctrl) => {
           if (typeof ctrl.get === 'function') return ctrl.get()
-          const findBy = config.findBy(context)
+          // Pass ctrl so findBy can access this.state (e.g., org resolved by @before hook)
+          const findBy = config.findBy(context, ctrl)
           const record = await singletonModel.findBy(findBy)
           if (!record) throw new NotFound(singletonModel.name)
           const inc = config.get?.include ?? []
@@ -281,7 +323,11 @@ export function buildRouter<TContext = Record<string, any>>(
       router.findOrCreate = builder.input(z.object(scopeSchema)).handler(async ({ input, context }) => {
         const rel = buildScopedRelation(singletonModel, input as any)
         return dispatch(ControllerClass, context as TContext, input as any, rel, 'findOrCreate',
-          async () => singletonFindOrCreate(singletonModel, config.findBy(context), config.defaultValues ?? {}))
+          async (ctrl) => singletonFindOrCreate(
+            singletonModel,
+            config.findBy(context, ctrl),
+            config.defaultValues ?? {},
+          ))
       })
       routes.push({ method: 'POST', path: basePath, procedure: 'findOrCreate', action: 'findOrCreate' })
     }
@@ -293,7 +339,7 @@ export function buildRouter<TContext = Record<string, any>>(
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'update',
         async (ctrl) => {
           if (typeof ctrl.update === 'function') return ctrl.update()
-          const findBy = config.findBy(context)
+          const findBy = config.findBy(context, ctrl)
           const record = await singletonModel.findBy(findBy)
           if (!record) throw new NotFound(singletonModel.name)
           const permitted = buildUpdatePermit((input as any).data, config.update)
@@ -311,11 +357,13 @@ export function buildRouter<TContext = Record<string, any>>(
         z.object({ ...scopeSchema, data: z.record(z.string(), z.any()).optional() })
       ).handler(async ({ input, context }) => {
         const rel = buildScopedRelation(singletonModel, input as any)
-        const findBy = config.findBy(context)
-        const record = await singletonModel.findBy(findBy)
-        if (!record) throw new NotFound(model.name)
         return dispatch(ControllerClass, context as TContext, input as any, rel, mut.method,
-          (ctrl) => ctrl[mut.method](record, (input as any).data))
+          async (ctrl) => {
+            const findBy = config.findBy(context, ctrl)
+            const record = await singletonModel.findBy(findBy)
+            if (!record) throw new NotFound(model.name)
+            return ctrl[mut.method](record, (input as any).data)
+          })
       })
       routes.push({ method: 'POST', path: `${basePath}/${kebab}`, procedure: mut.method, action: mut.method })
     }

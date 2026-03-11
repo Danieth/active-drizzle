@@ -104,17 +104,62 @@ describe('validator — association errors', () => {
     expectErrors(result, 'column "assetId" not found on table "campaigns"')
   })
 
-  it('warns on missing bidirectional association', () => {
+  it('warns on missing bidirectional association when target model not found in registry', () => {
     const project = createTestProject({
       schema: schemas.assetsAndBusinesses,
       models: {
-        // Asset hasMany campaigns, but there's no Campaign model with belongsTo
+        // Asset hasMany businesses, but there's no Business model loaded
         'Asset.model.ts': modelBuilder('Asset', 'assets').hasMany('businesses').build(),
       },
     })
 
     const result = project.run()
     expectWarnings(result, /bidirectional/i)
+  })
+
+  it('warns on missing inverse belongsTo when target MODEL exists but has no inverse', () => {
+    // Covers validator.ts lines 112-116: targetModel found but hasInverse = false
+    const testSchema = schemaBuilder()
+      .table('assets', t => t.integer('id').primaryKey().notNull())
+      .table('businesses', t => t.integer('id').primaryKey().notNull().integer('asset_id'))
+      .build()
+
+    const project = createTestProject({
+      schema: testSchema,
+      models: {
+        'Asset.model.ts': modelBuilder('Asset', 'assets')
+          .hasMany('businesses')
+          .build(),
+        // Business model exists but does NOT have a belongsTo('asset') inverse
+        'Business.model.ts': modelBuilder('Business', 'businesses').build(),
+      },
+    })
+
+    const result = project.run()
+    expectWarnings(result, /bidirectional/i)
+  })
+
+  it('warns when belongsTo FK column is missing from owner table', () => {
+    // Covers validator.ts lines 64-68: belongsTo FK absent from owner's own table
+    const testSchema = schemaBuilder()
+      .table('assets', t => t.integer('id').primaryKey().notNull())
+      // assets table does NOT have a business_id column
+      .table('businesses', t => t.integer('id').primaryKey().notNull())
+      .build()
+
+    const project = createTestProject({
+      schema: testSchema,
+      models: {
+        'Asset.model.ts': modelBuilder('Asset', 'assets')
+          .belongsTo('business', 'businesses')  // no explicit foreignKey option
+          .build(),
+      },
+    })
+
+    const result = project.run()
+    // Should warn that the FK column is missing
+    const fkWarnings = result.warnings.filter(w => /businessId/i.test(w.message))
+    expect(fkWarnings.length).toBeGreaterThan(0)
   })
 
   it('does NOT warn when bidirectional inverse correctly points back', () => {

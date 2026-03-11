@@ -104,9 +104,12 @@ export class ApplicationRecord {
     return new Relation(this).findOrInitializeBy(attrs)
   }
 
-  /** findOrCreateBy: find matching record or create it. */
-  static async findOrCreateBy(attrs: Record<string, any>): Promise<any> {
-    return new Relation(this).findOrCreateBy(attrs)
+  /**
+   * Finds the first record matching `conditions`, or creates it with `conditions` + optional `defaults`.
+   * Race-safe: retries the SELECT on unique-constraint violations.
+   */
+  static async findOrCreateBy(conditions: Record<string, any>, defaults: Record<string, any> = {}): Promise<any> {
+    return new Relation(this).findOrCreateBy(conditions, defaults)
   }
 
   static async create(attrs: Record<string, any>): Promise<any> {

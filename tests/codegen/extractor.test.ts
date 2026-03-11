@@ -700,3 +700,102 @@ export class Asset extends ApplicationRecord {
     expect(meta).toBeDefined()
   })
 })
+
+// ---------------------------------------------------------------------------
+// parseObjectLiteral branch coverage — false / array / expression values
+// ---------------------------------------------------------------------------
+
+describe('extractModel — parseObjectLiteral edge cases', () => {
+  it('parses boolean false option on belongsTo (exercises false branch in parseObjectLiteral)', () => {
+    // belongsTo({ optional: false }) exercises the `val.getText() === 'false'` branch
+    const project = createTestProject({
+      schema: schemaBuilder()
+        .table('assets',     t => t.integer('id').primaryKey().notNull().integer('business_id'))
+        .table('businesses', t => t.integer('id').primaryKey().notNull())
+        .build(),
+      models: {
+        'Asset.model.ts': `
+import { ApplicationRecord, belongsTo, model } from 'active-drizzle'
+@model('assets')
+export class Asset extends ApplicationRecord {
+  static business = belongsTo('businesses', { optional: false })
+}
+`,
+      },
+    })
+
+    const meta = project.extractModel('Asset.model.ts')
+    expect(meta.associations[0]?.propertyName).toBe('business')
+    // The option is parsed — optional: false (boolean)
+    expect(meta.associations[0]?.options?.optional).toBe(false)
+  })
+
+  it('parses expression (non-string/bool/array) option in parseObjectLiteral (exercises fallback branch)', () => {
+    // Using a numeric expression like a computed value triggers the fallback getText() branch
+    const project = createTestProject({
+      schema: schemaBuilder()
+        .table('assets',     t => t.integer('id').primaryKey().notNull().integer('business_id'))
+        .table('businesses', t => t.integer('id').primaryKey().notNull())
+        .build(),
+      models: {
+        'Asset.model.ts': `
+import { ApplicationRecord, belongsTo, model } from 'active-drizzle'
+@model('assets')
+export class Asset extends ApplicationRecord {
+  static business = belongsTo('businesses', { limit: 1 + 1 })
+}
+`,
+      },
+    })
+
+    // Should not throw — just extracts what it can
+    const meta = project.extractModel('Asset.model.ts')
+    expect(meta.associations[0]?.propertyName).toBe('business')
+  })
+
+  it('ignores plain (non-scope, non-computed) static methods during extractScopes', () => {
+    // A plain static method without @scope or @computed should be skipped
+    const project = createTestProject({
+      schema: schemas.assetsAndBusinesses,
+      models: {
+        'Asset.model.ts': `
+import { ApplicationRecord, model, scope } from 'active-drizzle'
+@model('assets')
+export class Asset extends ApplicationRecord {
+  // Plain static method — no @scope decorator
+  static tableMetadata() { return { version: 1 } }
+
+  @scope
+  static recent() { return this.where({ active: true }) }
+}
+`,
+      },
+    })
+
+    const meta = project.extractModel('Asset.model.ts')
+    // Only the @scope method should appear — the plain static method is skipped
+    expect(meta.scopes).toHaveLength(1)
+    expect(meta.scopes[0]?.name).toBe('recent')
+  })
+
+  it('skips hook methods in extractInstanceMethods (hook method not added to instanceMethods)', () => {
+    const project = createTestProject({
+      schema: schemas.assetsAndBusinesses,
+      models: {
+        'Asset.model.ts': modelBuilder('Asset', 'assets')
+          .beforeSave('doBeforeSave', "console.log('saving')")
+          .instanceMethod('computeSlug', 'string', 'return this.title.toLowerCase()')
+          .build(),
+      },
+    })
+
+    const meta = project.extractModel('Asset.model.ts')
+    // The @beforeSave method should NOT appear in instanceMethods (it IS in hooks)
+    const isHookInInstanceMethods = meta.instanceMethods.some(m => m.name === 'doBeforeSave')
+    expect(isHookInInstanceMethods).toBe(false)
+    // But it should appear in hooks
+    expect(meta.hooks.some(h => h.methodName === 'doBeforeSave')).toBe(true)
+    // The regular instance method should appear
+    expect(meta.instanceMethods.some(m => m.name === 'computeSlug')).toBe(true)
+  })
+})

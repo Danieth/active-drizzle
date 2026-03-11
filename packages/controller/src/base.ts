@@ -11,7 +11,10 @@ import { collectBeforeHooks, collectAfterHooks, collectRescueHandlers } from './
 /** Sentinel returned by _handleError when no rescue handler matched. */
 const UNHANDLED = Symbol('ad:unhandled')
 
-export class ActiveController<TContext = Record<string, any>> {
+export class ActiveController<
+  TContext = Record<string, any>,
+  TState extends Record<string, any> = Record<string, any>
+> {
   /** The request context (auth, team, user, etc.) — set before each action */
   protected context!: TContext
 
@@ -26,7 +29,7 @@ export class ActiveController<TContext = Record<string, any>> {
 
   /**
    * Pre-scoped Relation for the CRUD model.
-   * @scope decorators and defaultScopes are applied before the action runs.
+   * @scope decorators and scopeBy are applied before the action runs.
    * Handlers should NOT call Model.all() directly; always use this.relation.
    */
   protected relation!: any  // Relation<TModel> — typed via generated subclass
@@ -43,6 +46,23 @@ export class ActiveController<TContext = Record<string, any>> {
    * }
    */
   protected record: any = null
+
+  /**
+   * Mutable per-request state, populated by @before hooks.
+   * Use this to carry resolved entities (org, team, user) across the controller
+   * inheritance chain so child controllers can consume them without re-loading.
+   *
+   * @example
+   * // OrgController resolves the org once
+   * @before()
+   * async resolveOrg() {
+   *   this.state.org = await Organization.findOrCreateBy({ clerkOrgId: this.context.orgId })
+   * }
+   *
+   * // AssetController (extends OrgController) uses it
+   * // this.state.org is fully typed via TState generic
+   */
+  protected state: TState = {} as TState
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
