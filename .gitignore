@@ -21,8 +21,11 @@ _globals.gen.d.ts
 .env.*
 !.env.example
 
-# Lockfiles — keep package-lock.json, ignore bun.lock (not the primary package manager)
+# Lockfiles — library packages don't commit lockfiles (causes cross-platform issues for contributors)
+package-lock.json
 bun.lock
+yarn.lock
+pnpm-lock.yaml
 
 # Project-specific dev notes
 REMAINING.md
