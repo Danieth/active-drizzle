@@ -1,431 +1,342 @@
-# active-drizzle
+<p align="center">
+  <img src="docs/public/logo.svg" width="80" height="80" alt="ActiveDrizzle logo" />
+</p>
 
-Rails ActiveRecord patterns for [Drizzle ORM](https://orm.drizzle.team). Write expressive, type-safe models with associations, lifecycle hooks, dirty tracking, and enum transforms — while Drizzle handles the actual SQL. A Vite plugin catches schema errors at build time that Rails only finds in production.
+<h1 align="center">ActiveDrizzle</h1>
 
-## What it is
+<p align="center">
+  <strong>Rails-style ActiveRecord for Drizzle ORM.</strong><br/>
+  Associations. Lifecycle hooks. Dirty tracking. Enum transforms. Full TypeScript codegen.<br/>
+  <em>Write three files. Get a full-stack feature.</em>
+</p>
 
-| Rails ActiveRecord | active-drizzle |
+<p align="center">
+  <a href="https://www.npmjs.com/package/@active-drizzle/core"><img src="https://img.shields.io/npm/v/@active-drizzle/core?style=flat-square&color=3B82F6&label=core" alt="npm core"></a>
+  <a href="https://www.npmjs.com/package/@active-drizzle/controller"><img src="https://img.shields.io/npm/v/@active-drizzle/controller?style=flat-square&color=3B82F6&label=controller" alt="npm controller"></a>
+  <a href="https://www.npmjs.com/package/@active-drizzle/react"><img src="https://img.shields.io/npm/v/@active-drizzle/react?style=flat-square&color=3B82F6&label=react" alt="npm react"></a>
+  <a href="https://github.com/Danieth/active-drizzle/actions"><img src="https://img.shields.io/github/actions/workflow/status/Danieth/active-drizzle/ci.yml?style=flat-square&label=tests" alt="CI"></a>
+  <a href="https://danieth.github.io/active-drizzle/"><img src="https://img.shields.io/badge/docs-live-blue?style=flat-square" alt="Docs"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License"></a>
+</p>
+
+---
+
+Today, adding a feature to a typical TypeScript app means touching **8–12 files**. Schema. Drizzle table. Backend types. API route. Validation logic. Frontend types (duplicated). Fetch function. React Query hook. Cache key. Optimistic update logic. Form validation (duplicated again). Component.
+
+**With ActiveDrizzle, you touch three.**
+
+```
+Schema → Model → Controller → done.
+```
+
+Everything else — oRPC procedures, Zod schemas, React Query hooks, TypeScript types, form configs, cache invalidation — is generated at build time by a Vite plugin.
+
+> **[Read the full documentation →](https://danieth.github.io/active-drizzle/)**
+
+---
+
+## Install
+
+```bash
+npm install @active-drizzle/core @active-drizzle/controller @active-drizzle/react
+```
+
+## The Three Files
+
+### 1. Schema — your Drizzle table (you already have this)
+
+```ts
+// db/schema.ts
+export const campaigns = pgTable('campaigns', {
+  id:        serial('id').primaryKey(),
+  teamId:    integer('team_id').notNull().references(() => teams.id),
+  name:      varchar('name', { length: 255 }).notNull(),
+  status:    integer('status').notNull().default(0),
+  budget:    integer('budget'),
+  startDate: timestamp('start_date'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+})
+```
+
+### 2. Model — your business logic
+
+```ts
+// models/Campaign.model.ts
+@model('campaigns')
+export class Campaign extends ApplicationRecord {
+  static team    = belongsTo()
+  static creator = belongsTo('users', { foreignKey: 'creatorId' })
+  static status  = Attr.enum({ draft: 0, active: 1, paused: 2, completed: 3 } as const)
+
+  @scope static active() { return this.where({ status: 1 }) }
+  @scope static search(q: string) { return this.where({ name: ilike(`%${q}%`) }) }
+
+  @pure isEditable() { return ['draft', 'paused'].includes(this.status) }
+}
+```
+
+### 3. Controller — your HTTP API
+
+```ts
+// controllers/Campaign.ctrl.ts
+@controller('/campaigns')
+@crud(Campaign, {
+  scopeBy: (ctrl) => ({ organizationId: ctrl.state.org.id }),
+  index:   { scopes: ['active'], sortable: ['createdAt', 'name'], include: ['creator'] },
+  create:  { permit: ['name', 'budget', 'status'], autoSet: { creatorId: ctx => ctx.userId } },
+  update:  { permit: ['name', 'budget', 'status'] },
+})
+@scope('teamId')
+export class CampaignController extends OrgController {
+  @mutation()
+  async launch(campaign: Campaign) {
+    if (!campaign.isEditable()) throw new BadRequest('Cannot launch')
+    campaign.status = 'active'
+    campaign.startDate = new Date()
+    return campaign.save()
+  }
+}
+```
+
+### What you get (generated)
+
+Save those three files. Your terminal shows:
+
+```
+✓ Campaign.model.ts  → Campaign.model.gen.d.ts (2 scopes, 4 enum values, 2 associations)
+✓ Campaign.ctrl.ts   → campaign.router.gen.ts  (7 routes: index, get, create, update, destroy, launch)
+✓ Campaign.ctrl.ts   → Campaign.client.gen.ts  (React Query hooks, form config, typed client model)
+✓ _routes.gen.ts updated (7 new endpoints)
+```
+
+You now have:
+- **Full REST API** with nested routes, scoping, and Zod validation
+- **oRPC procedures** for type-safe client-server calls
+- **React Query hooks** with cache invalidation
+- **A typed client model** with enum predicates, dirty tracking, and inline validation
+- **TypeScript types everywhere** — columns, associations, write shapes, read shapes
+
+### Use it in React
+
+```tsx
+import { CampaignController } from '../_generated'
+
+function CampaignsPage({ teamId }: { teamId: number }) {
+  const ctrl = CampaignController.use({ teamId })
+
+  const { data } = ctrl.index({ scopes: ['active'], sort: { field: 'createdAt', dir: 'desc' } })
+  const launch = ctrl.mutateLaunch()
+
+  return data?.items.map(c => (
+    <div key={c.id}>
+      <h3>{c.name}</h3>
+      <span>{c.status}</span>  {/* 'active' | 'draft' | 'paused' — not an integer */}
+      {c.isEditable() && (
+        <button onClick={() => launch.mutate(c.id)}>Launch</button>
+      )}
+    </div>
+  ))
+}
+```
+
+---
+
+## Why ActiveDrizzle?
+
+### vs. plain Drizzle
+
+Drizzle is a great query builder. ActiveDrizzle sits on top of it and adds everything you keep rebuilding by hand:
+
+| You keep writing... | ActiveDrizzle gives you |
 |---|---|
-| `class Asset < ApplicationRecord` | `class Asset extends ApplicationRecord` |
-| `enum asset_type: { jpg: 116 }` | `static assetType = Attr.enum({ jpg: 116 })` |
-| `before_save :sanitize` | `@beforeSave() sanitize() {}` |
-| `has_many :attachments` | `static attachments = hasMany()` |
-| `has_many :campaigns, through: :assets_campaigns` | `static campaigns = hasMany({ through: 'assets_campaigns' })` |
-| `accepts_nested_attributes_for :campaigns` | `static campaigns = hasMany({ acceptsNested: true })` |
-| Catches nothing at build time | Catches missing FKs, bad enums, broken STI at **compile time** |
+| `db.select().from(assets).where(eq(assets.teamId, teamId))` | `Asset.where({ teamId })` |
+| Manual enum maps + helper functions | `static status = Attr.enum({ draft: 0, active: 1 })` → `asset.isActive()` |
+| No dirty tracking | `asset.nameChanged()`, `asset.nameWas()`, `asset.changedFields()` |
+| No associations | `belongsTo()`, `hasMany()`, `hasOne()`, `habtm()` — lazy-loaded |
+| No lifecycle hooks | `@beforeSave()`, `@afterCommit()`, `@validate()` |
+| N+1 queries by default | `User.includes('posts', 'avatar').load()` — one query |
+| Copy-paste validation everywhere | Define once in the model, enforced on server + generated for forms |
+
+### vs. Prisma
+
+| | Prisma | ActiveDrizzle |
+|---|---|---|
+| Query builder | Prisma Client (generated) | Drizzle (you own the SQL) |
+| Schema source | `schema.prisma` DSL | Standard Drizzle `pgTable()` |
+| Associations | Implicit via schema | Explicit: `belongsTo()`, `hasMany()` |
+| Lifecycle hooks | Middleware (limited) | Full Rails-style hooks with conditions |
+| Dirty tracking | None | Built-in |
+| Enum transforms | Mapped enums only | Integer ↔ label with predicates |
+| Frontend codegen | None | React Query hooks, form configs, typed clients |
+| STI | Not supported | Full Single Table Inheritance |
+
+### vs. Rails ActiveRecord
+
+| | Rails | ActiveDrizzle |
+|---|---|---|
+| Language | Ruby | TypeScript |
+| Type safety | Runtime only | Compile-time via codegen |
+| Error discovery | Production at 3am | Build step catches it |
+| Frontend | Separate API + separate types | Generated typed hooks from the same model |
+| Performance | Ruby | V8 + Drizzle SQL |
+
+ActiveDrizzle catches at **build time** what Rails only finds at runtime:
+
+```
+ERROR  Campaign.model.ts — Association "assets": column "campaignId" not found on table "assets"
+ERROR  TextMessage.model.ts — Enum "status": expects INTEGER column but found "text"
+WARN   Campaign.model.ts — no bidirectional belongsTo found on Asset
+```
+
+---
+
+## Features
+
+### Models
+
+- **Chainable queries** — `.where()`, `.order()`, `.limit()`, `.includes()`, `.pluck()`, `.count()`
+- **Associations** — `belongsTo`, `hasMany`, `hasOne`, `habtm`, with `through:`, `dependent: 'destroy'`, `counterCache`, `autosave`
+- **Attr transforms** — `Attr.enum()`, `Attr.json<T>()`, `Attr.string()`, `Attr.boolean()`, `Attr.new({ get, set })`
+- **Dirty tracking** — `isChanged()`, `changedFields()`, `fieldWas()`, `fieldChanged()`
+- **Lifecycle hooks** — `@beforeSave`, `@afterCommit`, `@beforeDestroy`, `@validate`, with `{ if: }` conditions
+- **Scopes** — `@scope static active() { ... }` → chainable, composable named queries
+- **STI** — `static stiType = 1000` → auto-filters, instantiates correct subclass
+- **Transactions** — `ApplicationRecord.transaction(async () => { ... })` via `AsyncLocalStorage`
+- **Nested attributes** — `hasMany({ acceptsNested: true })` → create/update/destroy children in one save
+- **Custom primary keys** — composite keys, non-`id` columns
+
+### Controllers
+
+- **`@crud`** — index, get, create, update, destroy from one decorator
+- **`@mutation`** — auto-loads record by `:id`, passes to method. `{ bulk: true, records: false }` for efficient mass updates
+- **`@action`** — custom GET/POST endpoints for stats, imports, background jobs
+- **`@before` / `@after`** — lifecycle hooks with `{ only: }`, `{ except: }`, `{ if: }` conditions
+- **`@rescue`** — Rails-style error handling. `RecordNotFound` → 404 automatically
+- **`@scope`** — URL nesting: `@scope('teamId')` → `/teams/:teamId/campaigns`
+- **`scopeBy`** — scope queries from resolved controller state (multi-tenant)
+- **`autoSet`** — stamp fields from context or state on create
+- **Dynamic `permit`** — `(ctx, ctrl) => string[]` for role-based field access
+- **Multi-tenant** — `this.state` with typed inheritance. Resolve org once, use everywhere
+
+### React Integration
+
+- **Generated hooks** — `ctrl.index()`, `ctrl.get(id)`, `ctrl.mutateCreate()`, `ctrl.mutateLaunch()`
+- **TanStack Form config** — default values, enum options, validators from model metadata
+- **Error parsing** — `parseControllerError()` maps 422 responses to per-field errors
+- **Client model** — typed instances with predicates, dirty tracking, validation on the frontend
+
+### Build-Time Codegen
+
+- **Vite plugin** — watches `.model.ts` and `.ctrl.ts` files, regenerates on save
+- **Type declarations** — `.gen.d.ts` per model with associations, enum predicates, dirty tracking
+- **Runtime code** — `.gen.ts` with `Model.Client` class for frontend hydration
+- **oRPC router** — type-safe procedures with Zod validation schemas
+- **LLM docs** — `.active-drizzle/schema.md` for AI-assisted development
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Your Application                             │
+├──────────────┬──────────────────┬──────────────────┬────────────────┤
+│   Schema     │     Models       │   Controllers    │    React       │
+│  (Drizzle)   │ (ApplicationRecord) │  (@crud, @mutation) │  (Generated)  │
+├──────────────┴──────────────────┴──────────────────┴────────────────┤
+│                    Vite Plugin (ts-morph codegen)                    │
+│  Extracts → Validates → Generates types + runtime + hooks + router  │
+├─────────────────────────────────────────────────────────────────────┤
+│              @active-drizzle/core    │  @active-drizzle/controller  │
+│  Relation, Attr, hooks, associations │  CRUD handlers, oRPC, REST  │
+├──────────────────────────────────────┴──────────────────────────────┤
+│                         Drizzle ORM                                 │
+│                         PostgreSQL                                  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+Three npm packages, each installable independently:
+
+| Package | What it is |
+|---------|-----------|
+| `@active-drizzle/core` | Models, associations, hooks, dirty tracking, Attr, codegen, Vite plugin |
+| `@active-drizzle/controller` | `@crud`, `@mutation`, `@action`, `@before`/`@after`, `@rescue`, oRPC router, REST adapters |
+| `@active-drizzle/react` | React Query hook generation, `ClientModel`, error parsing, form integration |
 
 ---
 
 ## Quick Start
 
 ```bash
-npm install active-drizzle drizzle-orm
+npm install @active-drizzle/core drizzle-orm
 ```
 
-```typescript
-// app/models/asset.model.ts
-import { ApplicationRecord, Attr, hasMany, belongsTo } from 'active-drizzle'
-import { model, beforeSave, afterCommit, validate } from 'active-drizzle'
-
-@model('assets')
-export class Asset extends ApplicationRecord {
-  // Enum: integer in DB, string label in your code
-  static assetType = Attr.enum({ jpg: 116, png: 125, gif: 111, mp4: 202 } as const)
-
-  // Typed attribute with inline validation
-  static title = Attr.string({ validate: v => v ? null : 'required' })
-
-  // JSON column as typed object
-  static metadata = Attr.json<{ tags: string[]; width: number }>()
-
-  // Associations
-  static uploader = belongsTo()
-  static attachments = hasMany()
-  static tags = habtm('assets_tags')
-
-  @beforeSave()
-  normalizeTitle() {
-    (this as any).title = (this as any).title?.trim()
-  }
-
-  @afterCommit()
-  scheduleProcessing() {
-    // Safe — fires only after the DB transaction commits
-    queue.add('process-asset', { id: (this as any).id })
-  }
-
-  @validate()
-  checkDimensions() {
-    const m = (this as any).metadata
-    if (m?.width > 10000) return 'Width exceeds maximum'
-  }
-}
-```
-
-```typescript
-// app/boot.ts
-import { boot } from 'active-drizzle'
+```ts
+// boot.ts
+import { boot } from '@active-drizzle/core'
 import { db } from './db'
 import * as schema from './schema'
 
 boot(db, schema)
 ```
 
----
-
-## Core Features
-
-### ApplicationRecord — the Proxy-wrapped base class
-
-Every model extends `ApplicationRecord`. A JavaScript Proxy wraps every instance, giving you transparent attribute transforms, dirty tracking, and enum helpers:
-
-```typescript
-const asset = await Asset.where({ uploaderId: userId }).first()
-
-// Attribute transforms happen transparently
-asset.assetType          // → 'jpg'  (integer 116 in DB)
-asset.assetType = 'png'  // stores integer 125
-
-// Codegen-generated enum predicates and bang setters
-asset.isJpg()            // → false
-asset.toPng()            // sets assetType = 'png', returns asset
-
-// Dirty tracking
-asset.assetTypeChanged() // → true
-asset.assetTypeWas()     // → 'jpg'
-asset.assetTypeChange()  // → ['jpg', 'png']
-asset.isChanged()        // → true
-asset.changedFields()    // → ['assetType']
-
-// Persistence
-await asset.save()       // INSERT or UPDATE, runs hooks, clears dirty state
-await asset.reload()     // re-fetches from DB, discards in-memory changes
-await asset.destroy()    // DELETE, runs beforeDestroy / afterDestroy
-
-// Convenience
-await asset.update({ title: 'New Title' })  // assign + save in one call
-```
-
-### Attr System
-
-Declarative field transforms, defaults, and validations:
-
-```typescript
-static status    = Attr.enum({ draft: 0, sent: 1, failed: 2 } as const)
-static price     = Attr.new({ get: v => v / 100, set: v => Math.round(v * 100) })
-static title     = Attr.string({ validate: v => v ? null : 'required' })
-static count     = Attr.integer()
-static active    = Attr.boolean()
-static settings  = Attr.json<UserSettings>()
-static fullName  = Attr.for('full_name', { get: v => v?.trim(), set: v => v?.trim() })
-```
-
-Transforms apply transparently through the Proxy — `.get()` on read, `.set()` on write, compared against the raw DB value to track changes.
-
-### Chainable Queries
-
-```typescript
-// Every method returns a Relation — nothing executes until you await
-const drafts = await Post.where({ status: 'draft' })
-                         .order('createdAt', 'desc')
-                         .limit(10)
-
-// Smart hash where — applies Attr.set() transforms automatically
-Post.where({ status: 'sent' })         // WHERE status = 1
-Post.where({ status: ['draft', 'sent'] })  // WHERE status IN (0, 1)
-Post.where({ deletedAt: null })         // WHERE deleted_at IS NULL
-Post.where({ id: Asset.videos() })      // WHERE id IN (SELECT id FROM assets WHERE ...)
-
-// Execution methods
-await Post.all()                         // all records
-await Post.first()                       // first record
-await Post.find(5)                       // by id, throws if not found
-await Post.findBy({ email: 'x@x.com' }) // returns null if not found
-await Post.pluck('id', 'title')          // array of values, no proxy overhead
-await Post.where({}).updateAll({ status: 'archived' })  // bulk UPDATE
-await Post.where({}).destroyAll()        // bulk DELETE
-
-// Batching large datasets
-await Post.where({ status: 'active' }).inBatches(500, async (batch) => {
-  await batch.updateAll({ processedAt: new Date() })
-})
-
-// Pessimistic locking
-await Asset.where({ id: assetId }).withLock(async (locked) => {
-  const asset = await locked.first()
-  await asset!.update({ status: 'processing' })
-})
-```
-
-### Associations — lazy-loaded, zero config
-
-```typescript
-static creator = belongsTo()              // FK: creatorId on this table
-static address = hasOne()                 // FK: ${modelName}Id on target
-static posts   = hasMany()                // FK: ${modelName}Id on target
-static tags    = habtm('posts_tags')      // join table
-static creator = belongsTo('users', { foreignKey: 'authorId' })
-static items   = hasMany({ through: 'order_items' })
-static items   = hasMany({ dependent: 'destroy' })   // cascade on destroy()
-static items   = hasMany({ acceptsNested: true })     // enables campaignsAttributes in Create type
-```
-
-Accessing an association on an instance returns a lazy value:
-```typescript
-const business = await asset.business         // Promise<Business | null>
-const campaigns = await asset.campaigns       // awaitable Relation<Campaign>
-const first = await asset.campaigns.first()   // chaining works
-```
-
-### Transactions
-
-```typescript
-await ApplicationRecord.transaction(async () => {
-  const asset = await Asset.create({ title: 'New' })
-  await business.update({ assetCount: business.assetCount + 1 })
-  // All queries automatically route through the transaction client via AsyncLocalStorage
-  // Roll back happens automatically if anything throws or AbortChain is thrown
-})
-```
-
-### Lifecycle Hooks
-
-```typescript
-@beforeSave()   method() {}   // before every save
-@afterSave()    method() {}   // after every save
-@beforeCreate() method() {}   // INSERT only
-@afterCreate()  method() {}   // INSERT only
-@beforeUpdate() method() {}   // UPDATE only
-@afterUpdate()  method() {}   // UPDATE only
-@beforeDestroy() method() {}  // before delete
-@afterDestroy()  method() {}  // after delete
-@afterCommit()   method() {}  // after transaction commits (safe for side effects)
-```
-
-Conditional execution:
-```typescript
-@beforeSave({ if: 'statusChanged' })          // runs only when status changed
-@afterCommit({ on: 'create' })                // runs only on first INSERT
-@beforeSave({ if: () => this.isJpg() })       // lambda condition
-```
-
-Returning `false` from a `before*` hook aborts the operation.
-
-### Validations
-
-```typescript
-// Inline — attached to a specific field
-static email = Attr.string({ validate: v => v?.includes('@') ? null : 'invalid email' })
-static price = Attr.new({ serverValidate: async v => {
-  const taken = await Price.findBy({ amount: v })
-  return taken ? 'price already in use' : null
-}})
-
-// Class-level — runs during save()
-@validate()
-checkDates() {
-  if ((this as any).startDate > (this as any).endDate)
-    return 'start must be before end'
-}
-
-@serverValidate()
-async checkUniqueness() {
-  const existing = await User.findBy({ email: (this as any).email })
-  if (existing) (this as any).errors.email = ['already taken']
-}
-```
-
-### STI — Single Table Inheritance
-
-```typescript
-@model('text_messages')
-class TextMessage extends ApplicationRecord {}
-
-@model('text_messages')
-class OutboundTemplate extends TextMessage {
-  static stiType = 1000  // auto-injects WHERE type = 1000 on all queries
-}
-
-// Loading from the parent table auto-instantiates the right subclass:
-const msgs = await TextMessage.where({})
-// msgs[0] might be OutboundTemplate, msgs[1] might be InboundMessage, etc.
-```
-
----
-
-## Build-Time Codegen (The Killer Feature)
-
-active-drizzle's Vite plugin runs `ts-morph` on your schema and model files at build time, catching errors that Rails only finds in production at 3am.
-
-```typescript
+```ts
 // vite.config.ts
-import activeDrizzle from 'active-drizzle/vite'
+import activeDrizzle from '@active-drizzle/core/vite'
 
 export default defineConfig({
   plugins: [
     activeDrizzle({
       schema: 'db/schema.ts',
       models: 'src/models/**/*.model.ts',
-    })
-  ]
-})
-```
-
-### What it catches
-
-```
-ERROR  Asset.model.ts — Association "imagePacks": table "image_packs" not found. Did you mean "assets"?
-ERROR  Campaign.model.ts — Association "assets": column "campaignId" not found on table "assets"
-ERROR  TextMessage.model.ts — Enum "status": expects INTEGER column but found "text"
-ERROR  Post.model.ts — Hook "notifyTeam": condition "teamIdsChanged" references field not found on table
-ERROR  Asset.model.ts — Attr.set() on "score" appears to return "string", but column "score" is typed as "integer"
-WARN   Campaign.model.ts — no bidirectional belongsTo found on Asset. Consider adding it.
-WARN   OutboundTemplate.model.ts — STI model: add `static stiType = <value>` for auto-scoping
-WARN   Asset.model.ts — Scope "recent": references `this.nonExistent` which was not found as a column or Attr
-```
-
-### What it generates (per model)
-
-Two files per model, placed next to the source:
-
-**`Asset.model.gen.d.ts`** — TypeScript type declarations:
-```typescript
-declare module './Asset.model' {
-  interface Asset {
-    isJpg(): boolean; toPng(): AssetRecord   // enum predicates + bang setters
-    assetTypeChanged(): boolean              // dirty tracking
-    assetTypeWas(): number | null
-    business: Promise<BusinessRecord>        // associations
-    campaigns: Relation<CampaignRecord, CampaignAssociations>
-  }
-  namespace Asset {
-    function where(condition?: AssetWhere): Relation<AssetRecord, AssetAssociations>
-    const recent: Relation<AssetRecord, AssetAssociations>  // scopes
-    class Client { ... }  // type for the isomorphic frontend class
-  }
-}
-export interface AssetWhere { status?: ('draft' | 'sent' | number) | ... | Relation }
-export interface AssetCreate { title?: string | null; businessId: number; ... }
-export type AssetUpdate = Partial<AssetCreate> & { id: number }
-```
-
-**`Asset.model.gen.ts`** — Executable runtime code:
-```typescript
-// Attaches Asset.Client — an isomorphic data class for the frontend
-export class AssetClient {
-  constructor(payload = {}) { ... }   // auto-hydrates defaults + nested associations
-  isChanged(): boolean                // client-side dirty tracking
-  restoreAttributes(): void           // revert to last-loaded state
-  validate(): Record<string, string[]> // runs inline validations, TanStack Form format
-  toJSON(): Record<string, unknown>
-}
-;(Asset as any).Client = AssetClient
-```
-
-**`_registry.gen.ts`** — Imports all models + wires up `.Client` constructors:
-```typescript
-import { Asset } from './Asset.model.js'
-import './Asset.model.gen.js'   // side-effect: attaches Asset.Client
-export const registry = { Asset, Business, ... } as const
-```
-
-**`.active-drizzle/schema.md`** — LLM-optimized schema reference. Point your AI agent here for zero-hallucination context of the entire data model.
-
-### `acceptsNestedAttributesFor` Runtime
-
-When `hasMany({ acceptsNested: true })` is declared, `save()` automatically processes `*Attributes` arrays on the instance — creating, updating, or destroying child records:
-
-```typescript
-const order = new Order({
-  status: 'pending',
-  lineItemsAttributes: [
-    { name: 'Widget', qty: 2 },        // → create
-    { id: 5, name: 'Updated', qty: 1 }, // → update
-    { id: 9, _destroy: true },          // → destroy
+      controllers: 'src/controllers/**/*.ctrl.ts',
+    }),
   ],
 })
-await order.save()  // inserts order, then creates/updates/destroys line items
 ```
 
-The `lineItemsAttributes` key is stripped from the parent DB payload automatically.
+> **[Full getting started guide →](https://danieth.github.io/active-drizzle/guide/getting-started)**
 
-### `hasMany` Declarative Order
+---
 
-Associations can declare a default sort order applied to every lazy-loaded Relation:
+## Documentation
 
-```typescript
-static comments = hasMany({ order: { createdAt: 'desc' } })
-// post.comments → Relation pre-ordered by createdAt DESC
-```
+The full documentation covers every feature with examples:
 
-### `counterCache`
-
-Automatically keeps a count column on the parent in sync:
-
-```typescript
-// In Post model
-static comments = hasMany({ counterCache: true })
-// → column "commentsCount" on posts table is incremented on create, decremented on destroy
-
-// Custom column name
-static comments = hasMany({ counterCache: 'totalComments' })
-```
-
-The child model needs a `belongsTo` back-reference for the FK to be discovered automatically.
-
-### `autosave`
-
-Saving a parent automatically saves any already-loaded associations with pending changes:
-
-```typescript
-static comments = hasMany({ autosave: true })
-
-post.comments[0].body = 'edited'
-await post.save()  // → also saves the changed comment
-```
-
-### Plain Column Access (no `Attr.*` declaration)
-
-Every DB column is readable and dirty-tracked through the proxy, even without an explicit `Attr.*` declaration. Columns with `Attr.*` gain transforms, coercion, and validation on top:
-
-```typescript
-// Works without any Attr declaration
-post.title = 'updated'
-post.isChanged()     // → true
-post.titleWas()      // → 'original'
-await post.save()    // → UPDATE includes title
-
-// Explicit Attr adds transforms/coercion on top
-static title = Attr.string()   // trims on write, null-safe on read
-```
-
-### The Isomorphic `Model.Client`
-
-After importing from `_registry.gen.ts`, every model has a `.Client` class for use in React forms:
-
-```typescript
-// Create form — defaults auto-populated from Attr.default()
-const asset = new Asset.Client()
-// → { status: 'draft', retries: 0, ... }
-
-// Re-hydrates nested associations from API payloads
-const asset = new Asset.Client(apiPayload)
-asset.campaigns[0]          // → Campaign.Client instance, not a plain object
-asset.campaigns[0].isActive()  // → works immediately, no state mapping
-
-// TanStack Form integration
-<Button disabled={!asset.isChanged()}>Save</Button>
-asset.restoreAttributes()   // user clicks Cancel — reverts to last-loaded state
-const errors = asset.validate()  // → { title: ['required'], price: ['must be positive'] }
-```
+| Section | Topics |
+|---------|--------|
+| **[Getting Started](https://danieth.github.io/active-drizzle/guide/getting-started)** | Installation, boot, project structure |
+| **[The Happy Path](https://danieth.github.io/active-drizzle/guide/happy-path)** | End-to-end: schema → model → controller → React |
+| **[Models](https://danieth.github.io/active-drizzle/models/overview)** | Attributes, associations, STI, custom PKs |
+| **[Querying](https://danieth.github.io/active-drizzle/querying/basics)** | where, order, includes, pluck, aggregates, scopes |
+| **[Controllers](https://danieth.github.io/active-drizzle/controllers/overview)** | CRUD, mutations, actions, hooks, error handling, multi-tenant |
+| **[React Query](https://danieth.github.io/active-drizzle/react/overview)** | Generated hooks, forms, error handling |
+| **[Codegen](https://danieth.github.io/active-drizzle/codegen/vite-plugin)** | Vite plugin, what gets generated, how it works |
 
 ---
 
 ## Testing
 
 ```bash
-npx vitest run           # run tests (258 passing)
-npx vitest run --coverage  # with V8 line coverage
+npm test                                # 615+ tests across all packages
+npm run test:coverage -w packages/core  # 96%+ line coverage
 ```
 
-active-drizzle tests use `ts-morph` in-memory projects for codegen tests — no disk I/O, instantaneous. Runtime tests use mock DB instances that capture query parameters for assertion.
+---
+
+## Contributing
+
+```bash
+git clone https://github.com/Danieth/active-drizzle.git
+cd active-drizzle
+npm install --legacy-peer-deps
+npm test
+```
+
+The repo is an npm workspaces monorepo. Each package builds with `tsup`. Tests use Vitest with `ts-morph` in-memory projects for codegen and mock DB instances for runtime tests.
+
+---
+
+## License
+
+[MIT](LICENSE) — Daniel Ackerman
