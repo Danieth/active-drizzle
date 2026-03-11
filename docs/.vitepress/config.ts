@@ -19,7 +19,7 @@ export default defineConfig({
       { text: 'Querying', link: '/querying/basics' },
       { text: 'Mutations', link: '/mutations/overview' },
       { text: 'Hooks', link: '/hooks/lifecycle' },
-      { text: 'Codegen', link: '/codegen/vite-plugin' },
+      { text: 'Codegen & CLI', link: '/codegen/vite-plugin' },
     ],
 
     sidebar: {
@@ -29,6 +29,7 @@ export default defineConfig({
           items: [
             { text: 'Getting Started', link: '/guide/getting-started' },
             { text: 'Installation & Boot', link: '/guide/installation' },
+            { text: 'Project Structure', link: '/guide/project-structure' },
           ],
         },
       ],
@@ -79,7 +80,7 @@ export default defineConfig({
         {
           text: 'Codegen',
           items: [
-            { text: 'Vite Plugin', link: '/codegen/vite-plugin' },
+            { text: 'Vite Plugin & CLI', link: '/codegen/vite-plugin' },
           ],
         },
       ],
