@@ -77,9 +77,16 @@ export function singleton<TModel extends new (...args: any[]) => any>(
 /**
  * Marks an instance method as a custom mutation action.
  * Non-bulk: auto-loads record by :id, passes as first arg.
- * Bulk: accepts ids[], loads all, passes array.
+ * Bulk: accepts ids[], loads all (unless records: false), passes array or ids.
  * Route: POST /<resource>/:id/<method-name> (non-bulk)
  *        POST /<resource>/<method-name>      (bulk)
+ *
+ * @example
+ * // Efficient bulk update (no record loading)
+ * @mutation({ bulk: true, records: false })
+ * async archive(ids: number[]) {
+ *   await this.relation.where({ id: ids }).updateAll({ status: 'archived' })
+ * }
  */
 export function mutation(config?: Omit<MutationEntry, 'method'> | null) {
   // supports both @mutation and @mutation({bulk: true})
@@ -88,6 +95,7 @@ export function mutation(config?: Omit<MutationEntry, 'method'> | null) {
     const entry: MutationEntry = {
       method: key,
       bulk: config?.bulk ?? false,
+      ...(config?.records !== undefined ? { records: config.records } : {}),
       ...(config?.optimistic !== undefined ? { optimistic: config.optimistic } : {}),
       ...(config?.returns !== undefined ? { returns: config.returns } : {}),
     }

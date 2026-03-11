@@ -86,8 +86,14 @@ async launch(campaign: Campaign) {
   campaign.status = 'active'
   return campaign.save()
 }
+```
 
-// Bulk mutation (operates on multiple records)
+### Bulk Mutations
+
+Use `bulk: true` to operate on multiple records. By default, all records are loaded into memory and passed as an array.
+
+```typescript
+// For 3-10 records: load them all
 @mutation({ bulk: true })
 async archive(campaigns: Campaign[]) {
   for (const c of campaigns) { c.status = 'archived'; await c.save() }
@@ -95,9 +101,22 @@ async archive(campaigns: Campaign[]) {
 }
 ```
 
+For large batches (100+), use `records: false` to skip loading and perform a single SQL update instead:
+
+```typescript
+// For 100+ records: efficient bulk update
+@mutation({ bulk: true, records: false })
+async archive(ids: number[]) {
+  // this.relation is already scoped to organizationId (via scopeBy)
+  // and filtered to the requested ids
+  await this.relation.updateAll({ status: 'archived' })
+  return { count: ids.length }
+}
+```
+
 Routes generated:
 - Non-bulk: `POST /campaigns/:id/launch`
-- Bulk: `POST /campaigns/archive`
+- Bulk: `POST /campaigns/archive` (accepts `{ ids: [1, 2, 3] }`)
 
 ## @action
 

@@ -265,9 +265,17 @@ export function buildRouter<TContext = Record<string, any>>(
           const rel = buildScopedRelation(model, input as any)
           return dispatch(ControllerClass, context as TContext, input as any, rel, mut.method,
             async (ctrl) => {
-              // Load records from the scopeBy-applied relation for cross-tenant safety
-              const records = await ctrl.relation.where({ id: (input as any).ids }).load()
-              return ctrl[mut.method](records)
+              const ids = (input as any).ids
+              // Apply id filter to ctrl.relation so method can use this.relation.updateAll()
+              ctrl.relation = ctrl.relation.where({ id: ids })
+              // If records: false, pass ids directly for efficient updateAll() usage.
+              // Otherwise, load all records (backward compat).
+              if (mut.records === false) {
+                return ctrl[mut.method](ids)
+              } else {
+                const records = await ctrl.relation.load()
+                return ctrl[mut.method](records)
+              }
             },
             undefined,
             config.scopeBy,
@@ -342,7 +350,7 @@ export function buildRouter<TContext = Record<string, any>>(
           const findBy = config.findBy(context, ctrl)
           const record = await singletonModel.findBy(findBy)
           if (!record) throw new NotFound(singletonModel.name)
-          const permitted = buildUpdatePermit((input as any).data, config.update)
+          const permitted = buildUpdatePermit((input as any).data, config.update, context, ctrl)
           for (const [k, v] of Object.entries(permitted)) (record as any)[k] = v
           if (!(await record.save())) throw toValidationError(record.errors)
           return record
@@ -448,11 +456,14 @@ function httpToOrpc(e: HttpError): ORPCError<string, unknown> {
 
 function buildUpdatePermit(
   data: Record<string, any>,
-  updateConfig?: { permit?: string[]; restrict?: string[] },
+  updateConfig?: { permit?: string[] | ((ctx: any, ctrl: any) => string[]); restrict?: string[] },
+  ctx?: any,
+  ctrl?: any,
 ): Record<string, any> {
   const { permit, restrict } = updateConfig ?? {}
-  if (permit) {
-    return Object.fromEntries(Object.entries(data).filter(([k]) => permit.includes(k)))
+  const resolvedPermit = typeof permit === 'function' ? permit(ctx, ctrl) : permit
+  if (resolvedPermit) {
+    return Object.fromEntries(Object.entries(data).filter(([k]) => resolvedPermit.includes(k)))
   }
   const out = { ...data }
   for (const k of ['id', 'createdAt', 'updatedAt', 'created_at', 'updated_at']) delete out[k]

@@ -113,6 +113,19 @@ export interface SingletonMeta {
 export interface MutationEntry {
   method: string
   bulk: boolean
+  /**
+   * For bulk mutations: if false, the handler receives `ids: number[]` instead of
+   * fully loaded records. Use this for efficient mass updates via `updateAll()`.
+   *
+   * Defaults to `true` (loads all records).
+   *
+   * @example
+   * @mutation({ bulk: true, records: false })
+   * async archive(ids: number[]) {
+   *   await this.relation.where({ id: ids }).updateAll({ status: 'archived' })
+   * }
+   */
+  records?: boolean
   optimistic?: Record<string, any>
   returns?: 'self' | 'new'
 }

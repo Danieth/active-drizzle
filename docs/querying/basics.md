@@ -410,7 +410,47 @@ const users = await User
 
 ---
 
-## 14. Relation Method Reference
+## 14. Efficient Bulk Updates with updateAll
+
+When you need to update hundreds or thousands of records with the same values, loading each record into memory and calling `.save()` is wasteful. Use `.updateAll()` instead:
+
+```ts
+// ❌ Slow: loads 500 records, runs 500 UPDATEs + validation + hooks
+const campaigns = await Campaign.where({ status: 'draft' }).load()
+for (const c of campaigns) {
+  c.status = 'archived'
+  await c.save()  // validates, runs callbacks, updates timestamps
+}
+
+// ✅ Fast: single UPDATE query, no loading, no hooks
+await Campaign.where({ status: 'draft' }).updateAll({ status: 'archived' })
+```
+
+**When to use `updateAll`:**
+- Mass status changes (archiving, publishing, flagging)
+- Bulk attribute updates (assigning a category, setting a flag)
+- Admin operations (marking as reviewed, setting defaults)
+
+**What `updateAll` does NOT do:**
+- Does not run validations
+- Does not fire callbacks (`@before`, `@after`)
+- Does not update `updatedAt` automatically (you must include it if needed)
+- Does not return the updated records
+
+If you need validations or callbacks, you must load the records and call `.save()` on each one. For bulk operations in controllers, use `@mutation({ bulk: true, records: false })` to expose an efficient bulk update endpoint:
+
+```ts
+@mutation({ bulk: true, records: false })
+async archive(ids: number[]) {
+  // this.relation is pre-scoped to organizationId and the requested ids
+  await this.relation.updateAll({ status: 'archived', updatedAt: new Date() })
+  return { count: ids.length }
+}
+```
+
+---
+
+## 15. Relation Method Reference
 
 | Method | Returns | Description |
 |--------|---------|-------------|
@@ -445,7 +485,7 @@ const users = await User
 
 ---
 
-## 15. How Queries Are Built
+## 16. How Queries Are Built
 
 Understanding the `Relation` pipeline helps with debugging:
 

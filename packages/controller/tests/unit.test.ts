@@ -223,6 +223,27 @@ describe('@mutation decorator', () => {
     const entry = mutations.find(m => m.method === 'bulkArchive')
     expect(entry?.bulk).toBe(true)
   })
+
+  it('supports records: false for efficient bulk mutations', () => {
+    class CtrlMut4 extends ActiveController {
+      @mutation({ bulk: true, records: false })
+      async archive() { return null }
+    }
+    const mutations = getMutations(CtrlMut4)
+    const entry = mutations.find(m => m.method === 'archive')
+    expect(entry?.bulk).toBe(true)
+    expect(entry?.records).toBe(false)
+  })
+
+  it('defaults to records: true (undefined) when not specified', () => {
+    class CtrlMut5 extends ActiveController {
+      @mutation({ bulk: true })
+      async bulkTag() { return null }
+    }
+    const mutations = getMutations(CtrlMut5)
+    const entry = mutations.find(m => m.method === 'bulkTag')
+    expect(entry?.records).toBeUndefined()  // undefined = default to true in router
+  })
 })
 
 describe('@action decorator', () => {

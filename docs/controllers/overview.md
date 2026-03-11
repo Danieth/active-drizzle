@@ -347,13 +347,12 @@ async publish(post: Post) {
 // Route: POST /posts/:id/publish
 // Frontend: ctrl.mutatePublish()
 
-@mutation({ bulk: true })
-async archive(posts: Post[]) {
-  for (const post of posts) {
-    post.status = 'archived'
-    await post.save()
-  }
-  return posts
+// Efficient bulk update (for 100+ records)
+@mutation({ bulk: true, records: false })
+async archive(ids: number[]) {
+  // this.relation is already scoped to organizationId + the requested ids
+  await this.relation.updateAll({ status: 'archived' })
+  return { count: ids.length }
 }
 // Route: POST /posts/archive  (accepts { ids: number[] })
 // Frontend: ctrl.mutateBulkArchive()
