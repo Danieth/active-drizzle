@@ -18,17 +18,3 @@ export {
   type SingletonHookConfig,
   type UseCrudReturn,
 } from './hooks.js'
-
-// UI components
-export {
-  ModelCombobox,
-  SearchBar,
-  IntersectionTrigger,
-  ScopeToggle,
-  type ComboboxOption,
-  type ComboboxConfig,
-  type ModelComboboxProps,
-  type SearchBarProps,
-  type IntersectionTriggerProps,
-  type ScopeToggleProps,
-} from './components.js'

@@ -20,7 +20,7 @@ export default defineConfig({
       { text: 'Mutations', link: '/mutations/overview' },
       { text: 'Hooks', link: '/hooks/lifecycle' },
       { text: 'Controllers', link: '/controllers/overview' },
-      { text: 'React', link: '/react/overview' },
+      { text: 'React Query', link: '/react/overview' },
       { text: 'Codegen & CLI', link: '/codegen/vite-plugin' },
     ],
 
@@ -93,8 +93,7 @@ export default defineConfig({
           text: 'React',
           items: [
             { text: 'Overview', link: '/react/overview' },
-            { text: 'ClientModel', link: '/react/client-model' },
-            { text: 'UI Components', link: '/react/components' },
+            { text: 'ClientModel & Type Safety', link: '/react/client-model' },
           ],
         },
       ],

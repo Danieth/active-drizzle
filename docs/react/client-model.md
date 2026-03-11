@@ -1,54 +1,138 @@
-# ClientModel
+# ClientModel & Type Safety
 
-`ClientModel<TAttrs>` is an immutable client-side record. Codegen emits a typed subclass for each model with:
+`ClientModel<TAttrs, TWrite>` is the client-side representation of a server record. It is immutable, type-safe in both reading and writing, and fully generated — you never write it by hand.
 
-- Predicate methods (`isDraft()`, `isActive()`)
-- `@pure` method stubs (`assetCount()`, `hasAssets()`)
-- Typed `set()` for producing a new instance with updated fields
-
-## API
+## Two Type Parameters, Two Guarantees
 
 ```typescript
-// Read attributes
-const c = campaign.get()          // { id: 1, name: 'Launch', status: 'active', ... }
-c.name                             // 'Launch'
-c.status                           // 'active' (enum label, not raw int)
-
-// Produce updated copy (immutable)
-const updated = c.set({ name: 'Relaunched' })  // new ClientModel instance
-
-// Convert to plain object
-c.toObject()                        // { id: 1, name: 'Launch', ... }
-
-// Create from raw server data
-CampaignClient.from({ id: 1, name: 'Launch', status: 1, teamId: 42 })
+class ClientModel<
+  TAttrs,   // Everything the backend can return (columns + included associations)
+  TWrite,   // Only what the backend accepts for writes (from the permit list)
+>
 ```
 
-## Generated Predicates
+**`TAttrs`** — the read shape. Derived at codegen time from:
+- All Drizzle schema columns (typed correctly, with enum columns converted from raw integers to string-literal unions)
+- Any associations the controller eager-loads via `include: [...]`
 
-For every `defineEnum` in the model, codegen emits a predicate per variant:
+**`TWrite`** — the write shape. A `Pick<TAttrs, ...>` using exactly the fields in the controller's `permit` list. Attempting `.set({ id: 99 })`, `.set({ createdAt: new Date() })`, or `.set({ teamId: 1 })` is a **compile-time error** — those fields are not in the permit list.
+
+## Generated Example
+
+Given this controller config:
 
 ```typescript
-// Model:
-static status = defineEnum({ draft: 0, active: 1, paused: 2, completed: 3 })
-
-// Generated ClientModel:
-isDraft():      boolean { return this.status === 'draft' }
-isActive():     boolean { return this.status === 'active' }
-isPaused():     boolean { return this.status === 'paused' }
-isCompleted():  boolean { return this.status === 'completed' }
+@crud(Campaign, {
+  get:    { include: ['team', 'creator'] },
+  create: { permit: ['name', 'budget', 'status', 'startDate'] },
+  update: { permit: ['name', 'budget', 'status'] },
+})
 ```
 
-## Cache Key Factories
+The generator emits:
 
 ```typescript
-import { modelCacheKeys } from '@active-drizzle/react'
+// useCampaign.gen.ts — DO NOT EDIT
 
-const keys = modelCacheKeys('campaigns', { teamId: 1 })
-keys.all()                  // ['campaigns', { teamId: 1 }]
-keys.index(searchState)     // ['campaigns', { teamId: 1 }, 'index', searchState]
-keys.record(42)             // ['campaigns', { teamId: 1 }, 42]
-keys.search(q)              // ['campaigns', { teamId: 1 }, 'search', q]
+import type { TeamAttrs }  from './useTeam.gen'
+import type { UserAttrs }  from './useUser.gen'
+
+// All fields the backend returns
+export interface CampaignAttrs {
+  id: number
+  name: string
+  budget: number | null
+  status: 'draft' | 'active' | 'paused' | 'completed'  // ← string union, not 0/1/2/3
+  teamId: number
+  creatorId: number | null
+  startDate: string | null
+  createdAt: string
+  updatedAt: string
+
+  // Eager-loaded associations (from include config)
+  team?:    TeamAttrs      // from get: { include: ['team'] }
+  creator?: UserAttrs      // from get: { include: ['creator'] }
+}
+
+// Union of create + update permit lists — what .set() accepts
+export type CampaignWrite = Pick<CampaignAttrs,
+  'name' | 'budget' | 'status' | 'startDate'>
+
+export class CampaignClient extends ClientModel<CampaignAttrs, CampaignWrite> {
+  declare id: number
+  declare name: string
+  declare budget: number | null
+  declare status: 'draft' | 'active' | 'paused' | 'completed'
+  declare team?:    TeamAttrs
+  declare creator?: UserAttrs
+
+  // Enum predicates — one per variant
+  statusIsDraft()     { return this.status === 'draft' }
+  statusIsActive()    { return this.status === 'active' }
+  statusIsPaused()    { return this.status === 'paused' }
+  statusIsCompleted() { return this.status === 'completed' }
+}
 ```
 
-Cache keys are scoped, so invalidating one team's campaign cache never affects another's.
+## What This Means at the Call Site
+
+```typescript
+const c = CampaignClient.from(serverPayload)
+
+// ✓ Reading — all typed
+c.name                   // string
+c.status                 // 'draft' | 'active' | 'paused' | 'completed'
+c.creator?.email         // string | undefined  (typed from UserAttrs)
+c.team?.name             // string | undefined  (typed from TeamAttrs)
+c.statusIsActive()       // boolean
+
+// ✓ Writing — only permit-listed fields accepted
+c.set({ name: 'New' })           // fine
+c.set({ status: 'active' })      // fine
+c.set({ startDate: '2026-01-01' }) // fine
+
+// ✗ TypeScript errors — not in CampaignWrite
+c.set({ id: 99 })                // ERROR: 'id' not in permit list
+c.set({ createdAt: new Date() }) // ERROR: 'createdAt' not in permit list
+c.set({ teamId: 5 })             // ERROR: 'teamId' not in permit list (scope field)
+c.set({ creator: { ... } })      // ERROR: 'creator' not in permit list (association)
+```
+
+## Immutability
+
+`set()` always returns a **new instance** — it never mutates `this`. This plays well with React's rendering model and object identity checks in TanStack Query.
+
+```typescript
+const original = CampaignClient.from(serverData)
+const updated  = original.set({ name: 'Updated' })
+
+original === updated          // false — new object
+original.name === 'Campaign'  // true — original unchanged
+updated.name  === 'Updated'   // true
+```
+
+## Association Types Extend Automatically
+
+When you add `include: ['media']` to a controller, the generator:
+
+1. Finds the `media` association on the Campaign model
+2. Resolves its target table → `medium` model → `MediumClient`
+3. Imports `MediumAttrs` from `./useMedium.gen`
+4. Adds `media?: MediumAttrs` to `CampaignAttrs`
+5. Adds `declare media?: MediumAttrs` to `CampaignClient`
+
+The type automatically tracks what the backend is actually returning. No manual type maintenance.
+
+## Cache Keys
+
+```typescript
+export const campaignKeys = modelCacheKeys<{ teamId: number }>('campaigns')
+
+campaignKeys.list({ teamId: 1 }, searchParams)
+// → ['campaigns', { teamId: 1 }, 'list', searchParams]
+
+campaignKeys.detail(42, { teamId: 1 })
+// → ['campaigns', { teamId: 1 }, 42]
+```
+
+Scoped cache keys ensure that invalidating one team's campaigns never touches another's.

@@ -8,12 +8,10 @@ export default defineConfig({
   clean: true,
   treeshake: true,
   splitting: false,
-  jsx: 'react',
   external: [
     '@active-drizzle/core',
     '@active-drizzle/controller',
     'react',
-    'react/jsx-runtime',
     '@tanstack/react-query',
     '@tanstack/react-form',
   ],
