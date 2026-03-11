@@ -16,9 +16,6 @@ export default defineConfig({
     nav: [
       { text: 'Guide', link: '/guide/getting-started' },
       { text: 'Models', link: '/models/overview' },
-      { text: 'Querying', link: '/querying/basics' },
-      { text: 'Mutations', link: '/mutations/overview' },
-      { text: 'Hooks', link: '/hooks/lifecycle' },
       { text: 'Controllers', link: '/controllers/overview' },
       { text: 'React Query', link: '/react/overview' },
       { text: 'Codegen & CLI', link: '/codegen/vite-plugin' },
@@ -29,81 +26,123 @@ export default defineConfig({
         {
           text: 'Introduction',
           items: [
+            { text: 'Getting Started', link: '/guide/getting-started' },
             { text: 'Architecture', link: '/guide/architecture' },
             { text: 'The Happy Path', link: '/guide/happy-path' },
-            { text: 'Getting Started', link: '/guide/getting-started' },
             { text: 'Installation & Boot', link: '/guide/installation' },
             { text: 'Project Structure', link: '/guide/project-structure' },
           ],
         },
       ],
+
       '/models/': [
         {
           text: 'Models',
           items: [
-            { text: 'Defining Models', link: '/models/overview' },
-            { text: 'Attributes (Attr)', link: '/models/attributes' },
+            { text: 'Overview', link: '/models/overview' },
+            { text: 'Attributes & Enums', link: '/models/attributes' },
             { text: 'Associations', link: '/models/associations' },
-            { text: 'Single Table Inheritance', link: '/models/sti' },
+            { text: 'STI', link: '/models/sti' },
             { text: 'Custom Primary Keys', link: '/models/custom-pk' },
           ],
         },
-      ],
-      '/querying/': [
         {
           text: 'Querying',
           items: [
             { text: 'Basics', link: '/querying/basics' },
-            { text: 'Aggregates & Counting', link: '/querying/aggregates' },
             { text: 'Scopes', link: '/querying/scopes' },
+            { text: 'Aggregates & Counting', link: '/querying/aggregates' },
+            { text: 'Pluck & Pick', link: '/querying/pluck' },
+          ],
+        },
+        {
+          text: 'Writing Data',
+          items: [
+            { text: 'Create, Update, Destroy', link: '/mutations/overview' },
+            { text: 'Validations', link: '/hooks/validations' },
+            { text: 'Transactions', link: '/mutations/transactions' },
+            { text: 'Nested Attributes', link: '/mutations/nested-attributes' },
+          ],
+        },
+        {
+          text: 'Behavior',
+          items: [
+            { text: 'Lifecycle Callbacks', link: '/hooks/lifecycle' },
+            { text: 'Dirty Tracking', link: '/hooks/dirty-tracking' },
+          ],
+        },
+      ],
+
+      // Legacy redirects — keep these sections accessible directly
+      '/querying/': [
+        {
+          text: 'Querying',
+          collapsed: false,
+          items: [
+            { text: '← Back to Models', link: '/models/overview' },
+            { text: 'Basics', link: '/querying/basics' },
+            { text: 'Scopes', link: '/querying/scopes' },
+            { text: 'Aggregates & Counting', link: '/querying/aggregates' },
             { text: 'Pluck & Pick', link: '/querying/pluck' },
           ],
         },
       ],
       '/mutations/': [
         {
-          text: 'Mutations',
+          text: 'Writing Data',
+          collapsed: false,
           items: [
+            { text: '← Back to Models', link: '/models/overview' },
             { text: 'Create, Update, Destroy', link: '/mutations/overview' },
-            { text: 'Nested Attributes', link: '/mutations/nested-attributes' },
             { text: 'Transactions', link: '/mutations/transactions' },
+            { text: 'Nested Attributes', link: '/mutations/nested-attributes' },
           ],
         },
       ],
       '/hooks/': [
         {
-          text: 'Hooks',
+          text: 'Behavior',
+          collapsed: false,
           items: [
-            { text: 'Lifecycle Hooks', link: '/hooks/lifecycle' },
+            { text: '← Back to Models', link: '/models/overview' },
+            { text: 'Lifecycle Callbacks', link: '/hooks/lifecycle' },
             { text: 'Validations', link: '/hooks/validations' },
             { text: 'Dirty Tracking', link: '/hooks/dirty-tracking' },
           ],
         },
       ],
+
       '/controllers/': [
         {
           text: 'Controllers',
           items: [
             { text: 'Overview', link: '/controllers/overview' },
-            { text: 'Decorators', link: '/controllers/decorators' },
-            { text: 'Actions & Custom Endpoints', link: '/controllers/actions' },
+            { text: 'Routing & URL Structure', link: '/controllers/routing' },
+            { text: 'CRUD Actions', link: '/controllers/crud-actions' },
+            { text: 'Scopes & Permit', link: '/controllers/decorators' },
+            { text: 'Custom Mutations', link: '/controllers/decorators#mutation' },
+            { text: 'Actions & Endpoints', link: '/controllers/actions' },
+            { text: 'Lifecycle Hooks', link: '/controllers/decorators#before-after' },
             { text: 'Error Handling', link: '/controllers/error-handling' },
           ],
         },
       ],
+
       '/react/': [
         {
           text: 'React Query',
           items: [
-            { text: 'Overview & Controller API', link: '/react/overview' },
+            { text: 'Overview', link: '/react/overview' },
             { text: 'ClientModel & Type Safety', link: '/react/client-model' },
-            { text: 'Error Handling (Frontend)', link: '/controllers/error-handling' },
+            { text: 'Form Integration', link: '/react/forms' },
+            { text: 'Error Handling', link: '/react/error-handling' },
           ],
         },
       ],
+
       '/codegen/': [
         {
-          text: 'Codegen',
+          text: 'Codegen & CLI',
           items: [
             { text: 'Vite Plugin & CLI', link: '/codegen/vite-plugin' },
           ],
