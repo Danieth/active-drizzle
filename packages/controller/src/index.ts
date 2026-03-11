@@ -23,8 +23,11 @@ export {
   action,
   before,
   after,
+  rescue,
   inferControllerPath,
   type HookConfig,
+  type ActionConfig,
+  type RescueConfig,
 } from './decorators.js'
 
 // Config types
@@ -37,6 +40,7 @@ export type {
   MutationEntry,
   ActionEntry,
   HookEntry,
+  RescueEntry,
 } from './metadata.js'
 
 // Router

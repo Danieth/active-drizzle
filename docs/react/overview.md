@@ -35,17 +35,27 @@ Every controller exports an object with two methods:
 ```typescript
 import { CampaignController, UploadController } from '../_generated'
 
-// .use(scopes) — call inside React components, returns hook results
+// .use(scopes) — call inside React components, returns hook results directly
 const ctrl = CampaignController.use({ teamId })
-const { data }   = ctrl.index(search.state)   // useQuery
-const create     = ctrl.create()               // useMutation
-const launch     = ctrl.launch()               // useMutation (@mutation)
-const stats      = ctrl.stats()                // useQuery (@action GET)
-const recalc     = ctrl.recalculate()          // useMutation (@action POST)
 
-// .with(scopes) — direct async calls outside React
-const result = await CampaignController.with({ teamId }).create({ name: 'New' })
-const url    = await UploadController.with({}).getUploadUrl({ filename: 'img.png', contentType: 'image/png' })
+// Queries
+const { data }     = ctrl.index(search.state)     // useQuery   — collection
+const { data: pg } = ctrl.infiniteIndex(params)   // useInfiniteQuery — infinite scroll
+const { data: c }  = ctrl.get(id)                 // useQuery   — single record
+const { data: st } = ctrl.indexStats()            // useQuery   — @action('GET') stats
+const { data: kp } = ctrl.indexKeypoints()        // useQuery   — @action('GET') keypoints
+
+// Mutations (all prefixed with 'mutate')
+const create     = ctrl.mutateCreate()            // useMutation — create
+const update     = ctrl.mutateUpdate()            // useMutation — update
+const destroy    = ctrl.mutateDestroy()           // useMutation — destroy
+const launch     = ctrl.mutateLaunch()            // useMutation — @mutation launch
+const archive    = ctrl.mutateBulkArchive()       // useMutation — @mutation({ bulk: true }) archive
+const recalc     = ctrl.mutateRecalculate()       // useMutation — @action('POST') recalculate
+
+// .with(scopes) — direct async calls outside React (same names, same types)
+const result = await CampaignController.with({ teamId }).mutateCreate({ name: 'New' })
+const url    = await UploadController.with({}).mutateGetUploadUrl({ filename: 'img.png', contentType: 'image/png' })
 ```
 
 **Destructure once** — `CampaignController.use({ teamId })` returns a plain object (no hooks inside). The hook calls happen when you call `.index()`, `.create()` etc. on the returned object.
@@ -60,8 +70,8 @@ function CampaignsPage({ teamId }: { teamId: number }) {
   const ctrl = CampaignController.use({ teamId })
 
   const { data, isLoading } = ctrl.index({ scopes: ['active'], sort: { field: 'createdAt', dir: 'desc' } })
-  const create = ctrl.create()
-  const launch = ctrl.launch()  // @mutation
+  const create = ctrl.mutateCreate()
+  const launch = ctrl.mutateLaunch()  // @mutation
 
   return (
     <div>
@@ -74,7 +84,7 @@ function CampaignsPage({ teamId }: { teamId: number }) {
           <span>by {c.creator?.name}</span>
 
           {c.statusIsDraft() && (
-            <button onClick={() => launch.mutate(c.id)}>Launch</button>
+          <button onClick={() => launch.mutate(c.id)}>Launch</button>
           )}
         </div>
       ))}
@@ -118,7 +128,7 @@ Generated usage:
 import { UploadController } from '../_generated'
 
 function UploadButton() {
-  const upload = UploadController.use({}).getUploadUrl()  // useMutation
+  const upload = UploadController.use({}).mutateGetUploadUrl()  // useMutation (@action POST /presign)
 
   const handleFile = async (file: File) => {
     const { uploadUrl, key } = await upload.mutateAsync({
@@ -133,7 +143,7 @@ function UploadButton() {
 }
 
 // Or outside React entirely:
-const { uploadUrl } = await UploadController.with({}).getUploadUrl({
+const { uploadUrl } = await UploadController.with({}).mutateGetUploadUrl({
   filename: 'report.pdf',
   contentType: 'application/pdf',
 })
@@ -146,7 +156,7 @@ import { useForm } from '@tanstack/react-form'
 import { campaignFormConfig, CampaignController } from '../_generated'
 
 function CreateCampaignForm({ teamId, onSuccess }) {
-  const create = CampaignController.with({ teamId }).create  // direct call
+  const create = CampaignController.with({ teamId }).mutateCreate  // direct call
 
   const form = useForm({
     ...campaignFormConfig,

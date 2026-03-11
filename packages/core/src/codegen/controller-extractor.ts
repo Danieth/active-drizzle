@@ -128,6 +128,12 @@ function extractController(cls: ClassDeclaration, filePath: string): CtrlMeta | 
     const args = actDec.getArguments()
     const httpMethod = args.length > 0 ? stripQuotes(args[0]!.getText()) : 'POST'
     const path = args.length > 1 ? stripQuotes(args[1]!.getText()) : undefined
+    // Third arg is ActionConfig — extract { load: true }
+    let load = false
+    if (args.length > 2) {
+      const configObj = parseObjectLiteral(args[2]!)
+      load = configObj?.load === true || configObj?.load === 'true'
+    }
 
     // Extract input type from first parameter type annotation
     const params = method.getParameters()
@@ -149,6 +155,7 @@ function extractController(cls: ClassDeclaration, filePath: string): CtrlMeta | 
     actions.push({
       method: methodName,
       httpMethod,
+      load,
       ...(path !== undefined ? { path } : {}),
       inputType,
       outputType,

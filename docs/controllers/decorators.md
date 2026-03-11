@@ -99,6 +99,64 @@ Routes generated:
 - Non-bulk: `POST /campaigns/:id/launch`
 - Bulk: `POST /campaigns/archive`
 
+## @action
+
+Marks a method as an explicit REST endpoint. Unlike `@mutation` (which always loads a single record by `:id`), `@action` gives you full control over the route shape.
+
+```typescript
+// Collection-level: no record loading
+@action('GET')
+async stats(): Promise<{ totalBudget: number; activeCount: number }> {
+  const rel = this.relation
+  const totalBudget = await rel.sum('budget')
+  const activeCount = await rel.active().count()
+  return { totalBudget, activeCount }
+}
+// → GET /campaigns/stats
+
+@action('POST')
+async recalculate(input: { fieldset: string }) {
+  await recalculateAll(this.relation, input.fieldset)
+  return { ok: true }
+}
+// → POST /campaigns/recalculate
+```
+
+**Record-loading actions** — pass `{ load: true }` as the third argument to auto-load the record by `:id`, just like `@mutation`:
+
+```typescript
+@action('GET', undefined, { load: true })
+async score(record: Campaign): Promise<{ score: number }> {
+  return { score: await computeScore(record) }
+}
+// → GET /campaigns/:id/score
+
+@action('POST', undefined, { load: true })
+async duplicate(record: Campaign) {
+  const copy = await Campaign.create({ ...record.attributes, name: `${record.name} (copy)` })
+  return copy
+}
+// → POST /campaigns/:id/duplicate
+```
+
+When `load: true`, the loaded record is also available as `this.record` inside `@before` hooks that run for that action — useful for ownership checks.
+
+**Custom paths:**
+
+```typescript
+@action('POST', '/campaigns/batch-import')
+async batchImport(input: { rows: { name: string; budget: number }[] }) { ... }
+// → POST /campaigns/batch-import
+```
+
+**Generated frontend names follow the prefix rules:**
+- `@action('GET') stats` → `ctrl.indexStats()` — prefixed with `index`
+- `@action('GET') indexKeypoints` → `ctrl.indexKeypoints()` — already has `index`, no double-prefix
+- `@action('POST') recalculate` → `ctrl.mutateRecalculate()` — prefixed with `mutate`
+- `@action('GET', ..., { load: true }) score` → `ctrl.indexScore(id)` — takes an id
+
+---
+
 ## @before / @after
 
 Hooks that run before/after actions. Inherited from parent classes (parent hooks fire first, like Rails `before_action` inheritance).
@@ -110,7 +168,7 @@ export class BaseTeamController extends ActiveController<AppContext> {
   @before()
   async loadTeam() {
     this.team = await Team.find(this.params.teamId)
-    if (!this.team) throw new NotFound('Team')
+    // Team.find() throws RecordNotFound if missing — auto-converted to 404
   }
 }
 
@@ -127,7 +185,56 @@ export class CampaignController extends BaseTeamController {
 }
 ```
 
+**`this.record` in hooks:** When an action auto-loads a record (`@mutation` or `@action({ load: true })`), the record is set on `this.record` *before* before-hooks run:
+
+```typescript
+@before({ only: ['launch', 'update'] })
+async ensureOwner() {
+  if (this.record.creatorId !== this.context.user.id) {
+    throw new Forbidden('Not your campaign')
+  }
+}
+```
+
 Options:
 - `only: ['create', 'update']` — run only for these actions
 - `except: ['index']` — run for all EXCEPT these actions
 - `if: 'methodName'` or `if: () => boolean` — conditional execution
+
+---
+
+## @rescue
+
+Rails-style error handler. Declare a method that receives the thrown error and either converts it to a different error or returns a fallback value.
+
+```typescript
+class SomeServiceError extends Error {}
+
+@controller('/campaigns')
+@crud(Campaign, { /* ... */ })
+@scope('teamId')
+export class CampaignController extends ActiveController<AppContext> {
+
+  // Convert third-party errors into user-friendly 400s
+  @rescue(SomeServiceError)
+  async handleServiceError(e: SomeServiceError) {
+    throw new BadRequest(`Service unavailable: ${e.message}`)
+  }
+
+  // Swallow a transient error with a fallback (only for 'index')
+  @rescue(CacheError, { only: ['index'] })
+  async handleCacheMiss(_e: CacheError) {
+    return { data: [], pagination: { totalCount: 0 } }
+  }
+}
+```
+
+`@rescue` handlers are **inherited** — define them in a base controller and every subclass gets them automatically.
+
+Options:
+- `only: ['create', 'update']` — rescue only for these actions
+- `except: ['index']` — rescue for all actions except these
+
+::: tip Auto-rescue for RecordNotFound
+You don't need `@rescue` for `RecordNotFound`. Any `RecordNotFound` error thrown anywhere in the dispatch cycle is automatically converted to a `NOT_FOUND` (404) response — including errors thrown by `Model.find()` inside action bodies.
+:::

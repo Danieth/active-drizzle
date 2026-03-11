@@ -40,6 +40,7 @@ import { NotFound } from '@active-drizzle/controller'
 export class CampaignController extends ActiveController<AppContext> {
   @mutation()
   async launch(campaign: Campaign) {
+    // campaign is auto-loaded from :id — no manual find() needed
     if (!campaign.hasAssets()) throw new BadRequest('Add assets before launching')
     campaign.status = 'active'
     campaign.startDate = new Date()

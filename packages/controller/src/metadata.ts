@@ -14,6 +14,7 @@ export const MUTATION_META    = Symbol('ad:mutations')
 export const ACTION_META      = Symbol('ad:actions')
 export const BEFORE_META      = Symbol('ad:before')
 export const AFTER_META       = Symbol('ad:after')
+export const RESCUE_META      = Symbol('ad:rescue')
 
 // ── Shape definitions ─────────────────────────────────────────────────────────
 
@@ -81,6 +82,8 @@ export interface ActionEntry {
   method: string
   httpMethod: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
   path?: string
+  /** If true, auto-loads the record by :id on CRUD controllers before calling the method. */
+  load?: boolean
 }
 
 export interface HookEntry {
@@ -90,10 +93,23 @@ export interface HookEntry {
   condition?: string | (() => boolean)
 }
 
+export interface RescueEntry {
+  /** The error class to match (instanceof check). */
+  errorClass: new (...args: any[]) => Error
+  /** The controller method to call with the error. */
+  method: string
+  only?: string[]
+  except?: string[]
+}
+
 // ── Getters / setters ─────────────────────────────────────────────────────────
 
 export function getControllerMeta(cls: any): ControllerMeta | undefined {
   return cls[CONTROLLER_META]
+}
+
+export function getRescueHandlers(cls: any): RescueEntry[] {
+  return cls[RESCUE_META] ?? []
 }
 
 export function getCrudMeta(cls: any): CrudMeta | undefined {
@@ -141,10 +157,29 @@ function collectHooks(cls: any, sym: symbol, actionName: string): HookEntry[] {
   return chain.flat().filter(h => appliesToAction(h, actionName))
 }
 
-function appliesToAction(hook: HookEntry, action: string): boolean {
+function appliesToAction(hook: HookEntry | RescueEntry, action: string): boolean {
   if (hook.only && !hook.only.includes(action)) return false
   if (hook.except && hook.except.includes(action)) return false
   return true
+}
+
+/**
+ * Collect @rescue handlers that match both the action and the error type.
+ * Walks the prototype chain — parent handlers fire first (least specific → most specific).
+ */
+export function collectRescueHandlers(cls: any, actionName: string, error: unknown): RescueEntry[] {
+  const chain: RescueEntry[][] = []
+  let proto = cls
+  while (proto && proto !== Function.prototype) {
+    if (Object.prototype.hasOwnProperty.call(proto, RESCUE_META)) {
+      chain.unshift(proto[RESCUE_META] as RescueEntry[])
+    }
+    proto = Object.getPrototypeOf(proto)
+  }
+  return chain.flat().filter(h =>
+    appliesToAction(h, actionName) &&
+    error instanceof h.errorClass,
+  )
 }
 
 // ── Infer scope resource name ─────────────────────────────────────────────────

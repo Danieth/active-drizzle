@@ -60,11 +60,18 @@ export function buildRouter<TContext = Record<string, any>>(
 
   // ── Shared: create a controller instance with context + params ─────────────
 
-  function makeController(context: TContext, params: Record<string, any>, startRelation: any): any {
+  function makeController(
+    context: TContext,
+    params: Record<string, any>,
+    startRelation: any,
+    record?: any,
+  ): any {
     const inst = new ControllerClass()
     inst['context'] = context
-    inst['params'] = params
+    inst['params']  = params
+    inst['input']   = params   // alias
     inst['relation'] = startRelation
+    if (record !== undefined) inst['record'] = record
     return inst
   }
 
@@ -95,17 +102,35 @@ export function buildRouter<TContext = Record<string, any>>(
     relation: any,
     actionName: string,
     handler: (ctrl: any) => Promise<any>,
+    record?: any,
   ): Promise<any> {
-    const ctrl = makeController(context, params, relation)
+    const ctrl = makeController(context, params, relation, record)
     try {
       await ctrl._runBeforeHooks(actionName)
       const result = await handler(ctrl)
       await ctrl._runAfterHooks(actionName)
       return result
     } catch (e) {
+      // 1. User-defined @rescue handlers (can convert or swallow the error)
+      const rescued = await ctrl._handleError(e, actionName)
+      if (rescued.handled) return rescued.value
+
+      // 2. Auto-rescue: RecordNotFound from the ORM → 404
+      if (isRecordNotFound(e)) {
+        throw new ORPCError('NOT_FOUND', { message: (e as Error).message })
+      }
+
+      // 3. HttpError subclasses (BadRequest, Unauthorized, etc.) → oRPC error
       if (e instanceof HttpError) throw httpToOrpc(e)
+
+      // 4. Re-throw unknown errors as-is
       throw e
     }
+  }
+
+  /** Duck-type check for RecordNotFound (avoids a hard dep on @active-drizzle/core). */
+  function isRecordNotFound(e: unknown): boolean {
+    return e instanceof Error && (e as any).name === 'RecordNotFound'
   }
 
   // ── CRUD routes ───────────────────────────────────────────────────────────
@@ -220,7 +245,9 @@ export function buildRouter<TContext = Record<string, any>>(
           const record = await rel.where({ id: (input as any).id }).first()
           if (!record) throw new NotFound(model.name)
           return dispatch(ControllerClass, context as TContext, input as any, rel, mut.method,
-            (ctrl) => ctrl[mut.method](record, (input as any).data))
+            (ctrl) => ctrl[mut.method](record, (input as any).data),
+            record,
+          )
         }))
         routes.push({ method: 'POST', path: `${basePath}/:id/${kebab}`, procedure: mut.method, action: mut.method })
       }
@@ -297,16 +324,39 @@ export function buildRouter<TContext = Record<string, any>>(
   // ── Plain @action routes ──────────────────────────────────────────────────
 
   for (const act of plainActions) {
-    const path = act.path ?? `${basePath}/${toKebab(act.method)}`
+    const crudModel = crud?.model ?? singleton?.model
+    const usesId    = act.load && !!crudModel
+    const defaultPath = usesId
+      ? `${basePath}/:id/${toKebab(act.method)}`
+      : `${basePath}/${toKebab(act.method)}`
+    const path = act.path ?? defaultPath
+
     const scopeSchema: Record<string, z.ZodTypeAny> = {}
     for (const s of scopes) scopeSchema[s.paramName] = z.number().int().positive()
-    router[act.method] = builder.input(
-      z.object({ ...scopeSchema, data: z.record(z.string(), z.any()).optional() })
-    ).handler(async ({ input, context }) => {
-      const rel = null
-      return dispatch(ControllerClass, context as TContext, input as any, rel as any, act.method,
-        (ctrl) => ctrl[act.method]((input as any).data ?? input))
-    })
+
+    if (usesId) {
+      // Load the record by :id and pass as first arg, like @mutation
+      router[act.method] = builder.input(
+        z.object({ ...scopeSchema, id: z.number().int().positive(), data: z.record(z.string(), z.any()).optional() })
+      ).handler(async ({ input, context }) => wrapErrors(async () => {
+        const rel = buildScopedRelation(crudModel!, input as any)
+        const record = await rel.where({ id: (input as any).id }).first()
+        if (!record) throw new NotFound(crudModel!.name)
+        return dispatch(
+          ControllerClass, context as TContext, input as any, rel, act.method,
+          (ctrl) => ctrl[act.method](record, (input as any).data ?? input),
+          record,
+        )
+      }))
+    } else {
+      router[act.method] = builder.input(
+        z.object({ ...scopeSchema, data: z.record(z.string(), z.any()).optional() })
+      ).handler(async ({ input, context }) => {
+        const rel = crudModel ? buildScopedRelation(crudModel, input as any) : null
+        return dispatch(ControllerClass, context as TContext, input as any, rel as any, act.method,
+          (ctrl) => ctrl[act.method]((input as any).data ?? input))
+      })
+    }
     routes.push({ method: act.httpMethod, path, procedure: act.method, action: act.method })
   }
 

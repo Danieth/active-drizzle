@@ -18,3 +18,10 @@ export {
   type SingletonHookConfig,
   type UseCrudReturn,
 } from './hooks.js'
+
+// Error utilities
+export {
+  parseControllerError,
+  applyFormErrors,
+  type ParsedControllerError,
+} from './errors.js'

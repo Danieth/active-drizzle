@@ -29,6 +29,8 @@ export default defineConfig({
         {
           text: 'Introduction',
           items: [
+            { text: 'Architecture', link: '/guide/architecture' },
+            { text: 'The Happy Path', link: '/guide/happy-path' },
             { text: 'Getting Started', link: '/guide/getting-started' },
             { text: 'Installation & Boot', link: '/guide/installation' },
             { text: 'Project Structure', link: '/guide/project-structure' },
@@ -84,16 +86,18 @@ export default defineConfig({
           items: [
             { text: 'Overview', link: '/controllers/overview' },
             { text: 'Decorators', link: '/controllers/decorators' },
+            { text: 'Actions & Custom Endpoints', link: '/controllers/actions' },
             { text: 'Error Handling', link: '/controllers/error-handling' },
           ],
         },
       ],
       '/react/': [
         {
-          text: 'React',
+          text: 'React Query',
           items: [
-            { text: 'Overview', link: '/react/overview' },
+            { text: 'Overview & Controller API', link: '/react/overview' },
             { text: 'ClientModel & Type Safety', link: '/react/client-model' },
+            { text: 'Error Handling (Frontend)', link: '/controllers/error-handling' },
           ],
         },
       ],

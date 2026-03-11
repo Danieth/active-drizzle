@@ -5,9 +5,9 @@
 import pluralize from 'pluralize'
 import {
   CONTROLLER_META, CRUD_META, SINGLETON_META, SCOPE_META,
-  MUTATION_META, ACTION_META, BEFORE_META, AFTER_META,
+  MUTATION_META, ACTION_META, BEFORE_META, AFTER_META, RESCUE_META,
   type CrudConfig, type SingletonConfig, type ScopeEntry,
-  type MutationEntry, type ActionEntry, type HookEntry,
+  type MutationEntry, type ActionEntry, type HookEntry, type RescueEntry,
   inferScopeResource,
 } from './metadata.js'
 
@@ -97,19 +97,35 @@ export function mutation(config?: Omit<MutationEntry, 'method'> | null) {
 
 // ── @action ───────────────────────────────────────────────────────────────────
 
+export interface ActionConfig {
+  /**
+   * If true and the controller has @crud, auto-loads the record by :id from
+   * the scoped relation and passes it as the first argument to the method.
+   * Requires path to include /:id (or the default /:id/<method-name> path).
+   * The loaded record is also available as `this.record`.
+   */
+  load?: boolean
+}
+
 /**
  * Marks an instance method as an explicit REST action.
- * For plain controllers (no @crud).
+ * Works on plain controllers (no @crud) and CRUD controllers alike.
+ *
+ * @param httpMethod  GET | POST | PUT | PATCH | DELETE
+ * @param path        Optional explicit path (default: /<resource>/:id/<method-name> if load:true, else /<resource>/<method-name>)
+ * @param config      ActionConfig — set { load: true } to auto-load the record by :id
  */
 export function action(
   httpMethod: ActionEntry['httpMethod'],
   path?: string,
+  config?: ActionConfig,
 ) {
   return function (_target: any, key: string, _descriptor: PropertyDescriptor) {
     const ctor = _target.constructor
     const entry: ActionEntry = {
       method: key,
       httpMethod,
+      load: config?.load ?? false,
       ...(path !== undefined ? { path } : {}),
     }
     ctor[ACTION_META] = [...(ctor[ACTION_META] ?? []), entry]
@@ -152,6 +168,56 @@ function hookDecorator(sym: symbol, config?: HookConfig) {
       ctor[sym] = []
     }
     ;(ctor[sym] as HookEntry[]).push(entry)
+  }
+}
+
+// ── @rescue ───────────────────────────────────────────────────────────────────
+
+export interface RescueConfig {
+  only?: string[]
+  except?: string[]
+}
+
+/**
+ * Rails-style error handler for controller methods.
+ *
+ * When any action throws an instance of `errorClass`, the decorated method
+ * is called with the error as its only argument. The handler can:
+ *   - throw an HttpError to convert the error into an HTTP response
+ *   - return a value to use as the action's response (swallows the error)
+ *
+ * Inherits from parent classes — parent rescues fire first (like Rails).
+ * Use `only`/`except` to limit which actions the rescue applies to.
+ *
+ * @example
+ * // Convert ORM RecordNotFound → 404
+ * @rescue(RecordNotFound)
+ * async handleNotFound(error: RecordNotFound) {
+ *   throw new NotFound(error.modelName)
+ * }
+ *
+ * // Return a fallback only on the 'show' action
+ * @rescue(SomeTransientError, { only: ['get'] })
+ * async handleTransient(_error: SomeTransientError) {
+ *   return { fallback: true }
+ * }
+ */
+export function rescue(
+  errorClass: new (...args: any[]) => Error,
+  config?: RescueConfig,
+) {
+  return function (_target: any, key: string, _descriptor: PropertyDescriptor) {
+    const ctor = _target.constructor
+    const entry: RescueEntry = {
+      errorClass,
+      method: key,
+      ...(config?.only ? { only: config.only } : {}),
+      ...(config?.except ? { except: config.except } : {}),
+    }
+    if (!Object.prototype.hasOwnProperty.call(ctor, RESCUE_META)) {
+      ctor[RESCUE_META] = []
+    }
+    ;(ctor[RESCUE_META] as RescueEntry[]).push(entry)
   }
 }
 

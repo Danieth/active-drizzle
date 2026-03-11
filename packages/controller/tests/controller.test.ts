@@ -4,7 +4,7 @@
  * Exercises all 22 cases from the spec against real Postgres.
  * Uses testcontainers to spin up a fresh DB per suite.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql'
 import { drizzle } from 'drizzle-orm/node-postgres'
 import { Pool } from 'pg'
@@ -25,10 +25,11 @@ import {
 // Controller imports
 import {
   ActiveController,
-  controller, crud, singleton, scope, mutation, before, after,
+  controller, crud, singleton, scope, mutation, action, before, after, rescue,
   buildRouter,
   BadRequest, Unauthorized, Forbidden, NotFound, ValidationError,
 } from '@active-drizzle/controller'
+import { parseControllerError, applyFormErrors } from '@active-drizzle/react'
 import { ORPCError } from '@orpc/server'
 
 /** Expect an oRPC call to reject with a specific HTTP status code. */
@@ -673,5 +674,230 @@ describe('buildRouter — route table', () => {
     expect(paths).toContain('GET /teams/:teamId/team-settings')
     expect(paths).toContain('PATCH /teams/:teamId/team-settings')
     expect(paths).not.toContain(expect.stringMatching(/:id/))
+  })
+})
+
+// ── @rescue decorator ─────────────────────────────────────────────────────────
+
+class DomainError extends Error {
+  constructor(msg = 'domain problem') {
+    super(msg)
+    this.name = 'DomainError'
+  }
+}
+class AnotherError extends Error {}
+
+@controller('/rescue-test')
+@crud(Campaign, { create: { permit: ['name', 'status'] }, update: { permit: ['name'] } })
+@scope('teamId')
+class RescueController extends BaseController {
+  /** Converts any DomainError → BadRequest 400 */
+  @rescue(DomainError)
+  async handleDomainError(e: DomainError) {
+    throw new BadRequest(`Rescued: ${e.message}`)
+  }
+
+  /** Swallows AnotherError and returns a fallback value */
+  @rescue(AnotherError)
+  async handleAnotherError(_e: AnotherError) {
+    return { swallowed: true }
+  }
+
+  /** Throws a DomainError so we can verify the rescue kicks in */
+  @action('POST', undefined, { load: true })
+  async triggerDomain(record: any) {
+    void record
+    throw new DomainError('something went wrong')
+  }
+
+  /** Throws AnotherError so we can verify the swallow rescue */
+  @action('POST')
+  async triggerSwallow() {
+    throw new AnotherError('swallowable')
+  }
+
+  /** Lets RecordNotFound bubble up (no rescue registered for it) */
+  @action('GET')
+  async triggerRecordNotFound() {
+    // Simulates calling Model.find(nonexistentId) inside a method
+    const RecordNotFoundError = class extends Error {
+      constructor() { super('Campaign with id=9999 not found'); this.name = 'RecordNotFound' }
+    }
+    throw new RecordNotFoundError()
+  }
+
+  @action('POST', undefined, { load: true })
+  async inspectRecord(record: any) {
+    return { id: record.id, name: record.name }
+  }
+}
+
+describe('@rescue decorator', () => {
+  beforeAll(truncate)
+
+  it('converts a DomainError into a BadRequest via @rescue handler', async () => {
+    const team = await Team.create({ name: 'Rescue-A' })
+    const c    = await Campaign.create({ name: 'R1', status: 0, teamId: team.id })
+    await expectStatus(
+      call(RescueController, 'triggerDomain', { teamId: team.id, id: c.id }, { teamId: team.id }),
+      'BAD_REQUEST',
+    )
+  })
+
+  it('swallows an error and returns the rescue handler return value', async () => {
+    const team = await Team.create({ name: 'Rescue-B' })
+    const res  = await call(RescueController, 'triggerSwallow', { teamId: team.id }, { teamId: team.id })
+    expect(res).toEqual({ swallowed: true })
+  })
+
+  it('auto-rescues RecordNotFound (by name) to NOT_FOUND when no @rescue matches', async () => {
+    const team = await Team.create({ name: 'Rescue-C' })
+    await expectStatus(
+      call(RescueController, 'triggerRecordNotFound', { teamId: team.id }, { teamId: team.id }),
+      'NOT_FOUND',
+    )
+  })
+})
+
+describe('@action({ load: true }) — auto-loads record by :id', () => {
+  beforeAll(truncate)
+
+  it('passes the loaded record as first arg and sets this.record', async () => {
+    const team = await Team.create({ name: 'Load-A' })
+    const c    = await Campaign.create({ name: 'Loadable', status: 0, teamId: team.id })
+    const res  = await call(RescueController, 'inspectRecord', { teamId: team.id, id: c.id }, { teamId: team.id })
+    expect(res.id).toBe(c.id)
+    expect(res.name).toBe('Loadable')
+  })
+
+  it('returns NOT_FOUND when :id does not exist', async () => {
+    const team = await Team.create({ name: 'Load-B' })
+    await expectStatus(
+      call(RescueController, 'inspectRecord', { teamId: team.id, id: 99999 }, { teamId: team.id }),
+      'NOT_FOUND',
+    )
+  })
+
+  it('@action with load:true generates a /:id route', () => {
+    const { routes } = buildRouter(RescueController)
+    const paths = routes.map(r => `${r.method} ${r.path}`)
+    expect(paths).toContain('POST /teams/:teamId/rescue-tests/:id/trigger-domain')
+    expect(paths).toContain('POST /teams/:teamId/rescue-tests/:id/inspect-record')
+    // Collection action (no load) has no :id
+    expect(paths).toContain('POST /teams/:teamId/rescue-tests/trigger-swallow')
+  })
+})
+
+describe('this.record is accessible in @before hooks', () => {
+  beforeAll(truncate)
+
+  it('allows a @before hook to read this.record before the mutation runs', async () => {
+    let capturedRecord: any = null
+
+    @controller('/capture-test')
+    @crud(Campaign, { update: { permit: ['name'] } })
+    @scope('teamId')
+    class CaptureController extends BaseController {
+      @before({ only: ['activate'] })
+      async captureIt() {
+        capturedRecord = (this as any).record
+      }
+
+      @mutation()
+      async activate(record: any) {
+        record.status = 'active'
+        await record.save()
+        return record
+      }
+    }
+
+    const team = await Team.create({ name: 'Cap-A' })
+    const c    = await Campaign.create({ name: 'Cap1', status: 0, teamId: team.id })
+    await call(CaptureController, 'activate', { teamId: team.id, id: c.id }, { teamId: team.id })
+    expect(capturedRecord).not.toBeNull()
+    expect(capturedRecord.id).toBe(c.id)
+  })
+})
+
+// ── parseControllerError ──────────────────────────────────────────────────────
+
+describe('parseControllerError', () => {
+  it('returns null for null/undefined', () => {
+    expect(parseControllerError(null)).toBeNull()
+    expect(parseControllerError(undefined)).toBeNull()
+  })
+
+  it('returns null for non-oRPC errors (no .code)', () => {
+    expect(parseControllerError(new Error('plain'))).toBeNull()
+    expect(parseControllerError('string error')).toBeNull()
+  })
+
+  it('parses UNPROCESSABLE_ENTITY with field errors', () => {
+    const orpcErr = { code: 'UNPROCESSABLE_ENTITY', message: 'Unprocessable Entity', data: { errors: { name: ["can't be blank"], status: ['is invalid'] } } }
+    const parsed = parseControllerError(orpcErr)!
+    expect(parsed.isValidation).toBe(true)
+    expect(parsed.code).toBe('UNPROCESSABLE_ENTITY')
+    expect(parsed.fields).toEqual({ name: ["can't be blank"], status: ['is invalid'] })
+    expect(parsed.isNotFound).toBe(false)
+  })
+
+  it('parses NOT_FOUND correctly', () => {
+    const parsed = parseControllerError({ code: 'NOT_FOUND', message: 'Campaign not found' })!
+    expect(parsed.isNotFound).toBe(true)
+    expect(parsed.isValidation).toBe(false)
+    expect(parsed.fields).toBeUndefined()
+  })
+
+  it('parses UNAUTHORIZED', () => {
+    const parsed = parseControllerError({ code: 'UNAUTHORIZED', message: 'Not authenticated' })!
+    expect(parsed.isUnauthorized).toBe(true)
+    expect(parsed.isForbidden).toBe(false)
+  })
+
+  it('parses FORBIDDEN', () => {
+    const parsed = parseControllerError({ code: 'FORBIDDEN', message: 'Access denied' })!
+    expect(parsed.isForbidden).toBe(true)
+    expect(parsed.isUnauthorized).toBe(false)
+  })
+
+  it('parses BAD_REQUEST', () => {
+    const parsed = parseControllerError({ code: 'BAD_REQUEST', message: 'bad input' })!
+    expect(parsed.isBadRequest).toBe(true)
+  })
+
+  it('uses fallback message when message is missing', () => {
+    const parsed = parseControllerError({ code: 'NOT_FOUND' })!
+    expect(parsed.message).toBe('Unknown error')
+  })
+})
+
+describe('applyFormErrors', () => {
+  it('does nothing when parsed is null', () => {
+    const setFieldMeta = vi.fn()
+    applyFormErrors({ setFieldMeta }, null)
+    expect(setFieldMeta).not.toHaveBeenCalled()
+  })
+
+  it('does nothing when there are no fields', () => {
+    const setFieldMeta = vi.fn()
+    applyFormErrors({ setFieldMeta }, parseControllerError({ code: 'NOT_FOUND', message: 'x' }))
+    expect(setFieldMeta).not.toHaveBeenCalled()
+  })
+
+  it('calls setFieldMeta for each field', () => {
+    const calls: any[] = []
+    const form = {
+      setFieldMeta: (field: string, fn: (meta: any) => any) => {
+        calls.push({ field, result: fn({ errors: [] }) })
+      },
+    }
+    applyFormErrors(form, parseControllerError({
+      code: 'UNPROCESSABLE_ENTITY',
+      message: 'invalid',
+      data: { errors: { name: ['required'], budget: ['must be >= 0'] } },
+    }))
+    expect(calls).toHaveLength(2)
+    expect(calls.find(c => c.field === 'name')?.result.errors).toEqual(['required'])
+    expect(calls.find(c => c.field === 'budget')?.result.errors).toEqual(['must be >= 0'])
   })
 })

@@ -255,61 +255,117 @@ function generateControllerFile(
   return L.join('\n')
 }
 
+// ── Name helpers ─────────────────────────────────────────────────────────────
+//
+// Naming rules (flat, prefix-based):
+//
+//   Queries:
+//     index, infiniteIndex, get           → as-is (standard CRUD)
+//     @action('GET') stats                → indexStats   (prefix 'index', dedup)
+//     @action('GET') indexStats           → indexStats   (already starts with 'index')
+//     @action('GET') getSummary           → getSummary   (already starts with 'get')
+//
+//   Mutations (ALL start with 'mutate'):
+//     create / update / destroy           → mutateCreate / mutateUpdate / mutateDestroy
+//     @mutation() launch                  → mutateLaunch
+//     @mutation({ bulk: true }) archive   → mutateBulkArchive   (prefix 'mutateBulk')
+//     @mutation({ bulk: true }) bulkArch  → mutateBulkArchive   (dedup: already has 'bulk')
+//     @action('POST') recalculate         → mutateRecalculate
+
+function toIndexName(methodName: string): string {
+  if (methodName.startsWith('index') || methodName.startsWith('get')) return methodName
+  return 'index' + capitalize(methodName)
+}
+
+function toMutateName(methodName: string): string {
+  return 'mutate' + capitalize(methodName)
+}
+
+function toBulkMutateName(methodName: string): string {
+  // If name already starts with 'bulk', the capitalize gives us e.g. 'BulkArchive',
+  // so 'mutate' + 'BulkArchive' → 'mutateBulkArchive' — natural dedup.
+  // If name doesn't start with 'bulk', we add it: 'mutateBulk' + 'Archive'.
+  if (methodName.startsWith('bulk')) {
+    return 'mutate' + capitalize(methodName)
+  }
+  return 'mutateBulk' + capitalize(methodName)
+}
+
 // ── .use() body ───────────────────────────────────────────────────────────────
 
 function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string): void {
-  const modelName  = ctrl.modelClass
+  const modelName   = ctrl.modelClass
   const scopeSpread = ctrl.scopes.length > 0 ? '...scopes, ' : ''
+  const keysRef     = modelName ? `${lcFirst(modelName)}Keys` : null
 
   if (ctrl.kind === 'crud' && modelName) {
-    // CRUD queries
-    L.push(`    /** Paginated list query. Pass search state from use${modelName}Search(). */`)
+    L.push(`    /** Paginated list. Pass search state from use${modelName}Search(). */`)
     L.push(`    index: (params?: ${modelName}SearchState) => useQuery({`)
-    L.push(`      queryKey: ${lcFirst(modelName)}Keys.list(scopes, params),`)
+    L.push(`      queryKey: ${keysRef}!.list(scopes, params),`)
     L.push(`      queryFn:  () => client.${clientKey}.index({ ${scopeSpread}...params }),`)
     L.push(`    }),`)
-    L.push(`    /** Infinite-scroll list query. */`)
+    L.push(`    /** Infinite-scroll list. */`)
     L.push(`    infiniteIndex: (params?: Omit<${modelName}SearchState, 'page'>) => useInfiniteQuery({`)
-    L.push(`      queryKey:       ${lcFirst(modelName)}Keys.list(scopes, params),`)
-    L.push(`      queryFn:        ({ pageParam = 0 }) => client.${clientKey}.index({ ${scopeSpread}...params, page: pageParam as number }),`)
+    L.push(`      queryKey:         ${keysRef}!.list(scopes, params),`)
+    L.push(`      queryFn:          ({ pageParam = 0 }) => client.${clientKey}.index({ ${scopeSpread}...params, page: pageParam as number }),`)
     L.push(`      initialPageParam: 0,`)
-    L.push(`      getNextPageParam: (last: any) => last?.pagination?.hasMore ? (last.pagination.page + 1) : undefined,`)
+    L.push(`      getNextPageParam:  (last: any) => last?.pagination?.hasMore ? (last.pagination.page + 1) : undefined,`)
     L.push(`    }),`)
-    L.push(`    /** Single-record query. Pass null/undefined to skip fetching. */`)
+    L.push(`    /** Single-record query. Pass null/undefined to disable fetching. */`)
     L.push(`    get: (id: number | string | null | undefined) => useQuery({`)
-    L.push(`      queryKey: ${lcFirst(modelName)}Keys.detail(id ?? 0, scopes),`)
+    L.push(`      queryKey: ${keysRef}!.detail(id ?? 0, scopes),`)
     L.push(`      queryFn:  () => client.${clientKey}.get({ ${scopeSpread}id }),`)
     L.push(`      enabled:  id != null,`)
     L.push(`    }),`)
-    // CRUD mutations
-    L.push(`    create:  () => useMutation({ mutationFn: (data: ${modelName}Write) => client.${clientKey}.create({ ${scopeSpread}data }) }),`)
-    L.push(`    update:  () => useMutation({ mutationFn: ({ id, ...data }: { id: number | string } & Partial<${modelName}Write>) => client.${clientKey}.update({ ${scopeSpread}id, data }) }),`)
-    L.push(`    destroy: () => useMutation({ mutationFn: (id: number | string) => client.${clientKey}.destroy({ ${scopeSpread}id }) }),`)
+    // Standard CRUD mutations — prefixed with 'mutate'
+    L.push(`    mutateCreate:  () => useMutation({ mutationFn: (data: ${modelName}Write) => client.${clientKey}.create({ ${scopeSpread}data }) }),`)
+    L.push(`    mutateUpdate:  () => useMutation({ mutationFn: ({ id, ...data }: { id: number | string } & Partial<${modelName}Write>) => client.${clientKey}.update({ ${scopeSpread}id, data }) }),`)
+    L.push(`    mutateDestroy: () => useMutation({ mutationFn: (id: number | string) => client.${clientKey}.destroy({ ${scopeSpread}id }) }),`)
   }
 
   if (ctrl.kind === 'singleton' && modelName) {
-    L.push(`    get:    () => useQuery({ queryKey: ${lcFirst(modelName)}Keys.singleton(scopes), queryFn: () => client.${clientKey}.get({ ${scopeSpread} }) }),`)
-    L.push(`    update: () => useMutation({ mutationFn: (data: ${modelName}Write) => client.${clientKey}.update({ ${scopeSpread}data }) }),`)
+    L.push(`    get:          () => useQuery({ queryKey: ${keysRef}!.singleton(scopes), queryFn: () => client.${clientKey}.get({ ${scopeSpread} }) }),`)
+    L.push(`    mutateUpdate: () => useMutation({ mutationFn: (data: ${modelName}Write) => client.${clientKey}.update({ ${scopeSpread}data }) }),`)
   }
 
-  // @mutation — always useMutation
+  // @mutation
   for (const mut of ctrl.mutations) {
+    const hookName = mut.bulk ? toBulkMutateName(mut.method) : toMutateName(mut.method)
     if (mut.bulk) {
-      L.push(`    ${mut.method}: () => useMutation({ mutationFn: (ids: (number | string)[]) => client.${clientKey}.${mut.method}({ ${scopeSpread}ids }) }),`)
+      L.push(`    ${hookName}: () => useMutation({ mutationFn: (ids: (number | string)[]) => client.${clientKey}.${mut.method}({ ${scopeSpread}ids }) }),`)
     } else {
-      L.push(`    ${mut.method}: () => useMutation({ mutationFn: (id: number | string) => client.${clientKey}.${mut.method}({ ${scopeSpread}id }) }),`)
+      L.push(`    ${hookName}: () => useMutation({ mutationFn: (id: number | string) => client.${clientKey}.${mut.method}({ ${scopeSpread}id }) }),`)
     }
   }
 
-  // @action — GET → useQuery, everything else → useMutation
+  // @action — GET → useQuery with 'index' prefix; everything else → useMutation with 'mutate' prefix
   for (const act of ctrl.actions) {
     const actionKey = toActionClientKey(act, clientKey)
     if (act.httpMethod === 'GET') {
-      const qk = `[...${lcFirst(modelName ?? 'controller')}Keys?.root(scopes) ?? [], '${act.method}']`
-      L.push(`    ${act.method}: () => useQuery({ queryKey: ${qk}, queryFn: () => client.${actionKey}({ ${scopeSpread} }) }),`)
+      const hookName = toIndexName(act.method)
+      if (act.load) {
+        // Record-level GET: takes id, uses detail cache key
+        const qk = keysRef
+          ? `${keysRef}.detail(id ?? 0, scopes)`
+          : `['${lcFirst(ctrl.className)}', scopes, id, '${act.method}']`
+        L.push(`    ${hookName}: (id: number | string | null | undefined) => useQuery({ queryKey: ${qk}, queryFn: () => client.${actionKey}({ ${scopeSpread}id }), enabled: id != null }),`)
+      } else {
+        const qk = keysRef
+          ? `[...${keysRef}.root(scopes), '${act.method}']`
+          : `['${lcFirst(ctrl.className)}', scopes, '${act.method}']`
+        L.push(`    ${hookName}: () => useQuery({ queryKey: ${qk}, queryFn: () => client.${actionKey}({ ${scopeSpread} }) }),`)
+      }
     } else {
-      const inputArg = act.inputType ? `(data: ${act.inputType})` : `(data?: Record<string, unknown>)`
-      L.push(`    ${act.method}: () => useMutation({ mutationFn: ${inputArg} => client.${actionKey}({ ${scopeSpread}data }) }),`)
+      const hookName = toMutateName(act.method)
+      if (act.load) {
+        // Record-level mutation: fn takes (id, data?)
+        const dataArg = act.inputType ? `, data: ${act.inputType}` : ''
+        const dataSpread = act.inputType ? ', data' : ''
+        L.push(`    ${hookName}: () => useMutation({ mutationFn: ({ id${dataSpread} }: { id: number | string${dataArg} }) => client.${actionKey}({ ${scopeSpread}id${dataSpread} }) }),`)
+      } else {
+        const inputArg = act.inputType ? `(data: ${act.inputType})` : `(data?: Record<string, unknown>)`
+        L.push(`    ${hookName}: () => useMutation({ mutationFn: ${inputArg} => client.${actionKey}({ ${scopeSpread}data }) }),`)
+      }
     }
   }
 }
@@ -317,38 +373,46 @@ function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string): void {
 // ── .with() body ──────────────────────────────────────────────────────────────
 
 function emitWith(L: string[], ctrl: CtrlMeta, clientKey: string): void {
-  const modelName  = ctrl.modelClass
+  const modelName   = ctrl.modelClass
   const scopeSpread = ctrl.scopes.length > 0 ? '...scopes, ' : ''
 
   if (ctrl.kind === 'crud' && modelName) {
-    L.push(`    index:   (params?: ${modelName}SearchState) => client.${clientKey}.index({ ${scopeSpread}...params }),`)
-    L.push(`    get:     (id: number | string) => client.${clientKey}.get({ ${scopeSpread}id }),`)
-    L.push(`    create:  (data: ${modelName}Write) => client.${clientKey}.create({ ${scopeSpread}data }),`)
-    L.push(`    update:  (id: number | string, data: Partial<${modelName}Write>) => client.${clientKey}.update({ ${scopeSpread}id, data }),`)
-    L.push(`    destroy: (id: number | string) => client.${clientKey}.destroy({ ${scopeSpread}id }),`)
+    L.push(`    index:         (params?: ${modelName}SearchState) => client.${clientKey}.index({ ${scopeSpread}...params }),`)
+    L.push(`    infiniteIndex: (params?: Omit<${modelName}SearchState, 'page'>) => client.${clientKey}.index({ ${scopeSpread}...params }),`)
+    L.push(`    get:           (id: number | string) => client.${clientKey}.get({ ${scopeSpread}id }),`)
+    L.push(`    mutateCreate:  (data: ${modelName}Write) => client.${clientKey}.create({ ${scopeSpread}data }),`)
+    L.push(`    mutateUpdate:  (id: number | string, data: Partial<${modelName}Write>) => client.${clientKey}.update({ ${scopeSpread}id, data }),`)
+    L.push(`    mutateDestroy: (id: number | string) => client.${clientKey}.destroy({ ${scopeSpread}id }),`)
   }
 
   if (ctrl.kind === 'singleton' && modelName) {
-    L.push(`    get:    () => client.${clientKey}.get({ ${scopeSpread} }),`)
-    L.push(`    update: (data: ${modelName}Write) => client.${clientKey}.update({ ${scopeSpread}data }),`)
+    L.push(`    get:          () => client.${clientKey}.get({ ${scopeSpread} }),`)
+    L.push(`    mutateUpdate: (data: ${modelName}Write) => client.${clientKey}.update({ ${scopeSpread}data }),`)
   }
 
   // @mutation
   for (const mut of ctrl.mutations) {
+    const fnName = mut.bulk ? toBulkMutateName(mut.method) : toMutateName(mut.method)
     if (mut.bulk) {
-      L.push(`    ${mut.method}: (ids: (number | string)[]) => client.${clientKey}.${mut.method}({ ${scopeSpread}ids }),`)
+      L.push(`    ${fnName}: (ids: (number | string)[]) => client.${clientKey}.${mut.method}({ ${scopeSpread}ids }),`)
     } else {
-      L.push(`    ${mut.method}: (id: number | string) => client.${clientKey}.${mut.method}({ ${scopeSpread}id }),`)
+      L.push(`    ${fnName}: (id: number | string) => client.${clientKey}.${mut.method}({ ${scopeSpread}id }),`)
     }
   }
 
   // @action
   for (const act of ctrl.actions) {
     const actionKey = toActionClientKey(act, clientKey)
-    if (act.inputType) {
-      L.push(`    ${act.method}: (data: ${act.inputType}) => client.${actionKey}({ ${scopeSpread}data }),`)
+    const fnName = act.httpMethod === 'GET' ? toIndexName(act.method) : toMutateName(act.method)
+    if (act.load) {
+      // Record-level: first arg is id; second optional arg is data
+      const dataArg = act.inputType ? `, data: ${act.inputType}` : ''
+      const dataSpread = act.inputType ? ', data' : ''
+      L.push(`    ${fnName}: (id: number | string${dataArg}) => client.${actionKey}({ ${scopeSpread}id${dataSpread} }),`)
+    } else if (act.inputType) {
+      L.push(`    ${fnName}: (data: ${act.inputType}) => client.${actionKey}({ ${scopeSpread}data }),`)
     } else {
-      L.push(`    ${act.method}: (data?: Record<string, unknown>) => client.${actionKey}({ ${scopeSpread}...data }),`)
+      L.push(`    ${fnName}: (data?: Record<string, unknown>) => client.${actionKey}({ ${scopeSpread}...data }),`)
     }
   }
 }

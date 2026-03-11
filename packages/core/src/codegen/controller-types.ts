@@ -45,6 +45,11 @@ export interface CtrlActionMeta {
   httpMethod: string
   path?: string
   /**
+   * If true, the route includes /:id and the record is auto-loaded by id,
+   * then passed as the first argument — mirrors @mutation behavior.
+   */
+  load: boolean
+  /**
    * TypeScript type text of the method's first parameter.
    * Extracted from ts-morph — used to type the `.with()` caller and the
    * `useMutation` / `useQuery` input in `.use()`.
