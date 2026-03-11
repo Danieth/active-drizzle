@@ -1,0 +1,83 @@
+{
+  "name": "@active-drizzle/core",
+  "version": "0.1.0",
+  "description": "Rails-style ActiveRecord for Drizzle ORM — associations, lifecycle hooks, dirty tracking, enums, and full TypeScript codegen",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./vite": {
+      "types": "./dist/vite/index.d.ts",
+      "import": "./dist/vite/index.js",
+      "require": "./dist/vite/index.cjs"
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "prepublishOnly": "npm run build && npm test",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "drizzle",
+    "orm",
+    "activerecord",
+    "rails",
+    "typescript",
+    "postgres",
+    "codegen",
+    "vite",
+    "associations",
+    "hooks",
+    "sti"
+  ],
+  "author": "Daniel Ackerman <danieth@github>",
+  "license": "MIT",
+  "homepage": "https://github.com/danieth/active-drizzle#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danieth/active-drizzle.git"
+  },
+  "bugs": {
+    "url": "https://github.com/danieth/active-drizzle/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "peerDependencies": {
+    "drizzle-orm": ">=0.30.0",
+    "typescript": ">=5.0.0"
+  },
+  "dependencies": {
+    "glob": "^13.0.6",
+    "pluralize": "^8.0.0",
+    "ts-morph": "^23.0.0"
+  },
+  "devDependencies": {
+    "@testcontainers/postgresql": "^11.12.0",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.18.0",
+    "@types/pluralize": "^0.0.33",
+    "@vitest/coverage-v8": "^3.0.0",
+    "@vitest/ui": "^3.0.0",
+    "drizzle-orm": "^0.40.0",
+    "pg": "^8.20.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

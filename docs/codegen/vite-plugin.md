@@ -1,11 +1,14 @@
 # Codegen
 
-ActiveDrizzle reads your Drizzle schema and model files at build time and generates:
+ActiveDrizzle reads your Drizzle schema, model files, and controller files at build time and generates:
 
 - **TypeScript types** (`.gen.d.ts`) — column types, enums, associations, scopes, dirty tracking helpers
 - **Client runtime** (`.gen.ts`) — an isomorphic `Model.Client` class that runs in the browser
 - **Model registry** (`_registry.gen.ts`) — all models in one importable file
+- **oRPC router** (`_routes.gen.ts`) — all controller routes merged into a single typed router
+- **React hooks** (`use{Model}.gen.ts`) — typed TanStack Query hooks + form config per model
 - **Schema docs** (`.active-drizzle/schema.md`) — LLM-optimized reference
+- **Route docs** (`_routes.gen.md`) — LLM-optimized API surface reference
 
 There are two ways to run codegen: **Vite plugin** (automatic, watches for changes) or **CLI** (manual, one-off).
 
@@ -25,9 +28,11 @@ import activeDrizzle           from 'active-drizzle/vite'
 export default defineConfig({
   plugins: [
     activeDrizzle({
-      schema:  'src/db/schema.ts',
-      models:  'src/models/**/*.model.ts',
-      outputDir: 'src/models',   // where _registry.gen.ts is written
+      schema:      'src/db/schema.ts',
+      models:      'src/models/**/*.model.ts',
+      controllers: 'src/controllers/**/*.ctrl.ts', // enables controller + hook codegen
+      reactHooks:  true,                           // emits use{Model}.gen.ts files
+      outputDir:   'src/models',                   // where _registry.gen.ts is written
     }),
   ],
 })
@@ -47,6 +52,11 @@ export default defineConfig({
 3. Global files (`_registry`, `schema.md`) are regenerated only if the model list changed
 4. Files are written only when content actually differs (prevents spurious HMR rounds)
 
+**On every `.ctrl.ts` save:**
+1. All controller files are re-scanned with mtime caching (unchanged files are skipped)
+2. `_routes.gen.ts` and `_routes.gen.md` regenerate only when the combined hash changes
+3. If `reactHooks: true`, updated `use{Model}.gen.ts` files emit only for controllers that changed
+
 **On `vite build`:**
 Codegen runs once before the TypeScript compiler sees anything. If the validator finds errors, the build fails with descriptive messages.
 
@@ -54,10 +64,12 @@ Codegen runs once before the TypeScript compiler sees anything. If the validator
 
 ```ts
 activeDrizzle({
-  schema:    'src/db/schema.ts',              // required — path to Drizzle schema
-  models:    'src/models/**/*.model.ts',      // required — glob for model files
-  outputDir: 'src/models',                   // optional — where registry goes (default: first model's dir)
-  tsconfig:  'tsconfig.json',                // optional — tsconfig for ts-morph (default: ./tsconfig.json)
+  schema:      'src/db/schema.ts',              // required — path to Drizzle schema
+  models:      'src/models/**/*.model.ts',      // required — glob for model files
+  controllers: 'src/controllers/**/*.ctrl.ts',  // optional — enables controller codegen
+  reactHooks:  true,                            // optional — emits use{Model}.gen.ts per controller
+  outputDir:   'src/models',                    // optional — where registry goes (default: first model's dir)
+  tsconfig:    'tsconfig.json',                 // optional — tsconfig for ts-morph (default: ./tsconfig.json)
 })
 ```
 

@@ -19,6 +19,8 @@ export default defineConfig({
       { text: 'Querying', link: '/querying/basics' },
       { text: 'Mutations', link: '/mutations/overview' },
       { text: 'Hooks', link: '/hooks/lifecycle' },
+      { text: 'Controllers', link: '/controllers/overview' },
+      { text: 'React', link: '/react/overview' },
       { text: 'Codegen & CLI', link: '/codegen/vite-plugin' },
     ],
 
@@ -73,6 +75,26 @@ export default defineConfig({
             { text: 'Lifecycle Hooks', link: '/hooks/lifecycle' },
             { text: 'Validations', link: '/hooks/validations' },
             { text: 'Dirty Tracking', link: '/hooks/dirty-tracking' },
+          ],
+        },
+      ],
+      '/controllers/': [
+        {
+          text: 'Controllers',
+          items: [
+            { text: 'Overview', link: '/controllers/overview' },
+            { text: 'Decorators', link: '/controllers/decorators' },
+            { text: 'Error Handling', link: '/controllers/error-handling' },
+          ],
+        },
+      ],
+      '/react/': [
+        {
+          text: 'React',
+          items: [
+            { text: 'Overview', link: '/react/overview' },
+            { text: 'ClientModel', link: '/react/client-model' },
+            { text: 'UI Components', link: '/react/components' },
           ],
         },
       ],
