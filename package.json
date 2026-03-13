@@ -1,8 +1,8 @@
 {
   "name": "active-drizzle-monorepo",
-  "version": "0.1.3",
+  "version": "0.1.9",
   "type": "module",
-  "private": true,
+  "private": false,
   "workspaces": [
     "packages/*"
   ],

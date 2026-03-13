@@ -1,6 +1,6 @@
 {
   "name": "@active-drizzle/react",
-  "version": "0.1.3",
+  "version": "0.1.9",
   "description": "React Query hooks and components for active-drizzle controllers",
   "type": "module",
   "exports": {

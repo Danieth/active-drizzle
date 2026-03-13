@@ -112,6 +112,14 @@ import { Business as _Business } from './Business.model.js'
 import { Campaign as _Campaign } from './Campaign.model.js'
 
 class AssetClient {
+  id: number;
+  assetType: number | null;
+  title: string | null;
+  businessId: number;
+  createdAt: Date;
+  updatedAt: Date;
+  business: BusinessClient | null;
+  campaigns: CampaignClient[];
   private _initial: any;
   constructor(payload: Record<string, any> = {}) {
     this.id = payload.id ?? null;

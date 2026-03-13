@@ -1,6 +1,6 @@
 {
   "name": "@active-drizzle/core",
-  "version": "0.1.3",
+  "version": "0.1.9",
   "description": "Rails-style ActiveRecord for Drizzle ORM — associations, lifecycle hooks, dirty tracking, enums, and full TypeScript codegen",
   "type": "module",
   "exports": {

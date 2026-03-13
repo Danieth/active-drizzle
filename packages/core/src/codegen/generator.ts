@@ -296,6 +296,25 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta): s
   }
   lines.push('');
   lines.push(`class ${model.className}Client {`);
+  
+  // Declare all properties first
+  if (table) {
+    for (const col of table.columns) {
+      const tsType = columnToTsType(col);
+      lines.push(`  ${col.name}: ${tsType};`);
+    }
+  }
+  
+  for (const assoc of model.associations) {
+    const targetClass = resolveAssocClass(assoc, project);
+    if (!targetClass) continue;
+    if (assoc.kind === 'hasMany' || assoc.kind === 'habtm') {
+      lines.push(`  ${assoc.propertyName}: ${targetClass}Client[];`);
+    } else {
+      lines.push(`  ${assoc.propertyName}: ${targetClass}Client | null;`);
+    }
+  }
+  
   lines.push(`  private _initial: any;`);
   lines.push(`  constructor(payload: Record<string, any> = {}) {`);
 

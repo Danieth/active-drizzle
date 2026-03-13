@@ -172,7 +172,7 @@ export function buildRouter<TContext = Record<string, any>>(
           acc[ps] = z.string().optional()
           return acc
         }, {} as Record<string, z.ZodTypeAny>),
-      })
+      }).passthrough()
     ).handler(async ({ input, context }) => {
       const rel = buildScopedRelation(model, input as any)
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'index',
@@ -188,7 +188,7 @@ export function buildRouter<TContext = Record<string, any>>(
 
     // GET
     router.get = builder.input(
-      z.object({ ...scopeSchema, id: z.number().int().positive() })
+      z.object({ ...scopeSchema, id: z.number().int().positive() }).passthrough()
     ).handler(async ({ input, context }) => {
       const rel = buildScopedRelation(model, input as any)
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'get',
@@ -204,7 +204,7 @@ export function buildRouter<TContext = Record<string, any>>(
 
     // CREATE
     router.create = builder.input(
-      z.object({ ...scopeSchema, data: z.record(z.string(), z.any()) })
+      z.object({ ...scopeSchema, data: z.record(z.string(), z.any()) }).passthrough()
     ).handler(async ({ input, context }) => {
       const rel = buildScopedRelation(model, input as any)
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'create',
@@ -224,7 +224,7 @@ export function buildRouter<TContext = Record<string, any>>(
 
     // UPDATE
     router.update = builder.input(
-      z.object({ ...scopeSchema, id: z.number().int().positive(), data: z.record(z.string(), z.any()) })
+      z.object({ ...scopeSchema, id: z.number().int().positive(), data: z.record(z.string(), z.any()) }).passthrough()
     ).handler(async ({ input, context }) => {
       const rel = buildScopedRelation(model, input as any)
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'update',
@@ -240,7 +240,7 @@ export function buildRouter<TContext = Record<string, any>>(
 
     // DESTROY
     router.destroy = builder.input(
-      z.object({ ...scopeSchema, id: z.number().int().positive() })
+      z.object({ ...scopeSchema, id: z.number().int().positive() }).passthrough()
     ).handler(async ({ input, context }) => {
       const rel = buildScopedRelation(model, input as any)
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'destroy',
@@ -260,7 +260,7 @@ export function buildRouter<TContext = Record<string, any>>(
       const kebab = toKebab(mut.method)
       if (mut.bulk) {
         router[mut.method] = builder.input(
-          z.object({ ...scopeSchema, ids: z.array(z.number().int().positive()) })
+          z.object({ ...scopeSchema, ids: z.array(z.number().int().positive()) }).passthrough()
         ).handler(async ({ input, context }) => {
           const rel = buildScopedRelation(model, input as any)
           return dispatch(ControllerClass, context as TContext, input as any, rel, mut.method,
@@ -284,7 +284,7 @@ export function buildRouter<TContext = Record<string, any>>(
         routes.push({ method: 'POST', path: `${basePath}/${kebab}`, procedure: mut.method, action: mut.method })
       } else {
         router[mut.method] = builder.input(
-          z.object({ ...scopeSchema, id: z.number().int().positive(), data: z.record(z.string(), z.any()).optional() })
+          z.object({ ...scopeSchema, id: z.number().int().positive(), data: z.record(z.string(), z.any()).optional() }).passthrough()
         ).handler(async ({ input, context }) => wrapErrors(async () => {
           const rel = buildScopedRelation(model, input as any)
           // Pre-load record from URL-scoped relation so this.record is available in @before hooks.
@@ -311,7 +311,7 @@ export function buildRouter<TContext = Record<string, any>>(
     const scopeSchema: Record<string, z.ZodTypeAny> = {}
     for (const s of scopes) scopeSchema[s.paramName] = z.number().int().positive()
 
-    router.get = builder.input(z.object(scopeSchema)).handler(async ({ input, context }) => {
+    router.get = builder.input(z.object(scopeSchema).passthrough()).handler(async ({ input, context }) => {
       const rel = buildScopedRelation(singletonModel, input as any)
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'get',
         async (ctrl) => {
@@ -328,7 +328,7 @@ export function buildRouter<TContext = Record<string, any>>(
     routes.push({ method: 'GET', path: basePath, procedure: 'get', action: 'get' })
 
     if (config.findOrCreate) {
-      router.findOrCreate = builder.input(z.object(scopeSchema)).handler(async ({ input, context }) => {
+      router.findOrCreate = builder.input(z.object(scopeSchema).passthrough()).handler(async ({ input, context }) => {
         const rel = buildScopedRelation(singletonModel, input as any)
         return dispatch(ControllerClass, context as TContext, input as any, rel, 'findOrCreate',
           async (ctrl) => singletonFindOrCreate(
@@ -341,7 +341,7 @@ export function buildRouter<TContext = Record<string, any>>(
     }
 
     router.update = builder.input(
-      z.object({ ...scopeSchema, data: z.record(z.string(), z.any()) })
+      z.object({ ...scopeSchema, data: z.record(z.string(), z.any()) }).passthrough()
     ).handler(async ({ input, context }) => {
       const rel = buildScopedRelation(singletonModel, input as any)
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'update',
@@ -362,7 +362,7 @@ export function buildRouter<TContext = Record<string, any>>(
     for (const mut of mutations) {
       const kebab = toKebab(mut.method)
       router[mut.method] = builder.input(
-        z.object({ ...scopeSchema, data: z.record(z.string(), z.any()).optional() })
+        z.object({ ...scopeSchema, data: z.record(z.string(), z.any()).optional() }).passthrough()
       ).handler(async ({ input, context }) => {
         const rel = buildScopedRelation(singletonModel, input as any)
         return dispatch(ControllerClass, context as TContext, input as any, rel, mut.method,
@@ -393,7 +393,7 @@ export function buildRouter<TContext = Record<string, any>>(
     if (usesId) {
       // Load the record by :id and pass as first arg, like @mutation
       router[act.method] = builder.input(
-        z.object({ ...scopeSchema, id: z.number().int().positive(), data: z.record(z.string(), z.any()).optional() })
+        z.object({ ...scopeSchema, id: z.number().int().positive(), data: z.record(z.string(), z.any()).optional() }).passthrough()
       ).handler(async ({ input, context }) => wrapErrors(async () => {
         const rel = buildScopedRelation(crudModel!, input as any)
         const record = await rel.where({ id: (input as any).id }).first()
@@ -406,7 +406,7 @@ export function buildRouter<TContext = Record<string, any>>(
       }))
     } else {
       router[act.method] = builder.input(
-        z.object({ ...scopeSchema, data: z.record(z.string(), z.any()).optional() })
+        z.object({ ...scopeSchema, data: z.record(z.string(), z.any()).optional() }).passthrough()
       ).handler(async ({ input, context }) => {
         const rel = crudModel ? buildScopedRelation(crudModel, input as any) : null
         return dispatch(ControllerClass, context as TContext, input as any, rel as any, act.method,
