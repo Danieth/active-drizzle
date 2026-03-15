@@ -15,6 +15,7 @@ export const ACTION_META      = Symbol('ad:actions')
 export const BEFORE_META      = Symbol('ad:before')
 export const AFTER_META       = Symbol('ad:after')
 export const RESCUE_META      = Symbol('ad:rescue')
+export const ATTACHABLE_META  = Symbol('ad:attachable')
 
 // ── Shape definitions ─────────────────────────────────────────────────────────
 
@@ -154,10 +155,26 @@ export interface RescueEntry {
   except?: string[]
 }
 
+export interface AttachableConfig {
+  /**
+   * Injects server-controlled values onto the Asset at presign time.
+   * Same pattern as @crud WriteConfig.autoSet.
+   *
+   * @example
+   * @attachable({ autoSet: { uploadedById: ctx => ctx.user.id } })
+   */
+  autoSet?: Record<string, (ctx: any, ctrl?: any) => any>
+}
+
 // ── Getters / setters ─────────────────────────────────────────────────────────
 
 export function getControllerMeta(cls: any): ControllerMeta | undefined {
   return cls[CONTROLLER_META]
+}
+
+export function getAttachableMeta(cls: any): AttachableConfig | undefined {
+  const meta = cls[ATTACHABLE_META]
+  return meta !== undefined ? meta : undefined
 }
 
 export function getRescueHandlers(cls: any): RescueEntry[] {

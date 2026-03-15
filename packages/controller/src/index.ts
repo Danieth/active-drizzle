@@ -24,6 +24,7 @@ export {
   before,
   after,
   rescue,
+  attachable,
   inferControllerPath,
   type HookConfig,
   type ActionConfig,
@@ -41,6 +42,7 @@ export type {
   ActionEntry,
   HookEntry,
   RescueEntry,
+  AttachableConfig,
 } from './metadata.js'
 
 // Router

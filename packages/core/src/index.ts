@@ -1,1 +1,5 @@
 export * from './runtime/index.js'
+export * from './storage/storage.js'
+export { AssetService, type CreateFromServiceInput } from './services/asset-service.js'
+export { runAssetCleanup, type AssetCleanupOptions } from './tasks/asset-cleanup-task.js'
+export { processAsset, type ProcessResult } from './tasks/asset-process-task.js'

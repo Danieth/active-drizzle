@@ -5,9 +5,10 @@
 import pluralize from 'pluralize'
 import {
   CONTROLLER_META, CRUD_META, SINGLETON_META, SCOPE_META,
-  MUTATION_META, ACTION_META, BEFORE_META, AFTER_META, RESCUE_META,
+  MUTATION_META, ACTION_META, BEFORE_META, AFTER_META, RESCUE_META, ATTACHABLE_META,
   type CrudConfig, type SingletonConfig, type ScopeEntry,
   type MutationEntry, type ActionEntry, type HookEntry, type RescueEntry,
+  type AttachableConfig,
   inferScopeResource,
 } from './metadata.js'
 
@@ -69,6 +70,24 @@ export function singleton<TModel extends new (...args: any[]) => any>(
 ) {
   return function (target: any) {
     target[SINGLETON_META] = { model, config }
+  }
+}
+
+// ── @attachable ──────────────────────────────────────────────────────────────
+
+/**
+ * Adds presign/confirm/attach endpoints to the controller for file uploads.
+ * Endpoints inherit the controller's auth context and scope params.
+ *
+ * @example
+ * @attachable()  // no custom scoping
+ *
+ * @example
+ * @attachable({ autoSet: { uploadedById: ctx => ctx.user.id } })
+ */
+export function attachable(config?: AttachableConfig) {
+  return function (target: any) {
+    target[ATTACHABLE_META] = config ?? {}
   }
 }
 

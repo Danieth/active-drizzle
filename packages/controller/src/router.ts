@@ -10,7 +10,7 @@ import { os, ORPCError } from '@orpc/server'
 import { z } from 'zod'
 import {
   getCrudMeta, getSingletonMeta, getScopes, getMutations, getActions,
-  getControllerMeta,
+  getControllerMeta, getAttachableMeta,
 } from './metadata.js'
 import { inferControllerPath } from './decorators.js'
 import {
@@ -230,7 +230,7 @@ export function buildRouter<TContext = Record<string, any>>(
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'update',
         async (ctrl) => {
           if (typeof ctrl.update === 'function') return ctrl.update()
-          return defaultUpdate(ctrl.relation, model, config, (input as any).id, (input as any).data, ctrl)
+          return defaultUpdate(ctrl.relation, model, config, (input as any).id, (input as any).data, context, ctrl)
         },
         undefined,
         config.scopeBy,
@@ -416,7 +416,174 @@ export function buildRouter<TContext = Record<string, any>>(
     routes.push({ method: act.httpMethod, path, procedure: act.method, action: act.method })
   }
 
+  // ── Attachable routes (presign / confirm / attach) ─────────────────────────
+
+  const attachableMeta = getAttachableMeta(ControllerClass)
+  if (attachableMeta) {
+    const crudModel = crud?.model ?? singleton?.model
+    const scopeSchema: Record<string, z.ZodTypeAny> = {}
+    for (const s of scopes) scopeSchema[s.paramName] = z.number().int().positive()
+
+    // PRESIGN — creates a pending Asset, returns { asset, uploadUrl }
+    router.presign = builder.input(
+      z.object({
+        ...scopeSchema,
+        filename: z.string().min(1),
+        contentType: z.string().min(1),
+        name: z.string().min(1),
+      }).passthrough()
+    ).handler(async ({ input, context }) => {
+      const { filename, contentType, name } = input as any
+      const rel = crudModel ? buildScopedRelation(crudModel, input as any) : null
+
+      return dispatch(ControllerClass, context as TContext, input as any, rel as any, 'presign',
+        async (ctrl) => {
+          // Look up attachment declaration on the model
+          const { getAttachmentEntry } = await import('@active-drizzle/core')
+          const modelClassName = crudModel?.name
+          const entry = modelClassName ? getAttachmentEntry(modelClassName, name) : null
+          if (!entry) {
+            throw new BadRequest(`Unknown attachment slot '${name}'`)
+          }
+
+          // Validate MIME type against accepts
+          if (entry.accepts) {
+            const acceptsPattern = entry.accepts
+            if (!mimeMatches(contentType, acceptsPattern)) {
+              throw new BadRequest(
+                `File type '${contentType}' is not accepted for '${name}'. Accepted: ${acceptsPattern}`
+              )
+            }
+          }
+
+          const access = entry.access
+          const maxSize = entry.maxSize
+
+          // Create pending Asset
+          const { Asset } = await import('@active-drizzle/core')
+          const { getStorage } = await import('@active-drizzle/core')
+          const storage = getStorage()
+          const key = storage.generateKey(filename)
+
+          const assetData: Record<string, any> = {
+            key,
+            filename,
+            contentType,
+            status: 'pending',
+            access,
+            metadata: { attachmentName: name },
+          }
+
+          // Apply autoSet fields from @attachable config
+          if (attachableMeta.autoSet) {
+            for (const [k, fn] of Object.entries(attachableMeta.autoSet)) {
+              assetData[k] = fn(context, ctrl)
+            }
+          }
+
+          const asset = await Asset.create(assetData)
+
+          // Generate presigned PUT URL with Content-Length conditions
+          const { url: uploadUrl } = await storage.presignPut(key, contentType, maxSize)
+
+          return {
+            asset: asset.toJSON(),
+            uploadUrl,
+            constraints: {
+              accepts: entry.accepts,
+              maxSize: maxSize ?? storage.defaultMaxSize,
+              access,
+            },
+          }
+        })
+    })
+    routes.push({ method: 'POST', path: `${basePath}/presign`, procedure: 'presign', action: 'presign' })
+
+    // CONFIRM — verifies upload in S3, sets status to 'ready'
+    router.confirm = builder.input(
+      z.object({
+        ...scopeSchema,
+        assetId: z.number().int().positive(),
+      }).passthrough()
+    ).handler(async ({ input, context }) => {
+      const rel = crudModel ? buildScopedRelation(crudModel, input as any) : null
+
+      return dispatch(ControllerClass, context as TContext, input as any, rel as any, 'confirm',
+        async (_ctrl) => {
+          const { Asset, getAttachmentEntry } = await import('@active-drizzle/core')
+          const { getStorage } = await import('@active-drizzle/core')
+
+          const asset = await Asset.find((input as any).assetId)
+          if (asset.status !== 'pending') throw new BadRequest('Asset is not in pending state')
+
+          const attachmentName = (asset.metadata as any)?.attachmentName
+          if (!attachmentName || !crudModel?.name) {
+            throw new BadRequest('Asset is missing attachment metadata')
+          }
+
+          const entry = getAttachmentEntry(crudModel.name, attachmentName)
+          if (!entry) throw new BadRequest(`Unknown attachment slot '${attachmentName}'`)
+
+          const storage = getStorage()
+          const head = await storage.headObject(asset.key)
+          const maxSize = entry.maxSize ?? storage.defaultMaxSize
+          if (head.contentLength > maxSize) {
+            try { await storage.deleteObject(asset.key) } catch { /* best effort */ }
+            await asset.destroy()
+            throw new BadRequest(
+              `Uploaded file exceeds maximum size for '${attachmentName}' (${head.contentLength} > ${maxSize})`,
+            )
+          }
+
+          asset.byteSize = head.contentLength
+          asset.checksum = head.etag ?? null
+          asset.status = 'ready'
+          await asset.save()
+
+          return asset.toJSON()
+        })
+    })
+    routes.push({ method: 'POST', path: `${basePath}/confirm`, procedure: 'confirm', action: 'confirm' })
+
+    // ATTACH — connects a ready Asset to a record
+    router.attach = builder.input(
+      z.object({
+        ...scopeSchema,
+        assetId: z.number().int().positive(),
+        name: z.string().min(1),
+        attachableId: z.number().int().positive(),
+      }).passthrough()
+    ).handler(async ({ input, context }) => {
+      if (!crudModel) throw new BadRequest('attach requires a CRUD controller with a model')
+      const rel = buildScopedRelation(crudModel, input as any)
+
+      return dispatch(ControllerClass, context as TContext, input as any, rel, 'attach',
+        async (ctrl) => {
+          const { assetId, name: attachName, attachableId } = input as any
+          const record = await ctrl.relation.where({ id: attachableId }).first()
+          if (!record) throw new NotFound(crudModel.name)
+
+          await record.attach(attachName, assetId)
+          return { success: true }
+        },
+        undefined,
+        crud?.config?.scopeBy,
+      )
+    })
+    routes.push({ method: 'POST', path: `${basePath}/attach`, procedure: 'attach', action: 'attach' })
+  }
+
   return { router, routes, basePath }
+}
+
+/** Matches a content type against a MIME pattern like 'image/*' or 'application/pdf'. */
+function mimeMatches(contentType: string, pattern: string): boolean {
+  if (pattern === '*/*') return true
+  if (pattern.endsWith('/*')) {
+    const prefix = pattern.slice(0, -2)
+    return contentType.startsWith(prefix + '/')
+  }
+  return contentType === pattern
 }
 
 // ── Merge multiple routers ────────────────────────────────────────────────────

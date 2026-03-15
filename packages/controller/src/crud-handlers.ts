@@ -155,6 +155,11 @@ export async function defaultCreate(
   // ApplicationRecord.create returns the instance even if save failed.
   // isNewRecord stays true when save failed (validation or DB error).
   if (record.isNewRecord) throw toValidationError(record.errors)
+  // Auto-attach: resolve permit list before passing (may be a function)
+  const createPermit = typeof config.create?.permit === 'function'
+    ? config.create.permit(ctx, ctrl)
+    : config.create?.permit
+  await _autoAttach(record, model, rawInput, createPermit)
   return record
 }
 
@@ -166,16 +171,23 @@ export async function defaultUpdate(
   config: CrudConfig,
   id: number | string,
   rawInput: Record<string, any>,
+  ctx: any,
   /** Controller instance — passed to permit functions that accept it. */
   ctrl?: any,
 ): Promise<any> {
   const record = await relation.where({ id }).first()
   if (!record) throw new NotFound(model.name)
-  const permitted = buildPermittedData(rawInput, config.update, null, model, ctrl)
+  const permitted = buildPermittedData(rawInput, config.update, ctx, model, ctrl)
   for (const [k, v] of Object.entries(permitted)) {
     (record as any)[k] = v
   }
   if (!(await record.save())) throw toValidationError(record.errors)
+  // Auto-attach: resolve permit list before passing (may be a function)
+  const updatePermitRaw = config.update?.permit ?? config.create?.permit
+  const updatePermit = typeof updatePermitRaw === 'function'
+    ? updatePermitRaw(ctx, ctrl)
+    : updatePermitRaw
+  await _autoAttach(record, model, rawInput, updatePermit)
   return record
 }
 
@@ -273,5 +285,54 @@ export async function singletonFindOrCreate(
       if (retried) return retried
     }
     throw e
+  }
+}
+
+// ── Auto-attach helper ────────────────────────────────────────────────────────
+
+/**
+ * After create/update, checks if any permitted fields match attachment declarations.
+ * hasOneAttachment 'logo' → looks for `logoAssetId` in input → calls record.attach('logo', id)
+ * hasManyAttachments 'docs' → looks for `docsAssetIds` in input → syncs (detach removed, attach added)
+ */
+async function _autoAttach(
+  record: any,
+  model: any,
+  rawInput: Record<string, any>,
+  permit?: string[],
+): Promise<void> {
+  const resolvedPermit = permit ?? []
+  let attachmentEntries: any[] | null = null
+
+  try {
+    const { getAttachments } = await import('@active-drizzle/core')
+    attachmentEntries = getAttachments(model.name)
+  } catch {
+    return
+  }
+
+  if (!attachmentEntries?.length) return
+
+  for (const entry of attachmentEntries) {
+    if (!resolvedPermit.includes(entry.name)) continue
+
+    if (entry.kind === 'one') {
+      const inputKey = `${entry.name}AssetId`
+      const assetId = rawInput[inputKey]
+      if (assetId !== undefined && assetId !== null) {
+        await record.replace(entry.name, assetId)
+      } else if (assetId === null) {
+        await record.detach(entry.name)
+      }
+    } else {
+      const inputKey = `${entry.name}AssetIds`
+      const assetIds = rawInput[inputKey]
+      if (Array.isArray(assetIds)) {
+        await record.detach(entry.name)
+        for (const id of assetIds) {
+          await record.attach(entry.name, id)
+        }
+      }
+    }
   }
 }

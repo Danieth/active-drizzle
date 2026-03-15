@@ -427,6 +427,152 @@ export class ApplicationRecord {
     return result
   }
 
+  // ── Attachment methods ───────────────────────────────────────────────────
+
+  /**
+   * Attaches an asset to this record by name. Enforces `max` for hasManyAttachments.
+   */
+  async attach(name: string, assetId: number): Promise<void> {
+    const ctor = this.constructor as any
+    const { getAttachmentEntryFromClass } = await import('./attachments.js')
+    const entry = getAttachmentEntryFromClass(ctor, name)
+    if (!entry) throw new Error(`No attachment '${name}' declared on ${ctor.name}`)
+    if (this.isNewRecord || this._attributes.id === undefined || this._attributes.id === null) {
+      throw new Error(`Cannot attach '${name}' on unsaved ${ctor.name} record`)
+    }
+
+    const attachableType = ctor.name
+    const attachableId = this._attributes.id
+
+    await _withAttachmentSlotLock(attachableType, attachableId, name, async () => {
+      const { Asset, Attachment } = await import('./asset.js')
+      const asset = await Asset.find(assetId)
+      if (asset.status !== 'ready') {
+        throw new Error(`Asset ${assetId} must be ready before attaching`)
+      }
+      if (entry.accepts && !_mimeMatches(asset.contentType, entry.accepts)) {
+        throw new Error(`Asset ${assetId} type '${asset.contentType}' is not accepted for '${name}' (${entry.accepts})`)
+      }
+      if (entry.maxSize && typeof asset.byteSize === 'number' && asset.byteSize > entry.maxSize) {
+        throw new Error(`Asset ${assetId} size ${asset.byteSize} exceeds maxSize ${entry.maxSize} for '${name}'`)
+      }
+
+      if (entry.kind === 'one') {
+        // Replace existing if any
+        const existing = await Attachment.where({
+          attachableType, attachableId, name,
+        }).load()
+        for (const row of existing) await row.destroy()
+      } else if (entry.max) {
+        const count = await Attachment.where({
+          attachableType, attachableId, name,
+        }).count()
+        if (count >= entry.max) {
+          throw new Error(`Maximum ${entry.max} attachments for '${name}' on ${ctor.name}`)
+        }
+      }
+
+      const position = entry.kind === 'many'
+        ? await Attachment.where({ attachableType, attachableId, name }).count()
+        : 0
+
+      await Attachment.create({
+        assetId,
+        attachableType,
+        attachableId,
+        name,
+        position,
+      })
+    })
+  }
+
+  /**
+   * Detaches asset(s) from this record.
+   * hasOne: detaches the single attachment.
+   * hasMany without assetId: detaches all.
+   * hasMany with assetId: detaches the specific one.
+   */
+  async detach(name: string, assetId?: number): Promise<void> {
+    const ctor = this.constructor as any
+    if (this.isNewRecord || this._attributes.id === undefined || this._attributes.id === null) {
+      throw new Error(`Cannot detach '${name}' on unsaved ${ctor.name} record`)
+    }
+    const attachableType = ctor.name
+    const attachableId = this._attributes.id
+    await _withAttachmentSlotLock(attachableType, attachableId, name, async () => {
+      const { Attachment } = await import('./asset.js')
+      const where: Record<string, any> = {
+        attachableType,
+        attachableId,
+        name,
+      }
+      if (assetId !== undefined) where.assetId = assetId
+
+      const attachments = await Attachment.where(where).load()
+      for (const att of attachments) await att.destroy()
+    })
+  }
+
+  /**
+   * Atomic detach + attach — replaces the current attachment.
+   * Wrapped in a transaction for atomicity.
+   */
+  async replace(name: string, assetId: number): Promise<void> {
+    const ctor = this.constructor as any
+    if (this.isNewRecord || this._attributes.id === undefined || this._attributes.id === null) {
+      throw new Error(`Cannot replace '${name}' on unsaved ${ctor.name} record`)
+    }
+    const attachableType = ctor.name
+    const attachableId = this._attributes.id
+    await _withAttachmentSlotLock(attachableType, attachableId, name, async () => {
+      await this.detach(name)
+      await this.attach(name, assetId)
+    })
+  }
+
+  /**
+   * Reorders hasManyAttachments by updating position on each attachment row.
+   */
+  async reorder(name: string, orderedAssetIds: number[]): Promise<void> {
+    const ctor = this.constructor as any
+    if (this.isNewRecord || this._attributes.id === undefined || this._attributes.id === null) {
+      throw new Error(`Cannot reorder '${name}' on unsaved ${ctor.name} record`)
+    }
+    const attachableType = ctor.name
+    const attachableId = this._attributes.id
+    await _withAttachmentSlotLock(attachableType, attachableId, name, async () => {
+      const { Attachment } = await import('./asset.js')
+
+      const attachments = await Attachment.where({
+        attachableType,
+        attachableId,
+        name,
+      }).load()
+
+      const currentIds = attachments.map((a: any) => a.assetId)
+      const dedup = new Set(orderedAssetIds)
+      if (dedup.size !== orderedAssetIds.length) {
+        throw new Error(`Cannot reorder '${name}' with duplicate asset IDs`)
+      }
+      if (orderedAssetIds.length !== currentIds.length) {
+        throw new Error(`Reorder for '${name}' must include exactly ${currentIds.length} assets`)
+      }
+      const currentIdSet = new Set(currentIds)
+      for (const id of orderedAssetIds) {
+        if (!currentIdSet.has(id)) throw new Error(`Asset ${id} is not attached in '${name}'`)
+      }
+
+      const byAssetId = new Map(attachments.map((a: any) => [a.assetId, a]))
+      for (let i = 0; i < orderedAssetIds.length; i++) {
+        const att = byAssetId.get(orderedAssetIds[i]!)
+        if (att && att.position !== i) {
+          att.position = i
+          await att.save()
+        }
+      }
+    })
+  }
+
   // ── Console inspect ──────────────────────────────────────────────────────
 
   [util.inspect.custom](_depth: number, _options: util.InspectOptions): string {
@@ -777,6 +923,36 @@ function _buildPkWhere(ctor: any, table: any, pkValue: any): any {
   return eq(table[pk as string], pkValue)
 }
 
+function _mimeMatches(contentType: string, pattern: string): boolean {
+  if (pattern === '*/*') return true
+  if (pattern.endsWith('/*')) {
+    const prefix = pattern.slice(0, -2)
+    return contentType.startsWith(prefix + '/')
+  }
+  return contentType === pattern
+}
+
+async function _withAttachmentSlotLock<T>(
+  attachableType: string,
+  attachableId: number,
+  name: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return transaction(async () => {
+    const db: any = getExecutor()
+    if (typeof db.execute === 'function') {
+      const slotKey = `${attachableType}:${name}`
+      try {
+        // Serializes mutations for a single attachment slot (record + name).
+        await db.execute(sql`select pg_advisory_xact_lock(hashtext(${slotKey}), ${attachableId})`)
+      } catch {
+        // Non-Postgres drivers/tests may not support advisory locks.
+      }
+    }
+    return fn()
+  })
+}
+
 // ── Proxy factory ─────────────────────────────────────────────────────────────
 
 function _wrapRecord<T extends ApplicationRecord>(record: T): T {
@@ -811,6 +987,17 @@ function _wrapRecord<T extends ApplicationRecord>(record: T): T {
           return attrConfig.get(def)
         }
         return undefined
+      }
+
+      // ── Attachment eager-load access ──────────────────────────────────────
+      // If the attachment was eager-loaded via includes(), it's already in _attributes.
+      // The proxy returns it directly (Asset or Asset[]).
+      const staticProp = ctor[prop]
+      if (staticProp && typeof staticProp === 'object' &&
+          (staticProp._type === 'hasOneAttachment' || staticProp._type === 'hasManyAttachments')) {
+        const loaded = target._attributes[prop]
+        if (loaded !== undefined) return loaded
+        return staticProp._type === 'hasOneAttachment' ? null : []
       }
 
       // ── Association lazy loading ────────────────────────────────────────
@@ -874,7 +1061,15 @@ function _wrapRecord<T extends ApplicationRecord>(record: T): T {
     },
 
     set(target: any, prop: string | symbol, value: any, receiver: any) {
-      if (typeof prop === 'symbol' || prop in target) {
+      if (typeof prop === 'symbol') {
+        return Reflect.set(target, prop, value, receiver)
+      }
+      const staticProp = ctor[prop]
+      const isModelField =
+        prop in target._attributes ||
+        target._changes.has(prop) ||
+        !!(staticProp && typeof staticProp === 'object')
+      if (!isModelField && prop in target) {
         return Reflect.set(target, prop, value, receiver)
       }
 

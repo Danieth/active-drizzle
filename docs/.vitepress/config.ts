@@ -8,6 +8,7 @@ const modelSidebar = [
       { text: 'Overview', link: '/models/overview' },
       { text: 'Attributes & Enums', link: '/models/attributes' },
       { text: 'Associations', link: '/models/associations' },
+      { text: 'File Attachments', link: '/models/attachments' },
       { text: 'STI', link: '/models/sti' },
       { text: 'Custom Primary Keys', link: '/models/custom-pk' },
     ],
@@ -75,6 +76,12 @@ export default defineConfig({
             { text: 'Project Structure', link: '/guide/project-structure' },
           ],
         },
+        {
+          text: 'File Storage',
+          items: [
+            { text: 'Storage Setup', link: '/guide/storage' },
+          ],
+        },
       ],
 
       // Shared sidebar for Models, Querying, Writing Data, Behavior — always visible
@@ -96,6 +103,7 @@ export default defineConfig({
             { text: 'Lifecycle Hooks', link: '/controllers/decorators#before-after' },
             { text: 'Error Handling', link: '/controllers/error-handling' },
             { text: 'Multi-Tenant Controllers', link: '/controllers/multi-tenant' },
+            { text: 'File Attachments', link: '/controllers/attachments' },
           ],
         },
       ],
@@ -107,6 +115,7 @@ export default defineConfig({
             { text: 'Overview', link: '/react/overview' },
             { text: 'ClientModel & Type Safety', link: '/react/client-model' },
             { text: 'Form Integration', link: '/react/forms' },
+            { text: 'File Upload Hooks', link: '/react/attachments' },
             { text: 'Error Handling', link: '/react/error-handling' },
           ],
         },

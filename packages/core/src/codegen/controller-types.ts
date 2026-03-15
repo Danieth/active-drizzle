@@ -64,6 +64,15 @@ export interface CtrlActionMeta {
   outputType: string | null
 }
 
+export interface CtrlAttachmentMeta {
+  name: string              // 'logo', 'documents'
+  kind: 'one' | 'many'
+  accepts?: string          // 'image/*'
+  maxSize?: number          // bytes
+  max?: number              // only for 'many'
+  access: 'public' | 'private'
+}
+
 export interface CtrlMeta {
   /** Absolute file path */
   filePath: string
@@ -94,6 +103,12 @@ export interface CtrlMeta {
 
   /** Actions defined with @action */
   actions: CtrlActionMeta[]
+
+  /** Whether @attachable() is present */
+  attachable?: boolean
+
+  /** Attachment declarations from the model (hasOneAttachment / hasManyAttachments) */
+  attachments?: CtrlAttachmentMeta[]
 }
 
 export interface CtrlProjectMeta {

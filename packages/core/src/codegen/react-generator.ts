@@ -29,7 +29,7 @@
 import { join, relative } from 'path'
 import { existsSync } from 'fs'
 import pluralize from 'pluralize'
-import type { CtrlProjectMeta, CtrlMeta, CtrlActionMeta } from './controller-types.js'
+import type { CtrlProjectMeta, CtrlMeta, CtrlActionMeta, CtrlAttachmentMeta } from './controller-types.js'
 import type { ProjectMeta, ModelMeta, ColumnMeta } from './types.js'
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -93,7 +93,7 @@ function generateControllerFile(
 
   // ── Imports ──────────────────────────────────────────────────────────────
   const needsQuery    = hasGetActions(ctrl) || ctrl.kind === 'crud'
-  const needsMutation = hasMutationActions(ctrl) || ctrl.mutations.length > 0 || ctrl.kind === 'crud' || ctrl.kind === 'singleton'
+  const needsMutation = hasMutationActions(ctrl) || ctrl.mutations.length > 0 || ctrl.kind === 'crud' || ctrl.kind === 'singleton' || ctrl.attachable
 
   const rqImports: string[] = []
   if (needsQuery) rqImports.push('useQuery', 'useInfiniteQuery')
@@ -106,6 +106,11 @@ function generateControllerFile(
   if (!isPlain) {
     L.push(`import { ClientModel, modelCacheKeys } from '@active-drizzle/react'`)
     L.push(`import type { SearchState } from '@active-drizzle/react'`)
+  }
+
+  if (ctrl.attachable) {
+    L.push(`import { useUploadFactory, useMultiUploadFactory } from '@active-drizzle/react'`)
+    L.push(`import type { UseUploadOptions, UseMultiUploadOptions, CtrlAttachmentMeta as AttachmentMeta } from '@active-drizzle/react'`)
   }
 
   L.push(`import { client } from './_client'`)
@@ -171,9 +176,34 @@ function generateControllerFile(
     const updatePermit = ctrl.crudConfig?.update?.permit ?? ctrl.crudConfig?.create?.permit ?? []
     const writableFields = [...new Set([...createPermit, ...updatePermit])]
 
-    if (writableFields.length > 0) {
+    // Separate regular fields from attachment fields
+    const attachmentNames = new Set((ctrl.attachments ?? []).map(a => a.name))
+    const regularWritable = writableFields.filter(f => !attachmentNames.has(f))
+    const attachableWritable = writableFields.filter(f => attachmentNames.has(f))
+
+    if (regularWritable.length > 0 || attachableWritable.length > 0) {
       L.push(`/** Only permit-listed fields — attempting .set() with any other key is a compile error. */`)
-      L.push(`export type ${modelName}Write = Pick<${modelName}Attrs, ${writableFields.map(f => `'${f}'`).join(' | ')}>`)
+      const parts: string[] = []
+      if (regularWritable.length > 0) {
+        parts.push(`Pick<${modelName}Attrs, ${regularWritable.map(f => `'${f}'`).join(' | ')}>`)
+      }
+      // Add attachment asset ID fields
+      const attachParts: string[] = []
+      for (const name of attachableWritable) {
+        const att = (ctrl.attachments ?? []).find(a => a.name === name)
+        if (att?.kind === 'one') {
+          attachParts.push(`${name}AssetId?: number | null`)
+        } else {
+          attachParts.push(`${name}AssetIds?: number[]`)
+        }
+      }
+      if (regularWritable.length > 0 && attachParts.length > 0) {
+        L.push(`export type ${modelName}Write = ${parts[0]} & { ${attachParts.join('; ')} }`)
+      } else if (attachParts.length > 0) {
+        L.push(`export type ${modelName}Write = { ${attachParts.join('; ')} }`)
+      } else {
+        L.push(`export type ${modelName}Write = ${parts[0]}`)
+      }
     } else {
       L.push(`export type ${modelName}Write = Record<string, never>`)
     }
@@ -220,6 +250,23 @@ function generateControllerFile(
     const resourceName = ctrl.basePath.split('/').pop()?.replace(/:[^/]*/g, '').replace(/\/+$/, '')
       ?? pluralize(lcFirst(ctrl.modelClass!))
     L.push(`export const ${lcFirst(ctrl.modelClass!)}Keys = modelCacheKeys<${scopeType}>('${resourceName}')`)
+    L.push('')
+  }
+
+  // ── Attachment metadata constant (if @attachable) ────────────────────────
+  if (ctrl.attachable) {
+    const modelKey = ctrl.modelClass ? lcFirst(ctrl.modelClass) : lcFirst(ctrl.className.replace(/Controller$/, ''))
+    L.push(`/** Attachment declarations — use for dropzone accept attributes and client-side validation. */`)
+    L.push(`export const ${modelKey}Attachments = {`)
+    for (const att of (ctrl.attachments ?? [])) {
+      const parts: string[] = [`kind: '${att.kind}'`]
+      parts.push(`accepts: ${att.accepts ? `'${att.accepts}'` : 'undefined'}`)
+      parts.push(`maxSize: ${att.maxSize ?? 'undefined'}`)
+      parts.push(`access: '${att.access}'`)
+      if (att.kind === 'many' && att.max) parts.push(`max: ${att.max}`)
+      L.push(`  ${att.name}: { ${parts.join(', ')} },`)
+    }
+    L.push(`} as const`)
     L.push('')
   }
 
@@ -338,6 +385,26 @@ function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string): void {
     }
   }
 
+  // @attachable upload hooks
+  if (ctrl.attachable) {
+    const modelKey = ctrl.modelClass ? lcFirst(ctrl.modelClass) : lcFirst(ctrl.className.replace(/Controller$/, ''))
+    const attConstName = `${modelKey}Attachments`
+    L.push(`    // ── Attachable hooks ─────────────────────────────────────────────`)
+    L.push(`    mutatePresign:  () => useMutation({ mutationFn: (input: { filename: string; contentType: string; name: string }) => client.${clientKey}.presign({ ${scopeSpread}...input }) }),`)
+    L.push(`    mutateConfirm:  () => useMutation({ mutationFn: (input: { assetId: number }) => client.${clientKey}.confirm({ ${scopeSpread}...input }) }),`)
+    L.push(`    mutateAttach:   () => useMutation({ mutationFn: (input: { assetId: number; name: string; attachableId: number }) => client.${clientKey}.attach({ ${scopeSpread}...input }) }),`)
+    L.push(`    useUpload:      (name: keyof typeof ${attConstName}, options?: UseUploadOptions) => useUploadFactory(`)
+    L.push(`      { presign: (input: any) => client.${clientKey}.presign({ ${scopeSpread}...input }), confirm: (input: any) => client.${clientKey}.confirm({ ${scopeSpread}...input }) },`)
+    L.push(`      { ...${attConstName}[name], name: name as string } as AttachmentMeta,`)
+    L.push(`      options,`)
+    L.push(`    ),`)
+    L.push(`    useMultiUpload: (name: keyof typeof ${attConstName}, options?: UseMultiUploadOptions) => useMultiUploadFactory(`)
+    L.push(`      { presign: (input: any) => client.${clientKey}.presign({ ${scopeSpread}...input }), confirm: (input: any) => client.${clientKey}.confirm({ ${scopeSpread}...input }) },`)
+    L.push(`      { ...${attConstName}[name], name: name as string } as AttachmentMeta,`)
+    L.push(`      options,`)
+    L.push(`    ),`)
+  }
+
   // @action — GET → useQuery with 'index' prefix; everything else → useMutation with 'mutate' prefix
   for (const act of ctrl.actions) {
     const actionKey = toActionClientKey(act, clientKey)
@@ -398,6 +465,13 @@ function emitWith(L: string[], ctrl: CtrlMeta, clientKey: string): void {
     } else {
       L.push(`    ${fnName}: (id: number | string) => client.${clientKey}.${mut.method}({ ${scopeSpread}id }),`)
     }
+  }
+
+  // @attachable async functions
+  if (ctrl.attachable) {
+    L.push(`    presign:  (input: { filename: string; contentType: string; name: string }) => client.${clientKey}.presign({ ${scopeSpread}...input }),`)
+    L.push(`    confirm:  (input: { assetId: number }) => client.${clientKey}.confirm({ ${scopeSpread}...input }),`)
+    L.push(`    attach:   (input: { assetId: number; name: string; attachableId: number }) => client.${clientKey}.attach({ ${scopeSpread}...input }),`)
   }
 
   // @action

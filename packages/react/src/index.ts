@@ -25,3 +25,19 @@ export {
   applyFormErrors,
   type ParsedControllerError,
 } from './errors.js'
+
+// Upload hooks
+export {
+  useUploadFactory,
+  useMultiUploadFactory,
+  type UploadStatus,
+  type UploadFileInfo,
+  type AssetData,
+  type CtrlAttachmentMeta,
+  type UploadEndpoints,
+  type UseUploadReturn,
+  type UseUploadOptions,
+  type MultiUploadSlot,
+  type UseMultiUploadReturn,
+  type UseMultiUploadOptions,
+} from './upload.js'

@@ -23,6 +23,10 @@ export const MODEL_REGISTRY: Record<string, any> = {}
 export function boot(db: GlobalDb, schema: Record<string, any>) {
   _activeDb = db
   _schema = schema
+  // Wire MODEL_REGISTRY into attachment lookups to avoid circular imports
+  import('./attachments.js').then(({ _wireAttachmentRegistry }) => {
+    _wireAttachmentRegistry(MODEL_REGISTRY)
+  }).catch(() => { /* attachments module may not be loaded */ })
 }
 
 export function getExecutor(): GlobalDb {

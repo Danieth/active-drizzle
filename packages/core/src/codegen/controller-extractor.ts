@@ -8,11 +8,13 @@
  *   - @scope field names
  *   - @mutation / @action method names + bulk flag
  */
-import type { Project, ClassDeclaration, Decorator, Node } from 'ts-morph'
+import { Node, SyntaxKind } from 'ts-morph'
+import type { Project, ClassDeclaration, Decorator } from 'ts-morph'
 import pluralize from 'pluralize'
 import type {
   CtrlMeta, CtrlProjectMeta, CtrlScopeMeta,
   CtrlCrudConfig, CtrlMutationMeta, CtrlActionMeta,
+  CtrlAttachmentMeta,
 } from './controller-types.js'
 
 export function extractControllers(
@@ -162,6 +164,16 @@ function extractController(cls: ClassDeclaration, filePath: string): CtrlMeta | 
     })
   }
 
+  // @attachable
+  const attachableDec = decorators.find(d => d.getName() === 'attachable')
+  const attachable = !!attachableDec
+
+  // Extract attachment declarations from the model class (if available via @crud)
+  let attachments: CtrlAttachmentMeta[] | undefined
+  if (attachable && modelClass) {
+    attachments = extractAttachmentsFromModel(cls, modelClass)
+  }
+
   return {
     filePath,
     className,
@@ -173,6 +185,8 @@ function extractController(cls: ClassDeclaration, filePath: string): CtrlMeta | 
     ...(crudConfig !== undefined ? { crudConfig } : {}),
     mutations,
     actions,
+    ...(attachable ? { attachable } : {}),
+    ...(attachments?.length ? { attachments } : {}),
   }
 }
 
@@ -190,6 +204,118 @@ function stripQuotes(text: string): string {
 
 function toKebab(name: string): string {
   return name.replace(/([A-Z])/g, (_, c) => '-' + c.toLowerCase()).replace(/^-/, '')
+}
+
+/**
+ * Extracts hasOneAttachment / hasManyAttachments declarations from the model class
+ * referenced by the controller's @crud decorator.
+ *
+ * Looks for static properties whose initializer calls hasOneAttachment() or hasManyAttachments().
+ */
+function extractAttachmentsFromModel(
+  controllerCls: ClassDeclaration,
+  modelClassName: string,
+): CtrlAttachmentMeta[] {
+  const file = controllerCls.getSourceFile()
+  const project = file.getProject()
+  const attachments: CtrlAttachmentMeta[] = []
+
+  // Find the model class across the project
+  for (const sf of project.getSourceFiles()) {
+    for (const cls of sf.getClasses()) {
+      if (cls.getName() !== modelClassName) continue
+
+      for (const prop of cls.getStaticProperties()) {
+        const init = prop.getInitializer()
+        if (!init || !Node.isCallExpression(init)) continue
+        const callee = init.getExpression().getText()
+
+        let kind: 'one' | 'many' | null = null
+        if (/(^|\.)(hasOneAttachment)$/.test(callee)) kind = 'one'
+        else if (/(^|\.)(hasManyAttachments)$/.test(callee)) kind = 'many'
+        if (!kind) continue
+
+        const args = init.getArguments()
+        const nameArg = args[0]
+        const name =
+          nameArg && Node.isStringLiteral(nameArg)
+            ? nameArg.getLiteralText()
+            : prop.getName()
+        const opts = parseAttachmentOptionsNode(args[1])
+
+        attachments.push({
+          name,
+          kind,
+          ...(opts.accepts ? { accepts: opts.accepts } : {}),
+          ...(opts.maxSize ? { maxSize: opts.maxSize } : {}),
+          ...(kind === 'many' && opts.max ? { max: opts.max } : {}),
+          access: (opts.access as 'public' | 'private') ?? 'private',
+        })
+      }
+      return attachments
+    }
+  }
+  return attachments
+}
+
+/** Extracts options from hasOneAttachment('name', { accepts: '...', ... }) call args. */
+function parseAttachmentOptionsNode(optionsNode: Node | undefined): Record<string, any> {
+  const result: Record<string, any> = {}
+  if (!optionsNode || !Node.isObjectLiteralExpression(optionsNode)) return result
+
+  for (const prop of optionsNode.getProperties()) {
+    if (!Node.isPropertyAssignment(prop)) continue
+    const key = prop.getName()
+    const init = prop.getInitializer()
+    if (!init) continue
+
+    if (key === 'accepts' || key === 'access') {
+      if (Node.isStringLiteral(init)) {
+        result[key] = init.getLiteralText()
+      }
+      continue
+    }
+
+    if (key === 'max' || key === 'maxSize') {
+      const evaluated = evaluateNumericExpression(init)
+      if (typeof evaluated === 'number' && Number.isFinite(evaluated)) {
+        result[key] = evaluated
+      }
+    }
+  }
+
+  return result
+}
+
+function evaluateNumericExpression(node: Node): number | undefined {
+  if (Node.isNumericLiteral(node)) {
+    return Number(node.getText().replace(/_/g, ''))
+  }
+  if (Node.isParenthesizedExpression(node)) {
+    return evaluateNumericExpression(node.getExpression())
+  }
+  if (Node.isPrefixUnaryExpression(node)) {
+    const val = evaluateNumericExpression(node.getOperand())
+    if (val === undefined) return undefined
+    const op = node.getOperatorToken()
+    if (op === SyntaxKind.PlusToken) return val
+    if (op === SyntaxKind.MinusToken) return -val
+    return undefined
+  }
+  if (Node.isBinaryExpression(node)) {
+    const left = evaluateNumericExpression(node.getLeft())
+    const right = evaluateNumericExpression(node.getRight())
+    if (left === undefined || right === undefined) return undefined
+    const op = node.getOperatorToken().getText()
+    switch (op) {
+      case '+': return left + right
+      case '-': return left - right
+      case '*': return left * right
+      case '/': return right === 0 ? undefined : left / right
+      default: return undefined
+    }
+  }
+  return undefined
 }
 
 /**

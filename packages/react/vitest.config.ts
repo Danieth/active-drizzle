@@ -5,7 +5,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@active-drizzle/core': resolve(__dirname, '../core/src/index.ts'),
-      '@active-drizzle/controller': resolve(__dirname, 'src/index.ts'),
+      '@active-drizzle/controller': resolve(__dirname, '../controller/src/index.ts'),
     },
     extensionAlias: {
       '.js': ['.ts', '.js'],
@@ -13,17 +13,10 @@ export default defineConfig({
   },
   test: {
     globals: true,
-    environment: 'node',
-    include: ['tests/**/*.test.ts'],
-    setupFiles: ['./tests/setup.ts'],
-    typecheck: {
-      tsconfig: './tsconfig.test.json',
-    },
+    environment: 'jsdom',
+    include: ['tests/**/*.test.ts', 'tests/**/*.test.tsx'],
     pool: 'forks',
-    poolOptions: { forks: { maxForks: 1 } },
-    testTimeout: 300_000,
-    hookTimeout: 90_000,
-
+    poolOptions: { forks: { maxForks: 2 } },
     coverage: {
       provider: 'v8',
       all: true,
