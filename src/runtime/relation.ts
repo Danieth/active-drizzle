@@ -186,7 +186,8 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     }
     if (n !== undefined) {
       cloned._limit = n
-      return cloned.load()
+      const rows = await cloned.load()
+      return rows.reverse()
     }
     cloned._limit = 1
     const rows = await cloned.load()
@@ -653,8 +654,18 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     callback: (batch: this) => Promise<void>
   ): Promise<void> {
     let offset = 0
+    let batchedRel = this._clone()
+    
+    // Postgres offset pagination is unstable without an ORDER BY clause.
+    if (batchedRel._order.length === 0) {
+      const pk = (this._ctor as any).primaryKey ?? 'id'
+      const pkCol = Array.isArray(pk) ? pk[0]! : pk
+      const table = this.getTable()
+      if (table[pkCol]) batchedRel._order = [asc(table[pkCol])]
+    }
+
     while (true) {
-      const batch = this._clone()
+      const batch = batchedRel._clone()
       batch._limit = batchSize
       batch._offset = offset
       const rows = await batch.load()
@@ -774,8 +785,9 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     const Ctor = this._ctor
 
     for (const [key, rawVal] of Object.entries(hash)) {
-      const col = table[key]
-      if (!col) throw new Error(`Column "${key}" not found on table "${this._tableName}". Check spelling (use camelCase).`)
+      const colKey = _resolveColKey(Ctor, key)
+      const col = table[colKey]
+      if (!col) throw new Error(`Column "${key}" (mapped to "${colKey}") not found on table "${this._tableName}". Check spelling (use camelCase).`)
 
       if (rawVal === null || rawVal === undefined) {
         this._where.push(isNull(col) as SQL)

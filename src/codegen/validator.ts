@@ -70,7 +70,7 @@ function validateAssociations(model: ModelMeta, project: ProjectMeta, out: Diagn
 
     // FK check for hasMany — check the target table for the foreign key
     if (assoc.kind === 'hasMany' && !assoc.through) {
-      const fkCol = assoc.foreignKey ?? `${pluralize.singular(model.className.toLowerCase())}Id`;
+      const fkCol = assoc.foreignKey ?? `${toCamelCase(pluralize.singular(model.className))}Id`;
       const targetSchema = project.schema.tables[targetTable];
       const hasFk = targetSchema?.columns.some(c =>
         c.name === fkCol || c.dbName === toSnakeCase(fkCol)
@@ -319,4 +319,10 @@ function findClose(target: string, options: string[]): string | null {
 
 function toSnakeCase(s: string): string {
   return s.replace(/([A-Z])/g, '_$1').toLowerCase();
+}
+
+function toCamelCase(s: string): string {
+  if (!s) return s;
+  const first = s[0]!.toLowerCase();
+  return first + s.slice(1);
 }

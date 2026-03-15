@@ -3,6 +3,15 @@ import { getExecutor, getSchema, MODEL_REGISTRY, transaction, RecordNotFound } f
 import type { ApplicationRecord } from './application-record.js'
 
 /**
+ * Given a Attr property name (e.g. 'price') that may have an Attr.for column mapping
+ * (e.g. '_column: priceInCents'), returns the actual DB column property name.
+ */
+function _resolveColKey(Ctor: any, field: string): string {
+  const attr = Ctor[field] as any
+  return attr?._isAttr && attr._column ? attr._column : field
+}
+
+/**
  * Chainable query builder — the Rails `ActiveRecord::Relation` equivalent.
  *
  * Accumulates where clauses, ordering, limits, and includes before execution.
@@ -186,7 +195,8 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     }
     if (n !== undefined) {
       cloned._limit = n
-      return cloned.load()
+      const rows = await cloned.load()
+      return rows.reverse()
     }
     cloned._limit = 1
     const rows = await cloned.load()
@@ -752,8 +762,9 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     const Ctor = this._ctor
 
     for (const [key, rawVal] of Object.entries(hash)) {
-      const col = table[key]
-      if (!col) throw new Error(`Column "${key}" not found on table "${this._tableName}". Check spelling (use camelCase).`)
+      const colKey = _resolveColKey(Ctor, key)
+      const col = table[colKey]
+      if (!col) throw new Error(`Column "${key}" (mapped to "${colKey}") not found on table "${this._tableName}". Check spelling (use camelCase).`)
 
       if (rawVal === null || rawVal === undefined) {
         this._where.push(isNull(col) as SQL)
@@ -821,15 +832,6 @@ function _isPlainObject(val: unknown): val is Record<string, unknown> {
 
 function _combine(clauses: SQL[]): SQL {
   return clauses.length === 1 ? clauses[0]! : (and(...clauses) as SQL)
-}
-
-/**
- * Given a Attr property name (e.g. 'price') that may have an Attr.for column mapping
- * (e.g. '_column: priceInCents'), returns the actual DB column property name.
- */
-function _resolveColKey(Ctor: any, field: string): string {
-  const attr = Ctor[field] as any
-  return attr?._isAttr && attr._column ? attr._column : field
 }
 
 /**

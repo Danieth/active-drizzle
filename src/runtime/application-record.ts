@@ -465,7 +465,7 @@ export class ApplicationRecord {
  *
  * FK inference rules:
  *   belongsTo: `${propertyName}Id` on owner table
- *   hasMany:   `${ownerClass.toLowerCase()}Id` on target table (unless foreignKey is set)
+ *   hasMany:   `${toCamelCase(ownerClass)}Id` on target table (unless foreignKey is set)
  *   through:   builds an IN subquery via the join table
  */
 function _resolveAssociation(marker: any, prop: string, target: any, ctor: any): any {
@@ -498,7 +498,7 @@ function _resolveAssociation(marker: any, prop: string, target: any, ctor: any):
   // ── hasOne — FK lives on the target table ────────────────────────────────
   if (marker._type === 'hasOne') {
     const ownerSingular = _singularize(ctor.tableName)
-    const fkField = marker.options?.foreignKey ?? `${ownerSingular}Id`
+    const fkField = marker.options?.foreignKey ?? `${toCamelCase(ownerSingular)}Id`
     const ownerId = target._attributes.id
     if (ownerId === null || ownerId === undefined) return Promise.resolve(null)
     return new Relation(TargetModel).where({ [fkField]: ownerId }).first()
@@ -513,8 +513,8 @@ function _resolveAssociation(marker: any, prop: string, target: any, ctor: any):
     const joinTableObj = schema[marker.table]
     if (!joinTableObj) return new Relation(TargetModel)
 
-    const ownerFk = marker.options?.foreignKey ?? `${_singularize(ctor.tableName)}Id`
-    const targetFk = marker.options?.associationForeignKey ?? `${_singularize(TargetModel._activeDrizzleTableName ?? TargetModel.name.toLowerCase())}Id`
+    const ownerFk = marker.options?.foreignKey ?? `${toCamelCase(_singularize(ctor.tableName))}Id`
+    const targetFk = marker.options?.associationForeignKey ?? `${toCamelCase(_singularize(TargetModel._activeDrizzleTableName ?? TargetModel.name))}Id`
 
     const joinOwnerCol = joinTableObj[ownerFk]
     const joinTargetCol = joinTableObj[targetFk]
@@ -541,8 +541,8 @@ function _resolveAssociation(marker: any, prop: string, target: any, ctor: any):
       const throughTableObj = schema[marker.options.through as string]
       if (!throughTableObj) return new Relation(TargetModel)
 
-      const ownerFk = marker.options?.foreignKey ?? `${_singularize(ctor.tableName)}Id`
-      const targetFk = marker.options?.sourceForeignKey ?? `${_singularize(TargetModel._activeDrizzleTableName ?? TargetModel.name.toLowerCase())}Id`
+      const ownerFk = marker.options?.foreignKey ?? `${toCamelCase(_singularize(ctor.tableName))}Id`
+      const targetFk = marker.options?.sourceForeignKey ?? `${toCamelCase(_singularize(TargetModel._activeDrizzleTableName ?? TargetModel.name))}Id`
 
       const throughOwnerCol = throughTableObj[ownerFk]
       const throughTargetCol = throughTableObj[targetFk]
@@ -560,7 +560,7 @@ function _resolveAssociation(marker: any, prop: string, target: any, ctor: any):
 
     // Simple hasMany
     const ownerSingular = _singularize(ctor.tableName)
-    const fkField = marker.options?.foreignKey ?? `${ownerSingular}Id`
+    const fkField = marker.options?.foreignKey ?? `${toCamelCase(ownerSingular)}Id`
     let rel = new Relation(TargetModel).where({ [fkField]: ownerId })
     // Apply declarative order from the association options
     if (marker.options?.order) {
@@ -665,7 +665,7 @@ async function _processNestedAttributes(record: any, ctor: any, snapshot: Record
     if (!TargetModel) continue
 
     const ownerSingular = _singularize(ctor.tableName)
-    const fkField = (marker.options?.foreignKey as string | undefined) ?? `${ownerSingular}Id`
+    const fkField = (marker.options?.foreignKey as string | undefined) ?? `${toCamelCase(ownerSingular)}Id`
 
     for (const item of nested) {
       const { _destroy, id, ...fields } = item
@@ -706,6 +706,9 @@ async function _adjustCounterCaches(record: any, ctor: any, delta: 1 | -1): Prom
       const parentMarker = ParentModel[parentKey]
       if (!parentMarker || typeof parentMarker !== 'object' || parentMarker._type !== 'hasMany') continue
       if (!parentMarker.options?.counterCache) continue
+
+      // Verify this hasMany actually points back to our model (the child)
+      if (_findModelByMarker(parentMarker, parentKey) !== ctor) continue
 
       // Determine the counter column name: boolean → `<assoc>Count`, string → explicit name
       const counterCol = typeof parentMarker.options.counterCache === 'string'
@@ -908,4 +911,11 @@ function _wrapRecord<T extends ApplicationRecord>(record: T): T {
       return true
     },
   })
+}
+
+function toCamelCase(s: string): string {
+  if (!s) return s
+  // if it's got snake_case, let's turn it into camelCase first
+  s = s.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase())
+  return s[0]!.toLowerCase() + s.slice(1)
 }

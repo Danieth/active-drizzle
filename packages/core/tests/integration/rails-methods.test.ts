@@ -245,9 +245,9 @@ describe('last() and take()', () => {
     await seedLibrary()
     const last2 = await Author.last(2) as any[]
     expect(last2.length).toBe(2)
-    // returned in DESC order
-    expect(last2[0]._attributes.name).toBe('Agatha Christie')
-    expect(last2[1]._attributes.name).toBe('Isaac Asimov')
+    // returned in ASC order
+    expect(last2[0]._attributes.name).toBe('Isaac Asimov')
+    expect(last2[1]._attributes.name).toBe('Agatha Christie')
   })
 
   it('take() returns any single record without caring about order', async () => {
@@ -266,6 +266,20 @@ describe('last() and take()', () => {
     await seedLibrary()
     const last = await Book.where({ genre: 'mystery' } as any).last() as any
     expect(['Murder on the Express', 'The ABC Murders']).toContain(last._attributes.title)
+  })
+
+  it('last(n) reverses the descending logic and returns items in ascending chronological order', async () => {
+    // If the fix wasn't there, last(2) would return [id 5, id 4] instead of [id 4, id 5]
+    await seedLibrary()
+    
+    // lotr, foundation, robot, mur, abc
+    const books = await Book.last(3) as any[]
+    expect(books.length).toBe(3)
+    
+    // They should be in ASCENDING order (the last 3 created)
+    expect(books[0]._attributes.title).toBe('I, Robot')
+    expect(books[1]._attributes.title).toBe('Murder on the Express')
+    expect(books[2]._attributes.title).toBe('The ABC Murders')
   })
 })
 
@@ -551,6 +565,23 @@ describe('findEach() — iterate one record at a time', () => {
     expect(visited.length).toBe(2)
     expect(visited.every((t: string) => ['Murder on the Express', 'The ABC Murders'].includes(t))).toBe(true)
   })
+
+  it('findEach and inBatches are stable by automatically sorting by PK', async () => {
+    await seedLibrary()
+    let offsetChecks: number[] = []
+
+    // Before the fix, Postgres could theoretically return items out of order when offset is used without ORDER BY.
+    // The query should automatically inject an ORDER BY authors.id ASC
+    await Author.all().inBatches(1, async (batch) => {
+      const records = await batch.load()
+      if (records.length > 0) {
+        offsetChecks.push(records[0].id)
+      }
+    })
+
+    // Validate that it explicitly iterated 1, 2, 3
+    expect(offsetChecks).toEqual([1, 2, 3])
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -685,5 +716,15 @@ describe('Complex chains combining new methods', () => {
     // In-stock only: 1499 + 999 + 799 + 1199 = 4496 / 4 = 1124
     const avgInStock = await Book.where({ inStock: true } as any).average('priceInCents')
     expect(avgInStock).toBeCloseTo(1124)
+  })
+
+  it('hash condition where() works correctly even if the property is aliased by Attr.for', async () => {
+    await seedLibrary()
+    // Book has: static price = Attr.for("priceInCents")
+    // By passing { price: 9.99 }, relation._applyHashWhere should resolve 'price' to 'priceInCents' and query it
+    
+    const cheapBook = await Book.where({ price: 7.99 } as any).first() as any
+    expect(cheapBook).not.toBeNull()
+    expect(cheapBook._attributes.title).toBe('I, Robot')
   })
 })

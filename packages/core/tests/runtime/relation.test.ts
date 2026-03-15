@@ -143,7 +143,7 @@ describe('Relation.where() — hash conditions', () => {
 
   it('throws if column not found in schema', () => {
     const rel = new Relation(Post)
-    expect(() => rel.where({ nonExistent: 'value' })).toThrow(/Column "nonExistent" not found/)
+    expect(() => rel.where({ nonExistent: 'value' })).toThrow(/nonExistent/i)
   })
 
   it('passes raw SQL expression through unchanged', () => {

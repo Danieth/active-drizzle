@@ -279,6 +279,17 @@ describe('Associations — eager loading via .includes()', () => {
     expect(orders.length).toBeGreaterThanOrEqual(1)
     expect((orders[0] as any)._attributes.userId).toBe(seed.users.bob.id)
   })
+
+  it('foreign key inference handles camelCase correctly (regression test)', async () => {
+    // If the fix wasn't present, User.orders would look for userid instead of userId
+    const u = await User.create({ email: 'camel@test.com' })
+    await Order.create({ userId: u.id, status: 0 })
+    
+    // Explicitly test the dynamic accessor
+    const orders = await (u as any).orders.load()
+    expect(orders.length).toBe(1)
+    expect(orders[0]._attributes.userId).toBe(u.id)
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -431,6 +442,26 @@ describe('acceptsNestedAttributesFor + counterCache', () => {
     await (order as any).save()
 
     expect(await LineItem.findBy({ id: item.id })).toBeNull()
+  })
+
+  it('counterCache only increments the correct parent when multiple parents have counterCache', async () => {
+    // Add testing for the bug where saving a child would increment unrelated parents
+    const u1 = await User.create({ email: 'cc1@test.com' })
+    const u2 = await User.create({ email: 'cc2@test.com' })
+    
+    const o1 = await Order.create({ userId: u1.id, status: 0 }) as any
+    const o2 = await Order.create({ userId: u2.id, status: 0 }) as any
+
+    const p = await Product.create({ name: 'gadget', priceInCents: 100, stock: 10 })
+
+    await LineItem.create({ orderId: o1.id, productId: p.id, name: 'gadget', priceInCents: 100, qty: 1 })
+
+    // Only o1 should have lineItemsCount incremented
+    const refreshedO1 = await Order.find(o1.id) as any
+    const refreshedO2 = await Order.find(o2.id) as any
+
+    expect(refreshedO1._attributes.lineItemsCount).toBe(1)
+    expect(refreshedO2._attributes.lineItemsCount).toBe(0) // Before the fix, this might be 1 too!
   })
 })
 
