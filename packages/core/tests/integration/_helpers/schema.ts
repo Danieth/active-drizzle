@@ -16,6 +16,28 @@ export const users = pgTable('users', {
   createdAt: timestamp('created_at').defaultNow(),
 })
 
+export const assets = pgTable('assets', {
+  id:          serial('id').primaryKey(),
+  key:         varchar('key', { length: 255 }).notNull(),
+  filename:    varchar('filename', { length: 255 }).notNull(),
+  contentType: varchar('content_type', { length: 255 }).notNull(),
+  byteSize:    integer('byte_size').notNull(),
+  checksum:    varchar('checksum', { length: 255 }).notNull(),
+  status:      varchar('status', { length: 50 }).notNull().default('pending'),
+  access:      varchar('access', { length: 50 }).notNull().default('private'),
+  createdAt:   timestamp('created_at').defaultNow(),
+})
+
+export const attachments = pgTable('attachments', {
+  id:             serial('id').primaryKey(),
+  name:           varchar('name', { length: 255 }).notNull(),
+  attachableType: varchar('attachable_type', { length: 255 }).notNull(),
+  attachableId:   integer('attachable_id').notNull(),
+  assetId:        integer('asset_id').notNull(),
+  position:       integer('position').notNull().default(0),
+  createdAt:      timestamp('created_at').defaultNow(),
+})
+
 /** STI: type column discriminates Product / DigitalProduct / BundleProduct */
 export const products = pgTable('products', {
   id:           serial('id').primaryKey(),
@@ -121,6 +143,8 @@ export const schema = {
   orders,       ordersRelations,
   line_items,   line_itemsRelations,
   reviews,      reviewsRelations,
+  assets,       active_drizzle_assets: assets,
+  attachments,  active_drizzle_attachments: attachments,
 }
 
 /** DDL — create all tables in the test Postgres container */
@@ -183,6 +207,28 @@ CREATE TABLE IF NOT EXISTS reviews (
   user_id         INTEGER NOT NULL,
   rating          INTEGER NOT NULL,
   body            TEXT,
+  created_at      TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS assets (
+  id           SERIAL PRIMARY KEY,
+  key          VARCHAR(255) NOT NULL,
+  filename     VARCHAR(255) NOT NULL,
+  content_type VARCHAR(255) NOT NULL,
+  byte_size    INTEGER NOT NULL,
+  checksum     VARCHAR(255) NOT NULL,
+  status       VARCHAR(50) NOT NULL DEFAULT 'pending',
+  access       VARCHAR(50) NOT NULL DEFAULT 'private',
+  created_at   TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS attachments (
+  id              SERIAL PRIMARY KEY,
+  name            VARCHAR(255) NOT NULL,
+  attachable_type VARCHAR(255) NOT NULL,
+  attachable_id   INTEGER NOT NULL,
+  asset_id        INTEGER NOT NULL,
+  position        INTEGER NOT NULL DEFAULT 0,
   created_at      TIMESTAMPTZ DEFAULT now()
 );
 `

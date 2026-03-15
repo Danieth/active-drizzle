@@ -528,14 +528,43 @@ export class ApplicationRecord {
    */
   async replace(name: string, assetId: number): Promise<void> {
     const ctor = this.constructor as any
+    const { getAttachmentEntryFromClass } = await import('./attachments.js')
+    const entry = getAttachmentEntryFromClass(ctor, name)
+    if (!entry) throw new Error(`No attachment '${name}' declared on ${ctor.name}`)
     if (this.isNewRecord || this._attributes.id === undefined || this._attributes.id === null) {
       throw new Error(`Cannot replace '${name}' on unsaved ${ctor.name} record`)
     }
     const attachableType = ctor.name
     const attachableId = this._attributes.id
+    
     await _withAttachmentSlotLock(attachableType, attachableId, name, async () => {
-      await this.detach(name)
-      await this.attach(name, assetId)
+      const { Asset, Attachment } = await import('./asset.js')
+      
+      const asset = await Asset.find(assetId)
+      if (asset.status !== 'ready') {
+        throw new Error(`Asset ${assetId} must be ready before attaching`)
+      }
+      if (entry.accepts && !_mimeMatches(asset.contentType, entry.accepts)) {
+        throw new Error(`Asset ${assetId} type '${asset.contentType}' is not accepted for '${name}' (${entry.accepts})`)
+      }
+      if (entry.maxSize && typeof asset.byteSize === 'number' && asset.byteSize > entry.maxSize) {
+        throw new Error(`Asset ${assetId} size ${asset.byteSize} exceeds maxSize ${entry.maxSize} for '${name}'`)
+      }
+
+      // Detach existing
+      const existing = await Attachment.where({
+        attachableType, attachableId, name,
+      }).load()
+      for (const row of existing) await row.destroy()
+
+      // Attach new
+      await Attachment.create({
+        assetId,
+        attachableType,
+        attachableId,
+        name,
+        position: 0,
+      })
     })
   }
 

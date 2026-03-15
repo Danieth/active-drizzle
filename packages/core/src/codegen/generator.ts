@@ -19,6 +19,7 @@ import type {
 } from './types.js';
 
 import pluralize from 'pluralize';
+import * as path from 'node:path';
 
 export type GeneratedFile = {
   path: string;
@@ -583,8 +584,16 @@ export function generateRegistry(project: ProjectMeta): string {
   lines.push(`// AUTO-GENERATED — do not edit manually`);
 
   for (const model of project.models) {
-    const basename = model.filePath.split('/').pop()!.replace('.ts', '');
-    lines.push(`import { ${model.className} } from './${basename}.js'`);
+    // model.filePath is absolute.
+    // _registry.gen.ts is generated in `src/generated/_registry.gen.ts`
+    // We compute the relative path from the expected `src/generated` dir
+    // to the actual model file.
+    const registryDir = path.join(process.cwd(), 'src/generated');
+    let rel = path.relative(registryDir, model.filePath);
+    if (!rel.startsWith('.')) rel = './' + rel;
+    // strip .ts, append .js
+    rel = rel.replace(/\.ts$/, '.js');
+    lines.push(`import { ${model.className} } from '${rel}'`);
   }
 
   lines.push('');
