@@ -125,7 +125,8 @@ class Token extends ApplicationRecord {
 /** Composite PK */
 @model('memberships')
 class Membership extends ApplicationRecord {
-  static primaryKey = ['tenantId', 'userId'] as const
+  static primaryKey = ['tenantId', 'userId']
+  static tenantId = Attr.integer()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

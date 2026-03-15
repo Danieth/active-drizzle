@@ -32,6 +32,9 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   protected _order: SQL[] = []
   protected _includes: Record<string, any> = {}
   protected _selectCols: string | undefined  // for toSubquery()
+  
+  protected _skipAllDefaultScopes = false
+  protected _excludedDefaultScopes = new Set<string>()
 
   constructor(modelClass: any) {
     this._ctor = modelClass
@@ -117,6 +120,48 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     return this as any
   }
 
+  /**
+   * Applies all active default scopes to a clone of this relation and returns it.
+   * Execution methods (load, count, etc.) call this before hitting the database.
+   */
+  protected _withDefaultScopes(): this {
+    if (this._skipAllDefaultScopes) return this
+
+    const dscopes = this._ctor.__defaultScopes as Map<string, (q: any) => any> | undefined
+    if (!dscopes || dscopes.size === 0) return this
+
+    let activeScopes = 0
+    for (const name of dscopes.keys()) {
+      if (!this._excludedDefaultScopes.has(name)) activeScopes++
+    }
+    if (activeScopes === 0) return this
+
+    const cloned = this._clone() as this
+    cloned._skipAllDefaultScopes = true // avoid recursive wrapping
+
+    for (const [name, fn] of dscopes.entries()) {
+      if (!this._excludedDefaultScopes.has(name)) {
+        fn.call(this._ctor, cloned)
+      }
+    }
+    return cloned
+  }
+
+  /**
+   * Removes default scopes.
+   *   .unscoped()               → removes all default scopes
+   *   .unscoped('SoftDelete')   → removes only the 'SoftDelete' scope
+   */
+  public unscoped(concernName?: string): this {
+    const next = this._clone() as this
+    if (concernName) {
+      next._excludedDefaultScopes.add(concernName)
+    } else {
+      next._skipAllDefaultScopes = true
+    }
+    return next
+  }
+
   // ── Execution ───────────────────────────────────────────────────────────
 
   /**
@@ -125,7 +170,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    * based on the type discriminator column.
    */
   public async load(): Promise<TModel[]> {
-    const rows = await this._buildQuery()
+    const rows = await this._withDefaultScopes()._buildQuery()
     return rows.map((r: any) => {
       const SubClass = this._resolveSubclass(r)
       return new (SubClass ?? this._ctor)(r, false)
@@ -159,7 +204,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
 
   /** Loads first record, returns null if none. */
   public async first(): Promise<TModel | null> {
-    const cloned = this._clone()
+    const cloned = this._clone() as this
     cloned._limit = 1
     const rows = await cloned.load()
     return rows[0] ?? null
@@ -228,8 +273,9 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   /** Returns the count of matching records. */
   public async count(): Promise<number> {
     if ((this as any)._isNone) return 0
-    const table     = this.getTable()
-    const whereExpr = this._buildFinalWhere()
+    const rel       = this._withDefaultScopes()
+    const table     = rel.getTable()
+    const whereExpr = rel._buildFinalWhere()
     let q: any = getExecutor().select({ n: sql`count(*)::int` }).from(table)
     if (whereExpr) q = q.where(whereExpr)
     const [row] = await q
@@ -239,11 +285,12 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   /** Returns the SUM of a column. Applies Attr.for column mapping. */
   public async sum(field: string): Promise<number> {
     if ((this as any)._isNone) return 0
-    const table  = this.getTable()
-    const colKey = _resolveColKey(this._ctor, field)
+    const rel    = this._withDefaultScopes()
+    const table  = rel.getTable()
+    const colKey = _resolveColKey(rel._ctor, field)
     const col    = table[colKey]
-    if (!col) throw new Error(`Column "${colKey}" not found on "${this._tableName}"`)
-    const whereExpr = this._buildFinalWhere()
+    if (!col) throw new Error(`Column "${colKey}" not found on "${rel._tableName}"`)
+    const whereExpr = rel._buildFinalWhere()
     let q: any = getExecutor().select({ n: sql`coalesce(sum(${col}), 0)::numeric` }).from(table)
     if (whereExpr) q = q.where(whereExpr)
     const [row] = await q
@@ -253,11 +300,12 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   /** Returns the AVERAGE of a column, or null if no rows. */
   public async average(field: string): Promise<number | null> {
     if ((this as any)._isNone) return null
-    const table  = this.getTable()
-    const colKey = _resolveColKey(this._ctor, field)
+    const rel    = this._withDefaultScopes()
+    const table  = rel.getTable()
+    const colKey = _resolveColKey(rel._ctor, field)
     const col    = table[colKey]
-    if (!col) throw new Error(`Column "${colKey}" not found on "${this._tableName}"`)
-    const whereExpr = this._buildFinalWhere()
+    if (!col) throw new Error(`Column "${colKey}" not found on "${rel._tableName}"`)
+    const whereExpr = rel._buildFinalWhere()
     let q: any = getExecutor().select({ n: sql`avg(${col})::numeric` }).from(table)
     if (whereExpr) q = q.where(whereExpr)
     const [row] = await q
@@ -267,11 +315,12 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   /** Returns the minimum value of a column. */
   public async minimum(field: string): Promise<any> {
     if ((this as any)._isNone) return null
-    const table  = this.getTable()
-    const colKey = _resolveColKey(this._ctor, field)
+    const rel    = this._withDefaultScopes()
+    const table  = rel.getTable()
+    const colKey = _resolveColKey(rel._ctor, field)
     const col    = table[colKey]
-    if (!col) throw new Error(`Column "${colKey}" not found on "${this._tableName}"`)
-    const whereExpr = this._buildFinalWhere()
+    if (!col) throw new Error(`Column "${colKey}" not found on "${rel._tableName}"`)
+    const whereExpr = rel._buildFinalWhere()
     let q: any = getExecutor().select({ n: sql`min(${col})` }).from(table)
     if (whereExpr) q = q.where(whereExpr)
     const [row] = await q
@@ -281,11 +330,12 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   /** Returns the maximum value of a column. */
   public async maximum(field: string): Promise<any> {
     if ((this as any)._isNone) return null
-    const table  = this.getTable()
-    const colKey = _resolveColKey(this._ctor, field)
+    const rel    = this._withDefaultScopes()
+    const table  = rel.getTable()
+    const colKey = _resolveColKey(rel._ctor, field)
     const col    = table[colKey]
-    if (!col) throw new Error(`Column "${colKey}" not found on "${this._tableName}"`)
-    const whereExpr = this._buildFinalWhere()
+    if (!col) throw new Error(`Column "${colKey}" not found on "${rel._tableName}"`)
+    const whereExpr = rel._buildFinalWhere()
     let q: any = getExecutor().select({ n: sql`max(${col})` }).from(table)
     if (whereExpr) q = q.where(whereExpr)
     const [row] = await q
@@ -299,11 +349,12 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    */
   public async tally(field: string): Promise<Record<string, number>> {
     if ((this as any)._isNone) return {}
-    const table  = this.getTable()
-    const colKey = _resolveColKey(this._ctor, field)
+    const rel = this._withDefaultScopes()
+    const table  = rel.getTable()
+    const colKey = _resolveColKey(rel._ctor, field)
     const col    = table[colKey]
-    if (!col) throw new Error(`Column "${colKey}" not found on "${this._tableName}"`)
-    const whereExpr = this._buildFinalWhere()
+    if (!col) throw new Error(`Column "${colKey}" not found on "${rel._tableName}"`)
+    const whereExpr = rel._buildFinalWhere()
     let q: any = getExecutor()
       .select({ val: col, n: sql<number>`count(*)::int` })
       .from(table)
@@ -311,7 +362,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     if (whereExpr) q = q.where(whereExpr)
 
     const rows: any[] = await q
-    const Ctor = this._ctor
+    const Ctor = rel._ctor
     const attrGet = (Ctor[field] as any)?._isAttr ? (Ctor[field] as any).get : undefined
 
     const result: Record<string, number> = {}
@@ -331,6 +382,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     if ((this as any)._isNone) return false
     let rel: Relation<TModel> = this._clone() as any
     if (cond) rel = rel.where(cond) as any
+    rel = rel._withDefaultScopes()
     const table = rel.getTable()
     const whereExpr = rel._buildFinalWhere()
     let q: any = getExecutor().select({ one: sql`1` }).from(table).limit(1)
@@ -452,11 +504,12 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    */
   public async pluck(...fields: string[]): Promise<any[]> {
     if ((this as any)._isNone) return []
-    const Ctor = this._ctor
+    const rel = this._withDefaultScopes()
+    const Ctor = rel._ctor
 
     // ── Fast path: all flat (no dots) ─────────────────────────────────────
     if (fields.every(f => !f.includes('.'))) {
-      return this._pluckFlat(fields, Ctor)
+      return rel._pluckFlat(fields, Ctor)
     }
 
     // ── Nested pluck: at least one dotted path ─────────────────────────────
@@ -512,13 +565,13 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     const config: Record<string, any> = {}
     if (Object.keys(topColumns).length > 0) config.columns = topColumns
     if (Object.keys(withConfig).length > 0)  config.with    = withConfig
-    const whereExpr = this._buildFinalWhere()
+    const whereExpr = rel._buildFinalWhere()
     if (whereExpr)              config.where   = whereExpr
-    if (this._limit)            config.limit   = this._limit
-    if (this._offset > 0)       config.offset  = this._offset
-    if (this._order.length > 0) config.orderBy = this._order
+    if (rel._limit)            config.limit   = rel._limit
+    if (rel._offset > 0)       config.offset  = rel._offset
+    if (rel._order.length > 0) config.orderBy = rel._order
 
-    const rows: any[] = await (getExecutor().query as any)[this._tableName].findMany(config)
+    const rows: any[] = await (getExecutor().query as any)[rel._tableName].findMany(config)
 
     return rows.map((row: any) => {
       // Single-field shortcut → plain value
@@ -555,8 +608,9 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   /** Flat-only pluck via `db.select()` — bypasses relational API entirely. */
   private async _pluckFlat(fields: string[], Ctor: any): Promise<any[]> {
     if ((this as any)._isNone) return []
+    const rel = this._withDefaultScopes()
     const db    = getExecutor()
-    const table = this.getTable()
+    const table = rel.getTable()
 
     const selection: Record<string, any> = {}
     const colMap: Record<string, { colKey: string; attrGet?: (v: any) => any }> = {}
@@ -571,11 +625,11 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     }
 
     let q: any = db.select(Object.keys(selection).length > 0 ? (selection as any) : undefined).from(table)
-    const whereExpr = this._buildFinalWhere()
+    const whereExpr = rel._buildFinalWhere()
     if (whereExpr)              q = q.where(whereExpr)
-    if (this._limit)            q = q.limit(this._limit)
-    if (this._offset > 0)       q = q.offset(this._offset)
-    if (this._order.length > 0) q = q.orderBy(...this._order)
+    if (rel._limit)            q = q.limit(rel._limit)
+    if (rel._offset > 0)       q = q.offset(rel._offset)
+    if (rel._order.length > 0) q = q.orderBy(...rel._order)
 
     const rows: any[] = await q
 
@@ -599,15 +653,16 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    * Values are run through Attr.set() before hitting the database.
    */
   public async updateAll(updates: Record<string, any>): Promise<number> {
+    const rel = this._withDefaultScopes()
     const db = getExecutor()
-    const table = this.getTable()
-    const Ctor = this._ctor
+    const table = rel.getTable()
+    const Ctor = rel._ctor
     const mapped: Record<string, any> = {}
     for (const [key, val] of Object.entries(updates)) {
       mapped[key] = Ctor[key]?._isAttr && Ctor[key].set ? Ctor[key].set(val) : val
     }
     let q: any = db.update(table).set(mapped)
-    const whereExpr = this._buildFinalWhere()
+    const whereExpr = rel._buildFinalWhere()
     if (whereExpr) q = q.where(whereExpr)
     const result = await q
     return (result as any)?.rowCount ?? (result as any)?.length ?? 0
@@ -617,10 +672,11 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    * Bulk DELETE for all records matching the current where clauses.
    */
   public async destroyAll(): Promise<number> {
+    const rel = this._withDefaultScopes()
     const db = getExecutor()
-    const table = this.getTable()
+    const table = rel.getTable()
     let q: any = db.delete(table)
-    const whereExpr = this._buildFinalWhere()
+    const whereExpr = rel._buildFinalWhere()
     if (whereExpr) q = q.where(whereExpr)
     const result = await q
     return (result as any)?.rowCount ?? 0
@@ -662,11 +718,12 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    *   → WHERE id IN (SELECT team_id FROM assets WHERE ...)
    */
   public toSubquery(selectColumn = 'id'): any {
-    const table = this.getTable()
+    const rel = this._withDefaultScopes()
+    const table = rel.getTable()
     const col = table[selectColumn]
-    if (!col) throw new Error(`Column "${selectColumn}" not found on table "${this._tableName}"`)
+    if (!col) throw new Error(`Column "${selectColumn}" not found on table "${rel._tableName}"`)
     let q: any = getExecutor().select({ _val: col }).from(table)
-    const whereExpr = this._buildFinalWhere()
+    const whereExpr = rel._buildFinalWhere()
     if (whereExpr) q = q.where(whereExpr)
     return q
   }

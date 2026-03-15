@@ -48,6 +48,7 @@ export class ApplicationRecord {
   static limit(n: number):                         Relation<any>      { return new Relation(this).limit(n) }
   static offset(n: number):                        Relation<any>      { return new Relation(this).offset(n) }
   static order(f: string, d: 'asc'|'desc' = 'asc'): Relation<any>  { return new Relation(this).order(f, d) }
+  static unscoped(concernName?: string):           Relation<any>      { return new Relation(this).unscoped(concernName) }
   static none():                                   Relation<any>      { return new Relation(this).none() }
 
   // ── Aggregates (static) ────────────────────────────────────────────────
@@ -151,6 +152,14 @@ export class ApplicationRecord {
   async validate(): Promise<boolean> {
     this.errors = {}
     const ctor = this.constructor as any
+
+    // beforeValidate lifecycle (concern callbacks + decorated methods)
+    for (const hook of collectHooks(ctor)) {
+      if (hook.event !== 'beforeValidate') continue
+      const method = (this as any)[hook.method]
+      if (typeof method !== 'function') continue
+      await method.call(this)
+    }
 
     // Attr.* property-level validations
     for (const key of Object.getOwnPropertyNames(ctor)) {
