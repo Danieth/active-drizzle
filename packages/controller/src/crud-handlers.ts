@@ -305,8 +305,8 @@ async function _autoAttach(
   let attachmentEntries: any[] | null = null
 
   try {
-    const { getAttachments } = await import('@active-drizzle/core')
-    attachmentEntries = getAttachments(model.name)
+    const core = await import('@active-drizzle/core' as string) as any
+    attachmentEntries = core.getAttachments(model.name)
   } catch {
     return
   }

@@ -14,8 +14,17 @@ import { randomUUID } from 'node:crypto'
 // installed (e.g. client-side builds, codegen, tests). The first call to any
 // storage method that needs AWS will load them on demand.
 
-let _awsSdk: typeof import('@aws-sdk/client-s3') | null = null
-let _presigner: typeof import('@aws-sdk/s3-request-presigner') | null = null
+type AwsSdkModule = {
+  S3Client: new (...args: any[]) => any
+  PutObjectCommand: new (...args: any[]) => any
+  GetObjectCommand: new (...args: any[]) => any
+  HeadObjectCommand: new (...args: any[]) => any
+  DeleteObjectCommand: new (...args: any[]) => any
+}
+type PresignerModule = { getSignedUrl: (client: any, command: any, options: any) => Promise<string> }
+
+let _awsSdk: AwsSdkModule | null = null
+let _presigner: PresignerModule | null = null
 
 async function loadAwsSdk() {
   if (!_awsSdk) {
@@ -36,10 +45,10 @@ async function loadAwsSdk() {
       )
     }
   }
-  return { sdk: _awsSdk, presigner: _presigner }
+  return { sdk: _awsSdk!, presigner: _presigner! }
 }
 
-type S3ClientType = InstanceType<typeof import('@aws-sdk/client-s3').S3Client>
+type S3ClientType = any
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 

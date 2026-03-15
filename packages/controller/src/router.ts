@@ -439,9 +439,9 @@ export function buildRouter<TContext = Record<string, any>>(
       return dispatch(ControllerClass, context as TContext, input as any, rel as any, 'presign',
         async (ctrl) => {
           // Look up attachment declaration on the model
-          const { getAttachmentEntry } = await import('@active-drizzle/core')
+          const core = await import('@active-drizzle/core' as string) as any
           const modelClassName = crudModel?.name
-          const entry = modelClassName ? getAttachmentEntry(modelClassName, name) : null
+          const entry = modelClassName ? core.getAttachmentEntry(modelClassName, name) : null
           if (!entry) {
             throw new BadRequest(`Unknown attachment slot '${name}'`)
           }
@@ -460,9 +460,8 @@ export function buildRouter<TContext = Record<string, any>>(
           const maxSize = entry.maxSize
 
           // Create pending Asset
-          const { Asset } = await import('@active-drizzle/core')
-          const { getStorage } = await import('@active-drizzle/core')
-          const storage = getStorage()
+          const Asset = core.Asset
+          const storage = core.getStorage()
           const key = storage.generateKey(filename)
 
           const assetData: Record<string, any> = {
@@ -510,10 +509,9 @@ export function buildRouter<TContext = Record<string, any>>(
 
       return dispatch(ControllerClass, context as TContext, input as any, rel as any, 'confirm',
         async (_ctrl) => {
-          const { Asset, getAttachmentEntry } = await import('@active-drizzle/core')
-          const { getStorage } = await import('@active-drizzle/core')
+          const core = await import('@active-drizzle/core' as string) as any
 
-          const asset = await Asset.find((input as any).assetId)
+          const asset = await core.Asset.find((input as any).assetId)
           if (asset.status !== 'pending') throw new BadRequest('Asset is not in pending state')
 
           const attachmentName = (asset.metadata as any)?.attachmentName
@@ -521,10 +519,10 @@ export function buildRouter<TContext = Record<string, any>>(
             throw new BadRequest('Asset is missing attachment metadata')
           }
 
-          const entry = getAttachmentEntry(crudModel.name, attachmentName)
+          const entry = core.getAttachmentEntry(crudModel.name, attachmentName)
           if (!entry) throw new BadRequest(`Unknown attachment slot '${attachmentName}'`)
 
-          const storage = getStorage()
+          const storage = core.getStorage()
           const head = await storage.headObject(asset.key)
           const maxSize = entry.maxSize ?? storage.defaultMaxSize
           if (head.contentLength > maxSize) {
