@@ -1,12 +1,15 @@
 # The Forms Surface
 
 The endgame: the field is the component, the controller is the truth, and the
-form assembles itself from the backend model's metadata.
+form assembles itself from the backend model's metadata. The API you use is
+**generated from your own controllers** — you import from your codegen
+output, not from the framework:
 
 ```tsx
-import { useEditForm } from '@active-drizzle/react'
+import { useLoanEditForm } from './_generated/loan.gen'
 
-const loan = useEditForm({ draft, envelope, submit })
+const { status, form: loan } = useLoanEditForm(id)
+if (status !== 'ready') return <Spinner />
 
 <loan.Form>
   <loan.amount edit />
@@ -17,6 +20,11 @@ const loan = useEditForm({ draft, envelope, submit })
   <loan.Submit event="submit">Submit application</loan.Submit>
 </loan.Form>
 ```
+
+The generated hook owns the whole lifecycle: it fetches the envelope,
+builds the typed handle, keys the session by id (navigating between records
+rebuilds), rehydrates a clean draft when a refetch lands (a dirty draft is
+never clobbered), and PATCHes the diff on submit.
 
 ## The naming law
 
@@ -84,8 +92,8 @@ re-field to `<loan.BaseErrors />`.
 
 ## Submit, transitions, and the self-locking form
 
-`<loan.Submit>` sends only `changedData()` plus the optimistic-lock
-`version`. `<loan.Submit event="submit">` also carries `_event` — the server
+`<loan.Submit>` sends only `changedData()`. `<loan.Submit event="submit">`
+also carries `_event` — the server
 fires the [state machine](/models/state-machines) transition **in the same
 save**, and the button disables itself from the server's `can` map.
 
@@ -96,7 +104,6 @@ zero client code.
 
 Other guarantees, all tested:
 
-- Stale `version` → 409; the client refetches, never silently overwrites.
 - A 401 mid-form sets `$status: 'unauthenticated'` and **keeps the draft** —
   re-auth, click again, the same diff submits.
 - Programmatic writes (`loan.$draft.amount = 5`) re-render subscribed fields.
@@ -181,11 +188,10 @@ if (status !== 'ready') return <Spinner />
 ```
 
 `useLoanEditForm` fetches the GET envelope through the generated client,
-builds the Client draft + FormSession, PATCHes the diff (+`version`,
-+`_event`) on submit, invalidates the model's cache keys, and maps transport
-failures onto the session (422 → fields, 401 → draft-preserving
-re-auth state, 409 → conflict message). `useLoanNewForm` does the same over
-`create` with a defaults draft.
+builds the Client draft + FormSession, PATCHes the diff (+`_event`) on
+submit, invalidates the model's cache keys, and maps transport failures onto
+the session (422 → fields, 401 → draft-preserving re-auth state).
+`useLoanNewForm` does the same over `create` with a defaults draft.
 
 ## Files are fields
 
@@ -265,17 +271,19 @@ interface, the gate stays open (plain strings), so adoption is incremental.
 The `requires` gate (presenter demands meta the Attr doesn't declare) backs
 this up with a loud dev-mode error.
 
-## Wiring transports manually
+## Escape hatch: wiring a session by hand
 
-`useForm` stays transport-agnostic for tests, storybooks, and non-generated
-paths — inject anything:
+You will rarely want this — the generated hooks are the API. But for tests,
+storybooks, and non-codegen contexts, `useForm` (from
+`@active-drizzle/react`) accepts a draft, an envelope, and any transport:
 
 ```tsx
-const loan = useEditForm({
-  draft: LoanClient.from(payload.record),
-  envelope: payload,                       // { abilities, can, version }
-  submit: async ({ data, version, _event }) => {
-    const res = await client.loans.update({ id, data: { ...data, _event }, version })
+import { useForm } from '@active-drizzle/react'
+
+const loan = useForm({
+  draft, mode: 'edit', envelope,           // { abilities, can }
+  submit: async ({ data, _event }) => {
+    const res = await client.loans.update({ id, data: { ...data, _event } })
     return { ok: true, envelope: res }
   },
 })

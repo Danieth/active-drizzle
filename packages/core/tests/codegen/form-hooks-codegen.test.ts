@@ -83,15 +83,20 @@ describe('typed form handle emission', () => {
     expect(out).toContain(`id: TypedFieldComponent<'integer'>`)
   })
 
-  it('wires useEditForm: GET envelope → session → handle; PATCH diff + version + _event', () => {
+  it('wires useEditForm through useGeneratedForm: id-keyed, envelope-fed, _event passthrough', () => {
     const out = generate()
     expect(out).toContain('export function useLoanEditForm(id: number)')
-    expect(out).toContain('abilities: payload.abilities ?? null')
-    expect(out).toContain('can: payload.can ?? null')
+    expect(out).toContain('useGeneratedForm<LoanClient>({')
+    expect(out).toContain('formKey: id,')
+    expect(out).toContain('data: query.data ?? null,')
+    expect(out).toContain('makeDraft: (r) => new LoanClient(r),')
     expect(out).toContain(`data: _event ? { ...data, _event } : data`)
-    expect(out).toContain('...(version ? { version } : {})')
     expect(out).toContain('qc.invalidateQueries')
     expect(out).toContain(`fieldMeta: (LoanClient as any).fieldMeta`)
+    // envelope-shaped responses ALWAYS flow through (abilities re-mask)
+    expect(out).toContain(`'record' in res ? { envelope: res }`)
+    // no versioning machinery anywhere
+    expect(out).not.toContain('version')
   })
 
   it('wires useNewForm with a defaults draft and create transport', () => {
@@ -101,10 +106,10 @@ describe('typed form handle emission', () => {
     expect(out).toContain('client.loans.create')
   })
 
-  it('maps transport failures to the SubmitResult contract (422/401/403/409)', () => {
+  it('maps transport failures to the SubmitResult contract (422/401/403)', () => {
     const out = generate()
     expect(out).toContain('parsed?.isValidation ? 422')
-    expect(out).toContain(`parsed?.code === 'CONFLICT' ? 409`)
+    expect(out).toContain('parsed?.isUnauthorized ? 401')
   })
 
   it('scoped controllers thread scope params through the transport', () => {

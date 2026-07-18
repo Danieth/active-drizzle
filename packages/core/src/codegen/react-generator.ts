@@ -111,9 +111,6 @@ function generateControllerFile(
     L.push(`import { ${[...new Set(rqImports)].join(', ')} } from '@tanstack/react-query'`)
   }
 
-  if (envelopeEnabled) {
-    L.push(`import { useRef } from 'react'`)
-  }
 
   // Which property validators ship to THIS client — projection-scoped AND
   // free of foreign identifiers — and whether any reference the Validates
@@ -129,15 +126,27 @@ function generateControllerFile(
         (model.propertyValidationAnalysis?.[prop]?.foreignRefs?.length ?? 0) === 0,
       )
     : []
+  const nestedChildModels = model
+    ? model.associations
+        .filter(a => a.acceptsNested)
+        .map(a => projectMeta?.models.find(m =>
+          m.tableName === (a.resolvedTable ?? a.explicitTable ?? pluralize(a.propertyName))))
+        .filter((m): m is ModelMeta => Boolean(m))
+    : []
   const needsValidates = shippablePropValidations.some(
     ([prop]) => model?.propertyValidationAnalysis?.[prop]?.usesValidates,
+  ) || nestedChildModels.some(cm =>
+    Object.keys(cm.propertyValidations ?? {}).some(p =>
+      cm.propertyValidationAnalysis?.[p]?.usesValidates &&
+      (cm.propertyValidationAnalysis?.[p]?.foreignRefs?.length ?? 0) === 0,
+    ),
   )
 
   if (!isPlain) {
     const adImports = ['ClientModel', 'modelCacheKeys']
     const adTypeImports = ['SearchState']
     if (envelopeEnabled) {
-      adImports.push('FormSession', 'createFormHandle', 'parseControllerError')
+      adImports.push('useGeneratedForm', 'parseControllerError')
       adTypeImports.push('FormHandleApi', 'TypedFieldComponent', 'SubmitResult')
     }
     if (needsValidates) adImports.push('Validates')
@@ -322,11 +331,37 @@ function generateControllerFile(
           fieldParts.push(`${col.name}: { kind: '${kind}'${label} }`)
         }
         const orderBy = assoc.order && typeof assoc.order === 'object' ? Object.keys(assoc.order)[0] : undefined
+        // Child rows validate client-side with the SAME shippable rules the
+        // child model declares — an empty Note.body errors in the form, not
+        // as a server 422 round-trip (#7 in the audit)
+        const childShippable = Object.entries(childModel.propertyValidations ?? {}).filter(([p]) =>
+          (childModel.propertyValidationAnalysis?.[p]?.foreignRefs?.length ?? 0) === 0,
+        )
+        let validatePart = ''
+        if (childShippable.length > 0) {
+          const runs = childShippable.map(([p, code]) => `_run('${p}', (${code}), (d as any).${p})`).join('; ')
+          validatePart = `, validate: (d: any) => { const e: Record<string, string[]> = {}; const _push = (f: string, m: unknown) => { if (typeof m === 'string' && m.trim()) (e[f] ??= []).push(m.trim()) }; const _run = (f: string, v: any, val: any) => { const l = Array.isArray(v) ? v : [v]; for (const fn of l) { if (typeof fn !== 'function') continue; try { _push(f, fn(val, d, f)) } catch { /* server-only gate */ } } }; ${runs}; return e }`
+        }
         nestedEntries.push(
-          `    ${assoc.propertyName}: { kind: 'nested'${orderBy ? `, orderBy: '${orderBy}'` : ''}, fields: { ${fieldParts.join(', ')} } },`,
+          `    ${assoc.propertyName}: { kind: 'nested'${orderBy ? `, orderBy: '${orderBy}'` : ''}${validatePart}, fields: { ${fieldParts.join(', ')} } },`,
         )
       }
-      const metaSource = renderFieldMeta(model, stateProjection, [...attachmentEntries, ...nestedEntries])
+      // Every field the typed handle declares gets a meta entry — a handle
+      // field whose meta lookup comes up empty would promise presenters the
+      // runtime can't resolve (id/ownerId/updatedAt etc. get their kind here)
+      const colTypesForMeta = new Map(
+        (projectMeta?.schema.tables[model.tableName]?.columns ?? []).map(c => [c.name, c.type as string]),
+      )
+      const covered = new Set([
+        ...Object.keys(model.fieldMeta ?? {}),
+        ...(ctrl.attachments ?? []).map(a => a.name),
+        ...model.associations.filter(a => a.acceptsNested).map(a => a.propertyName),
+      ])
+      const bareColumnEntries = [...stateProjection]
+        .filter(f => !covered.has(f) && colTypesForMeta.has(f))
+        .sort()
+        .map(f => `    ${f}: { kind: '${fieldKind(f, model, colTypesForMeta)}' },`)
+      const metaSource = renderFieldMeta(model, stateProjection, [...attachmentEntries, ...nestedEntries, ...bareColumnEntries])
       if (metaSource) {
         L.push('')
         L.push(`  static fieldMeta = ${metaSource} as const`)
@@ -491,9 +526,18 @@ function generateControllerFile(
   L.push(`   * Call inside a React component to get hook-returning functions.`)
   L.push(`   * Destructure once: const ctrl = ${exportName}.use(scopes)`)
   L.push(`   */`)
-  L.push(`  use: (${scopeParam}) => ({`)
+  // Members are hooks — also expose use-prefixed ALIASES (useIndex, useGet…)
+  // so eslint's rules-of-hooks can see them (#8 in the audit). Both names
+  // reference the SAME functions; prefer the use* names in new code.
+  L.push(`  use: (${scopeParam}) => {`)
+  L.push(`    const h = {`)
   emitUse(L, ctrl, clientKey)
-  L.push(`  }),`)
+  L.push(`    }`)
+  L.push(`    const aliases = Object.fromEntries(`)
+  L.push(`      Object.entries(h).map(([k, v]) => ['use' + k[0]!.toUpperCase() + k.slice(1), v]),`)
+  L.push(`    ) as { [K in keyof typeof h as \`use\${Capitalize<string & K>}\`]: (typeof h)[K] }`)
+  L.push(`    return { ...h, ...aliases }`)
+  L.push(`  },`)
   L.push('')
 
   // ── .with() ───────────────────────────────────────────────────────────────
@@ -824,20 +868,20 @@ function emitFormHooks(
   const scopesArg = hasScopes ? 'scopes' : '({} as Record<string, never>)'
   const scopeSpread = hasScopes ? '...scopes, ' : ''
 
-  // Shared transport: PATCH the diff (+_event/version), refresh caches,
-  // map errors to the FormSession contract
+  // Shared transport error mapping to the FormSession contract
   L.push(`function _${lcFirst(modelName)}SubmitResult(e: unknown): SubmitResult {`)
   L.push(`  const parsed = parseControllerError(e)`)
   L.push(`  const status = parsed?.isValidation ? 422`)
   L.push(`    : parsed?.isUnauthorized ? 401`)
   L.push(`    : parsed?.isForbidden ? 403`)
-  L.push(`    : parsed?.code === 'CONFLICT' ? 409`)
   L.push(`    : 500`)
   L.push(`  return { ok: false, status, ...(parsed?.fields ? { errors: parsed.fields } : {}) }`)
   L.push(`}`)
   L.push('')
 
-  L.push(`/** Envelope-wired edit form: GET → handle; submit PATCHes the diff (+version/_event). */`)
+  // Generated hooks are THIN wiring — identity keying, refetch rehydration,
+  // and StrictMode safety live in useGeneratedForm (tested in the package)
+  L.push(`/** Envelope-wired edit form. Session is keyed by id: navigating between records rebuilds; refetches rehydrate a CLEAN draft (dirty edits are never clobbered). */`)
   L.push(`export function use${modelName}EditForm(id: number${scopesParam}): { status: 'loading' | 'error' | 'ready'; form: ${modelName}FormHandle | null } {`)
   L.push(`  const qc = useQueryClient()`)
   L.push(`  const _scopes = ${scopesArg}`)
@@ -845,31 +889,22 @@ function emitFormHooks(
   L.push(`    queryKey: ${keysName}.detail(id, _scopes as any),`)
   L.push(`    queryFn: () => client.${clientKey}.get({ ${scopeSpread}id }),`)
   L.push(`  })`)
-  L.push(`  const ref = useRef<${modelName}FormHandle | null>(null)`)
-  L.push(`  if (!ref.current && query.data) {`)
-  L.push(`    const payload: any = query.data`)
-  L.push(`    const draft = new ${modelName}Client(payload.record ?? payload)`)
-  L.push(`    const session = new FormSession({`)
-  L.push(`      draft: draft as any,`)
-  L.push(`      mode: 'edit',`)
-  L.push(`      abilities: payload.abilities ?? null,`)
-  L.push(`      can: payload.can ?? null,`)
-  L.push(`      version: payload.version ?? null,`)
-  L.push(`      submit: async ({ data, version, _event }) => {`)
-  L.push(`        try {`)
-  L.push(`          const res: any = await client.${clientKey}.update({`)
-  L.push(`            ${scopeSpread}id,`)
-  L.push(`            data: _event ? { ...data, _event } : data,`)
-  L.push(`            ...(version ? { version } : {}),`)
-  L.push(`          })`)
-  L.push(`          qc.invalidateQueries({ queryKey: ${keysName}.root(_scopes as any) })`)
-  L.push(`          return { ok: true, ...(res?.abilities ? { envelope: res } : {}) }`)
-  L.push(`        } catch (e) { return _${lcFirst(modelName)}SubmitResult(e) }`)
-  L.push(`      },`)
-  L.push(`    })`)
-  L.push(`    ref.current = createFormHandle(session, { fieldMeta: (${modelName}Client as any).fieldMeta ?? {} }) as unknown as ${modelName}FormHandle`)
-  L.push(`  }`)
-  L.push(`  return { status: query.isError ? 'error' : ref.current ? 'ready' : 'loading', form: ref.current }`)
+  L.push(`  const { form } = useGeneratedForm<${modelName}Client>({`)
+  L.push(`    formKey: id,`)
+  L.push(`    mode: 'edit',`)
+  L.push(`    data: query.data ?? null,`)
+  L.push(`    makeDraft: (r) => new ${modelName}Client(r),`)
+  L.push(`    fieldMeta: (${modelName}Client as any).fieldMeta ?? {},`)
+  L.push(`    submit: async ({ data, _event }) => {`)
+  L.push(`      try {`)
+  L.push(`        const res: any = await client.${clientKey}.update({ ${scopeSpread}id, data: _event ? { ...data, _event } : data })`)
+  L.push(`        qc.invalidateQueries({ queryKey: ${keysName}.root(_scopes as any) })`)
+  L.push(`        // Envelope responses always flow through so abilities/can re-mask`)
+  L.push(`        return { ok: true, ...(res && typeof res === 'object' && 'record' in res ? { envelope: res } : {}) }`)
+  L.push(`      } catch (e) { return _${lcFirst(modelName)}SubmitResult(e) }`)
+  L.push(`    },`)
+  L.push(`  })`)
+  L.push(`  return { status: query.isError ? 'error' : form ? 'ready' : 'loading', form: form as ${modelName}FormHandle | null }`)
   L.push(`}`)
   L.push('')
 
@@ -877,24 +912,21 @@ function emitFormHooks(
   L.push(`export function use${modelName}NewForm(${hasScopes ? `scopes: ${scopeType}` : ''}): { status: 'ready'; form: ${modelName}FormHandle } {`)
   L.push(`  const qc = useQueryClient()`)
   L.push(`  const _scopes = ${scopesArg}`)
-  L.push(`  const ref = useRef<${modelName}FormHandle | null>(null)`)
-  L.push(`  if (!ref.current) {`)
-  L.push(`    const draft = new ${modelName}Client({})`)
-  L.push(`    const session = new FormSession({`)
-  L.push(`      draft: draft as any,`)
-  L.push(`      mode: 'new',`)
-  L.push(`      abilities: null,`)
-  L.push(`      submit: async ({ data }) => {`)
-  L.push(`        try {`)
-  L.push(`          const res: any = await client.${clientKey}.create({ ${scopeSpread}data })`)
-  L.push(`          qc.invalidateQueries({ queryKey: ${keysName}.root(_scopes as any) })`)
-  L.push(`          return { ok: true, ...(res?.abilities ? { envelope: res } : {}) }`)
-  L.push(`        } catch (e) { return _${lcFirst(modelName)}SubmitResult(e) }`)
-  L.push(`      },`)
-  L.push(`    })`)
-  L.push(`    ref.current = createFormHandle(session, { fieldMeta: (${modelName}Client as any).fieldMeta ?? {} }) as unknown as ${modelName}FormHandle`)
-  L.push(`  }`)
-  L.push(`  return { status: 'ready', form: ref.current }`)
+  L.push(`  const { form } = useGeneratedForm<${modelName}Client>({`)
+  L.push(`    formKey: 'new',`)
+  L.push(`    mode: 'new',`)
+  L.push(`    data: null,`)
+  L.push(`    makeDraft: (r) => new ${modelName}Client(r),`)
+  L.push(`    fieldMeta: (${modelName}Client as any).fieldMeta ?? {},`)
+  L.push(`    submit: async ({ data }) => {`)
+  L.push(`      try {`)
+  L.push(`        const res: any = await client.${clientKey}.create({ ${scopeSpread}data })`)
+  L.push(`        qc.invalidateQueries({ queryKey: ${keysName}.root(_scopes as any) })`)
+  L.push(`        return { ok: true, ...(res && typeof res === 'object' && 'record' in res ? { envelope: res } : {}) }`)
+  L.push(`      } catch (e) { return _${lcFirst(modelName)}SubmitResult(e) }`)
+  L.push(`    },`)
+  L.push(`  })`)
+  L.push(`  return { status: 'ready', form: form as ${modelName}FormHandle }`)
   L.push(`}`)
   L.push('')
 }

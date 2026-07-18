@@ -5,14 +5,13 @@
  *   - DRAFT record → abilities.amount === 'edit'; SUBMITTED → 'view'
  *   - field ∉ expose absent from both record and abilities
  *   - PATCH of a non-permitted field → stripped + { field, code: 'forbidden' }
- *   - stale version → 409 Conflict
  *   - _event fires the transition in the same save; blocked → 422
  *   - PATCH response = GET envelope (post-transition re-masking)
  */
 
 import { describe, it, expect, vi } from 'vitest'
-import { defaultGet, defaultUpdate, buildRecordEnvelope, versionOf } from '../src/crud-handlers.js'
-import { Conflict, ValidationError } from '../src/errors.js'
+import { defaultGet, defaultUpdate, buildRecordEnvelope } from '../src/crud-handlers.js'
+import { ValidationError } from '../src/errors.js'
 
 // ── Mock model + record (duck-typed ApplicationRecord surface) ───────────────
 
@@ -112,12 +111,6 @@ describe('GET envelope', () => {
     expect(res.can).toEqual({ submit: true, reopen: false })
   })
 
-  it('version derives from updatedAt', async () => {
-    const record = makeRecord({ id: 1, status: 'DRAFT', updatedAt: new Date(123456) })
-    const res = await defaultGet(relationFor(record), makeModel(), envelopeConfig, 1, ctx, ctrl)
-    expect(res.version).toBe('123456')
-  })
-
   it('expose WITHOUT abilities returns a bare filtered record (no envelope)', async () => {
     const record = makeRecord({ id: 1, amount: 5, status: 'DRAFT', secret: 'x' })
     const config = { get: { expose: ['id', 'amount'] } } as any
@@ -161,26 +154,6 @@ describe('PATCH with envelope', () => {
   })
 })
 
-// ── Optimistic locking ───────────────────────────────────────────────────────
-
-describe('version conflict', () => {
-  it('stale version → 409 Conflict, nothing saved', async () => {
-    const record = makeRecord({ id: 1, amount: 100, status: 'DRAFT', updatedAt: new Date(2000) })
-    await expect(
-      defaultUpdate(relationFor(record), makeModel(), envelopeConfig, 1,
-        { amount: 250 }, ctx, ctrl, '1000'),
-    ).rejects.toBeInstanceOf(Conflict)
-    expect(record.save).not.toHaveBeenCalled()
-  })
-
-  it('matching version proceeds', async () => {
-    const record = makeRecord({ id: 1, amount: 100, status: 'DRAFT', updatedAt: new Date(2000) })
-    const res = await defaultUpdate(relationFor(record), makeModel(), envelopeConfig, 1,
-      { amount: 250 }, ctx, ctrl, '2000')
-    expect(res.record.amount).toBe(250)
-  })
-})
-
 // ── _event: submit-as-transition ─────────────────────────────────────────────
 
 describe('_event transitions', () => {
@@ -211,18 +184,6 @@ describe('_event transitions', () => {
     await defaultUpdate(relationFor(record), makeModel(), envelopeConfig, 1,
       { _event: 'submit' }, ctx, ctrl)
     expect((record as any)._event).toBeUndefined()
-  })
-})
-
-// ── versionOf helper ─────────────────────────────────────────────────────────
-
-describe('versionOf', () => {
-  it('null when the record has no updatedAt', () => {
-    expect(versionOf(makeRecord({ id: 1 }))).toBeNull()
-  })
-
-  it('stringified epoch millis when it does', () => {
-    expect(versionOf(makeRecord({ id: 1, updatedAt: new Date(42) }))).toBe('42')
   })
 })
 

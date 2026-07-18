@@ -100,7 +100,6 @@ function makeHandle(opts: {
   draft?: LoanDraft
   abilities?: Record<string, 'edit' | 'view'> | null
   can?: Record<string, boolean>
-  version?: string | null
   validate?: (d: any) => Record<string, string[]>
   submit?: (payload: any) => Promise<SubmitResult>
 } = {}) {
@@ -111,7 +110,6 @@ function makeHandle(opts: {
       ? { amount: 'edit', purpose: 'edit', status: 'view', isPublished: 'edit', discount: 'edit' }
       : opts.abilities,
     can: opts.can ?? {},
-    version: opts.version ?? 'v1',
     ...(opts.validate ? { validate: opts.validate } : {}),
     ...(opts.submit ? { submit: opts.submit } : {}),
   })
@@ -172,8 +170,7 @@ describe('batched submit', () => {
     await waitFor(() => expect(submitSpy).toHaveBeenCalledTimes(1))
     expect(submitSpy.mock.calls[0]![0]).toEqual({
       data: { amount: '300000' },                     // ONLY the changed field
-      version: 'v1',
-    })
+      })
   })
 })
 

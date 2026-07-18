@@ -71,7 +71,6 @@ function makeHandle(opts: {
     },
     mode: 'edit',
     abilities: null,
-    version: 'v1',
     ...(opts.submit ? { submit: opts.submit } : {}),
   })
   return { handle: createFormHandle(session, { fieldMeta: meta as any }), session }

@@ -20,7 +20,7 @@ import { useRef } from 'react'
 import { FormSession, type FormSessionOptions, type ServerEnvelope } from './form-session.js'
 import { createFormHandle, type FormHandle } from './form-handle.js'
 
-export interface UseFormOptions<T extends Record<string, any>> extends Omit<FormSessionOptions<T>, 'abilities' | 'can' | 'version'> {
+export interface UseFormOptions<T extends Record<string, any>> extends Omit<FormSessionOptions<T>, 'abilities' | 'can'> {
   /** The GET envelope, when the controller ships abilities. */
   envelope?: ServerEnvelope | null
   /** Per-field meta — defaults to the draft class's generated static fieldMeta. */
@@ -35,7 +35,6 @@ export function useForm<T extends Record<string, any>>(opts: UseFormOptions<T>):
       ...sessionOpts,
       abilities: envelope?.abilities ?? null,
       can: envelope?.can ?? null,
-      version: envelope?.version ?? null,
     })
     ref.current = createFormHandle(session, fieldMeta ? { fieldMeta } : {})
   }

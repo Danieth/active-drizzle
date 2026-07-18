@@ -230,14 +230,13 @@ export function buildRouter<TContext = Record<string, any>>(
         ...scopeSchema,
         id: z.number().int().positive(),
         data: z.record(z.string(), z.any()),
-        version: z.string().optional(),   // optimistic-lock token (envelope controllers)
       }).passthrough()
     ).handler(async ({ input, context }) => {
       const rel = buildScopedRelation(model, input as any)
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'update',
         async (ctrl) => {
           if (typeof ctrl.update === 'function') return ctrl.update()
-          return defaultUpdate(ctrl.relation, model, config, (input as any).id, (input as any).data, context, ctrl, (input as any).version)
+          return defaultUpdate(ctrl.relation, model, config, (input as any).id, (input as any).data, context, ctrl)
         },
         undefined,
         config.scopeBy,
@@ -619,7 +618,6 @@ function httpToOrpc(e: HttpError): ORPCError<string, unknown> {
     401: 'UNAUTHORIZED',
     403: 'FORBIDDEN',
     404: 'NOT_FOUND',
-    409: 'CONFLICT',
     422: 'UNPROCESSABLE_ENTITY',
   }
   const code = STATUS_TO_CODE[e.status] ?? 'INTERNAL_SERVER_ERROR'

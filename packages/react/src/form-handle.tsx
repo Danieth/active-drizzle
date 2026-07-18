@@ -76,7 +76,6 @@ export interface FormHandleApi<T extends Record<string, any> = Record<string, an
   $errors: Record<string, string[]>
   $dirty: boolean
   $status: SessionStatus
-  $version: string | null
   $submit: (opts?: { event?: string }) => Promise<boolean>
   $can: (event: string) => boolean
   Form: FC<{ children?: ReactNode; onSuccess?: () => void; autosave?: boolean }>
@@ -371,7 +370,6 @@ export function createFormHandle<T extends Record<string, any>>(
         case '$errors': return session.allErrors()
         case '$dirty': return session.isDirty()
         case '$status': return session.getStatus()
-        case '$version': return session.getVersion()
         case '$submit': return (opts?: { event?: string }) => session.submit(opts)
         case '$can': return (event: string) => session.can(event)
         case 'Form': return FormComponent

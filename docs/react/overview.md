@@ -477,7 +477,7 @@ function CreateCampaignDialog({ teamId, onSuccess }) {
 }
 ```
 
-See [Form Integration](/react/forms) for the complete form guide including update forms, dirty state, and multi-step forms.
+See [The Forms Surface](/react/forms-surface) for the complete form guide — generated hooks, presenters, nested forms, and autosave.
 
 ---
 
@@ -653,7 +653,7 @@ function CreateCampaignForm({ teamId, onSuccess }) {
 | Topic | Where to go |
 |-------|-------------|
 | ClientModel types and `TAttrs`/`TWrite` | [ClientModel & Type Safety](/react/client-model) |
-| TanStack Form integration deep dive | [Form Integration](/react/forms) |
+| Forms deep dive (generated hooks, presenters) | [The Forms Surface](/react/forms-surface) |
 | Error handling reference | [Error Handling](/react/error-handling) |
 | Controller configuration | [Controllers Overview](/controllers/overview) |
 | Vite plugin setup | [Vite Plugin & CLI](/codegen/vite-plugin) |

@@ -3,26 +3,17 @@
  * These are the 12-step index, get, create, update, destroy implementations.
  * Controllers that define their own methods override these automatically.
  */
-import { BadRequest, Conflict, NotFound, ValidationError, toValidationError } from './errors.js'
+import { BadRequest, NotFound, ValidationError, toValidationError } from './errors.js'
 import type { CrudConfig, IndexConfig } from './metadata.js'
 
-// ── Forms envelope (expose / abilities / can / version) ───────────────────────
+// ── Forms envelope (expose / abilities / can) ─────────────────────────────────
 
 export interface RecordEnvelope {
   record: Record<string, any>
   abilities: Record<string, 'edit' | 'view'>
   can: Record<string, boolean>
-  version: string | null
   /** Non-fatal write problems, e.g. stripped non-permitted fields. */
   issues?: Array<{ field: string; code: string }>
-}
-
-/** Optimistic-lock token — derived from updatedAt when the column exists. */
-export function versionOf(record: any): string | null {
-  const u = record?.updatedAt ?? record?._attributes?.updatedAt
-  if (!u) return null
-  const t = u instanceof Date ? u.getTime() : new Date(u).getTime()
-  return Number.isFinite(t) ? String(t) : null
 }
 
 /** All Attr.state event names declared on the model (duck-typed, no core dep). */
@@ -39,7 +30,7 @@ function collectStateEvents(model: any): string[] {
 
 /**
  * Builds the Forms envelope for a record:
- *   { record, abilities, can, version }
+ *   { record, abilities, can }
  *
  * - record: serialized through the `expose` ceiling (+ get includes)
  * - abilities: 'edit' iff field ∈ update-permit resolved against THIS record;
@@ -47,7 +38,6 @@ function collectStateEvents(model: any): string[] {
  *   ceiling — the UI consumes permissions, it never creates them.
  * - can: server-computed verdict per Attr.state event (full data, no
  *   projection problem — the client's own can() only ever narrows this)
- * - version: optimistic-lock token
  */
 export function buildRecordEnvelope(
   record: any,
@@ -85,7 +75,6 @@ export function buildRecordEnvelope(
     record: serialized,
     abilities,
     can,
-    version: versionOf(record),
   }
   if (issues && issues.length > 0) envelope.issues = issues
   return envelope
@@ -274,22 +263,11 @@ export async function defaultUpdate(
   ctx: any,
   /** Controller instance — passed to permit functions that accept it. */
   ctrl?: any,
-  /** Optimistic-lock token echoed by the client (envelope controllers). */
-  version?: string,
 ): Promise<any> {
   const record = await relation.where({ id }).first()
   if (!record) throw new NotFound(model.name)
 
   const envelope = usesEnvelope(config)
-
-  // Optimistic locking: a stale token means the record changed under the
-  // form — 409, never a silent overwrite.
-  if (envelope && version !== undefined && version !== null) {
-    const current = versionOf(record)
-    if (current !== null && current !== String(version)) {
-      throw new Conflict()
-    }
-  }
 
   // `_event` rides the PATCH but is a state-machine instruction, not a field
   const { _event, ...fields } = rawInput ?? {}

@@ -59,8 +59,7 @@ below), so the generated UI can't hide a permit bug.
 {
   "record":    { "id": 1, "amount": 250000, "status": "draft", … },  // expose-filtered
   "abilities": { "amount": "edit", "termMonths": "edit", "status": "view" },
-  "can":       { "submit": true, "approve": false, "reject": false },
-  "version":   "1721294460000"
+  "can":       { "submit": true, "approve": false, "reject": false }
 }
 ```
 
@@ -70,13 +69,6 @@ below), so the generated UI can't hide a permit bug.
 - **`can[event]`** — server-computed verdict for every
   [`Attr.state`](/models/state-machines) event, with full data. Generated
   client `can()` only ever narrows this.
-- **`version`** — optimistic-lock token derived from `updatedAt`.
-
-## Optimistic locking
-
-PATCH echoes `version`. A stale token means the record changed under the
-form → **409 Conflict**, nothing saved. The client should refetch and retry —
-never silently overwrite.
 
 ## Stripped writes are reported
 
@@ -122,10 +114,9 @@ is the stable seam a second client (mobile, another team, curl) builds
 against. Contract, versioned here:
 
 ```
-GET  <base>/:id            → { record, abilities, can, version }
+GET  <base>/:id            → { record, abilities, can }
 PATCH <base>/:id
-  body: { data: { ...changedFields, <assoc>Attributes?: [...], _event?: string },
-          version?: string }
+  body: { data: { ...changedFields, <assoc>Attributes?: [...], _event?: string } }
   →   the same envelope, recomputed against the SAVED record
 POST <base>                → the same envelope (when abilities is enabled)
 
@@ -133,14 +124,17 @@ record     expose-filtered serialization (+ get includes); pk always present
 abilities  { [field]: 'edit' | 'view' } — edit iff permitted for THIS user on
            THIS record; view iff exposed; absent otherwise
 can        { [stateEvent]: boolean } — server-computed with full data
-version    optimistic-lock token (updatedAt-derived); echo it on PATCH;
-           mismatch → 409
 issues     [{ field, code: 'forbidden' }] — present when a PATCH contained
            stripped non-permitted fields
 
-Errors: 401/403 (auth) · 404 · 409 (version conflict) ·
+Errors: 401/403 (auth) · 404 ·
         422 { errors: { [field | 'base' | 'assoc[id:N|new:K].field']: string[] } }
         (transition failures arrive as base with code transition_blocked)
+
+Writes are last-writer-wins, like Rails. No version tokens, no client-side
+lock bookkeeping. If your domain needs idempotent retries, put an
+idempotency key on the specific endpoint that needs it — it is not a
+framework concern.
 
 Nested writes: [{ id, ...diff } | { id, _destroy: true } | { ...fields, _key }]
                — _key is client-ephemeral identity, echoed in 422 paths,

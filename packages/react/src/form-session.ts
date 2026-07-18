@@ -7,8 +7,8 @@
  *
  *   - touched / submitAttempted (error display timing — C1)
  *   - per-field subscriptions (a keystroke re-renders one field)
- *   - the abilities mask + can map + version from the server envelope
- *   - submit lifecycle (diff + version + optional _event; 422/409 handling)
+ *   - the abilities mask + can map from the server envelope
+ *   - submit lifecycle (diff + optional _event; 422 handling)
  *
  * It is deliberately framework-agnostic — React binds to it through
  * `useSyncExternalStore` in the form handle. State lives HERE, not in field
@@ -23,7 +23,6 @@ export interface ServerEnvelope {
   record?: Record<string, any>
   abilities?: Record<string, Ability>
   can?: Record<string, boolean>
-  version?: string | null
   issues?: Array<{ field: string; code: string }>
 }
 
@@ -33,7 +32,6 @@ export type SubmitResult =
 
 export interface SubmitPayload {
   data: Record<string, any>
-  version?: string | null
   _event?: string
 }
 
@@ -44,8 +42,6 @@ export interface FormSessionOptions<T extends Record<string, any>> {
   abilities?: Record<string, Ability> | null
   /** Server-computed Attr.state verdicts. */
   can?: Record<string, boolean> | null
-  /** Optimistic-lock token, echoed on submit. */
-  version?: string | null
   /**
    * Client validation over the draft. Defaults to calling `draft.validate()`
    * when the generated Client provides one.
@@ -61,7 +57,6 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
 
   private abilities: Record<string, Ability> | null
   private canMap: Record<string, boolean>
-  private version: string | null
 
   private touched = new Set<string>()
   private submitAttempted = false
@@ -96,7 +91,6 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     this.mode = opts.mode
     this.abilities = opts.abilities ?? null
     this.canMap = opts.can ?? {}
-    this.version = opts.version ?? null
     this.validateFn = opts.validate
       ?? ((d: T) => (typeof (d as any).validate === 'function' ? (d as any).validate() : {}))
     if (opts.submit) this.submitFn = opts.submit
@@ -202,7 +196,6 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   }
 
   getStatus(): SessionStatus { return this.status }
-  getVersion(): string | null { return this.version }
   getIssues(): Array<{ field: string; code: string }> { return this.serverIssues }
 
   /** Per-field autosave state — 'ready' when nothing is in flight. */
@@ -296,7 +289,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     this.status = 'saving'
     this.notifyAll()
 
-    const payload: SubmitPayload = { data: this.changedData(), version: this.version }
+    const payload: SubmitPayload = { data: this.changedData() }
     if (opts.event) payload._event = opts.event
 
     let result: SubmitResult
@@ -324,14 +317,6 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
 
     if (result.status === 401 || result.status === 403) {
       this.status = 'unauthenticated'   // draft untouched — re-auth then retry
-    } else if (result.status === 409) {
-      // Optimistic-lock conflict carries no field errors — surface it on base
-      // so the form can tell the user to refresh instead of silently failing
-      this.serverErrors = {
-        base: ['This record was changed by someone else — refresh to see the latest version.'],
-        ...(result.errors ?? {}),
-      }
-      this.status = 'error'
     } else {
       this.serverErrors = this.refieldErrors(result.errors ?? {})
       this.status = 'error'
@@ -368,7 +353,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
 
     let result: SubmitResult
     try {
-      result = await this.submitFn({ data: { [field]: now[field] }, version: this.version })
+      result = await this.submitFn({ data: { [field]: now[field] } })
     } catch {
       result = { ok: false, status: 0 }
     }
@@ -385,11 +370,6 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     ;(this.draft as any)[field] = previous
     if (result.status === 401 || result.status === 403) {
       this.status = 'unauthenticated'
-    } else if (result.status === 409) {
-      this.serverErrors = {
-        ...this.serverErrors,
-        base: ['This record was changed by someone else — refresh to see the latest version.'],
-      }
     } else {
       this.serverErrors = { ...this.serverErrors, ...this.refieldErrors(result.errors ?? {}) }
     }
@@ -407,7 +387,6 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     }
     if (envelope.abilities !== undefined) this.abilities = envelope.abilities ?? null
     if (envelope.can !== undefined) this.canMap = envelope.can ?? {}
-    if (envelope.version !== undefined) this.version = envelope.version ?? null
     this.serverIssues = envelope.issues ?? []
     this.baseline = this.snapshotDraft()
     this.notifyAll()

@@ -59,6 +59,7 @@ export {
 } from './form-handle.js'
 export { NestedArrayManager, type NestedChild } from './nested.js'
 export { useForm, useEditForm, useNewForm, type UseFormOptions } from './use-form.js'
+export { useGeneratedForm, type UseGeneratedFormOptions } from './generated-form.js'
 
 // Error utilities
 export {
