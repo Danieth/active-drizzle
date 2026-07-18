@@ -114,3 +114,38 @@ expose  (codegen ceiling)   what CAN ever be seen        — static, per control
 ```
 
 The server enforces at every layer regardless of what the client renders.
+
+## The envelope is a wire contract (v1)
+
+The envelope is **not** an implementation detail of the generated client — it
+is the stable seam a second client (mobile, another team, curl) builds
+against. Contract, versioned here:
+
+```
+GET  <base>/:id            → { record, abilities, can, version }
+PATCH <base>/:id
+  body: { data: { ...changedFields, <assoc>Attributes?: [...], _event?: string },
+          version?: string }
+  →   the same envelope, recomputed against the SAVED record
+POST <base>                → the same envelope (when abilities is enabled)
+
+record     expose-filtered serialization (+ get includes); pk always present
+abilities  { [field]: 'edit' | 'view' } — edit iff permitted for THIS user on
+           THIS record; view iff exposed; absent otherwise
+can        { [stateEvent]: boolean } — server-computed with full data
+version    optimistic-lock token (updatedAt-derived); echo it on PATCH;
+           mismatch → 409
+issues     [{ field, code: 'forbidden' }] — present when a PATCH contained
+           stripped non-permitted fields
+
+Errors: 401/403 (auth) · 404 · 409 (version conflict) ·
+        422 { errors: { [field | 'base' | 'assoc[id:N|new:K].field']: string[] } }
+        (transition failures arrive as base with code transition_blocked)
+
+Nested writes: [{ id, ...diff } | { id, _destroy: true } | { ...fields, _key }]
+               — _key is client-ephemeral identity, echoed in 422 paths,
+               never stored
+```
+
+Compatibility promise: additive fields may appear on the envelope; the
+meanings above don't change without a major version.

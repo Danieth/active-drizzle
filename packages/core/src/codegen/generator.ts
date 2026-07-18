@@ -477,7 +477,11 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta): s
   lines.push(`      const list = Array.isArray(validators) ? validators : [validators];`);
   lines.push(`      for (const fn of list) {`);
   lines.push(`        if (typeof fn !== 'function') continue;`);
-  lines.push(`        try { _push(field, fn(value, this, field)); } catch { /* server-only gate — degrade */ }`);
+  lines.push(`        try { _push(field, fn(value, this, field)); } catch (e) {`);
+  lines.push(`          if (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production') {`);
+  lines.push(`            console.warn('[active-drizzle] validator for "' + field + '" threw client-side (treated as server-only):', e);`);
+  lines.push(`          }`);
+  lines.push(`        }`);
   lines.push(`      }`);
   lines.push(`    };`);
 

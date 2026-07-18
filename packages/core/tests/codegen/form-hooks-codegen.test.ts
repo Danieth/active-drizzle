@@ -11,6 +11,8 @@
 import { describe, it, expect } from 'vitest'
 import { createTestProject } from '../helpers/index.js'
 import { generateReactHooks } from '../../src/codegen/react-generator.js'
+import { extractControllers } from '../../src/codegen/controller-extractor.js'
+import { Project } from 'ts-morph'
 import type { CtrlMeta, CtrlProjectMeta } from '../../src/codegen/controller-types.js'
 import type { ProjectMeta } from '../../src/codegen/types.js'
 
@@ -171,5 +173,81 @@ export class Note extends ApplicationRecord {
     expect(out).toContain(`notes: { kind: 'nested', orderBy: 'position', fields: {`)
     expect(out).toContain(`body: { kind: 'string', label: "Note" }`)
     expect(out).toContain(`position: { kind: 'integer' }`)
+  })
+})
+
+describe('review findings — write types and state typing', () => {
+  it('permit: [...SPREAD] of a local const resolves (write type not empty)', () => {
+    const project = createTestProject({
+      schema: loansSchema,
+      models: { 'Loan.model.ts': loanModel },
+    })
+    const ctrlSource = `
+import { controller, crud } from '@active-drizzle/controller'
+class Loan {}
+const EDITABLE = ['amount', 'purpose'] as const
+
+@controller()
+@crud(Loan, {
+  get: { expose: ['id', 'amount', 'purpose', 'status'], abilities: true },
+  create: { permit: [...EDITABLE] },
+  update: { permit: (ctx: any, ctrl: any, r: any) => (r.isDraft() ? [...EDITABLE] : []) },
+})
+class LoanController {}
+`
+    const p2 = new Project({ useInMemoryFileSystem: true, compilerOptions: { strict: false } })
+    p2.createSourceFile('/src/loan.ctrl.ts', ctrlSource)
+    const ctrl = extractControllers(p2, ['/src/loan.ctrl.ts']).controllers[0]!
+    expect(ctrl.crudConfig?.create?.permit).toEqual(['amount', 'purpose'])
+
+    const projectMeta: ProjectMeta = {
+      schema: project.extractSchema(),
+      models: [project.extractModel('Loan.model.ts')],
+    }
+    const out = generateReactHooks({ controllers: [ctrl] } as CtrlProjectMeta, projectMeta, '/out')
+      .find(f => f.filePath.includes('loan.gen'))!.content
+    expect(out).toContain(`export type LoanWrite = Pick<LoanAttrs, 'amount' | 'purpose'>`)
+  })
+
+  it('all-dynamic permits fall back to expose-derived write type', () => {
+    const out = generate({
+      crudConfig: {
+        get: { expose: ['id', 'amount', 'purpose', 'updatedAt'], abilities: true },
+        // both permits dynamic → extracted as undefined
+      },
+    } as Partial<CtrlMeta>)
+    // id/updatedAt never writable; the rest form the static Write type
+    expect(out).toContain(`export type LoanWrite = Pick<LoanAttrs, 'amount' | 'purpose'>`)
+  })
+
+  it('Attr.state fields are typed as label unions in Attrs and declares', () => {
+    const out = generate()
+    expect(out).toMatch(/status\??: 'draft' \| 'submitted'/)
+    expect(out).not.toMatch(/status\??: number/)
+  })
+
+  it('dev-mode warn is emitted inside the validator catch', () => {
+    const project = createTestProject({
+      schema: loansSchema,
+      models: { 'Loan.model.ts': `
+import { ApplicationRecord, model, Attr, Validates } from 'active-drizzle'
+@model('loans')
+export class Loan extends ApplicationRecord {
+  static purpose = Attr.string({ validates: Validates.presence() })
+}
+` },
+    })
+    const projectMeta: ProjectMeta = {
+      schema: project.extractSchema(),
+      models: [project.extractModel('Loan.model.ts')],
+    }
+    const ctrl: CtrlMeta = {
+      filePath: '/x.ctrl.ts', className: 'LoanController', basePath: '/loans',
+      scopes: [], kind: 'crud', modelClass: 'Loan', mutations: [], actions: [],
+      crudConfig: { get: { expose: ['id', 'purpose'], abilities: true }, update: { permit: ['purpose'] }, create: { permit: ['purpose'] } },
+    } as CtrlMeta
+    const out = generateReactHooks({ controllers: [ctrl] } as CtrlProjectMeta, projectMeta, '/out')
+      .find(f => f.filePath.includes('loan.gen'))!.content
+    expect(out).toContain('threw client-side (treated as server-only)')
   })
 })

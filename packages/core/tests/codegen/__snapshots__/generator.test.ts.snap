@@ -171,7 +171,11 @@ class AssetClient {
       const list = Array.isArray(validators) ? validators : [validators];
       for (const fn of list) {
         if (typeof fn !== 'function') continue;
-        try { _push(field, fn(value, this, field)); } catch { /* server-only gate — degrade */ }
+        try { _push(field, fn(value, this, field)); } catch (e) {
+          if (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production') {
+            console.warn('[active-drizzle] validator for "' + field + '" threw client-side (treated as server-only):', e);
+          }
+        }
       }
     };
     if ((this as any).business) {

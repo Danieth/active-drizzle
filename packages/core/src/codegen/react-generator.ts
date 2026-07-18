@@ -178,6 +178,12 @@ function generateControllerFile(
     for (const e of model.enums) {
       enumByProp.set(e.propertyName, Object.keys(e.values).map(k => `'${k}'`).join(' | '))
     }
+    // Attr.state fields hydrate as LABELS over the wire, exactly like enums —
+    // without this, `stage` would be typed number while runtime yields 'draft'
+    // (the class of bug this framework exists to prevent, in its own output)
+    for (const st of model.states ?? []) {
+      enumByProp.set(st.propertyName, Object.keys(st.values).map(k => `'${k}'`).join(' | '))
+    }
 
     const allIncludes = new Set([
       ...(ctrl.crudConfig?.get?.include ?? []),
@@ -211,7 +217,14 @@ function generateControllerFile(
     // TWrite
     const createPermit = ctrl.crudConfig?.create?.permit ?? []
     const updatePermit = ctrl.crudConfig?.update?.permit ?? ctrl.crudConfig?.create?.permit ?? []
-    const writableFields = [...new Set([...createPermit, ...updatePermit])]
+    let writableFields = [...new Set([...createPermit, ...updatePermit])]
+    // Every permit dynamic (record-aware fns extract as undefined) → the
+    // static Write TYPE falls back to expose minus the never-writable columns.
+    // Compile-time convenience only: the runtime permit still strips.
+    if (writableFields.length === 0 && ctrl.crudConfig?.get?.expose?.length) {
+      const NEVER_WRITABLE = new Set(['id', 'createdAt', 'updatedAt'])
+      writableFields = ctrl.crudConfig.get.expose.filter(f => !NEVER_WRITABLE.has(f))
+    }
 
     // Separate regular fields from attachment fields
     const attachmentNames = new Set((ctrl.attachments ?? []).map(a => a.name))
@@ -400,7 +413,14 @@ function generateControllerFile(
       L.push(`      const list = Array.isArray(validators) ? validators : [validators]`)
       L.push(`      for (const fn of list) {`)
       L.push(`        if (typeof fn !== 'function') continue`)
-      L.push(`        try { _push(field, fn(value, this, field)) } catch { /* server-only gate */ }`)
+      L.push(`        try { _push(field, fn(value, this, field)) } catch (e) {`)
+      L.push(`          // A throw here USUALLY means a record-gate touched a field outside`)
+      L.push(`          // this projection (fine — the server runs the full rule). In dev,`)
+      L.push(`          // surface it so a genuinely broken validator can't hide behind the gate.`)
+      L.push(`          if (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production') {`)
+      L.push(`            console.warn('[active-drizzle] validator for "' + field + '" threw client-side (treated as server-only):', e)`)
+      L.push(`          }`)
+      L.push(`        }`)
       L.push(`      }`)
       L.push(`    }`)
       for (const [prop, code] of clientPropValidations) {

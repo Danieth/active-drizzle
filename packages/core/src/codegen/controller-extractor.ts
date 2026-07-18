@@ -348,10 +348,11 @@ function parseConfigObject(node: Node): Record<string, any> {
     if (Node.isObjectLiteralExpression(v)) {
       result[key] = parseConfigObject(v)
     } else if (Node.isArrayLiteralExpression(v)) {
-      result[key] = v.getElements()
-        .map(e => unwrapAs(e))
-        .filter(Node.isStringLiteral)
-        .map(e => e.getLiteralValue())
+      result[key] = resolveStringArray(v)
+    } else if (Node.isIdentifier(v)) {
+      // permit: EDITABLE — a const array declared nearby
+      const resolved = resolveIdentifierArray(v)
+      if (resolved) result[key] = resolved
     } else if (Node.isStringLiteral(v)) {
       result[key] = v.getLiteralValue()
     } else if (Node.isNumericLiteral(v)) {
@@ -364,6 +365,44 @@ function parseConfigObject(node: Node): Record<string, any> {
     // functions and anything else: intentionally omitted (see doc comment)
   }
   return result
+}
+
+/**
+ * Flattens a string array literal INCLUDING spreads of local const arrays —
+ * `permit: [...EDITABLE, 'extra']` is the idiomatic DRY form and silently
+ * dropping the spread would empty a security-relevant list.
+ */
+function resolveStringArray(arr: Node): string[] {
+  if (!Node.isArrayLiteralExpression(arr)) return []
+  const out: string[] = []
+  for (const el of arr.getElements()) {
+    const e = unwrapAs(el)
+    if (Node.isStringLiteral(e)) {
+      out.push(e.getLiteralValue())
+    } else if (Node.isSpreadElement(e)) {
+      const inner = unwrapAs(e.getExpression())
+      if (Node.isIdentifier(inner)) {
+        const resolved = resolveIdentifierArray(inner)
+        if (resolved) out.push(...resolved)
+      } else if (Node.isArrayLiteralExpression(inner)) {
+        out.push(...resolveStringArray(inner))
+      }
+    }
+  }
+  return out
+}
+
+/** Follows an identifier to a same-file `const X = [...] (as const)` declaration. */
+function resolveIdentifierArray(id: Node): string[] | null {
+  if (!Node.isIdentifier(id)) return null
+  for (const def of id.getDefinitionNodes()) {
+    if (!Node.isVariableDeclaration(def)) continue
+    const init = def.getInitializer()
+    if (!init) continue
+    const unwrapped = unwrapAs(init)
+    if (Node.isArrayLiteralExpression(unwrapped)) return resolveStringArray(unwrapped)
+  }
+  return null
 }
 
 /** Strips `as const` / parens so `['a'] as const` parses like `['a']`. */
