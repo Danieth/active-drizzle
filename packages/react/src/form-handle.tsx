@@ -11,9 +11,18 @@
  * for programmatic reads. Each field subscribes to ITS OWN slice of the
  * FormSession via useSyncExternalStore — a keystroke re-renders one field.
  */
-import React, { useSyncExternalStore, type FC, type ReactNode } from 'react'
+import React, { createContext, useContext, useSyncExternalStore, type FC, type ReactNode } from 'react'
 import { FormSession, type SessionStatus } from './form-session.js'
 import { resolvePresenter, checkRequiredMeta, type PresenterBind } from './presenters.js'
+
+/**
+ * Context decides what COMMIT does — the presenter never knows:
+ *   inside <Form>          → 'stage'    (batch; Submit sends the diff)
+ *   inside <Form autosave> → 'autosave' (single-field PATCH per commit)
+ *   no Form at all         → 'autosave' by definition (the handle owns the
+ *                            transport; without one, commits just stage)
+ */
+const FormModeContext = createContext<'stage' | 'autosave' | null>(null)
 
 export interface FieldProps {
   /** absent → view · true → Attr/default edit presenter · string → named override. Never inferred. */
@@ -85,6 +94,8 @@ export function createFormHandle<T extends Record<string, any>>(
         () => session.fieldVersion(channel),
         () => session.fieldVersion(channel),
       )
+      const contextMode = useContext(FormModeContext)
+      const commitMode: 'stage' | 'autosave' = contextMode ?? 'autosave'
 
       const rawMeta = fieldMeta[field] ?? {}
       const meta = resolveCopy(rawMeta, session.draft)
@@ -112,13 +123,27 @@ export function createFormHandle<T extends Record<string, any>>(
         name: field,
         onChange: (value: any) => {
           session.setValue(field, value)
-          // Discrete inputs (toggle/select) commit on change — errors become
-          // visible immediately, and autosave contexts will PATCH here (M4)
-          if (commitMoment === 'change') session.touch(field)
+          // Discrete inputs (toggle/select) commit on change — instant
+          // autosave in autosave contexts, staged + errors-visible otherwise
+          if (commitMoment === 'change') void session.commitField(field, commitMode)
         },
-        onCommit: () => session.touch(field),
-        onBlur: () => session.touch(field),
-        disabled: session.getStatus() === 'saving',
+        onCommit: () => void session.commitField(field, commitMode),
+        onBlur: (e?: { relatedTarget?: any }) => {
+          // C10: blur fires before a Cancel button's click — a blur INTO an
+          // element marked data-ad-cancel must not autosave first
+          const cancelIntent = Boolean(
+            e?.relatedTarget?.closest?.('[data-ad-cancel]') ?? e?.relatedTarget?.dataset?.adCancel,
+          )
+          if (cancelIntent) session.touch(field)
+          else void session.commitField(field, commitMode)
+        },
+        onCompositionStart: () => session.beginComposition(field),
+        onCompositionEnd: () => {
+          // C11: IME composition commits once, at composition end
+          session.endComposition(field)
+          if (commitMoment === 'change') void session.commitField(field, commitMode)
+        },
+        disabled: session.getStatus() === 'saving' || session.fieldState(field) === 'saving',
       }
 
       const overrides: Record<string, any> = { ...(props.props ?? {}) }
@@ -135,7 +160,7 @@ export function createFormHandle<T extends Record<string, any>>(
           mode={resolved.mode}
           draft={session.draft}
           errors={session.visibleErrors(field)}
-          state={session.getStatus()}
+          state={session.fieldState(field) !== 'ready' ? session.fieldState(field) : session.getStatus()}
         />
       )
     }
@@ -149,15 +174,17 @@ export function createFormHandle<T extends Record<string, any>>(
     return Field as FieldComponent
   }
 
-  const FormComponent: FC<{ children?: ReactNode; onSuccess?: () => void }> = ({ children, onSuccess }) => (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault()
-        void session.submit().then((ok) => { if (ok) onSuccess?.() })
-      }}
-    >
-      {children}
-    </form>
+  const FormComponent: FC<{ children?: ReactNode; onSuccess?: () => void; autosave?: boolean }> = ({ children, onSuccess, autosave }) => (
+    <FormModeContext.Provider value={autosave ? 'autosave' : 'stage'}>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault()
+          void session.submit().then((ok) => { if (ok) onSuccess?.() })
+        }}
+      >
+        {children}
+      </form>
+    </FormModeContext.Provider>
   )
   FormComponent.displayName = 'AdForm'
 

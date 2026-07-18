@@ -30,7 +30,14 @@ export interface PresenterBind {
   onChange: (value: any) => void
   /** The presenter's natural commit moment fires this (blur for text, change for toggles). */
   onCommit: () => void
-  onBlur: () => void
+  /**
+   * Pass the focus event through — a blur into an element marked
+   * `data-ad-cancel` skips the autosave commit (C10).
+   */
+  onBlur: (e?: { relatedTarget?: any }) => void
+  /** IME guards — while composing, commit-on-change is suppressed (C11). */
+  onCompositionStart: () => void
+  onCompositionEnd: () => void
   disabled: boolean
 }
 

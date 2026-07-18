@@ -68,6 +68,10 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   private status: SessionStatus = 'ready'
   private serverErrors: Record<string, string[]> = {}
   private serverIssues: Array<{ field: string; code: string }> = []
+  /** Per-field autosave lifecycle for save-indicators (spinner/checkmark). */
+  private fieldStates = new Map<string, 'saving' | 'saved' | 'error'>()
+  /** Fields mid-IME-composition — commit-on-change is suppressed (C11). */
+  private composing = new Set<string>()
 
   /** Baseline for the submit diff — reset on load and on successful submit. */
   private baseline: Record<string, any>
@@ -103,6 +107,8 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     // Editing again after a settled submit returns the session to ready —
     // otherwise 'saved'/'error' stick forever and save-indicators lie
     if (this.status === 'saved' || this.status === 'error') this.status = 'ready'
+    const fs = this.fieldStates.get(field)
+    if (fs === 'saved' || fs === 'error') this.fieldStates.delete(field)
     this.notify(field)
   }
 
@@ -150,6 +156,15 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   getStatus(): SessionStatus { return this.status }
   getVersion(): string | null { return this.version }
   getIssues(): Array<{ field: string; code: string }> { return this.serverIssues }
+
+  /** Per-field autosave state — 'ready' when nothing is in flight. */
+  fieldState(field: string): 'ready' | 'saving' | 'saved' | 'error' {
+    return this.fieldStates.get(field) ?? 'ready'
+  }
+
+  beginComposition(field: string): void { this.composing.add(field) }
+  endComposition(field: string): void { this.composing.delete(field) }
+  isComposing(field: string): boolean { return this.composing.has(field) }
 
   // ── Errors ────────────────────────────────────────────────────────────────
 
@@ -241,6 +256,64 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
       this.serverErrors = this.refieldErrors(result.errors ?? {})
       this.status = 'error'
     }
+    this.notifyAll()
+    return false
+  }
+
+  /**
+   * Commit ONE field under the given policy. 'stage' just marks touched
+   * (batch submit sends it later). 'autosave' sends a single-field PATCH:
+   * optimistic (the draft already holds the value), rolled back on failure,
+   * gated by that field's own validators, no-op when the field is clean or
+   * mid-composition (C11). Errors land on the field like any other.
+   */
+  async commitField(field: string, mode: 'stage' | 'autosave'): Promise<boolean> {
+    this.touch(field)
+    if (mode !== 'autosave' || !this.submitFn) return true
+    if (this.composing.has(field)) return true
+
+    const now = this.snapshotDraft()
+    if (valueEquals(this.baseline[field], now[field])) return true   // clean → no PATCH
+
+    // Field-local validation gate: never autosave a value the client knows is bad
+    const fieldErrors = this.allErrors()[field] ?? []
+    if (fieldErrors.length > 0) {
+      this.notify(field)
+      return false
+    }
+
+    const previous = this.baseline[field]
+    this.fieldStates.set(field, 'saving')
+    this.notify(field)
+
+    let result: SubmitResult
+    try {
+      result = await this.submitFn({ data: { [field]: now[field] }, version: this.version })
+    } catch {
+      result = { ok: false, status: 0 }
+    }
+
+    if (result.ok) {
+      if (result.envelope) this.applyEnvelope(result.envelope)
+      else this.baseline[field] = now[field]
+      this.fieldStates.set(field, 'saved')
+      this.notify(field)
+      return true
+    }
+
+    // Rollback the optimistic write — the field shows what the server has
+    ;(this.draft as any)[field] = previous
+    if (result.status === 401 || result.status === 403) {
+      this.status = 'unauthenticated'
+    } else if (result.status === 409) {
+      this.serverErrors = {
+        ...this.serverErrors,
+        base: ['This record was changed by someone else — refresh to see the latest version.'],
+      }
+    } else {
+      this.serverErrors = { ...this.serverErrors, ...this.refieldErrors(result.errors ?? {}) }
+    }
+    this.fieldStates.set(field, 'error')
     this.notifyAll()
     return false
   }

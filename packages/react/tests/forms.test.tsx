@@ -398,3 +398,127 @@ describe('status returns to ready on edit', () => {
     expect(session.getStatus()).toBe('ready')
   })
 })
+
+// ── M4: autosave (T6/T7 + C10/C11 + rollback) ────────────────────────────────
+
+describe('M4 — autosave', () => {
+  function AutoInput({ value, bind }: PresenterProps) {
+    return (
+      <input
+        aria-label={bind.name}
+        value={value ?? ''}
+        disabled={bind.disabled}
+        onChange={(e) => bind.onChange(e.target.value)}
+        onBlur={(e) => bind.onBlur(e)}
+        onCompositionStart={bind.onCompositionStart}
+        onCompositionEnd={bind.onCompositionEnd}
+      />
+    )
+  }
+
+  beforeEach(() => {
+    registerPresenter('autoText', { kind: '*', commit: 'blur', component: AutoInput })
+  })
+
+  it('T6: standalone field autosaves the single-field diff on blur', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const { handle: loan, session } = makeHandle({ submit: submitSpy })
+
+    render(<loan.amount edit="autoText" />)   // NO Form → autosave by definition
+    const input = screen.getByRole('textbox')
+    fireEvent.change(input, { target: { value: '300000' } })
+    expect(submitSpy).not.toHaveBeenCalled()  // typing alone never PATCHes
+
+    fireEvent.blur(input)
+    await waitFor(() => expect(submitSpy).toHaveBeenCalledTimes(1))
+    expect(submitSpy.mock.calls[0]![0]).toEqual({ data: { amount: '300000' }, version: 'v1' })
+    await waitFor(() => expect(session.fieldState('amount')).toBe('saved'))
+  })
+
+  it('inside <Form autosave>, a toggle PATCHes instantly on flip', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const { handle: loan } = makeHandle({ submit: submitSpy })
+
+    render(<loan.Form autosave><loan.isPublished edit /></loan.Form>)
+    fireEvent.click(screen.getByRole('switch'))
+    await waitFor(() => expect(submitSpy).toHaveBeenCalledTimes(1))
+    expect(submitSpy.mock.calls[0]![0].data).toEqual({ isPublished: true })
+  })
+
+  it('inside plain <Form>, blur only stages — no PATCH until Submit', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const { handle: loan } = makeHandle({ submit: submitSpy })
+
+    render(<loan.Form><loan.amount edit="autoText" /></loan.Form>)
+    const input = screen.getByRole('textbox')
+    fireEvent.change(input, { target: { value: '1' } })
+    fireEvent.blur(input)
+    await new Promise(r => setTimeout(r, 10))
+    expect(submitSpy).not.toHaveBeenCalled()
+  })
+
+  it('T7: local validator blocks the autosave — zero PATCHes, error shown', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const validate = (d: any) => (Number(d.amount) > 0 ? {} : { amount: ['must be positive'] })
+    const { handle: loan } = makeHandle({ submit: submitSpy, validate })
+
+    render(<loan.amount edit="autoText" />)
+    const input = screen.getByRole('textbox')
+    fireEvent.change(input, { target: { value: '-5' } })
+    fireEvent.blur(input)
+    await new Promise(r => setTimeout(r, 10))
+    expect(submitSpy).not.toHaveBeenCalled()
+  })
+
+  it('failure rolls the optimistic value back and marks the field errored', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> =>
+      ({ ok: false, status: 422, errors: { amount: ['too big'] } }))
+    const { handle: loan, session } = makeHandle({ submit: submitSpy })
+
+    render(<loan.amount edit="autoText" />)
+    const input = screen.getByRole('textbox')
+    fireEvent.change(input, { target: { value: '999' } })
+    fireEvent.blur(input)
+
+    await waitFor(() => expect(session.fieldState('amount')).toBe('error'))
+    expect(session.getValue('amount')).toBe('250000')   // rolled back
+    expect(session.allErrors().amount).toContain('too big')
+  })
+
+  it('C10: blur into a data-ad-cancel element does NOT autosave', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const { handle: loan } = makeHandle({ submit: submitSpy })
+
+    render(
+      <>
+        <loan.amount edit="autoText" />
+        <button data-ad-cancel>Cancel</button>
+      </>,
+    )
+    const input = screen.getByRole('textbox')
+    const cancel = screen.getByRole('button', { name: 'Cancel' })
+    fireEvent.change(input, { target: { value: '5' } })
+    fireEvent.blur(input, { relatedTarget: cancel })
+    await new Promise(r => setTimeout(r, 10))
+    expect(submitSpy).not.toHaveBeenCalled()
+  })
+
+  it('C11: no commit while composing; one commit at composition end', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const { handle: loan } = makeHandle({ submit: submitSpy })
+    registerPresenter('autoTextChange', { kind: '*', commit: 'change', component: AutoInput })
+
+    render(<loan.amount edit="autoTextChange" />)
+    const input = screen.getByRole('textbox')
+
+    fireEvent.compositionStart(input)
+    fireEvent.change(input, { target: { value: 'に' } })
+    fireEvent.change(input, { target: { value: 'にほ' } })
+    await new Promise(r => setTimeout(r, 10))
+    expect(submitSpy).not.toHaveBeenCalled()           // suppressed mid-composition
+
+    fireEvent.compositionEnd(input)
+    await waitFor(() => expect(submitSpy).toHaveBeenCalledTimes(1))
+    expect(submitSpy.mock.calls[0]![0].data).toEqual({ amount: 'にほ' })
+  })
+})
