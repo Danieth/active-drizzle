@@ -397,6 +397,44 @@ describe('nested-nested forms', () => {
   })
 })
 
+// ── allow_destroy: destroying persisted rows is a model-level opt-in ─────────
+
+describe('allowDestroy gating', () => {
+  const metaNoDestroy = { ...FIELD_META, assets: { ...FIELD_META.assets, allowDestroy: false } }
+
+  it('without allowDestroy: persisted rows have no Remove and never send _destroy', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const session = new FormSession({
+      draft: { id: 1, amount: '100', assets: [{ id: 7, name: 'Truck', value: '1' }] },
+      mode: 'edit', abilities: null, submit: submitSpy,
+    })
+    const loan: any = createFormHandle(session, { fieldMeta: metaNoDestroy as any })
+    renderAssets(loan)
+
+    // Persisted row: no Remove button rendered
+    expect(screen.queryByRole('button', { name: /Remove id:7/ })).toBeNull()
+
+    // Even a forced programmatic remove marks nothing for destruction
+    const mgr: any = session.getNested('assets')
+    mgr.remove('id:7')
+    expect(mgr.visible()).toHaveLength(1)
+    expect(mgr.attributesPayload()).toBeNull()
+  })
+
+  it('without allowDestroy: NEW rows are still removable (nothing to destroy)', () => {
+    const session = new FormSession({
+      draft: { id: 1, amount: '100', assets: [] },
+      mode: 'edit', abilities: null,
+    })
+    const loan: any = createFormHandle(session, { fieldMeta: metaNoDestroy as any })
+    renderAssets(loan)
+    fireEvent.click(screen.getByRole('button', { name: 'Add asset' }))
+    expect(screen.getAllByRole('textbox', { name: 'name' })).toHaveLength(1)
+    fireEvent.click(screen.getByRole('button', { name: /Remove new:1/ }))
+    expect(screen.queryByRole('textbox', { name: 'name' })).toBeNull()
+  })
+})
+
 // ── Permit-governed nested arrays: the abilities mask locks the tree ─────────
 
 describe('permit-governed nested arrays (self-locking)', () => {

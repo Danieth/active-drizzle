@@ -149,7 +149,7 @@ export const notes = pgTable('notes', {
 import { ApplicationRecord, model, Attr, hasMany } from 'active-drizzle'
 @model('deals')
 export class Deal extends ApplicationRecord {
-  static notes = hasMany('notes', { acceptsNested: true, order: { position: 'asc' } })
+  static notes = hasMany('notes', { acceptsNested: { allowDestroy: true }, order: { position: 'asc' } })
 }
 `
     const noteModel = `
@@ -178,11 +178,14 @@ export class Note extends ApplicationRecord {
       get: { expose: ['id', 'name'], abilities: true, include: ['notes'] },
       update: { permit: ['name', 'notesAttributes'] }, create: { permit: ['name', 'notesAttributes'] },
     })
-    expect(out).toContain(`notes: { kind: 'nested', orderBy: 'position', fields: {`)
+    expect(out).toContain(`notes: { kind: 'nested', allowDestroy: true, orderBy: 'position', fields: {`)
     expect(out).toContain(`body: { kind: 'string', label: "Note" }`)
     expect(out).toContain(`position: { kind: 'integer' }`)
     expect(out).toContain(`notesAttributes?: Array<Record<string, any> & { id?: number; _destroy?: boolean; _key?: string }>`)
     expect(out).not.toContain(`'notesAttributes'>`)   // never a Pick key — it isn't a column
+    // The parent foreign key is NEVER advertised as an editable child field
+    // (it is forced server-side; the sanitizer strips it) — dealId absent
+    expect(out).not.toContain(`dealId:`)
 
     // Fail-closed gate: both permits static and neither includes
     // notesAttributes → the server would strip every nested write, so the

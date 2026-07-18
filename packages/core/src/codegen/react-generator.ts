@@ -356,15 +356,25 @@ function generateControllerFile(
         if (!childModel) continue
         const childCols = projectMeta?.schema.tables[childModel.tableName]?.columns ?? []
         const childColTypes = new Map(childCols.map(c => [c.name, c.type as string]))
+        // Fields the server-side sanitizer strips must not be advertised as
+        // editable: the parent fk (forced server-side) and the STI
+        // discriminator `type` never appear in child meta
+        const parentFk = assoc.foreignKey ?? `${pluralize.singular(model.tableName)}Id`
         const fieldParts: string[] = []
         for (const col of childCols) {
           if (col.primaryKey) continue
+          if (col.name === parentFk || col.name === 'type') continue
           const cm = childModel.fieldMeta?.[col.name]
           const kind = cm?.semantic ?? cm?.kind ?? fieldKind(col.name, childModel, childColTypes)
           const label = cm?.label ? `, label: ${JSON.stringify(cm.label)}` : ''
           fieldParts.push(`${col.name}: { kind: '${kind}'${label} }`)
         }
         const orderBy = assoc.order && typeof assoc.order === 'object' ? Object.keys(assoc.order)[0] : undefined
+        // Rails' allow_destroy: destroy is an explicit model-level opt-in;
+        // the meta carries the verdict so the runtime hides Remove for
+        // persisted rows when destroying is off
+        const acceptsOpt = (assoc.options as any)?.acceptsNested
+        const allowDestroy = typeof acceptsOpt === 'object' && acceptsOpt?.allowDestroy === true
         // Child rows validate client-side with the SAME shippable rules the
         // child model declares — an empty Note.body errors in the form, not
         // as a server 422 round-trip (#7 in the audit)
@@ -377,7 +387,7 @@ function generateControllerFile(
           validatePart = `, validate: (d: any) => { const e: Record<string, string[]> = {}; const _push = (f: string, m: unknown) => { if (typeof m === 'string' && m.trim()) (e[f] ??= []).push(m.trim()) }; const _run = (f: string, v: any, val: any) => { const l = Array.isArray(v) ? v : [v]; for (const fn of l) { if (typeof fn !== 'function') continue; try { _push(f, fn(val, d, f)) } catch { /* server-only gate */ } } }; ${runs}; return e }`
         }
         nestedEntries.push(
-          `    ${assoc.propertyName}: { kind: 'nested'${orderBy ? `, orderBy: '${orderBy}'` : ''}${validatePart}, fields: { ${fieldParts.join(', ')} } },`,
+          `    ${assoc.propertyName}: { kind: 'nested', allowDestroy: ${allowDestroy}${orderBy ? `, orderBy: '${orderBy}'` : ''}${validatePart}, fields: { ${fieldParts.join(', ')} } },`,
         )
       }
       // Every field the typed handle declares gets a meta entry — a handle

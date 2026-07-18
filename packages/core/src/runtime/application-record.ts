@@ -551,6 +551,12 @@ export class ApplicationRecord {
 
       return true
     } catch (err) {
+      if (err instanceof NestedAttributesError) {
+        // Forged/foreign nested ids surface as a validation failure (422),
+        // matching the shape a failed validation already has
+        this.errors.add(err.field, err.message)
+        return false
+      }
       return this._handleDbError(err, isNew ? 'insert' : 'update')
     }
   }
@@ -1112,7 +1118,54 @@ function _isNestedAttrsKey(key: string, ctor: any): boolean {
   if (!key.endsWith('Attributes')) return false
   const assocName = key.slice(0, -'Attributes'.length)
   const marker = ctor[assocName]
-  return marker?._type === 'hasMany' && marker.options?.acceptsNested === true
+  // acceptsNested: true | { allowDestroy?: boolean } — any truthy value opts in
+  return marker?._type === 'hasMany' && Boolean(marker.options?.acceptsNested)
+}
+
+/**
+ * A nested-attributes item referenced a row that doesn't belong to the owner
+ * (or doesn't exist). save() converts this into a validation error and
+ * returns false — the same 422 shape a failed validation has — instead of
+ * letting a forged child id update, re-parent, or destroy foreign rows.
+ */
+export class NestedAttributesError extends Error {
+  constructor(readonly field: string, message: string) {
+    super(message)
+    this.name = 'NestedAttributesError'
+  }
+}
+
+/**
+ * Public duck-typing helper (used by @active-drizzle/controller to sanitize
+ * nested writes without a hard dependency): the acceptsNested associations
+ * of a model with their wire key, forced foreign key, destroy policy, and
+ * resolved child model class.
+ */
+export function resolveNestedAssociations(model: any): Array<{
+  name: string
+  attrsKey: string
+  fkField: string
+  allowDestroy: boolean
+  childModel: any
+}> {
+  const out: Array<{ name: string; attrsKey: string; fkField: string; allowDestroy: boolean; childModel: any }> = []
+  if (!model) return out
+  for (const key of Object.getOwnPropertyNames(model)) {
+    const marker = (model as any)[key]
+    if (!marker || typeof marker !== 'object' || marker._type !== 'hasMany') continue
+    const accepts = marker.options?.acceptsNested
+    if (!accepts) continue
+    let ownerSingular: string
+    try { ownerSingular = _singularize(model.tableName) } catch { continue }
+    out.push({
+      name: key,
+      attrsKey: `${key}Attributes`,
+      fkField: (marker.options?.foreignKey as string | undefined) ?? `${ownerSingular}Id`,
+      allowDestroy: accepts === true ? false : accepts?.allowDestroy === true,
+      childModel: (() => { try { return _findModelByMarker(marker, key) } catch { return null } })(),
+    })
+  }
+  return out
 }
 
 /**
@@ -1156,18 +1209,33 @@ async function _processNestedAttributes(record: any, ctor: any, snapshot: Record
 
     const ownerSingular = _singularize(ctor.tableName)
     const fkField = (marker.options?.foreignKey as string | undefined) ?? `${ownerSingular}Id`
+    // Rails semantics: destroying children through nesting is an explicit
+    // opt-in — acceptsNested: { allowDestroy: true }. Bare `true` updates
+    // and creates only; a _destroy marker is ignored.
+    const accepts = marker.options?.acceptsNested
+    const allowDestroy = accepts !== true && accepts?.allowDestroy === true
 
     for (const item of nested) {
       // _key is the client's ephemeral identity for NEW rows (form error
       // routing) — never a column, always stripped before create/update
       const { _destroy, _key, id, ...fields } = item
-      if (_destroy && id) {
-        const child = await TargetModel.find(id)
-        if (child) await child.destroy()
-      } else if (id) {
-        const child = await TargetModel.find(id)
-        if (child) await child.update({ ...fields, [fkField]: ownerId })
-      } else {
+      if (id != null) {
+        // find() throws RecordNotFound — a bogus id is the same violation as
+        // a foreign one, so both collapse into one indistinguishable error
+        let child: any = null
+        try { child = await TargetModel.find(id) } catch { /* treated as not-ours below */ }
+        // Ownership gate: an id that is not a child of THIS record must not
+        // be reachable — otherwise any row in the child table could be
+        // updated, re-parented onto this record, or destroyed by forging ids
+        if (!child || String((child as any)[fkField]) !== String(ownerId)) {
+          throw new NestedAttributesError(key, `row ${id} is not part of this record's ${key}`)
+        }
+        if (_destroy) {
+          if (allowDestroy) await child.destroy()
+        } else {
+          await child.update({ ...fields, [fkField]: ownerId })
+        }
+      } else if (!_destroy) {
         await TargetModel.create({ ...fields, [fkField]: ownerId })
       }
     }

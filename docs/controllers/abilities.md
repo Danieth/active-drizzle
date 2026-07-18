@@ -90,6 +90,34 @@ issue). A record-aware permit locks the association exactly like a scalar:
 `deal.isDraft() ? [...EDITABLE, 'notesAttributes'] : []` means notes freeze
 with the rest of the form after submission.
 
+### The two-layer rule (model allows, controller gates)
+
+`acceptsNested` on the **model** only makes an association *nestable*. It is
+never sufficient authorization on its own — the **controller** must still
+permit `<assoc>Attributes` for a request to write it. This split matters:
+one model can back several controllers with different exposure (an admin
+controller that permits nested writes, a public one that doesn't).
+
+The server hardens every nested write regardless of what the client sends:
+
+- **Ownership is enforced.** A child `id` that isn't already a child of this
+  record can't be updated, re-parented, or destroyed — forging one fails the
+  save with a 422 (`row N is not part of this record's <assoc>`). A
+  nonexistent id fails identically, so ids can't be probed.
+- **The parent foreign key is forced**, never taken from the wire — a row
+  can't be moved between parents by sending a different fk.
+- **Server-owned fields strip** from every child row: `id` is protocol,
+  timestamps are server-owned, and the STI discriminator `type` is stripped
+  so subclasses can't be forged through nesting.
+- **Destroying is a separate opt-in.** `acceptsNested: true` accepts creates
+  and updates only; a `_destroy` marker is ignored. Destroying persisted
+  children requires `acceptsNested: { allowDestroy: true }` (Rails'
+  `allow_destroy`). The generated form hides Remove on persisted rows when
+  it's off.
+- **Grandchildren must be declared.** A nested `<x>Attributes` inside a child
+  row is only honored when the child model itself declares `acceptsNested`
+  for it — undeclared nested keys drop before they can reach an INSERT.
+
 ## Stripped writes are reported
 
 When the envelope is on, a PATCH **or POST** containing non-permitted fields
@@ -124,6 +152,11 @@ data, and fires the event **in the same save** — there is no
 saved-but-not-transitioned limbo. A blocked event → 422 with a
 `transition_blocked` base error, and nothing is saved.
 
+`_event` is a **strict allowlist**: it may only name a declared `Attr.state`
+transition. It never reaches mass assignment, and it cannot be used to invoke
+an arbitrary record method — `_event: 'destroy'` (or any other non-transition
+method) is a 400, not a call.
+
 Because the PATCH response is the same envelope as GET, a transition that
 narrows `permit` (DRAFT → SUBMITTED → `permit: []`) re-masks the response:
 every field comes back `view`, and the same UI renders read-only. **The form
@@ -138,6 +171,9 @@ expose  (codegen ceiling)   what CAN ever be seen        — static, per control
 ```
 
 The server enforces at every layer regardless of what the client renders.
+`expose` also governs **`index`** — the list endpoint serializes each row
+through the same ceiling, so a list can't leak a column the detail envelope
+hides.
 
 ## The envelope is a wire contract (v1)
 

@@ -10,8 +10,10 @@
  */
 
 import { describe, it, expect, vi } from 'vitest'
-import { defaultGet, defaultUpdate, buildRecordEnvelope } from '../src/crud-handlers.js'
-import { ValidationError } from '../src/errors.js'
+import {
+  defaultGet, defaultUpdate, defaultIndex, buildRecordEnvelope, sanitizeNestedWrites,
+} from '../src/crud-handlers.js'
+import { ValidationError, BadRequest } from '../src/errors.js'
 
 // ── Mock model + record (duck-typed ApplicationRecord surface) ───────────────
 
@@ -184,6 +186,71 @@ describe('_event transitions', () => {
     await defaultUpdate(relationFor(record), makeModel(), envelopeConfig, 1,
       { _event: 'submit' }, ctx, ctrl)
     expect((record as any)._event).toBeUndefined()
+  })
+
+  it("_event is a strict allowlist — '_event: destroy' cannot invoke arbitrary methods", async () => {
+    const record = makeRecord({ id: 1, amount: 100, status: 'DRAFT', updatedAt: new Date(1000) })
+    ;(record as any).destroy = vi.fn(async () => true)
+    await expect(
+      defaultUpdate(relationFor(record), makeModel(), envelopeConfig, 1,
+        { _event: 'destroy' }, ctx, ctrl),
+    ).rejects.toBeInstanceOf(BadRequest)
+    expect((record as any).destroy).not.toHaveBeenCalled()
+    expect(record.save).not.toHaveBeenCalled()
+  })
+})
+
+// ── Nested write sanitization (the controller-level lock) ────────────────────
+
+describe('sanitizeNestedWrites', () => {
+  function nestedModel() {
+    const m = makeModel()
+    ;(m as any).tableName = 'loans'
+    ;(m as any).notes = { _type: 'hasMany', table: 'notes', options: { acceptsNested: true } }
+    return m
+  }
+
+  it('strips server-owned fields, the parent fk, STI type, and undeclared grandchild keys', async () => {
+    const out = await sanitizeNestedWrites({
+      amount: 5,
+      notesAttributes: [{
+        id: 7, _destroy: true, _key: 'new:1', body: 'hi',
+        loanId: 999,                    // re-parent attempt — forced server-side
+        type: 'EvilSubclass',           // STI discriminator forgery
+        createdAt: 'x', updatedAt: 'y', // server-owned
+        bogusAttributes: [{ a: 1 }],    // undeclared nesting → would 500 as unknown column
+      }],
+    }, nestedModel())
+    expect(out['notesAttributes']).toEqual([{ id: 7, _destroy: true, _key: 'new:1', body: 'hi' }])
+    expect(out['amount']).toBe(5)       // flat fields untouched
+  })
+
+  it('drops non-object rows and mistyped protocol fields', async () => {
+    const out = await sanitizeNestedWrites({
+      notesAttributes: [
+        'a string', null, 42,
+        { id: { evil: true }, _destroy: 'yes', _key: 9, body: 'ok' },
+      ],
+    }, nestedModel())
+    expect(out['notesAttributes']).toEqual([{ body: 'ok' }])
+  })
+})
+
+// ── Index respects the read ceiling ──────────────────────────────────────────
+
+describe('index expose', () => {
+  it('the list endpoint cannot leak columns the GET envelope hides', async () => {
+    const record = makeRecord({ id: 1, amount: 5, status: 'DRAFT', secret: 'classified' })
+    const rel: any = {
+      count: async () => 1,
+      limit: () => rel, offset: () => rel, order: () => rel,
+      where: () => rel, includes: () => rel,
+      load: async () => [record],
+    }
+    const res = await defaultIndex(rel, makeModel(), envelopeConfig as any, {})
+    expect(res.data[0].secret).toBeUndefined()
+    expect(res.data[0].amount).toBe(5)
+    expect(res.data[0].id).toBe(1)
   })
 })
 

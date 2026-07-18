@@ -44,6 +44,13 @@ export class NestedArrayManager {
   private positionField?: string
   /** Envelope said `<name>Attributes: 'view'` — rows render read-only, no mutations. */
   private locked = false
+  /**
+   * Rails' allow_destroy: destroying PERSISTED rows through nesting is a
+   * model-level opt-in the generated meta carries down. New (unsaved) rows
+   * are always removable — dropping a row that never existed destroys
+   * nothing. Defaults true for hand-rolled meta; generated meta is explicit.
+   */
+  readonly allowDestroy: boolean
 
   constructor(
     parent: FormSession<any>,
@@ -53,10 +60,12 @@ export class NestedArrayManager {
       validate?: (draft: any) => Record<string, string[]>
       nestedKeys?: string[]
       positionField?: string
+      allowDestroy?: boolean
     } = {},
   ) {
     this.parent = parent
     this.name = name
+    this.allowDestroy = opts.allowDestroy !== false
     this.nestedKeys = new Set(opts.nestedKeys ?? [])
     if (opts.positionField) this.positionField = opts.positionField
     if (opts.validate) this.validateChild = opts.validate
@@ -155,7 +164,8 @@ export class NestedArrayManager {
     if (idx === -1) return
     const child = this.children[idx]!
     if (child.isNew) this.children.splice(idx, 1)
-    else child.destroyed = true
+    else if (this.allowDestroy) child.destroyed = true
+    else return   // destroying persisted rows is not opted in — no-op
     this.parent.notifyExternal(this.name)
   }
 
@@ -169,7 +179,7 @@ export class NestedArrayManager {
     for (const child of this.children) {
       const draft: any = child.session.draft
       if (child.destroyed) {
-        out.push({ id: draft.id, _destroy: true })
+        if (this.allowDestroy) out.push({ id: draft.id, _destroy: true })
       } else if (child.isNew) {
         const data = { ...child.session.changedData() }
         // A brand-new row's ENTIRE draft is its diff (baseline was the

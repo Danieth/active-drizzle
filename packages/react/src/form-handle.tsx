@@ -141,6 +141,7 @@ export function createFormHandle<T extends Record<string, any>>(
         ...(meta.validate ? { validate: meta.validate } : {}),
         nestedKeys: Object.keys(childFields).filter(k => childFields[k]?.kind === 'nested'),
         ...(meta.orderBy ? { positionField: meta.orderBy } : {}),
+        ...(meta.allowDestroy !== undefined ? { allowDestroy: Boolean(meta.allowDestroy) } : {}),
       },
     )
     session.registerNested(name, manager)
@@ -151,6 +152,9 @@ export function createFormHandle<T extends Record<string, any>>(
       if (h) return h
       const RemoveComponent: FC<{ children?: ReactNode; className?: string }> = ({ children, className }) => {
         if (manager.isLocked()) return null
+        // Persisted rows only expose Remove when the model opted into
+        // allow_destroy; new rows are always droppable (nothing to destroy)
+        if (!child.isNew && !manager.allowDestroy) return null
         return (
           <button type="button" {...(className !== undefined ? { className } : {})} onClick={() => manager.remove(child.key)}>
             {children ?? 'Remove'}

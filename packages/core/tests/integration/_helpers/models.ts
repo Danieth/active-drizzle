@@ -111,7 +111,7 @@ export function getAfterCommitLog()   { return afterCommitFired }
 @model('orders')
 export class Order extends ApplicationRecord {
   static user      = belongsTo()
-  static lineItems = hasMany('line_items', { acceptsNested: true, counterCache: true } as any)
+  static lineItems = hasMany('line_items', { acceptsNested: { allowDestroy: true }, counterCache: true } as any)
 
   static status = Attr.enum({
     pending:   0,

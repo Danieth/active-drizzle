@@ -377,6 +377,94 @@ describe('acceptsNestedAttributesFor runtime', () => {
   })
 })
 
+// ── nested attributes security: ownership + allow_destroy ────────────────────
+
+describe('nested attributes security', () => {
+  @model('sec_items')
+  class SecItem extends ApplicationRecord {}
+  void SecItem
+
+  @model('sec_orders')
+  class SecOrder extends ApplicationRecord {
+    static items = hasMany('sec_items', { acceptsNested: true } as any)
+  }
+
+  @model('des_items')
+  class DesItem extends ApplicationRecord {}
+  void DesItem
+
+  @model('des_orders')
+  class DesOrder extends ApplicationRecord {
+    static items = hasMany('des_items', { acceptsNested: { allowDestroy: true } } as any)
+  }
+
+  const secSchema = {
+    sec_orders: fakeTable(['id']),
+    sec_items: fakeTable(['id', 'sec_orderId', 'name']),
+    des_orders: fakeTable(['id']),
+    des_items: fakeTable(['id', 'des_orderId', 'name']),
+  }
+
+  /** Parent INSERT returns id 10; find() resolves `childRow` (or nothing). */
+  function securityDb(childRow: any) {
+    const db: any = {
+      query: {},
+      select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => ({
+        limit: vi.fn(async () => (childRow ? [childRow] : [])),
+      })) })) })),
+      insert: vi.fn(() => ({ values: vi.fn(() => ({ returning: vi.fn(async () => [{ id: 10 }]) })) })),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: vi.fn(() => ({
+        returning: vi.fn(async () => [childRow]),
+      })) })) })),
+      delete: vi.fn(() => ({ where: vi.fn(async () => []) })),
+      transaction: vi.fn((cb: any) => cb(db)),
+    }
+    return db
+  }
+
+  it('HIJACK: a child id belonging to ANOTHER record fails the save (422), touches nothing', async () => {
+    const db = securityDb({ id: 99, sec_orderId: 777, name: 'someone elses row' })
+    boot(db, secSchema)
+    const order = new SecOrder({ itemsAttributes: [{ id: 99, name: 'pwned' }] })
+    expect(await order.save()).toBe(false)
+    expect(db.update).not.toHaveBeenCalled()     // never re-parented/overwritten
+    expect(db.delete).not.toHaveBeenCalled()
+  })
+
+  it('a NONEXISTENT child id fails identically (indistinguishable from foreign)', async () => {
+    const db = securityDb(null)
+    boot(db, secSchema)
+    const order = new SecOrder({ itemsAttributes: [{ id: 4242, _destroy: true }] })
+    expect(await order.save()).toBe(false)
+    expect(db.delete).not.toHaveBeenCalled()
+  })
+
+  it('a child that IS ours updates normally', async () => {
+    const db = securityDb({ id: 99, sec_orderId: 10, name: 'Widget' })
+    boot(db, secSchema)
+    const order = new SecOrder({ itemsAttributes: [{ id: 99, name: 'Widget XL' }] })
+    expect(await order.save()).toBe(true)
+    expect(db.update).toHaveBeenCalledTimes(1)
+  })
+
+  it('_destroy WITHOUT allowDestroy is ignored (Rails allow_destroy default)', async () => {
+    const db = securityDb({ id: 99, sec_orderId: 10, name: 'Widget' })
+    boot(db, secSchema)
+    const order = new SecOrder({ itemsAttributes: [{ id: 99, _destroy: true }] })
+    expect(await order.save()).toBe(true)        // save fine — marker just ignored
+    expect(db.delete).not.toHaveBeenCalled()
+    expect(db.update).not.toHaveBeenCalled()
+  })
+
+  it('acceptsNested: { allowDestroy: true } destroys an OWNED child', async () => {
+    const db = securityDb({ id: 99, des_orderId: 10, name: 'Widget' })
+    boot(db, secSchema)
+    const order = new DesOrder({ itemsAttributes: [{ id: 99, _destroy: true }] })
+    expect(await order.save()).toBe(true)
+    expect(db.delete).toHaveBeenCalledTimes(1)
+  })
+})
+
 // ── hasOne lazy loading ───────────────────────────────────────────────────────
 
 describe('hasOne lazy loading', () => {

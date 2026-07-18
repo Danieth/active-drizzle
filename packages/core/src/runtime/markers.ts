@@ -27,8 +27,13 @@ export type HasManyOptions = {
   dependent?: 'destroy' | 'delete' | 'nullify' | 'restrict'
   autosave?: boolean
   counterCache?: boolean | string
-  /** Enables acceptsNestedAttributesFor — codegen adds `${name}Attributes` to Create/Update types */
-  acceptsNested?: boolean
+  /**
+   * Enables acceptsNestedAttributesFor — codegen adds `${name}Attributes` to
+   * Create/Update types. Destroying children through nesting is a separate
+   * opt-in (Rails' allow_destroy): `acceptsNested: { allowDestroy: true }`.
+   * Bare `true` accepts creates and updates only.
+   */
+  acceptsNested?: boolean | { allowDestroy?: boolean }
 }
 
 export type HasOneOptions = Omit<HasManyOptions, 'through' | 'source'>

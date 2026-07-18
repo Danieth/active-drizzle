@@ -78,16 +78,15 @@ export interface GetConfig {
    */
   expose?: string[]
   /**
-   * When true, get/update respond with the Forms envelope instead of the
-   * bare record:
+   * When true, get/update/create respond with the Forms envelope instead of
+   * the bare record:
    *
-   *   { record, abilities, can, version }
+   *   { record, abilities, can, issues? }
    *
    * abilities[f] = 'edit' iff f ∈ permit(ctx, ctrl, record) (update config),
-   * else 'view' iff f ∈ expose, else absent. `can` maps every Attr.state
-   * event to a server-computed boolean. `version` is the optimistic-lock
-   * token (from updatedAt), echoed on PATCH; mismatch ⇒ 409.
-   * Requires `expose`.
+   * else 'view' iff f ∈ expose, else absent. acceptsNested associations get
+   * an `<assoc>Attributes` verdict from the same permit. `can` maps every
+   * Attr.state event to a server-computed boolean. Requires `expose`.
    */
   abilities?: boolean
 }

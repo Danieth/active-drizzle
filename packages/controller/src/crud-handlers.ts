@@ -205,8 +205,20 @@ export async function defaultIndex(
   // 10. Execute
   const data = await rel.load()
 
+  // 11. The read ceiling applies to index too — a list endpoint must not
+  // leak columns the GET envelope hides. (Included associations serialize
+  // whole; keep secrets out of included tables.)
+  const expose = config.get?.expose
+  const serialized = expose?.length
+    ? data.map((r: any) => {
+        if (typeof r.toJSON !== 'function') return r
+        const pk = typeof model?.primaryKey === 'string' ? model.primaryKey : 'id'
+        return r.toJSON({ only: [...new Set([pk, ...expose, ...(idx.include ?? [])])] })
+      })
+    : data
+
   return {
-    data,
+    data: serialized,
     pagination: {
       page,
       perPage,
@@ -255,7 +267,9 @@ export async function defaultCreate(
 ): Promise<any> {
   // Record-aware permit on create receives a defaults-draft instance
   const draft = typeof model === 'function' ? new (model as any)({}, true) : undefined
-  const permitted = buildPermittedData(rawInput, config.create, ctx, model, ctrl, draft)
+  const permitted = await sanitizeNestedWrites(
+    buildPermittedData(rawInput, config.create, ctx, model, ctrl, draft), model,
+  )
   // Scope overrides are applied AFTER permit — they cannot be excluded or overridden
   const record = await model.create({ ...permitted, ...scopeOverrides })
   // ApplicationRecord.create returns the instance even if save failed.
@@ -302,14 +316,22 @@ export async function defaultUpdate(
   // `_event` rides the PATCH but is a state-machine instruction, not a field
   const { _event, ...fields } = rawInput ?? {}
 
-  const permitted = buildPermittedData(fields, config.update, ctx, model, ctrl, record)
+  const permitted = await sanitizeNestedWrites(
+    buildPermittedData(fields, config.update, ctx, model, ctrl, record), model,
+  )
   for (const [k, v] of Object.entries(permitted)) {
     (record as any)[k] = v
   }
 
   // Fire the transition in the SAME save as the field diff — there is no
   // saved-but-not-transitioned limbo. Guard failure ⇒ 422 transition_blocked.
-  if (_event) {
+  if (_event !== undefined && _event !== null) {
+    // Strict allowlist: _event may only name a DECLARED Attr.state transition.
+    // Without this, `_event: 'destroy'` (or any zero-arg method) would invoke
+    // arbitrary record methods through the update endpoint.
+    if (typeof _event !== 'string' || !collectStateEvents(model).includes(_event)) {
+      throw new BadRequest(`Unknown event '${String(_event)}'`)
+    }
     const fired = typeof (record as any)[_event] === 'function' ? (record as any)[_event]() : false
     if (!fired) {
       throw new ValidationError({ base: [`transition_blocked: cannot ${String(_event)} right now`] })
@@ -372,6 +394,78 @@ export async function defaultDestroy(
 // ── Permit / restrict helpers ─────────────────────────────────────────────────
 
 const ALWAYS_EXCLUDED = ['id', 'createdAt', 'updatedAt', 'created_at', 'updated_at']
+
+/**
+ * Fields a nested child row may NEVER carry from the client, even inside a
+ * permitted `<assoc>Attributes` array: identity/timestamps are server-owned,
+ * and `type` is the STI discriminator — a client that could set it would
+ * forge subclasses through nesting.
+ */
+const NESTED_ALWAYS_STRIPPED = new Set(['createdAt', 'updatedAt', 'created_at', 'updated_at', 'type'])
+
+/**
+ * Controller-level sanitization of permitted nested writes. The MODEL opts an
+ * association into nesting; the CONTROLLER decides what the wire may carry:
+ *
+ *   - `id` / `_destroy` / `_key` pass through typed (the protocol triple)
+ *   - server-owned fields strip (timestamps, STI `type`)
+ *   - the parent foreign key strips — it is forced server-side; accepting it
+ *     from the wire would let a row be re-parented
+ *   - grandchild `<x>Attributes` recurse ONLY when the child model declares
+ *     acceptsNested for them; undeclared keys drop entirely (they would
+ *     otherwise reach the INSERT as unknown columns → error-based probing)
+ *
+ * Model resolution duck-types through @active-drizzle/core when present;
+ * without it, grandchild arrays fail closed (dropped).
+ */
+export async function sanitizeNestedWrites(
+  permitted: Record<string, any>,
+  model: any,
+): Promise<Record<string, any>> {
+  const attrsKeys = Object.keys(permitted).filter(k => k.endsWith('Attributes') && Array.isArray(permitted[k]))
+  if (attrsKeys.length === 0) return permitted
+
+  let resolveNested: ((m: any) => Array<{ attrsKey: string; fkField: string; childModel: any }>) | null = null
+  try {
+    const core = await import('@active-drizzle/core' as string) as any
+    if (typeof core.resolveNestedAssociations === 'function') resolveNested = core.resolveNestedAssociations
+  } catch { /* controller used without core — fail closed below */ }
+
+  /** One level of rows: `fkField` strips at THIS level, `rowModel` is the
+   *  class the rows belong to (its nested assocs authorize grandchildren). */
+  const sanitizeRows = (items: any[], fkField: string | null, rowModel: any): any[] => {
+    const grandAssocs = rowModel && resolveNested ? resolveNested(rowModel) : []
+    const out: any[] = []
+    for (const item of items) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+      const clean: Record<string, any> = {}
+      if (typeof item.id === 'number' || typeof item.id === 'string') clean['id'] = item.id
+      if (item._destroy === true) clean['_destroy'] = true
+      if (typeof item._key === 'string') clean['_key'] = item._key
+      for (const [k, v] of Object.entries(item)) {
+        if (k === 'id' || k === '_destroy' || k === '_key') continue
+        if (NESTED_ALWAYS_STRIPPED.has(k)) continue
+        if (fkField && k === fkField) continue
+        if (k.endsWith('Attributes')) {
+          const grand = grandAssocs.find(a => a.attrsKey === k)
+          if (grand && Array.isArray(v)) clean[k] = sanitizeRows(v, grand.fkField, grand.childModel)
+          continue   // undeclared nested keys never pass
+        }
+        clean[k] = v
+      }
+      out.push(clean)
+    }
+    return out
+  }
+
+  const out = { ...permitted }
+  const topAssocs = resolveNested ? resolveNested(model) : []
+  for (const key of attrsKeys) {
+    const meta = topAssocs.find(a => a.attrsKey === key)
+    out[key] = sanitizeRows(out[key], meta?.fkField ?? null, meta?.childModel ?? null)
+  }
+  return out
+}
 
 function buildPermittedData(
   input: Record<string, any>,
