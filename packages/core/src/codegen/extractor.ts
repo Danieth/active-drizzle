@@ -480,14 +480,16 @@ function extractPropertyValidations(classDecl: ClassDeclaration): Record<string,
     if (!Node.isPropertyDeclaration(prop)) continue;
     const init = prop.getInitializer();
     if (!init || !Node.isCallExpression(init)) continue;
-    
-    // Check for Attr.new({ validate: ... })
-    const arg = init.getArguments()[0];
-    if (Node.isObjectLiteralExpression(arg)) {
-      const validateProp = arg.getProperty('validate');
-      if (Node.isPropertyAssignment(validateProp)) {
-        result[prop.getName()] = validateProp.getInitializer()?.getText() || '';
-      }
+
+    // Attr.*(…, { validate / validates: … })
+    for (const arg of init.getArguments()) {
+      if (!Node.isObjectLiteralExpression(arg)) continue;
+      const validateProp = arg.getProperty('validates') ?? arg.getProperty('validate');
+      if (!Node.isPropertyAssignment(validateProp)) continue;
+      const initializer = validateProp.getInitializer();
+      if (!initializer) continue;
+      // Store source text — array or single function both serialize fine for client emission
+      result[prop.getName()] = initializer.getText();
     }
   }
   return result;

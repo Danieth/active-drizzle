@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { Attr } from '../../src/runtime/attr.js'
+import { Attr, rangeIncludes } from '../../src/runtime/attr.js'
 import { ApplicationRecord } from '../../src/runtime/application-record.js'
 
 // ---------------------------------------------------------------------------
@@ -408,13 +408,58 @@ describe('ApplicationRecord.validate() with Attr', () => {
   it('passes when value is valid', async () => {
     const p = new Product({ id: 1, price: 500 }, false)
     expect(await p.validate()).toBe(true)
-    expect(p.errors).toEqual({})
+    expect(p.errors.all()).toEqual({})
   })
 
   it('fails when value is invalid', async () => {
     const p = new Product({ id: 1, price: -100 }, false)
     expect(await p.validate()).toBe(false)
-    expect(p.errors['price']).toContain('price must be non-negative')
+    expect(p.errors.on('price')).toContain('price must be non-negative')
+  })
+})
+
+describe('Attr validates: [] array + required messages', () => {
+  class Slug extends ApplicationRecord {
+    static slug = Attr.string({
+      validates: [
+        (v: string | null) => (v && v.length > 0 ? null : 'cannot be blank'),
+        (v: string | null) => (v && /^[a-z0-9-]+$/.test(v) ? null : 'must be lowercase alphanumeric'),
+      ],
+    })
+  }
+
+  it('runs every validator and collects all messages', async () => {
+    const s = new Slug({ slug: '' }, false)
+    expect(await s.validate()).toBe(false)
+    expect(s.errors.on('slug')).toEqual([
+      'cannot be blank',
+      'must be lowercase alphanumeric',
+    ])
+  })
+
+  it('passes when all validators pass', async () => {
+    const s = new Slug({ slug: 'hello-world' }, false)
+    expect(await s.isValid()).toBe(true)
+    expect(s.errors.isEmpty()).toBe(true)
+  })
+
+  it('errors.add rejects empty messages', () => {
+    const s = new Slug({}, true)
+    expect(() => s.errors.add('slug', '')).toThrow(/non-empty message/)
+    expect(() => s.errors.add('slug', '   ')).toThrow(/non-empty message/)
+    s.errors.add('slug', 'is required')
+    expect(s.errors.on('slug')).toEqual(['is required'])
+    expect(s.errors.full()).toEqual(['slug is required'])
+  })
+
+  it('empty-string validator return is treated as pass (not an error)', async () => {
+    class Soft extends ApplicationRecord {
+      static name = Attr.string({
+        validate: () => '' as any, // no message → no error
+      })
+    }
+    const r = new Soft({ name: 'x' }, false)
+    expect(await r.validate()).toBe(true)
   })
 })
 
@@ -455,5 +500,293 @@ describe('Attr.for() — column remapping', () => {
     w.restoreAttributes()
     expect(w._changes.size).toBe(0)
     expect((w as any).displayName).toBe('Alice')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Attr.int — strict integer
+// ---------------------------------------------------------------------------
+
+describe('Attr.int — strict integers only', () => {
+  const quantity = Attr.int()
+
+  it('accepts integers and integer strings', () => {
+    expect(quantity.set!(3)).toBe(3)
+    expect(quantity.set!('12')).toBe(12)
+    expect(quantity.set!(0)).toBe(0)
+    expect(quantity.set!(-4)).toBe(-4)
+  })
+
+  it('nulls pass through', () => {
+    expect(quantity.set!(null)).toBeNull()
+    expect(quantity.set!(undefined)).toBeNull()
+    expect(quantity.get!(null)).toBeNull()
+  })
+
+  it('throws on floats, garbage strings, NaN, unsafe integers', () => {
+    expect(() => quantity.set!(3.5)).toThrow(TypeError)
+    expect(() => quantity.set!('3.5')).toThrow(TypeError)
+    expect(() => quantity.set!('abc')).toThrow(TypeError)
+    expect(() => quantity.set!(NaN)).toThrow(TypeError)
+    expect(() => quantity.set!(Number.MAX_SAFE_INTEGER + 1)).toThrow(TypeError)
+  })
+
+  it('reads raw values as numbers', () => {
+    expect(quantity.get!(42)).toBe(42)
+    expect(quantity.get!('42')).toBe(42)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Attr.money — integer cents ↔ decimal dollars
+// ---------------------------------------------------------------------------
+
+describe('Attr.money — cents in DB, dollars on model', () => {
+  const price = Attr.money('priceCents')
+
+  it('maps to the cents column', () => {
+    expect((price as any)._column).toBe('priceCents')
+  })
+
+  it('in-place variant has no column mapping', () => {
+    expect((Attr.money() as any)._column).toBeUndefined()
+  })
+
+  it('writes dollars as rounded integer cents', () => {
+    expect(price.set!(19.99)).toBe(1999)
+    expect(price.set!(0.1)).toBe(10)
+    expect(price.set!('5.25')).toBe(525)
+    expect(price.set!(0)).toBe(0)
+    expect(price.set!(-3.5)).toBe(-350)
+  })
+
+  it('reads cents as dollars', () => {
+    expect(price.get!(1999)).toBe(19.99)
+    expect(price.get!(0)).toBe(0)
+    expect(price.get!('1999')).toBe(19.99)
+  })
+
+  it('round-trips without float drift', () => {
+    for (const dollars of [19.99, 0.01, 0.1, 123.45, 1.005]) {
+      const stored = price.set!(dollars) as number
+      expect(Number.isSafeInteger(stored)).toBe(true)
+    }
+  })
+
+  it('throws on NaN, Infinity, garbage, and unsafe magnitudes', () => {
+    expect(() => price.set!(NaN)).toThrow(TypeError)
+    expect(() => price.set!(Infinity)).toThrow(TypeError)
+    expect(() => price.set!('abc')).toThrow(TypeError)
+    expect(() => price.set!(Number.MAX_SAFE_INTEGER)).toThrow(TypeError)
+  })
+
+  it('nulls pass through', () => {
+    expect(price.set!(null)).toBeNull()
+    expect(price.get!(null)).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Attr.percent — fraction in DB, percent on model
+// ---------------------------------------------------------------------------
+
+describe('Attr.percent — automagic fraction ↔ percent', () => {
+  const rate = Attr.percent()
+
+  it('reads fractions as percents', () => {
+    expect(rate.get!(0.153)).toBeCloseTo(15.3)
+    expect(rate.get!(1)).toBe(100)
+    expect(rate.get!(0)).toBe(0)
+    expect(rate.get!('0.5')).toBe(50)
+  })
+
+  it('writes percents as fractions', () => {
+    expect(rate.set!(15.3)).toBeCloseTo(0.153)
+    expect(rate.set!(100)).toBe(1)
+    expect(rate.set!('25')).toBe(0.25)
+  })
+
+  it('round-trips', () => {
+    expect(rate.get!(rate.set!(42.5))).toBeCloseTo(42.5)
+  })
+
+  it('nulls pass through, garbage throws', () => {
+    expect(rate.set!(null)).toBeNull()
+    expect(rate.get!(null)).toBeNull()
+    expect(() => rate.set!('abc')).toThrow(TypeError)
+    expect(() => rate.set!(NaN)).toThrow(TypeError)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Attr.range / dateRange / percentRange / multirange
+// ---------------------------------------------------------------------------
+
+describe('Attr.range — numeric ranges', () => {
+  const seats = Attr.range()
+
+  it('parses PG literals with bound inclusivity', () => {
+    expect(seats.get!('[1,10)')).toEqual({
+      lower: 1, upper: 10, lowerInclusive: true, upperInclusive: false,
+    })
+    expect(seats.get!('(0,5]')).toEqual({
+      lower: 0, upper: 5, lowerInclusive: false, upperInclusive: true,
+    })
+  })
+
+  it('handles unbounded and empty ranges', () => {
+    expect(seats.get!('[3,)')).toMatchObject({ lower: 3, upper: null })
+    expect(seats.get!('(,5]')).toMatchObject({ lower: null, upper: 5 })
+    expect(seats.get!('empty')).toMatchObject({ isEmpty: true })
+  })
+
+  it('serializes back to the literal', () => {
+    expect(seats.set!({ lower: 5, upper: 20, lowerInclusive: true, upperInclusive: false })).toBe('[5,20)')
+    expect(seats.set!({ lower: null, upper: 7, lowerInclusive: false, upperInclusive: true })).toBe('(,7]')
+    expect(seats.set!({ lower: null, upper: null, lowerInclusive: false, upperInclusive: false, isEmpty: true })).toBe('empty')
+  })
+
+  it('round-trips', () => {
+    const r = seats.get!('[1,10)')
+    expect(seats.set!(r)).toBe('[1,10)')
+  })
+
+  it('rangeIncludes respects inclusivity', () => {
+    const r = seats.get!('[1,10)') as any
+    expect(rangeIncludes(r, 1)).toBe(true)
+    expect(rangeIncludes(r, 9.99)).toBe(true)
+    expect(rangeIncludes(r, 10)).toBe(false)
+    expect(rangeIncludes(r, 0)).toBe(false)
+  })
+})
+
+describe('Attr.dateRange — tstzrange', () => {
+  const during = Attr.dateRange()
+
+  it('parses bounds as Dates', () => {
+    const r = during.get!('["2026-01-01 00:00:00+00","2026-02-01 00:00:00+00")') as any
+    expect(r.lower).toBeInstanceOf(Date)
+    expect(r.lower.toISOString()).toBe('2026-01-01T00:00:00.000Z')
+    expect(r.upperInclusive).toBe(false)
+  })
+
+  it('serializes Dates as quoted ISO strings', () => {
+    const out = during.set!({
+      lower: new Date('2026-01-01T00:00:00Z'),
+      upper: new Date('2026-02-01T00:00:00Z'),
+      lowerInclusive: true,
+      upperInclusive: false,
+    }) as string
+    expect(out).toBe('["2026-01-01T00:00:00.000Z","2026-02-01T00:00:00.000Z")')
+  })
+})
+
+describe('Attr.percentRange — the "% range" (numrange of fractions, percent on model)', () => {
+  const target = Attr.percentRange()
+
+  it('reads fraction bounds as percents', () => {
+    expect(target.get!('[0.025,0.1)')).toEqual({
+      lower: 2.5, upper: 10, lowerInclusive: true, upperInclusive: false,
+    })
+  })
+
+  it('writes percent bounds as fractions', () => {
+    expect(target.set!({ lower: 2.5, upper: 10, lowerInclusive: true, upperInclusive: false })).toBe('[0.025,0.1)')
+  })
+
+  it('handles unbounded sides', () => {
+    expect(target.get!('[0.5,)')).toMatchObject({ lower: 50, upper: null })
+    expect(target.set!({ lower: 50, upper: null, lowerInclusive: true, upperInclusive: false })).toBe('[0.5,)')
+  })
+
+  it('round-trips', () => {
+    const r = target.get!('[0.025,0.1)')
+    expect(target.set!(r)).toBe('[0.025,0.1)')
+  })
+})
+
+describe('Attr.multirange', () => {
+  const avail = Attr.multirange()
+
+  it('parses multirange literals', () => {
+    expect(avail.get!('{[1,3),[5,8)}')).toEqual([
+      { lower: 1, upper: 3, lowerInclusive: true, upperInclusive: false },
+      { lower: 5, upper: 8, lowerInclusive: true, upperInclusive: false },
+    ])
+    expect(avail.get!('{}')).toEqual([])
+  })
+
+  it('serializes arrays of ranges', () => {
+    expect(avail.set!([
+      { lower: 1, upper: 3, lowerInclusive: true, upperInclusive: false },
+      { lower: 5, upper: 8, lowerInclusive: true, upperInclusive: false },
+    ])).toBe('{[1,3),[5,8)}')
+    expect(avail.set!([])).toBe('{}')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Attr.array — Postgres arrays
+// ---------------------------------------------------------------------------
+
+describe('Attr.array', () => {
+  it('passes through driver-parsed arrays', () => {
+    const tags = Attr.array()
+    expect(tags.get!(['a', 'b'])).toEqual(['a', 'b'])
+    expect(tags.set!(['x'])).toEqual(['x'])
+  })
+
+  it('parses raw literals including quoted elements', () => {
+    const tags = Attr.array()
+    expect(tags.get!('{a,b,"c d"}')).toEqual(['a', 'b', 'c d'])
+    expect(tags.get!('{}')).toEqual([])
+  })
+
+  it('element transform coerces each item', () => {
+    const scores = Attr.array({ element: Number })
+    expect(scores.get!(['1', '2'])).toEqual([1, 2])
+    expect(scores.get!('{3,4}')).toEqual([3, 4])
+  })
+
+  it('rejects non-arrays on write, nulls pass', () => {
+    const tags = Attr.array()
+    expect(() => tags.set!('nope')).toThrow(TypeError)
+    expect(tags.set!(null)).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Attr.money with currency column + <prop>Formatted()
+// ---------------------------------------------------------------------------
+
+describe('Attr.money with currency column', () => {
+  class Payment extends ApplicationRecord {
+    static price = Attr.money('priceCents', { currency: 'currency' })
+  }
+
+  it('records the currency column on the config', () => {
+    expect((Payment.price as any)._currencyColumn).toBe('currency')
+    expect((Payment.price as any)._type).toBe('money')
+  })
+
+  it('priceFormatted() uses the row currency', () => {
+    const p = new Payment({ priceCents: 1999, currency: 'EUR' }, false)
+    expect((p as any).priceFormatted()).toBe('€19.99')
+    expect((p as any).priceFormatted('de-DE')).toBe('19,99\u00A0€')
+  })
+
+  it('defaults to USD when the currency column is empty', () => {
+    const p = new Payment({ priceCents: 500, currency: null }, false)
+    expect((p as any).priceFormatted()).toBe('$5.00')
+  })
+
+  it('returns null for null amounts', () => {
+    const p = new Payment({ priceCents: null, currency: 'USD' }, false)
+    expect((p as any).priceFormatted()).toBeNull()
+  })
+
+  it('value still reads as dollars through the proxy', () => {
+    const p = new Payment({ priceCents: 1999, currency: 'EUR' }, false)
+    expect((p as any).price).toBe(19.99)
   })
 })

@@ -38,9 +38,15 @@ export class ValidationError extends HttpError {
   }
 }
 
-/** Convert a model's `.errors` map to a ValidationError. */
-export function toValidationError(modelErrors: Record<string, string[]>): ValidationError {
-  return new ValidationError(modelErrors)
+/** Convert a model's `.errors` map (or ValidationErrors) to a ValidationError. */
+export function toValidationError(
+  modelErrors: Record<string, string[]> | { all(): Record<string, string[]> },
+): ValidationError {
+  const fields =
+    typeof (modelErrors as { all?: () => Record<string, string[]> }).all === 'function'
+      ? (modelErrors as { all(): Record<string, string[]> }).all()
+      : (modelErrors as Record<string, string[]>)
+  return new ValidationError(fields)
 }
 
 /** Serialize an HttpError to its wire format. */

@@ -1,13 +1,7 @@
 import { defineConfig } from 'vitest/config'
-import { resolve } from 'path'
 
 export default defineConfig({
   resolve: {
-    alias: {
-      '@active-drizzle/core': resolve(__dirname, '../core/src/index.ts'),
-      '@active-drizzle/controller': resolve(__dirname, 'src/index.ts'),
-      '@active-drizzle/react': resolve(__dirname, '../react/src/index.ts'),
-    },
     extensionAlias: {
       '.js': ['.ts', '.js'],
     },
@@ -16,15 +10,6 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     include: ['tests/**/*.test.ts'],
-    setupFiles: ['./tests/setup.ts'],
-    typecheck: {
-      tsconfig: './tsconfig.test.json',
-    },
-    pool: 'forks',
-    poolOptions: { forks: { maxForks: 1 } },
-    testTimeout: 300_000,
-    hookTimeout: 90_000,
-
     coverage: {
       provider: 'v8',
       all: true,

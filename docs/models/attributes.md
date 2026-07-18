@@ -204,6 +204,84 @@ r.rate          // → 0.0825 (number)
 typeof r.rate   // 'number'
 ```
 
+## `Attr.int` — strict integers
+
+Unlike `Attr.integer` (lenient `Number()` coercion), `Attr.int` **rejects** non-integers at the assignment site — a float can never reach an integer column:
+
+```ts
+static quantity = Attr.int()
+
+order.quantity = 3      // ✓
+order.quantity = '12'   // ✓ numeric strings accepted
+order.quantity = 3.5    // ✗ throws TypeError immediately
+```
+
+## `Attr.money` — integer cents ↔ decimal dollars
+
+The column stores integer minor units (never floats); the model speaks major units:
+
+```ts
+export const products = pgTable('products', {
+  priceCents: integer('price_cents'),
+  currency:   varchar('currency', { length: 3 }),
+})
+```
+
+```ts
+static price = Attr.money('priceCents', { currency: 'currency' })
+```
+
+```ts
+product.price = 19.99          // stored as 1999
+product.price                  // → 19.99
+product.priceFormatted()       // → '€19.99' — reads the row's own currency column
+product.priceFormatted('de-DE') // → '19,99 €'
+```
+
+The `currency` option is optional — without it, `priceFormatted()` formats as USD. Because `Attr.money` rides the same column mapping as `Attr.for`, queries work in model units against the raw column: `Product.where({ price: ... })` and `pluck('price')` apply the transform automatically.
+
+Multi-currency guidance: keep amounts in a `*_cents` integer column and the ISO code in its own `currency` column (the classic Rails `money-rails` layout). Never mix currencies in aggregate SQL without grouping by the currency column.
+
+## `Attr.percent` — fraction in the DB, percent on the model
+
+The database stores the mathematically honest fraction (0–1, aggregation-friendly); the model speaks human percent (0–100):
+
+```ts
+static conversionRate = Attr.percent()   // column: doublePrecision()
+
+funnel.conversionRate = 15.3   // stored as 0.153
+funnel.conversionRate          // → 15.3
+```
+
+SQL like `avg(conversion_rate)` stays fraction-math; every model read/write is already in display units.
+
+## Ranges, multiranges, and arrays
+
+First-class support for Postgres' exotic types. Ranges parse the wire literal into a structured object:
+
+```ts
+static seats        = Attr.range()          // int4range / numrange
+static bookedDuring = Attr.dateRange()      // tstzrange — bounds are JS Dates
+static targetRate   = Attr.percentRange()   // numrange of fractions, percent on the model
+static availability = Attr.multirange()     // nummultirange (PG 14+)
+static tags         = Attr.array()          // text[] etc.
+```
+
+```ts
+venue.seats                    // → { lower: 1, upper: 10, lowerInclusive: true, upperInclusive: false }
+venue.seats = { lower: 5, upper: 20, lowerInclusive: true, upperInclusive: false }  // → '[5,20)'
+
+campaign.targetRate = { lower: 2.5, upper: 10, lowerInclusive: true, upperInclusive: false }
+// stored as '[0.025,0.1)' — fraction math in SQL, percent at the model
+
+room.availability              // → [{ lower: 1, upper: 3, ... }, { lower: 5, upper: 8, ... }]
+
+post.tags = ['a', 'b']         // JS arrays pass through to the driver natively
+Attr.array({ element: Number }) // per-element coercion: '{1,2}' → [1, 2]
+```
+
+Unbounded sides are `null` (`'[3,)'` → `{ lower: 3, upper: null }`), and PG's `'empty'` range maps to `{ isEmpty: true }`. A `rangeIncludes(range, value)` helper is exported for inclusivity-correct containment checks.
+
 ## Defaults
 
 Every `Attr.*` method accepts a `default` option. The default is applied when reading a field on a **new** record that hasn't been set yet:

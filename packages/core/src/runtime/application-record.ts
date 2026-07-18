@@ -4,6 +4,14 @@ import { Relation } from './relation.js'
 import { getExecutor, getSchema, MODEL_REGISTRY, transaction, transactionContext, afterCommitQueue, AbortChain, RecordNotFound } from './boot.js'
 import { runHooks, collectHooks } from './hooks.js'
 import type { AttrEnumConfig } from './attr.js'
+import {
+  ValidationErrors,
+  createValidationErrors,
+  runValidators,
+  runAsyncValidators,
+  normalizeMessage,
+  type AttrValidator,
+} from './validation-errors.js'
 
 /**
  * The shape every Attr.* config object must satisfy.
@@ -15,14 +23,22 @@ export interface AttrConfig {
   get?: (raw: any) => any
   set?: (val: any) => any
   default?: any | (() => any)
-  validate?: (val: any) => string | null
-  serverValidate?: (val: any) => Promise<string | null>
+  /** One validator or an array — every failure must return a non-empty message. */
+  validate?: AttrValidator | AttrValidator[]
+  /** Alias for `validate` (Rails-ish). */
+  validates?: AttrValidator | AttrValidator[]
+  serverValidate?:
+    | ((val: any) => Promise<string | null | undefined>)
+    | Array<(val: any) => Promise<string | null | undefined>>
+  serverValidates?:
+    | ((val: any) => Promise<string | null | undefined>)
+    | Array<(val: any) => Promise<string | null | undefined>>
 }
 
 export class ApplicationRecord {
   public _attributes: Record<string, any> = {}
   public _changes: Map<string, { was: any; is: any }> = new Map()
-  public errors: Record<string, string[]> = {}
+  public errors: ValidationErrors = createValidationErrors()
   public isNewRecord: boolean = true
 
   // ── Static table name ──────────────────────────────────────────────────
@@ -113,7 +129,7 @@ export class ApplicationRecord {
   static async create(attrs: Record<string, any>): Promise<any> {
     const instance = new (this as any)(attrs, true)
     const saved    = await instance.save()
-    if (!saved) throw new Error(`Validation failed: ${JSON.stringify(instance.errors)}`)
+    if (!saved) throw new Error(`Validation failed: ${JSON.stringify(instance.errors.all())}`)
     return instance
   }
 
@@ -150,7 +166,7 @@ export class ApplicationRecord {
   // ── Validation ──────────────────────────────────────────────────────────
 
   async validate(): Promise<boolean> {
-    this.errors = {}
+    this.errors = createValidationErrors()
     const ctor = this.constructor as any
 
     // beforeValidate lifecycle (concern callbacks + decorated methods)
@@ -161,19 +177,20 @@ export class ApplicationRecord {
       await method.call(this)
     }
 
-    // Attr.* property-level validations
+    // Attr.* property-level validations (validate / validates — single or array)
     for (const key of Object.getOwnPropertyNames(ctor)) {
       const attr = ctor[key] as AttrConfig | undefined
       if (attr?._isAttr !== true) continue
-      if (!attr.validate && !attr.serverValidate) continue
+      const syncFns = attr.validates ?? attr.validate
+      const asyncFns = attr.serverValidates ?? attr.serverValidate
+      if (!syncFns && !asyncFns) continue
+
       const value = (this as any)[key]
-      if (typeof attr.validate === 'function') {
-        const err = attr.validate(value)
-        if (err) (this.errors[key] ??= []).push(err)
+      for (const msg of runValidators(syncFns, value)) {
+        this.errors.add(key, msg)
       }
-      if (typeof attr.serverValidate === 'function') {
-        const err = await attr.serverValidate(value)
-        if (err) (this.errors[key] ??= []).push(err)
+      for (const msg of await runAsyncValidators(asyncFns, value)) {
+        this.errors.add(key, msg)
       }
     }
 
@@ -183,18 +200,33 @@ export class ApplicationRecord {
       const method = (this as any)[hook.method]
       if (typeof method !== 'function') continue
       const result = await method.call(this)
-      // Method can either return a string (base error) or push to this.errors directly
-      if (typeof result === 'string') (this.errors['base'] ??= []).push(result)
+      // Method can return a string (base error) or push via this.errors.add()
+      const msg = normalizeMessage(result)
+      if (msg !== null) this.errors.add('base', msg)
     }
 
-    return Object.keys(this.errors).length === 0
+    return this.errors.isEmpty()
+  }
+
+  /** Runs validate(); returns true when valid. */
+  async isValid(): Promise<boolean> {
+    return this.validate()
+  }
+
+  /** Runs validate(); returns true when invalid. */
+  async isInvalid(): Promise<boolean> {
+    return !(await this.validate())
   }
 
   // ── Instance persistence ─────────────────────────────────────────────
 
-  async save(): Promise<boolean> {
-    const isValid = await this.validate()
-    if (!isValid) return false
+  async save(options: { validate?: boolean } = {}): Promise<boolean> {
+    if (options.validate !== false) {
+      const ok = await this.validate()
+      if (!ok) return false
+    } else {
+      this.errors = createValidationErrors()
+    }
 
     const isNew = this.isNewRecord
     if (!(await runHooks(this, 'beforeSave', isNew))) {
@@ -1066,6 +1098,22 @@ function _wrapRecord<T extends ApplicationRecord>(record: T): T {
               ;(receiver as any)[enumProp] = labelKey
               return receiver
             }
+          }
+        }
+      }
+
+      // ── <prop>Formatted() from Attr.money ───────────────────────────────
+      if (prop.endsWith('Formatted')) {
+        const field = prop.slice(0, -9)
+        const moneyConfig = ctor[field] as any
+        if (moneyConfig?._isAttr && moneyConfig._type === 'money') {
+          return (locale = 'en-US') => {
+            const dollars = (receiver as any)[field]
+            if (dollars === null || dollars === undefined) return null
+            const currency = moneyConfig._currencyColumn
+              ? ((receiver as any)[moneyConfig._currencyColumn] ?? 'USD')
+              : 'USD'
+            return new Intl.NumberFormat(locale, { style: 'currency', currency }).format(dollars)
           }
         }
       }

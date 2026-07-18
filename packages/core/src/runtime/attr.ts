@@ -1,6 +1,57 @@
 import type { AttrConfig } from './application-record.js'
 
 /**
+ * A parsed Postgres range. Mirrors the wire format `[lower,upper)`:
+ * null bounds mean unbounded, `isEmpty` mirrors PG's 'empty' ranges.
+ */
+export interface PgRange<T = number> {
+  lower: T | null
+  upper: T | null
+  lowerInclusive: boolean
+  upperInclusive: boolean
+  isEmpty?: boolean
+}
+
+/** Parses a Postgres range literal: '[1,10)', '(,5]', 'empty'. */
+export function parsePgRange<T>(raw: string, parseBound: (s: string) => T): PgRange<T> {
+  const s = raw.trim()
+  if (s === 'empty') {
+    return { lower: null, upper: null, lowerInclusive: false, upperInclusive: false, isEmpty: true }
+  }
+  const m = s.match(/^([[(])(.*),(.*)([\])])$/)
+  if (!m) throw new Error(`Invalid Postgres range literal: ${JSON.stringify(raw)}`)
+  const [, lb, lo = '', hi = '', ub] = m
+  const unquote = (v: string) => v.replace(/^"(.*)"$/, '$1')
+  return {
+    lower: lo === '' ? null : parseBound(unquote(lo)),
+    upper: hi === '' ? null : parseBound(unquote(hi)),
+    lowerInclusive: lb === '[',
+    upperInclusive: ub === ']',
+  }
+}
+
+/** Serializes a PgRange back to the Postgres literal format. */
+export function serializePgRange<T>(range: PgRange<T>, formatBound: (v: T) => string): string {
+  if (range.isEmpty) return 'empty'
+  const lb = range.lowerInclusive ? '[' : '('
+  const ub = range.upperInclusive ? ']' : ')'
+  const lo = range.lower === null ? '' : formatBound(range.lower)
+  const hi = range.upper === null ? '' : formatBound(range.upper)
+  return `${lb}${lo},${hi}${ub}`
+}
+
+/** Does the range contain the value? Respects bound inclusivity. */
+export function rangeIncludes<T extends number | Date>(range: PgRange<T>, value: T): boolean {
+  if (range.isEmpty) return false
+  const v = value instanceof Date ? value.getTime() : value
+  const lo = range.lower instanceof Date ? range.lower.getTime() : range.lower
+  const hi = range.upper instanceof Date ? range.upper.getTime() : range.upper
+  if (lo !== null && (range.lowerInclusive ? v < lo : v <= lo)) return false
+  if (hi !== null && (range.upperInclusive ? v > hi : v >= hi)) return false
+  return true
+}
+
+/**
  * Extended config for Attr.enum — carries the raw values map so the Proxy
  * can synthesise is<Label>() / to<Label>() methods at runtime.
  */
@@ -73,7 +124,7 @@ export const Attr = {
    *     set: v => v?.trim(),
    *   })
    */
-  for(column: string, config: Pick<AttrConfig, 'get' | 'set' | 'default' | 'validate'>): AttrConfig & { _column: string } {
+  for(column: string, config: Pick<AttrConfig, 'get' | 'set' | 'default' | 'validate' | 'validates' | 'serverValidate' | 'serverValidates'>): AttrConfig & { _column: string } {
     return { ...config, _isAttr: true, _column: column }
   },
 
@@ -162,6 +213,293 @@ export const Attr = {
         return isNaN(d.getTime()) ? null : d
       },
       ...config,
+    }
+  },
+
+  /**
+   * Strict integer attr — REJECTS non-integers instead of silently coercing.
+   *
+   * Unlike Attr.integer (lenient Number() coercion), Attr.int guarantees the
+   * stored value passed Number.isSafeInteger. Assigning 3.5 or 'abc' throws
+   * immediately at the assignment site, so a float can never reach an
+   * integer column.
+   *
+   *   static quantity = Attr.int()
+   *   order.quantity = 3      // ✓
+   *   order.quantity = 3.5    // ✗ throws TypeError
+   *   order.quantity = '12'   // ✓ numeric strings accepted → 12
+   */
+  int(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig {
+    return {
+      _isAttr: true,
+      get: (raw) => (raw === null || raw === undefined ? null : Number(raw)),
+      set: (val) => {
+        if (val === null || val === undefined) return null
+        const n = typeof val === 'string' ? Number(val) : val
+        if (typeof n !== 'number' || !Number.isSafeInteger(n)) {
+          throw new TypeError(`Attr.int: ${JSON.stringify(val)} is not a safe integer`)
+        }
+        return n
+      },
+      ...config,
+    }
+  },
+
+  /**
+   * Money attr — integer cents in the database, decimal dollars on the model.
+   *
+   * The column stores integer minor units (the classic no-float-drift rule).
+   * Reads give you major units as a number; writes accept major units and
+   * round to the nearest cent. Assigning a non-finite value throws.
+   *
+   *   // schema: priceCents: integer('price_cents')
+   *   static price = Attr.money('priceCents')
+   *   product.price = 19.99      // stored as 1999
+   *   product.price              // → 19.99
+   *   product.priceCents         // → 1999 (raw column still accessible)
+   *
+   * With a currency column, the record gains an automatic `<prop>Formatted()`
+   * helper that reads the row's own currency:
+   *
+   *   // schema: priceCents: integer(), currency: varchar()
+   *   static price = Attr.money('priceCents', { currency: 'currency' })
+   *   product.currency = 'EUR'
+   *   product.priceFormatted()          // → '19,99 €' (uses row currency)
+   *   product.priceFormatted('en-US')   // → '€19.99'
+   *
+   * Without a column argument it transforms in place (for a column that
+   * already holds cents under the same name).
+   */
+  money(
+    column?: string,
+    config: Partial<Omit<AttrConfig, '_isAttr'>> & { currency?: string } = {}
+  ): AttrConfig & { _column?: string; _type: 'money'; _currencyColumn?: string } {
+    const { currency: currencyColumn, ...rest } = config
+    return {
+      _isAttr: true,
+      _type: 'money' as const,
+      ...(column ? { _column: column } : {}),
+      ...(currencyColumn ? { _currencyColumn: currencyColumn } : {}),
+      get: (raw): number | null => {
+        if (raw === null || raw === undefined) return null
+        return Number(raw) / 100
+      },
+      set: (val): number | null => {
+        if (val === null || val === undefined) return null
+        const n = typeof val === 'string' ? Number(val) : val
+        if (typeof n !== 'number' || !Number.isFinite(n)) {
+          throw new TypeError(`Attr.money: ${JSON.stringify(val)} is not a finite number`)
+        }
+        // Epsilon-nudge: 1.005 * 100 is 100.4999... in binary floats
+        const sign = n < 0 ? -1 : 1
+        const c = sign * Math.round((Math.abs(n) + Number.EPSILON) * 100)
+        if (!Number.isSafeInteger(c)) {
+          throw new TypeError(`Attr.money: ${n} exceeds safe integer cents`)
+        }
+        return c
+      },
+      ...rest,
+    }
+  },
+
+  /**
+   * Percent attr — the DB stores a FRACTION (float 0–1, the mathematically
+   * honest representation), the model speaks PERCENT (0–100, the human one).
+   *
+   *   // schema: conversionRate: doublePrecision('conversion_rate')
+   *   static conversionRate = Attr.percent()
+   *   funnel.conversionRate = 15.3   // stored as 0.153
+   *   funnel.conversionRate          // → 15.3
+   *
+   * So SQL aggregation stays fraction-math (`avg(conversion_rate)`) while
+   * every read/write at the model layer is already in display units.
+   */
+  percent(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'percent' } {
+    return {
+      _isAttr: true,
+      _type: 'percent' as const,
+      get: (raw): number | null => {
+        if (raw === null || raw === undefined) return null
+        return Number(raw) * 100
+      },
+      set: (val): number | null => {
+        if (val === null || val === undefined) return null
+        const n = typeof val === 'string' ? Number(val) : val
+        if (typeof n !== 'number' || !Number.isFinite(n)) {
+          throw new TypeError(`Attr.percent: ${JSON.stringify(val)} is not a finite number`)
+        }
+        return n / 100
+      },
+      ...config,
+    }
+  },
+
+  /**
+   * Postgres range attr (`int4range`, `int8range`, `numrange`).
+   * The driver returns range columns as literals like '[1,10)'; this parses
+   * them into a structured object and serializes on write.
+   *
+   *   // schema: seats: customType numrange
+   *   static seats = Attr.range()
+   *   venue.seats               // → { lower: 1, upper: 10, lowerInclusive: true, upperInclusive: false }
+   *   venue.seats = { lower: 5, upper: 20, lowerInclusive: true, upperInclusive: false }
+   */
+  range(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'range' } {
+    return {
+      _isAttr: true,
+      _type: 'range' as const,
+      get: (raw): PgRange | null => {
+        if (raw === null || raw === undefined) return null
+        if (typeof raw === 'object') return raw as PgRange // already parsed
+        return parsePgRange(String(raw), Number)
+      },
+      set: (val): string | null => {
+        if (val === null || val === undefined) return null
+        if (typeof val === 'string') return val // raw literal passthrough
+        return serializePgRange(val as PgRange, String)
+      },
+      ...config,
+    }
+  },
+
+  /**
+   * Postgres timestamp range attr (`tstzrange`). Bounds are JS Dates.
+   *
+   *   static bookedDuring = Attr.dateRange()
+   *   booking.bookedDuring   // → { lower: Date, upper: Date, ... }
+   */
+  dateRange(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'range' } {
+    return {
+      _isAttr: true,
+      _type: 'range' as const,
+      get: (raw): PgRange<Date> | null => {
+        if (raw === null || raw === undefined) return null
+        if (typeof raw === 'object') return raw as PgRange<Date>
+        return parsePgRange(String(raw), (s) => new Date(s))
+      },
+      set: (val): string | null => {
+        if (val === null || val === undefined) return null
+        if (typeof val === 'string') return val
+        return serializePgRange(val as PgRange<Date>, (d) => `"${d.toISOString()}"`)
+      },
+      ...config,
+    }
+  },
+
+  /**
+   * Percent range — a Postgres `numrange` of FRACTIONS (0–1) exposed as a
+   * range of PERCENTS (0–100) on the model. The "% range" type:
+   *
+   *   // schema: targetRate: customType numrange
+   *   static targetRate = Attr.percentRange()
+   *   campaign.targetRate = { lower: 2.5, upper: 10, lowerInclusive: true, upperInclusive: false }
+   *   // stored as '[0.025,0.1)' — fraction math in SQL, percent at the model
+   *   campaign.targetRate.upper   // → 10
+   */
+  percentRange(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'range' } {
+    return {
+      _isAttr: true,
+      _type: 'range' as const,
+      get: (raw): PgRange | null => {
+        if (raw === null || raw === undefined) return null
+        const r = typeof raw === 'object' ? (raw as PgRange) : parsePgRange(String(raw), Number)
+        return {
+          ...r,
+          lower: r.lower === null ? null : r.lower * 100,
+          upper: r.upper === null ? null : r.upper * 100,
+        }
+      },
+      set: (val): string | null => {
+        if (val === null || val === undefined) return null
+        if (typeof val === 'string') return val
+        const r = val as PgRange
+        const scaled: PgRange = {
+          ...r,
+          lower: r.lower === null ? null : r.lower / 100,
+          upper: r.upper === null ? null : r.upper / 100,
+        }
+        return serializePgRange(scaled, String)
+      },
+      ...config,
+    }
+  },
+
+  /**
+   * Postgres multirange attr (`nummultirange`, `int4multirange` — PG 14+).
+   * Literal '{[1,3),[5,8)}' ↔ PgRange[].
+   *
+   *   static availability = Attr.multirange()
+   *   room.availability   // → [{ lower: 1, upper: 3, ... }, { lower: 5, upper: 8, ... }]
+   */
+  multirange(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'multirange' } {
+    return {
+      _isAttr: true,
+      _type: 'multirange' as const,
+      get: (raw): PgRange[] | null => {
+        if (raw === null || raw === undefined) return null
+        if (Array.isArray(raw)) return raw as PgRange[]
+        const s = String(raw).trim()
+        if (!s.startsWith('{') || !s.endsWith('}')) {
+          throw new Error(`Invalid Postgres multirange literal: ${JSON.stringify(raw)}`)
+        }
+        const inner = s.slice(1, -1).trim()
+        if (inner === '') return []
+        // Split on commas BETWEEN ranges (after a closing bracket)
+        return inner
+          .split(/(?<=[\])]),/)
+          .map((part) => parsePgRange(part.trim(), Number))
+      },
+      set: (val): string | null => {
+        if (val === null || val === undefined) return null
+        if (typeof val === 'string') return val
+        const ranges = val as PgRange[]
+        return `{${ranges.map((r) => serializePgRange(r, String)).join(',')}}`
+      },
+      ...config,
+    }
+  },
+
+  /**
+   * Postgres array attr (`text[]`, `integer[]`, ...). node-postgres already
+   * parses most array columns to JS arrays — this attr normalizes both
+   * directions and optionally transforms each element.
+   *
+   *   static tags = Attr.array()                       // string[] passthrough
+   *   static scores = Attr.array({ element: Number }) // '{"1","2"}' → [1, 2]
+   */
+  array(
+    config: Partial<Omit<AttrConfig, '_isAttr'>> & { element?: (v: any) => any } = {}
+  ): AttrConfig & { _type: 'array' } {
+    const { element, ...rest } = config
+    return {
+      _isAttr: true,
+      _type: 'array' as const,
+      get: (raw): unknown[] | null => {
+        if (raw === null || raw === undefined) return null
+        let arr: unknown[]
+        if (Array.isArray(raw)) {
+          arr = raw
+        } else {
+          // Fallback literal parse: '{a,b,"c d"}'
+          const s = String(raw).trim()
+          if (!s.startsWith('{') || !s.endsWith('}')) {
+            throw new Error(`Invalid Postgres array literal: ${JSON.stringify(raw)}`)
+          }
+          const inner = s.slice(1, -1)
+          arr = inner === '' ? [] : inner
+            .match(/("([^"\\]|\\.)*"|[^,]+)/g)!
+            .map((p) => p.replace(/^"(.*)"$/, '$1').replace(/\\(.)/g, '$1'))
+        }
+        return element ? arr.map(element) : arr
+      },
+      set: (val): unknown[] | null => {
+        if (val === null || val === undefined) return null
+        if (!Array.isArray(val)) {
+          throw new TypeError(`Attr.array: expected an array, got ${JSON.stringify(val)}`)
+        }
+        return val // drizzle/node-postgres serialize JS arrays natively
+      },
+      ...rest,
     }
   },
 

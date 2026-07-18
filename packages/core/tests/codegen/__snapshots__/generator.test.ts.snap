@@ -161,6 +161,16 @@ class AssetClient {
 
   validate(path = ''): Record<string, string[]> {
     let errors: Record<string, string[]> = {};
+    const _push = (field: string, msg: unknown) => {
+      if (typeof msg !== 'string') return;
+      const t = msg.trim();
+      if (!t) return;
+      (errors[field] = errors[field] || []).push(t);
+    };
+    const _run = (field: string, validators: any, value: any) => {
+      const list = Array.isArray(validators) ? validators : [validators];
+      for (const fn of list) { if (typeof fn === 'function') _push(field, fn(value)); }
+    };
     if ((this as any).business) {
       errors = { ...errors, ...(this as any).business.validate(path ? \`\${path}.business\` : 'business') };
     }

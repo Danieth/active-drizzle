@@ -781,10 +781,11 @@ describe('@action({ load: true }) — auto-loads record by :id', () => {
   it('@action with load:true generates a /:id route', () => {
     const { routes } = buildRouter(RescueController)
     const paths = routes.map(r => `${r.method} ${r.path}`)
-    expect(paths).toContain('POST /teams/:teamId/rescue-tests/:id/trigger-domain')
-    expect(paths).toContain('POST /teams/:teamId/rescue-tests/:id/inspect-record')
+    // @controller('/rescue-test') is an explicit path — used verbatim, not pluralized
+    expect(paths).toContain('POST /teams/:teamId/rescue-test/:id/trigger-domain')
+    expect(paths).toContain('POST /teams/:teamId/rescue-test/:id/inspect-record')
     // Collection action (no load) has no :id
-    expect(paths).toContain('POST /teams/:teamId/rescue-tests/trigger-swallow')
+    expect(paths).toContain('POST /teams/:teamId/rescue-test/trigger-swallow')
   })
 })
 

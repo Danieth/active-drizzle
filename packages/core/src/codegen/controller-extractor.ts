@@ -226,6 +226,7 @@ function extractAttachmentsFromModel(
       if (cls.getName() !== modelClassName) continue
 
       for (const prop of cls.getStaticProperties()) {
+        if (!Node.isPropertyDeclaration(prop)) continue
         const init = prop.getInitializer()
         if (!init || !Node.isCallExpression(init)) continue
         const callee = init.getExpression().getText()

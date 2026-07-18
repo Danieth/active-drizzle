@@ -1,4 +1,4 @@
-import type { HookEntry, ActionEntry } from './metadata.js'
+import type { HookEntry, ActionEntry } from '../metadata.js'
 
 export interface ControllerConcernDef<TConfig = void> {
   name: string

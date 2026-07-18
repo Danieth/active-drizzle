@@ -177,6 +177,11 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     })
   }
 
+  /** Alias for load() — `User.where({ active: true }).all()` executes the query. */
+  public all(): Promise<TModel[]> {
+    return this.load()
+  }
+
   /**
    * Dispatch query into the async pool immediately, return later.
    * Prevents serial blocking.

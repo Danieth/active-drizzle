@@ -375,9 +375,19 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta): s
 
   lines.push(`  validate(path = ''): Record<string, string[]> {`);
   lines.push(`    let errors: Record<string, string[]> = {};`);
+  lines.push(`    const _push = (field: string, msg: unknown) => {`);
+  lines.push(`      if (typeof msg !== 'string') return;`);
+  lines.push(`      const t = msg.trim();`);
+  lines.push(`      if (!t) return;`);
+  lines.push(`      (errors[field] = errors[field] || []).push(t);`);
+  lines.push(`    };`);
+  lines.push(`    const _run = (field: string, validators: any, value: any) => {`);
+  lines.push(`      const list = Array.isArray(validators) ? validators : [validators];`);
+  lines.push(`      for (const fn of list) { if (typeof fn === 'function') _push(field, fn(value)); }`);
+  lines.push(`    };`);
 
   for (const [prop, code] of Object.entries(model.propertyValidations)) {
-    lines.push(`    { const _v = (this as any).${prop}; const _e = (${code})(_v); if (_e) { const _p = path ? \`\${path}.${prop}\` : '${prop}'; (errors[_p] = errors[_p] || []).push(_e); } }`);
+    lines.push(`    { const _v = (this as any).${prop}; _run(path ? \`\${path}.${prop}\` : '${prop}', (${code}), _v); }`);
   }
 
   // Inline @validate instance method bodies directly into validate()
@@ -385,7 +395,7 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta): s
     if (!method.isValidation || !method.body) continue;
     lines.push(`    {`);
     lines.push(`      const _result = ((function(this: any) ${method.body}).call(this));`);
-    lines.push(`      if (typeof _result === 'string') { const _p = path || 'base'; (errors[_p] = errors[_p] || []).push(_result); }`);
+    lines.push(`      _push(path || 'base', _result);`);
     lines.push(`    }`);
   }
 

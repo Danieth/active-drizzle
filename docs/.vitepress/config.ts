@@ -74,6 +74,8 @@ export default defineConfig({
             { text: 'The Happy Path', link: '/guide/happy-path' },
             { text: 'Installation & Boot', link: '/guide/installation' },
             { text: 'Project Structure', link: '/guide/project-structure' },
+            { text: 'Console', link: '/guide/console' },
+            { text: 'Helpers', link: '/guide/helpers' },
           ],
         },
         {

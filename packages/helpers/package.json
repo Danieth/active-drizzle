@@ -1,7 +1,7 @@
 {
-  "name": "@active-drizzle/react",
+  "name": "@active-drizzle/helpers",
   "version": "0.1.12",
-  "description": "React Query hooks and components for active-drizzle controllers",
+  "description": "Rails-style (ActiveSupport) helpers for arrays, strings, numbers, objects — plus an awesome_print-style ap() — for active-drizzle apps",
   "type": "module",
   "exports": {
     ".": {
@@ -16,6 +16,7 @@
   "files": [
     "dist"
   ],
+  "sideEffects": false,
   "publishConfig": {
     "access": "public"
   },
@@ -28,24 +29,13 @@
   },
   "author": "Daniel Ackerman <danieth@github>",
   "license": "MIT",
-  "peerDependencies": {
-    "@active-drizzle/controller": "*",
-    "@active-drizzle/core": "*",
-    "@tanstack/react-query": ">=5.0.0",
-    "react": ">=18.0.0"
+  "dependencies": {
+    "pluralize": "^8.0.0",
+    "temporal-polyfill": "^1.0.1"
   },
   "devDependencies": {
-    "@active-drizzle/controller": "*",
-    "@active-drizzle/core": "*",
-    "@tanstack/react-form": "^1.28.4",
-    "@tanstack/react-query": "^5.90.21",
-    "@testing-library/dom": "^10.4.1",
-    "@testing-library/react": "^16.3.2",
     "@types/node": "^22.0.0",
-    "@types/react": "^19.2.14",
-    "happy-dom": "^20.8.4",
-    "jsdom": "^28.1.0",
-    "react": "^19.2.4",
+    "@types/pluralize": "^0.0.33",
     "tsup": "^8.0.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"

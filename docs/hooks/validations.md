@@ -77,25 +77,24 @@ export class User extends ApplicationRecord {
 
 `@serverValidate` runs during `save()` / `create()` on the server. In client-generated code (via codegen), `@serverValidate` methods are excluded from the client bundle.
 
-## Inline validation with `Attr.new`
+## Inline validation with `validate` / `validates`
 
-For simple per-field rules, use the `validate` option on `Attr.new`:
+For simple per-field rules, use `validate` (or the Rails-ish alias `validates`) on any `Attr.*`.  
+A validator returns a **non-empty message string** on failure, or `null` to pass. Empty strings are ignored (not errors).
 
 ```ts
-static price = Attr.new({
-  get: (v: number) => v / 100,
-  set: (v: number) => Math.round(v * 100),
-  validate: (v: number) => v >= 0 ? null : 'must be non-negative',
+static price = Attr.money('priceCents', {
+  validate: (v) => (v !== null && v >= 0 ? null : 'must be non-negative'),
 })
 ```
 
-Multiple validators as an array:
+Multiple validators as an array — **all** run; every failure needs a real message:
 
 ```ts
-static slug = Attr.new({
-  validate: [
-    (v: string) => v?.length > 0 ? null : 'cannot be blank',
-    (v: string) => /^[a-z0-9-]+$/.test(v) ? null : 'must be lowercase alphanumeric',
+static slug = Attr.string({
+  validates: [
+    (v) => (v?.length ? null : 'cannot be blank'),
+    (v) => (/^[a-z0-9-]+$/.test(v ?? '') ? null : 'must be lowercase alphanumeric'),
   ],
 })
 ```
@@ -118,14 +117,18 @@ ensureTransitionAllowed() {
 
 ## `errors` API
 
+Every error **must** include a non-empty message. `errors.add(field, '')` throws.
+
 | Method | Returns |
 |--------|---------|
-| `errors.add(field, message)` | Add an error |
+| `errors.add(field, message)` | Add an error (message required) |
 | `errors.on(field)` | `string[]` — messages for that field |
 | `errors.all()` | `Record<string, string[]>` — all errors |
 | `errors.full()` | `string[]` — `['field message', ...]` format |
 | `errors.clear()` | Remove all errors |
 | `errors.isEmpty()` | `boolean` |
+
+Legacy bracket access still works: `errors['email']`, `errors['email'] = ['is invalid']`.
 
 ## `isValid()` / `isInvalid()`
 
