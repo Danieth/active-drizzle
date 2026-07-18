@@ -20,6 +20,7 @@ import type {
 
 import pluralize from 'pluralize';
 import * as path from 'node:path';
+import { depsFitProjection } from './validation-deps.js';
 
 export type GeneratedFile = {
   path: string;
@@ -390,9 +391,13 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta): s
     lines.push(`    { const _v = (this as any).${prop}; _run(path ? \`\${path}.${prop}\` : '${prop}', (${code}), _v); }`);
   }
 
-  // Inline @validate instance method bodies directly into validate()
+  // Inline @validate instance methods whose deps ⊆ this model's field projection.
+  // Unprovable deps are codegen errors (validator); we never ship them quietly.
+  const projection = modelProjectionFields(model, project);
   for (const method of model.instanceMethods) {
     if (!method.isValidation || !method.body) continue;
+    if (method.validationDepsError || !method.validationDeps) continue;
+    if (!depsFitProjection(method.validationDeps, projection)) continue;
     lines.push(`    {`);
     lines.push(`      const _result = ((function(this: any) ${method.body}).call(this));`);
     lines.push(`      _push(path || 'base', _result);`);
@@ -587,6 +592,21 @@ function collectAllScopes(model: ModelMeta, project: ProjectMeta): ScopeMeta[] {
   }
   
   return scopes;
+}
+
+/** Fields available on the model Client projection (columns + attrs + associations). */
+function modelProjectionFields(model: ModelMeta, project: ProjectMeta): Set<string> {
+  const fields = new Set<string>();
+  const table = project.schema.tables[model.tableName];
+  if (table) {
+    for (const c of table.columns) fields.add(c.name);
+  }
+  for (const e of model.enums) fields.add(e.propertyName);
+  for (const a of model.associations) fields.add(a.propertyName);
+  for (const p of Object.keys(model.propertyValidations)) fields.add(p);
+  for (const p of Object.keys(model.propertyDefaults)) fields.add(p);
+  for (const p of Object.keys(model.attrSetReturnTypes)) fields.add(p);
+  return fields;
 }
 
 export function generateRegistry(project: ProjectMeta): string {

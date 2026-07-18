@@ -31,6 +31,7 @@ import { existsSync } from 'fs'
 import pluralize from 'pluralize'
 import type { CtrlProjectMeta, CtrlMeta, CtrlActionMeta, CtrlAttachmentMeta } from './controller-types.js'
 import type { ProjectMeta, ModelMeta, ColumnMeta } from './types.js'
+import { depsFitProjection } from './validation-deps.js'
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -234,6 +235,49 @@ function generateControllerFile(
         }
       }
     }
+
+    // Projection-scoped validate(): only validations whose deps fit this controller's
+    // permit ∪ includes. Server still runs the full set on the merged record.
+    const projection = controllerProjectionFields(ctrl, model, writableFields)
+    const clientValidations = (model.instanceMethods ?? []).filter(m =>
+      m.isValidation &&
+      m.body &&
+      !m.validationDepsError &&
+      m.validationDeps &&
+      depsFitProjection(m.validationDeps, projection)
+    )
+    const clientPropValidations = Object.entries(model.propertyValidations ?? {}).filter(([prop]) =>
+      projection.has(prop)
+    )
+
+    if (clientValidations.length > 0 || clientPropValidations.length > 0) {
+      L.push('')
+      L.push(`  /** Client-side UX validation — subset whose deps fit this controller's projection. */`)
+      L.push(`  validate(): Record<string, string[]> {`)
+      L.push(`    const errors: Record<string, string[]> = {}`)
+      L.push(`    const _push = (field: string, msg: unknown) => {`)
+      L.push(`      if (typeof msg !== 'string') return`)
+      L.push(`      const t = msg.trim()`)
+      L.push(`      if (!t) return`)
+      L.push(`      ;(errors[field] ??= []).push(t)`)
+      L.push(`    }`)
+      L.push(`    const _run = (field: string, validators: any, value: any) => {`)
+      L.push(`      const list = Array.isArray(validators) ? validators : [validators]`)
+      L.push(`      for (const fn of list) if (typeof fn === 'function') _push(field, fn(value))`)
+      L.push(`    }`)
+      for (const [prop, code] of clientPropValidations) {
+        L.push(`    _run('${prop}', (${code}), (this as any).${prop})`)
+      }
+      for (const method of clientValidations) {
+        L.push(`    {`)
+        L.push(`      const _result = ((function(this: any) ${method.body}).call(this))`)
+        L.push(`      _push('base', _result)`)
+        L.push(`    }`)
+      }
+      L.push(`    return errors`)
+      L.push(`  }`)
+    }
+
     L.push('}')
     L.push('')
 
@@ -533,6 +577,26 @@ export const client: any = null
 /** Convert controller class name to file name segment, e.g. CampaignController → campaign */
 function toFileName(className: string): string {
   return lcFirst(className.replace(/Controller$/, ''))
+}
+
+/**
+ * Controller projection field set: permit-listed write fields ∪ get/index includes ∪ id.
+ * Validations ship to this Client iff deps ⊆ this set.
+ */
+function controllerProjectionFields(
+  ctrl: CtrlMeta,
+  model: ModelMeta,
+  writableFields: string[],
+): Set<string> {
+  const fields = new Set<string>(['id', ...writableFields])
+  for (const inc of ctrl.crudConfig?.get?.include ?? []) fields.add(inc)
+  for (const inc of ctrl.crudConfig?.index?.include ?? []) fields.add(inc)
+  // Association property names from the model that are included
+  for (const a of model.associations) {
+    if (fields.has(a.propertyName)) continue
+    // also allow association name if listed in includes
+  }
+  return fields
 }
 
 /**

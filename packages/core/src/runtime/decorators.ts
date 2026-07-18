@@ -8,6 +8,16 @@ export type HookOptions = {
   on?: 'create' | 'update'
 }
 
+/** Options for `@validate` / `@serverValidate`. */
+export type ValidateOptions = HookOptions & {
+  /**
+   * Explicit field dependencies. Required only when the body cannot be
+   * statically analyzed (computed access, `this` escaping, etc.).
+   * Normally omit — codegen infers deps from `this.field` reads.
+   */
+  deps?: string[]
+}
+
 /**
  * @model('table_name') — binds the class to a database table.
  * Sets _activeDrizzleTableName so ApplicationRecord.tableName returns it.
@@ -134,7 +144,10 @@ export function server(_target: unknown, _key: string, _descriptor: PropertyDesc
  * @validate() — marks an instance method as a class-level synchronous validation.
  * The method runs during save() and can either:
  *   - Return a string error message (pushed to errors['base'])
- *   - Push directly to this.errors[field]
+ *   - Push directly via this.errors.add(field, message)
+ *
+ * Deps are inferred from the body (`this.amount`). If inference fails, declare:
+ *   @validate({ deps: ['amount', 'adminCap'] })
  *
  * @example
  *   @validate()
@@ -142,7 +155,7 @@ export function server(_target: unknown, _key: string, _descriptor: PropertyDesc
  *     if (this.startDate > this.endDate) return 'start must be before end'
  *   }
  */
-export function validate(options?: HookOptions): MethodDecorator {
+export function validate(options?: ValidateOptions): MethodDecorator {
   return (target: object, key: string | symbol) => {
     registerHook(target, 'validate', String(key), options)
   }
@@ -150,9 +163,9 @@ export function validate(options?: HookOptions): MethodDecorator {
 
 /**
  * @serverValidate() — asynchronous server-side validation (uniqueness checks, DB queries).
- * Runs during save() after all synchronous @validate() methods.
+ * Runs during save() after all synchronous @validate() methods. Never shipped to the Client.
  */
-export function serverValidate(options?: HookOptions): MethodDecorator {
+export function serverValidate(options?: ValidateOptions): MethodDecorator {
   return (target: object, key: string | symbol) => {
     registerHook(target, 'serverValidate', String(key), options)
   }

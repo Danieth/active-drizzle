@@ -18,6 +18,7 @@ import type {
   HookMeta,
   InstanceMethodMeta,
 } from './types.js';
+import { resolveValidationDeps, parseDeclaredDeps } from './validation-deps.js';
 
 // ---------------------------------------------------------------------------
 // extractSchema
@@ -451,7 +452,8 @@ function extractInstanceMethods(classDecl: ClassDeclaration): InstanceMethodMeta
     if (isHook) continue;
 
     const isServerOnly = method.getDecorators().some(d => d.getName() === 'server');
-    const isValidation = method.getDecorators().some(d => d.getName() === 'validate');
+    const validateDec = method.getDecorators().find(d => d.getName() === 'validate');
+    const isValidation = Boolean(validateDec);
 
     // Capture the body text for client-side method emission.
     // Server-only methods are never sent to the client, so no body needed.
@@ -468,6 +470,25 @@ function extractInstanceMethods(classDecl: ClassDeclaration): InstanceMethodMeta
       isValidation,
     };
     if (body !== undefined) entry.body = body;
+
+    if (isValidation) {
+      let declaredDeps: string[] | undefined
+      try {
+        declaredDeps = parseDeclaredDeps(validateDec?.getArguments()[0])
+      } catch (e: any) {
+        entry.validationDepsError = e?.message ?? String(e)
+      }
+      if (!entry.validationDepsError) {
+        const resolved = resolveValidationDeps(method, classDecl, declaredDeps)
+        if (resolved.ok) {
+          entry.validationDeps = resolved.deps
+          entry.validationDepsSource = resolved.source
+        } else {
+          entry.validationDepsError = resolved.error
+        }
+      }
+    }
+
     result.push(entry);
   }
 

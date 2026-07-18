@@ -115,6 +115,32 @@ ensureTransitionAllowed() {
 }
 ```
 
+## Client projection filtering (deps)
+
+Codegen **infers** which fields each `@validate` method reads (`this.amount`, destructuring, own-method calls). A validation is shipped to a generated Client **only if every dep fits that controller's projection** (permit ∪ includes).
+
+```ts
+@validate()  // deps inferred: { amount, adminCap }
+checkCap() {
+  if (this.amount > this.adminCap) return 'exceeds cap'
+}
+```
+
+- Admin controller that permits both fields → Client gets `checkCap`
+- Borrower controller that only permits `amount` → Client does **not** get `checkCap`
+- Server always runs the full set on the merged record
+
+If the body can't be analyzed (`this[field]`, passing `this` out), codegen **errors**. Escape hatch:
+
+```ts
+@validate({ deps: ['amount', 'adminCap'] })
+checkWeird() {
+  return externalCheck(this)
+}
+```
+
+Never fail open: unprovable deps are refused, not silently omitted.
+
 ## `errors` API
 
 Every error **must** include a non-empty message. `errors.add(field, '')` throws.

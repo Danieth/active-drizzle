@@ -19,6 +19,7 @@ export function validate(project: ProjectMeta, validateOnly?: Set<string>): Diag
     validateScopes(model, project, diagnostics);
     validateAttrSetTypes(model, project, diagnostics);
     validateSti(model, project, diagnostics);
+    validateValidationDeps(model, project, diagnostics);
   }
 
   return diagnostics;
@@ -271,6 +272,26 @@ function validateSti(model: ModelMeta, project: ProjectMeta, out: Diagnostic[]) 
       model.filePath,
       `STI model "${model.className}": add \`static stiType = <discriminatorValue>\` to your class so active-drizzle automatically injects WHERE type = <value> on all queries and instantiates the correct subclass when loading from the parent table.`,
     ));
+  }
+}
+
+/**
+ * Fail-loud: every @validate method must have provable deps (inferred or declared).
+ * Never ship a Client validation whose field reads we can't prove.
+ */
+function validateValidationDeps(model: ModelMeta, _project: ProjectMeta, out: Diagnostic[]) {
+  for (const method of model.instanceMethods) {
+    if (!method.isValidation) continue;
+    if (method.validationDepsError) {
+      out.push(err(model.filePath, method.validationDepsError));
+      continue;
+    }
+    if (!method.validationDeps) {
+      out.push(err(
+        model.filePath,
+        `can't infer deps for "${method.name}": no dependency set resolved. Declare @validate({ deps: [...] }) or simplify the body.`,
+      ));
+    }
   }
 }
 

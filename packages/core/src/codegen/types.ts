@@ -122,6 +122,12 @@ export type InstanceMethodMeta = {
   isServerOnly: boolean
   isValidation: boolean
   body?: string         // method body text (e.g. "{ return this.x + 1 }") — undefined if server-only
+  /** Fields this @validate method reads — inferred or declared. */
+  validationDeps?: string[]
+  /** How deps were obtained. */
+  validationDepsSource?: 'inferred' | 'declared'
+  /** Set when deps cannot be proved — codegen must fail. */
+  validationDepsError?: string
 }
 
 /** Everything the extractor finds about a single model file */
