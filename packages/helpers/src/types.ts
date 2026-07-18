@@ -56,14 +56,31 @@ export function cents(value: number): Cents {
 }
 
 /**
- * Converts a decimal major-unit amount to Cents, rounding half-up at the
- * second decimal: `dollarsToCents(19.99)` → 1999. Throws on NaN/Infinity.
+ * Converts a decimal major-unit amount to Cents, rounding half away from
+ * zero at the second decimal: `dollarsToCents(19.99)` → 1999. Throws on
+ * NaN/Infinity.
+ *
+ * The conversion is exact decimal-string math, not `amount * 100`:
+ * `8.165 * 100` is `816.4999…` in binary floats, and an epsilon nudge only
+ * papers over magnitudes below ~2 (Number.EPSILON is the float gap AT 1).
+ * `String(8.165)` is exactly `'8.165'` — the shortest round-trip
+ * representation — so shifting THAT string's decimal point never drifts.
  */
 export function dollarsToCents(amount: number): Cents {
   if (!Number.isFinite(amount)) throw new TypeError(`dollarsToCents(): ${amount} is not finite`)
-  // Epsilon-nudge before rounding: 1.005 * 100 is 100.4999... in binary floats
-  const sign = amount < 0 ? -1 : 1
-  return cents(sign * Math.round((Math.abs(amount) + Number.EPSILON) * 100))
+  const m = /^(\d+)(?:\.(\d+))?(?:e([+-]?\d+))?$/.exec(String(Math.abs(amount)))
+  if (!m) throw new TypeError(`dollarsToCents(): ${amount} is not finite`)
+  let digits = m[1]! + (m[2] ?? '')
+  let point = m[1]!.length + (m[3] ? parseInt(m[3], 10) : 0) + 2 // ×100
+  if (point < 0) {
+    digits = '0'.repeat(-point) + digits
+    point = 0
+  } else if (point > digits.length) {
+    digits += '0'.repeat(point - digits.length)
+  }
+  let c = Number(digits.slice(0, point) || '0')
+  if (digits[point] !== undefined && digits[point]! >= '5') c += 1
+  return cents(amount < 0 ? -c : c)
 }
 
 /** Cents → decimal major units: `centsToDollars(cents(1999))` → 19.99. */

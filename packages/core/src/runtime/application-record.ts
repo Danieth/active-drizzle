@@ -283,7 +283,9 @@ export class ApplicationRecord {
     const ctor = this.constructor as any
     for (const key of Object.getOwnPropertyNames(ctor)) {
       const cfg = ctor[key] as AttrStateConfig | undefined
-      if (cfg?._type !== 'state' || !(event in cfg.transitions)) continue
+      // Object.hasOwn: `'toString' in transitions` finds Object.prototype and
+      // would crash stateCanFire instead of reporting an unknown event.
+      if (cfg?._type !== 'state' || !Object.hasOwn(cfg.transitions, event)) continue
       return stateCanFire(cfg, (this as any)[key], event, this).ok
     }
     return false
@@ -303,7 +305,9 @@ export class ApplicationRecord {
     const ctor = this.constructor as any
     for (const key of Object.getOwnPropertyNames(ctor)) {
       const cfg = ctor[key] as AttrStateConfig | undefined
-      if (cfg?._type !== 'state' || !(event in cfg.transitions)) continue
+      // Object.hasOwn: `'toString' in transitions` finds Object.prototype and
+      // would crash stateCanFire instead of reporting an unknown event.
+      if (cfg?._type !== 'state' || !Object.hasOwn(cfg.transitions, event)) continue
       const res = stateCanFire(cfg, (this as any)[key], event, this)
       if (!res.ok) {
         this.errors.add(key, res.reason)
@@ -1192,11 +1196,11 @@ function _wrapRecord<T extends ApplicationRecord>(record: T): T {
         if (stateCfg?._type !== 'state') continue
         if (prop.length > 3 && prop.startsWith('can')) {
           const eventKey = prop[3]!.toLowerCase() + prop.slice(4)
-          if (eventKey in stateCfg.transitions) {
+          if (Object.hasOwn(stateCfg.transitions, eventKey)) {
             return () => stateCanFire(stateCfg, (receiver as any)[stateProp], eventKey, receiver).ok
           }
         }
-        if (prop in stateCfg.transitions) {
+        if (Object.hasOwn(stateCfg.transitions, prop)) {
           return () => {
             const res = stateCanFire(stateCfg, (receiver as any)[stateProp], prop, receiver)
             if (!res.ok) return false
@@ -1213,7 +1217,7 @@ function _wrapRecord<T extends ApplicationRecord>(record: T): T {
           const labelKey = prop[2]!.toLowerCase() + prop.slice(3)
           for (const [enumProp, enumConfig] of Object.entries(ctor) as [string, any][]) {
             if (enumConfig?._type !== 'enum' && enumConfig?._type !== 'state') continue
-            if (!(labelKey in (enumConfig as AttrEnumConfig).values)) continue
+            if (!Object.hasOwn((enumConfig as AttrEnumConfig).values, labelKey)) continue
             if (prefix === 'is') {
               return () => {
                 const raw = target._changes.has(enumProp)
@@ -1293,7 +1297,9 @@ function _wrapRecord<T extends ApplicationRecord>(record: T): T {
         const colKey: string = (attrConfig as any)._column ?? (prop as string)
         const rawOriginal = target._attributes[colKey]
         const rawNew = attrConfig.set(value)   // DB value to store and send
-        if (rawOriginal !== rawNew) {
+        // Object.is: with `!==`, a NaN attribute is permanently dirty
+        // (NaN !== NaN) and re-marks changed on every identical assignment.
+        if (!Object.is(rawOriginal, rawNew)) {
           const was = attrConfig.get ? attrConfig.get(rawOriginal) : rawOriginal
           target._changes.set(colKey, { was, is: rawNew })
         } else {
@@ -1305,7 +1311,7 @@ function _wrapRecord<T extends ApplicationRecord>(record: T): T {
       // Plain column (no Attr) — mirror Attr pattern: keep _attributes as the
       // original DB value, track the new value only in _changes.
       const rawOriginal = target._attributes[prop as string]
-      if (rawOriginal !== value) {
+      if (!Object.is(rawOriginal, value)) {
         target._changes.set(prop as string, { was: rawOriginal, is: value })
       } else {
         // Setting back to original — clear any pending change

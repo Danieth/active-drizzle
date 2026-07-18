@@ -523,12 +523,17 @@ describe('Attr.int — strict integers only', () => {
     expect(quantity.get!(null)).toBeNull()
   })
 
-  it('throws on floats, garbage strings, NaN, unsafe integers', () => {
+  it('throws on floats, garbage strings, unsafe integers', () => {
     expect(() => quantity.set!(3.5)).toThrow(TypeError)
     expect(() => quantity.set!('3.5')).toThrow(TypeError)
     expect(() => quantity.set!('abc')).toThrow(TypeError)
-    expect(() => quantity.set!(NaN)).toThrow(TypeError)
     expect(() => quantity.set!(Number.MAX_SAFE_INTEGER + 1)).toThrow(TypeError)
+  })
+
+  it('NaN and blank strings cast to null — NaN is never a value', () => {
+    expect(quantity.set!(NaN)).toBeNull()
+    expect(quantity.set!('')).toBeNull()
+    expect(quantity.set!('   ')).toBeNull()
   })
 
   it('reads raw values as numbers', () => {
@@ -573,11 +578,13 @@ describe('Attr.money — cents in DB, dollars on model', () => {
     }
   })
 
-  it('throws on NaN, Infinity, garbage, and unsafe magnitudes', () => {
-    expect(() => price.set!(NaN)).toThrow(TypeError)
-    expect(() => price.set!(Infinity)).toThrow(TypeError)
-    expect(() => price.set!('abc')).toThrow(TypeError)
+  it('NaN, Infinity, and garbage cast to null; unsafe magnitudes throw', () => {
+    expect(price.set!(NaN)).toBeNull()
+    expect(price.set!(Infinity)).toBeNull()
+    expect(price.set!('abc')).toBeNull()
+    expect(price.set!('')).toBeNull()
     expect(() => price.set!(Number.MAX_SAFE_INTEGER)).toThrow(TypeError)
+    expect(() => price.set!(true as any)).toThrow(TypeError)
   })
 
   it('nulls pass through', () => {
@@ -610,11 +617,13 @@ describe('Attr.percent — automagic fraction ↔ percent', () => {
     expect(rate.get!(rate.set!(42.5))).toBeCloseTo(42.5)
   })
 
-  it('nulls pass through, garbage throws', () => {
+  it('nulls pass through; NaN and garbage cast to null', () => {
     expect(rate.set!(null)).toBeNull()
     expect(rate.get!(null)).toBeNull()
-    expect(() => rate.set!('abc')).toThrow(TypeError)
-    expect(() => rate.set!(NaN)).toThrow(TypeError)
+    expect(rate.set!('abc')).toBeNull()
+    expect(rate.set!(NaN)).toBeNull()
+    expect(rate.set!('')).toBeNull()
+    expect(() => rate.set!(true as any)).toThrow(TypeError)
   })
 })
 

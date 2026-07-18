@@ -66,6 +66,22 @@ describe('cents / dollars conversion', () => {
     expect(() => dollarsToCents(Infinity)).toThrow(TypeError)
   })
 
+  it('dollarsToCents is exact at EVERY magnitude, not just below 2', () => {
+    // Number.EPSILON is the float gap at magnitude 1 — an epsilon nudge does
+    // nothing at 8.165 (whose double is 8.16499999999999914…). Each of these
+    // used to lose a cent.
+    expect(dollarsToCents(4.015)).toBe(402)
+    expect(dollarsToCents(8.165)).toBe(817)
+    expect(dollarsToCents(19.995)).toBe(2000)
+    expect(dollarsToCents(1234567.005)).toBe(123456701)
+    expect(dollarsToCents(-8.165)).toBe(-817)
+    expect(dollarsToCents(0.005)).toBe(1)
+    expect(dollarsToCents(-0.005)).toBe(-1)
+    expect(dollarsToCents(1e-8)).toBe(0)      // exponent form of String(n)
+    expect(dollarsToCents(0)).toBe(0)
+    expect(() => dollarsToCents(1e21)).toThrow(TypeError) // beyond safe cents
+  })
+
   it('centsToDollars', () => {
     expect(centsToDollars(cents(1999))).toBe(19.99)
     expect(centsToDollars(cents(0))).toBe(0)
