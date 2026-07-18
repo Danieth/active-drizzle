@@ -118,7 +118,8 @@ export default defineConfig({
           items: [
             { text: 'Overview', link: '/react/overview' },
             { text: 'ClientModel & Type Safety', link: '/react/client-model' },
-            { text: 'Form Integration', link: '/react/forms' },
+            { text: 'The Forms Surface', link: '/react/forms-surface' },
+            { text: 'Form Integration (TanStack)', link: '/react/forms' },
             { text: 'File Upload Hooks', link: '/react/attachments' },
             { text: 'Error Handling', link: '/react/error-handling' },
           ],
