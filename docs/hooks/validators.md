@@ -86,6 +86,37 @@ validates: [Validates.presence(), Validates.length({ min: 3 })]
 This keeps conditional schemas honest: an optional field validates its
 format only when it has a value.
 
+## Implicit validations from the schema
+
+Some validations you never write — the drizzle schema already declares
+them, and `validate()` derives them automatically:
+
+| Schema declaration | Implicit validation | Instead of |
+| --- | --- | --- |
+| `.notNull()` (no default) | `can't be blank` | PG `23502 not_null_violation` |
+| `varchar('x', { length: 80 })` | `is too long (maximum is 80 characters)` | PG `22001 string_data_right_truncation` |
+| `smallint` / `integer` / `bigint` | `must be between -32768 and 32767` … | PG `22003 numeric_value_out_of_range` |
+
+```ts
+// schema: title: varchar('title', { length: 80 }).notNull()
+const post = new Post({}, true)
+await post.validate()          // → false
+post.errors.on('title')        // → ["can't be blank"] — no PG round-trip
+```
+
+The rules mirror what the database would actually enforce:
+
+- **New records** check every column; **persisted records** check only the
+  columns being written (partial `SELECT`s stay safe).
+- Columns with a DB default, an Attr `default`, identity/serial generation,
+  or primary keys are exempt — anything the database or `save()` fills.
+- The STI `type` discriminator is exempt (stamped during save).
+- Opt a model out entirely with `static implicitValidations = false`.
+
+One ordering caveat: lifecycle hooks (`@beforeSave`, `@beforeCreate`) run
+*after* validation. A NOT NULL column filled inside one of those hooks will
+false-positive — fill it in `beforeValidate` instead, or opt the model out.
+
 ## Uniqueness caveat
 
 `Validates.uniqueness()` is an application-level check, race-prone by

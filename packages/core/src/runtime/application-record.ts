@@ -1,5 +1,5 @@
 import util from 'util'
-import { eq, and, inArray, sql } from 'drizzle-orm'
+import { eq, and, inArray, sql, getTableColumns } from 'drizzle-orm'
 import { Relation } from './relation.js'
 import { getExecutor, getSchema, MODEL_REGISTRY, transaction, transactionContext, afterCommitQueue, AbortChain, RecordNotFound } from './boot.js'
 import { runHooks, collectHooks } from './hooks.js'
@@ -269,7 +269,99 @@ export class ApplicationRecord {
       }
     }
 
+    this._runImplicitSchemaValidations(ctor)
+
     return this.errors.isEmpty()
+  }
+
+  /**
+   * Schema-derived implicit validations — the constraints the DATABASE
+   * already declares become friendly validation errors instead of raw PG
+   * failures (23502 not_null_violation, 22001 string_data_right_truncation,
+   * 22003 numeric_value_out_of_range):
+   *
+   *   - NOT NULL without a default (DB or Attr) → "can't be blank"
+   *   - varchar(n)                              → "is too long (maximum is n characters)"
+   *   - smallint / integer column width         → "must be between …"
+   *
+   * New records check every column; persisted records only check what
+   * changed (unselected columns are never touched, so partial SELECTs stay
+   * safe). Identity/serial columns report hasDefault and are skipped.
+   * Opt out per model with `static implicitValidations = false`.
+   */
+  private _runImplicitSchemaValidations(ctor: any): void {
+    if (ctor.implicitValidations === false) return
+    // tableName's fallback reads this.name — which a `static name = Attr…`
+    // shadows with a config object. No resolvable table → nothing to derive.
+    let tableName: string | undefined
+    try {
+      tableName = ctor.tableName
+    } catch {
+      return
+    }
+    const table = tableName ? getSchema()[tableName] : undefined
+    if (!table) return // not booted (unit tests) — nothing to derive
+
+    // Columns that an Attr default will fill during save()
+    const attrDefaulted = new Set<string>()
+    for (const key of Object.getOwnPropertyNames(ctor)) {
+      const attr = ctor[key]
+      if (attr?._isAttr === true && attr.default !== undefined) {
+        attrDefaulted.add(attr._column ?? key)
+      }
+    }
+
+    let columns: Record<string, any> | undefined
+    try {
+      columns = getTableColumns(table)
+    } catch {
+      return
+    }
+    // Mock/partial table objects (unit-test boots) yield nothing — skip.
+    if (!columns || typeof columns !== 'object') return
+
+    const INT_BOUNDS: Record<string, [number, number]> = {
+      PgSmallInt: [-32_768, 32_767],
+      PgInteger: [-2_147_483_648, 2_147_483_647],
+      PgBigInt53: [-Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER],
+    }
+
+    for (const [colKey, col] of Object.entries(columns)) {
+      // STI discriminator is stamped by save() after validation — never blank.
+      if (colKey === 'type' && ctor.stiType) continue
+      // Primary keys are DB-generated or app-assigned (sometimes in
+      // beforeCreate hooks, which run AFTER validate) — never police them.
+      if (col.primary) continue
+      const changed = this._changes.has(colKey)
+      const value = changed ? this._changes.get(colKey)!.is : this._attributes[colKey]
+
+      // Only police values actually being written: the whole row on INSERT,
+      // assigned columns on UPDATE.
+      if (!this.isNewRecord && !changed) continue
+
+      if (value === null || value === undefined) {
+        const required = col.notNull && !col.hasDefault && !attrDefaulted.has(colKey)
+        // On INSERT a missing required column is an error; on UPDATE only an
+        // explicit assignment to null is (absent means "leave it alone").
+        if (required && (this.isNewRecord || changed)) {
+          this.errors.add(colKey, "can't be blank")
+        }
+        continue
+      }
+
+      if (col.columnType === 'PgVarchar' && typeof col.length === 'number' && typeof value === 'string') {
+        if (value.length > col.length) {
+          this.errors.add(colKey, `is too long (maximum is ${col.length} characters)`)
+        }
+      }
+
+      const bounds = INT_BOUNDS[col.columnType as string]
+      if (bounds && typeof value === 'number' && Number.isFinite(value)) {
+        if (value < bounds[0] || value > bounds[1]) {
+          this.errors.add(colKey, `must be between ${bounds[0]} and ${bounds[1]}`)
+        }
+      }
+    }
   }
 
   // ── State machine (Attr.state) ──────────────────────────────────────────
