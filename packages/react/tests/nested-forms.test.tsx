@@ -19,14 +19,17 @@ import {
   type SubmitResult,
 } from '../src/index.js'
 
-function TextInput({ value, bind }: PresenterProps) {
+function TextInput({ value, bind, errors }: PresenterProps) {
   return (
-    <input
-      aria-label={bind.name}
-      value={value ?? ''}
-      onChange={(e) => bind.onChange(e.target.value)}
-      onBlur={(e) => bind.onBlur(e)}
-    />
+    <>
+      <input
+        aria-label={bind.name}
+        value={value ?? ''}
+        onChange={(e) => bind.onChange(e.target.value)}
+        onBlur={(e) => bind.onBlur(e)}
+      />
+      {errors?.map(msg => <span key={msg} role="alert">{msg}</span>)}
+    </>
   )
 }
 function TextView({ value }: PresenterProps) {
@@ -194,6 +197,71 @@ describe('child validation and errors', () => {
     expect(submitSpy).not.toHaveBeenCalled()
   })
 
+  it('an UNTOUCHED invalid child SHOWS its error on submit — a blocked save is never silent', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const { handle: loan } = makeHandle({
+      submit: submitSpy,
+      childValidate: (d) => (d.name ? {} : { name: ["can't be blank"] }),
+    })
+    renderAssets(loan)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add asset' }))
+    // Pristine row: error exists but stays hidden until an interaction
+    expect(screen.queryByText("can't be blank")).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    // The submit attempt propagates to child sessions — the row lights up
+    await waitFor(() => expect(screen.getByText("can't be blank")).toBeTruthy())
+    expect(submitSpy).not.toHaveBeenCalled()
+  })
+
+  it('an invalid GRANDCHILD blocks the submit AND shows its error (nested-nested)', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const meta = {
+      assets: {
+        kind: 'nested',
+        fields: {
+          name: { kind: 'string' },
+          liens: {
+            kind: 'nested',
+            fields: { holder: { kind: 'string' } },
+            validate: (d: any) => (d.holder ? {} : { holder: ['holder required'] }),
+          },
+        },
+      },
+    }
+    const session = new FormSession({
+      draft: { id: 1, assets: [] },
+      mode: 'edit', abilities: null,
+      submit: submitSpy,
+    })
+    const loan: any = createFormHandle(session, { fieldMeta: meta as any })
+    render(
+      <loan.Form>
+        <loan.assets>
+          {(asset: any) => (
+            <>
+              <asset.name edit />
+              <asset.liens>{(lien: any) => <lien.holder edit />}</asset.liens>
+              <asset.liens.Add>Add lien</asset.liens.Add>
+            </>
+          )}
+        </loan.assets>
+        <loan.assets.Add>Add asset</loan.assets.Add>
+        <loan.Submit>Save</loan.Submit>
+      </loan.Form>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add asset' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'name' }), { target: { value: 'Truck' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add lien' }))   // holder left blank
+    expect(screen.queryByText('holder required')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(screen.getByText('holder required')).toBeTruthy())
+    expect(submitSpy).not.toHaveBeenCalled()   // grandchild gates the parent
+  })
+
   it('server errors addressed by _key route to the right child session', async () => {
     const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({
       ok: false,
@@ -213,6 +281,27 @@ describe('child validation and errors', () => {
     })
     // Nothing leaked to the parent's base
     expect(session.allErrors().base).toBeUndefined()
+  })
+
+  it("a stale child 422 doesn't wedge the resubmit after the user fixes it", async () => {
+    let call = 0
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => {
+      call++
+      if (call === 1) return { ok: false, status: 422, errors: { 'assets[id:8].value': ['too expensive'] } }
+      return { ok: true }
+    })
+    const { handle: loan, session } = makeHandle({ submit: submitSpy })
+    renderAssets(loan)
+
+    fireEvent.change(screen.getAllByRole('textbox', { name: 'name' })[1]!, { target: { value: 'Crane 2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(submitSpy).toHaveBeenCalledTimes(1))
+
+    // User corrects and tries again — the gate must not replay the old 422
+    fireEvent.change(screen.getAllByRole('textbox', { name: 'name' })[1]!, { target: { value: 'Crane 3' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(session.getStatus()).toBe('saved'))
+    expect(submitSpy).toHaveBeenCalledTimes(2)
   })
 })
 

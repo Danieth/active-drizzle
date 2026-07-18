@@ -81,6 +81,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     errors(): Record<string, string[]>
     routeServerError(path: string, msgs: string[]): boolean
     commitBaselines(savedRows?: any[]): void
+    markSubmitAttempted(): void
   }>()
 
   private readonly validateFn: (draft: T) => Record<string, string[]>
@@ -155,6 +156,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     errors(): Record<string, string[]>
     routeServerError(path: string, msgs: string[]): boolean
     commitBaselines(savedRows?: any[]): void
+    markSubmitAttempted(): void
   }): void {
     this.nested.set(name, manager)
   }
@@ -172,9 +174,22 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     this.notifyAll()
   }
 
-  /** Re-snapshot the baseline (post-save settle). */
+  /**
+   * A submit was attempted — errors become visible on EVERY field, including
+   * untouched fields in nested child rows (and their children, recursively).
+   * Without the recursion, an invalid untouched child blocks the submit while
+   * showing nothing: the form just silently refuses to save.
+   */
+  markSubmitAttempted(): void {
+    this.submitAttempted = true
+    for (const manager of this.nested.values()) manager.markSubmitAttempted()
+    this.notifyAll()
+  }
+
+  /** Re-snapshot the baseline (post-save settle). Stale 422s don't linger. */
   resetBaseline(): void {
     this.baseline = this.snapshotDraft()
+    this.serverErrors = {}
     this.notifyAll()
   }
 
@@ -246,6 +261,18 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   }
 
   /**
+   * Client errors that GATE a submit: this session's validate() plus every
+   * nested child's, recursively (grandchildren included). Server errors are
+   * display-only here — a stale 422 must never block resubmitting the
+   * corrected value.
+   */
+  gateErrors(): Record<string, string[]> {
+    const out: Record<string, string[]> = { ...this.clientValidate() }
+    for (const manager of this.nested.values()) Object.assign(out, manager.errors())
+    return out
+  }
+
+  /**
    * Errors VISIBLE for a field right now — validate-on-change, display gated
    * by touched ∪ submitAttempted; once visible, they clear live while typing.
    */
@@ -268,13 +295,10 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
    * fields; unknown fields land on base. On 401, the draft SURVIVES (C15).
    */
   async submit(opts: { event?: string } = {}): Promise<boolean> {
-    this.submitAttempted = true
+    this.markSubmitAttempted()
 
-    const clientErrors = { ...this.clientValidate() }
-    // Children gate the parent: an invalid row blocks the whole submit
-    for (const manager of this.nested.values()) {
-      Object.assign(clientErrors, manager.errors())
-    }
+    // Children (and grandchildren) gate the parent: any invalid row blocks
+    const clientErrors = this.gateErrors()
     if (Object.keys(clientErrors).length > 0) {
       this.status = 'error'
       this.notifyAll()

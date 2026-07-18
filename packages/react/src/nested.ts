@@ -157,15 +157,24 @@ export class NestedArrayManager {
     return out.length > 0 ? out : null
   }
 
-  /** Client-side validity across live children — blocks the parent submit. */
+  /**
+   * Client-side validity across live children — blocks the parent submit.
+   * gateErrors (not allErrors): recursion pulls grandchildren in, and stale
+   * server errors on a child never wedge the parent's resubmit.
+   */
   errors(): Record<string, string[]> {
     const out: Record<string, string[]> = {}
     for (const child of this.visible()) {
-      for (const [field, msgs] of Object.entries(child.session.allErrors())) {
+      for (const [field, msgs] of Object.entries(child.session.gateErrors())) {
         out[`${this.name}[${child.key}].${field}`] = msgs
       }
     }
     return out
+  }
+
+  /** Parent submit attempted → every live child's errors become visible too. */
+  markSubmitAttempted(): void {
+    for (const child of this.visible()) child.session.markSubmitAttempted()
   }
 
   /** Route server errors addressed as `name[id:7].field` / `name[new:3].field`. */
