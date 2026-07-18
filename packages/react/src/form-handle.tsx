@@ -11,7 +11,7 @@
  * for programmatic reads. Each field subscribes to ITS OWN slice of the
  * FormSession via useSyncExternalStore — a keystroke re-renders one field.
  */
-import React, { createContext, useContext, useSyncExternalStore, Fragment, type FC, type ReactNode } from 'react'
+import React, { createContext, useContext, useEffect, useSyncExternalStore, Fragment, type FC, type ReactNode } from 'react'
 import { FormSession, type SessionStatus } from './form-session.js'
 import { NestedArrayManager, type NestedChild } from './nested.js'
 import { resolvePresenter, checkRequiredMeta, type PresenterBind } from './presenters.js'
@@ -351,6 +351,15 @@ export function createFormHandle<T extends Record<string, any>>(
   }
 
   const FormComponent: FC<{ children?: ReactNode; onSuccess?: () => void; autosave?: boolean; className?: string }> = ({ children, onSuccess, autosave, className }) => {
+    // Offline autosave: when connectivity returns, retry any queued deltas.
+    // The whole "orchestrator" — one listener, kept deliberately tiny.
+    useEffect(() => {
+      if (!autosave || typeof window === 'undefined') return
+      const onOnline = () => void session.flushPending()
+      window.addEventListener('online', onOnline)
+      return () => window.removeEventListener('online', onOnline)
+    }, [autosave])
+
     const submitThroughForm = async (opts?: { event?: string }) => {
       const ok = await session.submit(opts ?? {})
       if (ok) onSuccess?.()

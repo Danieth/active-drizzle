@@ -64,9 +64,11 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   private serverErrors: Record<string, string[]> = {}
   private serverIssues: Array<{ field: string; code: string }> = []
   /** Per-field autosave lifecycle for save-indicators (spinner/checkmark). */
-  private fieldStates = new Map<string, 'saving' | 'saved' | 'error'>()
+  private fieldStates = new Map<string, 'saving' | 'saved' | 'error' | 'pending'>()
   /** Fields mid-IME-composition — commit-on-change is suppressed (C11). */
   private composing = new Set<string>()
+  /** Offline autosave queue — field → newest value, retried by flushPending(). */
+  private pendingWrites = new Map<string, any>()
 
   /** Baseline for the submit diff — reset on load and on successful submit. */
   private baseline: Record<string, any>
@@ -255,7 +257,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   getIssues(): Array<{ field: string; code: string }> { return this.serverIssues }
 
   /** Per-field autosave state — 'ready' when nothing is in flight. */
-  fieldState(field: string): 'ready' | 'saving' | 'saved' | 'error' {
+  fieldState(field: string): 'ready' | 'saving' | 'saved' | 'error' | 'pending' {
     return this.fieldStates.get(field) ?? 'ready'
   }
 
@@ -430,13 +432,26 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     if (result.ok) {
       if (result.envelope) this.applyEnvelope(result.envelope)
       else this.baseline[field] = now[field]
+      this.pendingWrites.delete(field)
       this.fieldStates.set(field, 'saved')
       this.notify(field)
       return true
     }
 
-    // Rollback the optimistic write — the field shows what the server has
+    // OFFLINE (network failure, status 0): keep the optimistic value and
+    // QUEUE the delta — the edit is never lost. flushPending() retries it
+    // (the Form wires this to the browser 'online' event). This is the whole
+    // "orchestrator", deliberately tiny: last-write-per-field, retried later.
+    if (result.status === 0) {
+      this.pendingWrites.set(field, now[field])
+      this.fieldStates.set(field, 'pending')
+      this.notify(field)
+      return false
+    }
+
+    // Server rejected it (validation/auth) — roll back to what the server has
     ;(this.draft as any)[field] = previous
+    this.pendingWrites.delete(field)
     if (result.status === 401 || result.status === 403) {
       this.status = 'unauthenticated'
     } else {
@@ -446,6 +461,19 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     this.notifyAll()
     return false
   }
+
+  /**
+   * Retry every queued offline write (newest value per field). Called when
+   * connectivity returns. Clean, fail-closed: a field that fails again just
+   * stays queued for the next flush.
+   */
+  async flushPending(): Promise<void> {
+    if (this.pendingWrites.size === 0) return
+    const fields = [...this.pendingWrites.keys()]
+    for (const field of fields) await this.commitField(field, 'autosave')
+  }
+
+  hasPending(): boolean { return this.pendingWrites.size > 0 }
 
   /** Fold a server envelope in: new record values, mask, can, version. */
   applyEnvelope(envelope: ServerEnvelope): void {

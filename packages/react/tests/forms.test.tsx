@@ -268,6 +268,41 @@ describe('commit policy', () => {
   })
 })
 
+// ── Autosave: per-field PATCH + simple offline queue ─────────────────────────
+
+describe('autosave offline queue', () => {
+  it('a network failure KEEPS the edit, queues it, and flush retries when back online', async () => {
+    let online = false
+    const submit = vi.fn(async ({ data }: any): Promise<SubmitResult> =>
+      online ? { ok: true } : { ok: false, status: 0 })
+    const { session } = makeHandle({ submit })
+
+    session.setValue('amount', '999')
+    const first = await session.commitField('amount', 'autosave')
+    expect(first).toBe(false)
+    expect(session.getValue('amount')).toBe('999')       // NOT rolled back (offline)
+    expect(session.fieldState('amount')).toBe('pending')
+    expect(session.hasPending()).toBe(true)
+
+    online = true
+    await session.flushPending()
+    expect(session.getValue('amount')).toBe('999')
+    expect(session.fieldState('amount')).toBe('saved')
+    expect(session.hasPending()).toBe(false)
+  })
+
+  it('a SERVER rejection (422) still rolls back — only network failures queue', async () => {
+    const submit = vi.fn(async (): Promise<SubmitResult> =>
+      ({ ok: false, status: 422, errors: { amount: ['too big'] } }))
+    const { session } = makeHandle({ submit })
+    session.setValue('amount', '999')
+    await session.commitField('amount', 'autosave')
+    expect(session.getValue('amount')).toBe('250000')    // rolled back to server truth
+    expect(session.hasPending()).toBe(false)
+    expect(session.fieldState('amount')).toBe('error')
+  })
+})
+
 // ── C13/C14: submit-as-transition + the self-locking form ────────────────────
 
 describe('submit event → envelope re-mask', () => {

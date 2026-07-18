@@ -127,11 +127,19 @@ inputs like toggles: `commit: 'change'`; continuous inputs: `'blur'`). The
 
 Autosave is optimistic with rollback, gated by the field's own validators
 (a locally-invalid value never PATCHes), and exposes per-field
-`saving | saved | error` through the presenter's `state` prop — a
+`saving | saved | error | pending` through the presenter's `state` prop — a
 spinner-in-the-switch is one prop read. Two footguns are handled for you:
 a blur into an element marked `data-ad-cancel` skips the commit (the classic
 autosave-races-the-Cancel-button bug), and commits are suppressed during IME
 composition, firing once at composition end.
+
+**Offline, kept simple.** A commit that fails on the *network* (not a server
+rejection) does not roll back — the edit stays, the field goes `pending`, and
+the delta is queued (newest-value-per-field). `<Form autosave>` retries the
+queue on the browser's `online` event; you can also call
+`session.flushPending()` yourself. A *server* rejection (422/401/403) still
+rolls back to server truth — only lost connectivity queues. That is the whole
+"orchestrator": one Map, one listener, no bookkeeping.
 
 ## Nested forms — `accepts_nested_attributes_for`, unfurled
 
