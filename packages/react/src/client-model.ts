@@ -89,9 +89,13 @@ export class ClientModel<
     return { ...this._attrs }
   }
 
-  get id(): any {
-    return this._attrs['id']
-  }
+  /**
+   * `id` is a plain data property defined by the constructor when present.
+   * (It was once a prototype accessor — which made `draft.id = 9` THROW on
+   * drafts constructed from empty payloads, e.g. new-record forms receiving
+   * their created id. Never again.)
+   */
+  declare id: any
 }
 
 // ── Cache key factories ───────────────────────────────────────────────────────

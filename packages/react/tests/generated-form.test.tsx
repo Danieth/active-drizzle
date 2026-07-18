@@ -12,6 +12,8 @@ import React from 'react'
 import { describe, it, expect } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 import { useGeneratedForm } from '../src/generated-form.js'
+import { ClientModel } from '../src/client-model.js'
+import { FormSession } from '../src/form-session.js'
 
 const envelope = (record: Record<string, any>, extra: Record<string, any> = {}) => ({
   record,
@@ -102,5 +104,31 @@ describe('useGeneratedForm', () => {
     const first = hook.result.current.form
     hook.rerender({ formKey: 5, data })
     expect(hook.result.current.form).toBe(first)   // stable identity, no churn
+  })
+})
+
+describe('new-form create response (the getter-only id crash)', () => {
+  it('applyEnvelope assigns id onto an empty-constructed ClientModel draft', async () => {
+    class DealClient extends ClientModel<any, any> {}
+    const draft: any = new DealClient({})              // new-record form: EMPTY payload
+    const session = new FormSession({ draft, mode: 'new', abilities: null })
+    // The create response envelope carries the fresh id — this THREW before
+    session.applyEnvelope({ record: { id: 9, name: 'Created' } })
+    expect(draft.id).toBe(9)
+    expect(draft.name).toBe('Created')
+  })
+
+  it('submit resolves true and applies the envelope end-to-end for a new form', async () => {
+    class DealClient extends ClientModel<any, any> {}
+    const draft: any = new DealClient({})
+    const session = new FormSession({
+      draft, mode: 'new', abilities: null,
+      submit: async () => ({ ok: true, envelope: { record: { id: 42, name: 'Made' } } }),
+    })
+    ;(draft as any).name = 'Made'
+    const ok = await session.submit()
+    expect(ok).toBe(true)
+    expect(draft.id).toBe(42)
+    expect(session.getStatus()).toBe('saved')
   })
 })

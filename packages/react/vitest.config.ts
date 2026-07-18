@@ -4,6 +4,7 @@ import { resolve } from 'path'
 export default defineConfig({
   resolve: {
     alias: {
+      '@active-drizzle/core/validators': resolve(__dirname, '../core/src/runtime/validators.ts'),
       '@active-drizzle/core': resolve(__dirname, '../core/src/index.ts'),
       '@active-drizzle/controller': resolve(__dirname, '../controller/src/index.ts'),
     },

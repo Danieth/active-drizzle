@@ -319,6 +319,12 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
       this.status = 'unauthenticated'   // draft untouched — re-auth then retry
     } else {
       this.serverErrors = this.refieldErrors(result.errors ?? {})
+      // A failure must never be invisible: 500s (or empty bodies) get a base
+      // fallback. Errors that ROUTED to nested children are already visible
+      // there, so only the truly-empty case falls back.
+      if (Object.keys(result.errors ?? {}).length === 0) {
+        this.serverErrors = { base: ['Something went wrong — please try again.'] }
+      }
       this.status = 'error'
     }
     this.notifyAll()
@@ -382,7 +388,13 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   applyEnvelope(envelope: ServerEnvelope): void {
     if (envelope.record) {
       for (const [k, v] of Object.entries(envelope.record)) {
-        ;(this.draft as any)[k] = v
+        // Accessor-proof: a draft class with a getter-only property must not
+        // blow up the success path — define over it instead
+        try {
+          ;(this.draft as any)[k] = v
+        } catch {
+          Object.defineProperty(this.draft, k, { value: v, writable: true, enumerable: true, configurable: true })
+        }
       }
     }
     if (envelope.abilities !== undefined) this.abilities = envelope.abilities ?? null

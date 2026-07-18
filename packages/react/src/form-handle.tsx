@@ -25,6 +25,9 @@ import { resolvePresenter, checkRequiredMeta, type PresenterBind } from './prese
  */
 const FormModeContext = createContext<'stage' | 'autosave' | null>(null)
 
+/** The enclosing Form's submit pipeline — Submit buttons route through it so onSuccess fires. */
+const FormSubmitContext = createContext<((opts?: { event?: string }) => Promise<boolean>) | null>(null)
+
 export interface FieldProps {
   /** absent → view · true → Attr/default edit presenter · string → named override. Never inferred. */
   edit?: boolean | string
@@ -302,19 +305,28 @@ export function createFormHandle<T extends Record<string, any>>(
     return Field as FieldComponent
   }
 
-  const FormComponent: FC<{ children?: ReactNode; onSuccess?: () => void; autosave?: boolean; className?: string }> = ({ children, onSuccess, autosave, className }) => (
-    <FormModeContext.Provider value={autosave ? 'autosave' : 'stage'}>
-      <form
-        {...(className !== undefined ? { className } : {})}
-        onSubmit={(e) => {
-          e.preventDefault()
-          void session.submit().then((ok) => { if (ok) onSuccess?.() })
-        }}
-      >
-        {children}
-      </form>
-    </FormModeContext.Provider>
-  )
+  const FormComponent: FC<{ children?: ReactNode; onSuccess?: () => void; autosave?: boolean; className?: string }> = ({ children, onSuccess, autosave, className }) => {
+    const submitThroughForm = async (opts?: { event?: string }) => {
+      const ok = await session.submit(opts ?? {})
+      if (ok) onSuccess?.()
+      return ok
+    }
+    return (
+      <FormModeContext.Provider value={autosave ? 'autosave' : 'stage'}>
+        <FormSubmitContext.Provider value={submitThroughForm}>
+          <form
+            {...(className !== undefined ? { className } : {})}
+            onSubmit={(e) => {
+              e.preventDefault()
+              void submitThroughForm()
+            }}
+          >
+            {children}
+          </form>
+        </FormSubmitContext.Provider>
+      </FormModeContext.Provider>
+    )
+  }
   FormComponent.displayName = 'AdForm'
 
   const SubmitComponent: FC<{ children?: ReactNode; event?: string; className?: string }> = ({ children, event, className }) => {
@@ -323,15 +335,23 @@ export function createFormHandle<T extends Record<string, any>>(
       () => session.fieldVersion('*'),
       () => session.fieldVersion('*'),
     )
+    // Inside a Form, route through its pipeline so onSuccess fires;
+    // standalone buttons submit the session directly
+    const formSubmit = useContext(FormSubmitContext)
+    const status = session.getStatus()
+    const saving = status === 'saving'
     // Event buttons carry the server's can verdict; plain submit only
     // disables while in flight
-    const disabled = session.getStatus() === 'saving' || (event !== undefined && !session.can(event))
+    const disabled = saving || (event !== undefined && !session.can(event))
+    const doSubmit = formSubmit ?? ((opts?: { event?: string }) => session.submit(opts ?? {}))
     return (
       <button
         type="button"
         {...(className !== undefined ? { className } : {})}
         disabled={disabled}
-        onClick={() => void session.submit(event !== undefined ? { event } : {})}
+        aria-busy={saving || undefined}
+        data-status={status}
+        onClick={() => void doSubmit(event !== undefined ? { event } : undefined)}
       >
         {children ?? 'Save'}
       </button>

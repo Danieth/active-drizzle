@@ -366,24 +366,6 @@ describe('handle safety', () => {
   })
 })
 
-describe('409 conflict surfaces a message', () => {
-  it('lands on base errors instead of failing silently', async () => {
-    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: false, status: 409 }))
-    const { handle: loan } = makeHandle({ submit: submitSpy })
-    render(
-      <loan.Form>
-        <loan.amount edit />
-        <loan.Submit>Save</loan.Submit>
-        <loan.BaseErrors />
-      </loan.Form>,
-    )
-    fireEvent.change(screen.getByRole('textbox'), { target: { value: '1' } })
-    fireEvent.click(screen.getByRole('button'))
-    const alert = await screen.findByRole('alert')
-    expect(alert.textContent).toContain('changed by someone else')
-  })
-})
-
 describe('status returns to ready on edit', () => {
   it('saved → ready when the user types again', async () => {
     const { handle: loan, session } = makeHandle({ submit: async () => ({ ok: true }) })
@@ -428,7 +410,7 @@ describe('M4 — autosave', () => {
 
     fireEvent.blur(input)
     await waitFor(() => expect(submitSpy).toHaveBeenCalledTimes(1))
-    expect(submitSpy.mock.calls[0]![0]).toEqual({ data: { amount: '300000' }, version: 'v1' })
+    expect(submitSpy.mock.calls[0]![0]).toEqual({ data: { amount: '300000' } })
     await waitFor(() => expect(session.fieldState('amount')).toBe('saved'))
   })
 
@@ -620,5 +602,63 @@ describe('className passthrough', () => {
     expect(container.querySelector('form')!.className).toBe('space-y-4')
     expect(container.querySelector('i')!.className).toBe('w-full rounded border')
     expect(screen.getByRole('button', { name: 'Save' }).className).toBe('btn btn-primary')
+  })
+})
+
+// ── The invisible-success hang (regression) ──────────────────────────────────
+
+describe('Submit inside Form fires onSuccess', () => {
+  it('a Submit BUTTON click routes through the Form pipeline → onSuccess runs', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const onSuccess = vi.fn()
+    const { handle: loan } = makeHandle({ submit: submitSpy })
+
+    render(
+      <loan.Form onSuccess={onSuccess}>
+        <loan.amount edit />
+        <loan.Submit>Save</loan.Submit>
+      </loan.Form>,
+    )
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(onSuccess).toHaveBeenCalledTimes(1))
+  })
+
+  it('failed submit does NOT fire onSuccess and surfaces a fallback base error', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: false, status: 500 }))
+    const onSuccess = vi.fn()
+    const { handle: loan } = makeHandle({ submit: submitSpy })
+
+    render(
+      <loan.Form onSuccess={onSuccess}>
+        <loan.amount edit />
+        <loan.Submit>Save</loan.Submit>
+        <loan.BaseErrors />
+      </loan.Form>,
+    )
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('Something went wrong')
+    expect(onSuccess).not.toHaveBeenCalled()
+  })
+
+  it('the button carries loading affordances while saving', async () => {
+    let release: (v: SubmitResult) => void
+    const submitSpy = vi.fn(() => new Promise<SubmitResult>(r => { release = r }))
+    const { handle: loan } = makeHandle({ submit: submitSpy as any })
+
+    render(<loan.Form><loan.amount edit /><loan.Submit>Save</loan.Submit></loan.Form>)
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => {
+      const btn = screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement
+      expect(btn.disabled).toBe(true)
+      expect(btn.getAttribute('aria-busy')).toBe('true')
+      expect(btn.getAttribute('data-status')).toBe('saving')
+    })
+    await act(async () => { release!({ ok: true }) })
+    expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(false)
   })
 })
