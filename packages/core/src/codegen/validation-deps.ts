@@ -122,7 +122,7 @@ export function inferValidationDeps(
         const init = decl.getInitializer()
         const nameNode = decl.getNameNode()
 
-        if (init && isThisExpression(init)) {
+        if (init && isThisExpression(unwrapExpression(init))) {
           if (Node.isObjectBindingPattern(nameNode)) {
             for (const el of nameNode.getElements()) {
               const prop = el.getPropertyNameNode()?.getText() ?? el.getName()
@@ -218,8 +218,9 @@ export function inferValidationDeps(
   const walkExpression = (expr: Expression): string | null => walkNodeSubtree(expr)
 
   const isThisOrAlias = (expr: Node): boolean => {
-    if (isThisExpression(expr)) return true
-    if (Node.isIdentifier(expr) && aliases.has(expr.getText())) return true
+    const inner = unwrapExpression(expr)
+    if (isThisExpression(inner)) return true
+    if (Node.isIdentifier(inner) && aliases.has(inner.getText())) return true
     return false
   }
 
@@ -230,6 +231,31 @@ export function inferValidationDeps(
 
 function isThisExpression(node: Node): boolean {
   return node.getKind() === SyntaxKind.ThisKeyword || Node.isThisExpression(node)
+}
+
+/**
+ * Strips wrappers that don't change what an expression IS:
+ * `(this)`, `this as any`, `this!`, `this satisfies X`, `<any>this`.
+ * Without this, `(this as any)[key]` would evade the computed-access refusal —
+ * a fail-open hole. Casting away the type must never cast away the analysis.
+ */
+function unwrapExpression(node: Node): Node {
+  let cur = node
+  for (;;) {
+    if (Node.isParenthesizedExpression(cur) || Node.isAsExpression(cur) || Node.isNonNullExpression(cur)) {
+      cur = cur.getExpression()
+      continue
+    }
+    if (Node.isSatisfiesExpression?.(cur)) {
+      cur = (cur as any).getExpression()
+      continue
+    }
+    if (cur.getKind() === SyntaxKind.TypeAssertionExpression) {
+      cur = (cur as any).getExpression()
+      continue
+    }
+    return cur
+  }
 }
 
 /** Parse `@validate({ deps: ['a', 'b'] })` decorator args. */

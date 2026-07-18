@@ -238,13 +238,26 @@ function generateControllerFile(
 
     // Projection-scoped validate(): only validations whose deps fit this controller's
     // permit ∪ includes. Server still runs the full set on the merged record.
+    //
+    // Fail-closed on method calls: the controller Client emits validator bodies
+    // WITHOUT sibling instance methods, so a body calling `this.helper()` (or a
+    // proxy synthetic like `this.amountChanged()`) would blow up in the browser.
+    // Such validators stay server-only. Field reads and the enum helpers the
+    // Client actually generates (statusIsDraft()) remain shippable.
+    const clientCallable = new Set<string>(['raw', 'toObject'])
+    for (const e of model.enums) {
+      for (const label of Object.keys(e.values)) {
+        clientCallable.add(`${lcFirst(e.propertyName)}Is${capitalize(label)}`)
+      }
+    }
     const projection = controllerProjectionFields(ctrl, model, writableFields)
     const clientValidations = (model.instanceMethods ?? []).filter(m =>
       m.isValidation &&
       m.body &&
       !m.validationDepsError &&
       m.validationDeps &&
-      depsFitProjection(m.validationDeps, projection)
+      depsFitProjection(m.validationDeps, projection) &&
+      !bodyCallsUnavailableMethods(m.body, clientCallable)
     )
     const clientPropValidations = Object.entries(model.propertyValidations ?? {}).filter(([prop]) =>
       projection.has(prop)
@@ -583,6 +596,21 @@ function toFileName(className: string): string {
  * Controller projection field set: permit-listed write fields ∪ get/index includes ∪ id.
  * Validations ship to this Client iff deps ⊆ this set.
  */
+/**
+ * True when `body` calls a `this.<method>()` that the generated controller
+ * Client will not have. Property READS (`this.amount`) are fine — only calls
+ * are checked. Fail-closed: any unknown call name keeps the validator
+ * server-side rather than shipping code that throws in the browser.
+ */
+function bodyCallsUnavailableMethods(body: string, available: Set<string>): boolean {
+  const re = /\bthis\.([A-Za-z_$][\w$]*)\s*\(/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(body)) !== null) {
+    if (!available.has(m[1]!)) return true
+  }
+  return false
+}
+
 function controllerProjectionFields(
   ctrl: CtrlMeta,
   model: ModelMeta,

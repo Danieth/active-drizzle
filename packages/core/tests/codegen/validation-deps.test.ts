@@ -93,6 +93,52 @@ describe('inferValidationDeps', () => {
     if (!result.ok) expect(result.error).toMatch(/computed/)
   })
 
+  it('refuses computed access even through a cast — (this as any)[k]', () => {
+    const { cls } = loadClass(`
+      class Loan {
+        @validate()
+        check() {
+          const k = 'amount' + ''
+          if ((this as any)[k] < 0) return 'bad'
+        }
+      }
+      function validate() { return () => {} }
+    `)
+    const result = inferValidationDeps(method(cls, 'check'), cls)
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toMatch(/computed/)
+  })
+
+  it('counts (this as any).field as a normal field read', () => {
+    const { cls } = loadClass(`
+      class Loan {
+        @validate()
+        check() {
+          if ((this as any).amount < 0) return 'bad'
+        }
+      }
+      function validate() { return () => {} }
+    `)
+    const result = inferValidationDeps(method(cls, 'check'), cls)
+    expect(result).toEqual({ ok: true, deps: ['amount'], source: 'inferred' })
+  })
+
+  it('refuses a cast this escaping as an argument — helper(this as any)', () => {
+    const { cls } = loadClass(`
+      class Loan {
+        @validate()
+        check() {
+          return externalCheck(this as any)
+        }
+      }
+      function validate() { return () => {} }
+      function externalCheck(x: unknown) { return null }
+    `)
+    const result = inferValidationDeps(method(cls, 'check'), cls)
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toMatch(/escapes/)
+  })
+
   it('refuses this escaping as an argument', () => {
     const { cls } = loadClass(`
       class Loan {
