@@ -19,6 +19,35 @@ export {
   type UseCrudReturn,
 } from './hooks.js'
 
+// Forms — FormSession, presenter registry, callable field handles
+export {
+  FormSession,
+  type Ability,
+  type SessionStatus,
+  type ServerEnvelope,
+  type SubmitResult,
+  type SubmitPayload,
+  type FormSessionOptions,
+} from './form-session.js'
+export {
+  registerPresenter,
+  setDefaultPresenters,
+  getPresenter,
+  clearPresenters,
+  resolvePresenter,
+  type PresenterProps,
+  type PresenterDef,
+  type PresenterBind,
+  type ResolvedPresenter,
+} from './presenters.js'
+export {
+  createFormHandle,
+  type FormHandle,
+  type FieldComponent,
+  type FieldProps,
+} from './form-handle.js'
+export { useForm, useEditForm, useNewForm, type UseFormOptions } from './use-form.js'
+
 // Error utilities
 export {
   parseControllerError,
