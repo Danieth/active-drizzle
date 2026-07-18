@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { Table, getTableColumns, is } from 'drizzle-orm'
 import type { PgDatabase } from 'drizzle-orm/pg-core'
 
 type GlobalDb = PgDatabase<any, any, any>
@@ -20,7 +21,36 @@ let _schema: Record<string, any> = {}
 
 export const MODEL_REGISTRY: Record<string, any> = {}
 
+/**
+ * Column-name suffixes the record Proxy claims for synthesized dirty-tracking
+ * helpers (`titleChanged()`, `titleWas()`, `titleChange()`). A real column
+ * with one of these names would be SHADOWED — reads would return the helper
+ * function instead of the value — so boot() refuses the schema outright.
+ */
+const RESERVED_COLUMN_SUFFIXES = ['Changed', 'Was', 'Change'] as const
+
+function assertNoReservedColumnNames(schema: Record<string, any>): void {
+  const violations: string[] = []
+  for (const [tableName, table] of Object.entries(schema)) {
+    if (!is(table, Table)) continue
+    for (const columnKey of Object.keys(getTableColumns(table))) {
+      const suffix = RESERVED_COLUMN_SUFFIXES.find(
+        (s) => columnKey.length > s.length && columnKey.endsWith(s)
+      )
+      if (suffix) violations.push(`'${columnKey}' on '${tableName}' (reserved suffix '${suffix}')`)
+    }
+  }
+  if (violations.length > 0) {
+    throw new Error(
+      `active-drizzle: column names ending in ${RESERVED_COLUMN_SUFFIXES.map(s => `'${s}'`).join('/')} ` +
+      `collide with synthesized dirty-tracking helpers and would be unreadable: ` +
+      `${violations.join(', ')}. Rename the column(s).`
+    )
+  }
+}
+
 export function boot(db: GlobalDb, schema: Record<string, any>) {
+  assertNoReservedColumnNames(schema)
   _activeDb = db
   _schema = schema
   // Wire MODEL_REGISTRY into attachment lookups to avoid circular imports

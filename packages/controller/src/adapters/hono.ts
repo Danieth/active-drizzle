@@ -40,11 +40,15 @@ export function honoAdapter<TContext = AnyContext>(
         if (route.method !== 'GET') {
           try { body = await c.req.json() } catch { body = {} }
         }
-        // Coerce numeric path params
+        // Coerce numeric path params — but only CANONICAL numbers, i.e.
+        // strings that survive a Number round-trip. This keeps zip codes
+        // ('01234'), hex/exponent forms ('0x10', '1e5'), 'Infinity'/'NaN',
+        // and ids past 2^53 (which Number would silently round) as strings.
         const numericParams: Record<string, any> = {}
         for (const [k, v] of Object.entries({ ...pathParams, ...queryParams })) {
           const n = Number(v)
-          numericParams[k] = isNaN(n) || v === '' ? v : n
+          numericParams[k] =
+            typeof v === 'string' && v !== '' && Number.isFinite(n) && String(n) === v ? n : v
         }
         const input = { ...numericParams, ...body }
         const procedure = resolveProcedure(router, route.procedure)

@@ -1,4 +1,12 @@
 import type { AttrConfig } from './application-record.js'
+import {
+  decimalToScaledBigInt,
+  numberToDecimalString,
+  scaleExact,
+  shiftDecimalString,
+  toFiniteNumber,
+  toStrictInt,
+} from './decimal.js'
 
 /**
  * A parsed Postgres range. Mirrors the wire format `[lower,upper)`:
@@ -44,6 +52,9 @@ export function serializePgRange<T>(range: PgRange<T>, formatBound: (v: T) => st
 export function rangeIncludes<T extends number | Date>(range: PgRange<T>, value: T): boolean {
   if (range.isEmpty) return false
   const v = value instanceof Date ? value.getTime() : value
+  // NaN compares false against every bound, which would fall through to
+  // `true` — but NaN is in no range, ever.
+  if (typeof v === 'number' && Number.isNaN(v)) return false
   const lo = range.lower instanceof Date ? range.lower.getTime() : range.lower
   const hi = range.upper instanceof Date ? range.upper.getTime() : range.upper
   if (lo !== null && (range.lowerInclusive ? v < lo : v <= lo)) return false
@@ -114,7 +125,8 @@ export function stateCanFire(
   event: string,
   record: any,
 ): { ok: true } | { ok: false; reason: string } {
-  const t = config.transitions[event]
+  // Object.hasOwn: `transitions['toString']` must not find Object.prototype
+  const t = Object.hasOwn(config.transitions, event) ? config.transitions[event] : undefined
   if (!t) return { ok: false, reason: `unknown event '${event}'` }
   if (fromLabel !== null && fromLabel !== undefined && t.from !== '*' && !t.from.includes(fromLabel)) {
     return { ok: false, reason: t.message ?? `cannot ${event} from '${fromLabel}'` }
@@ -152,6 +164,183 @@ export function stateLegalMove(
   }
 }
 
+/** Optional numeric bounds accepted by the numeric Attr constructors. */
+export type NumericBounds = { min?: number; max?: number }
+
+/**
+ * Folds `min`/`max` into the attr's validators (model-unit values, checked
+ * at validate() time like any other validator). Merges into `validates` when
+ * the caller used that alias — the validate loop reads `validates ?? validate`,
+ * so writing the other key would silently disable the bounds.
+ */
+function withBounds<C extends Partial<AttrConfig> & NumericBounds>(config: C): Omit<C, 'min' | 'max'> {
+  const { min, max, ...rest } = config
+  if (min === undefined && max === undefined) return rest
+  const bounds = (v: any) => {
+    if (v === null || v === undefined) return null
+    if (min !== undefined && v < min) return `must be greater than or equal to ${min}`
+    if (max !== undefined && v > max) return `must be less than or equal to ${max}`
+    return null
+  }
+  const key = rest.validates !== undefined ? 'validates' : 'validate'
+  const existing = (rest as any)[key]
+  const merged = existing === undefined ? [bounds]
+    : Array.isArray(existing) ? [...existing, bounds]
+    : [existing, bounds]
+  return { ...rest, [key]: merged } as Omit<C, 'min' | 'max'>
+}
+
+/**
+ * Number|string → canonical decimal string, or null (the NaN→null policy):
+ * NaN, ±∞, '', whitespace, and unparseable strings all come back null.
+ * Exponent forms expand ('1e-7' → '0.0000001'); digits are never rounded.
+ */
+function toDecimalString(val: unknown): string | null {
+  if (typeof val === 'number') return numberToDecimalString(val)
+  if (typeof val === 'string') {
+    const t = val.trim()
+    if (t === '') return null
+    return shiftDecimalString(t, 0)
+  }
+  return null
+}
+
+/** Strings the boolean attr reads as false: '0', 'f', 'false', 'off' (any case). */
+const FALSE_STRINGS = new Set(['0', 'f', 'false', 'off'])
+
+/** Boolean cast used on both sides of Attr.boolean. */
+function toBooleanValue(val: unknown): boolean | null {
+  if (val === null || val === undefined) return null
+  if (typeof val === 'string') {
+    const t = val.trim().toLowerCase()
+    if (t === '') return null
+    return !FALSE_STRINGS.has(t)
+  }
+  return Boolean(val)
+}
+
+/** Date cast used on both sides of Attr.date. */
+function toDateValue(val: unknown): Date | null {
+  if (val === null || val === undefined) return null
+  if (val instanceof Date) return isNaN(val.getTime()) ? null : val
+  if (typeof val === 'string') {
+    if (val.trim() === '') return null
+    const d = new Date(val)
+    return isNaN(d.getTime()) ? null : d
+  }
+  if (typeof val === 'number') {
+    if (!Number.isFinite(val)) return null
+    return new Date(val)
+  }
+  // Booleans/objects never coerce — `new Date(true)` is 1ms past the epoch.
+  return null
+}
+
+/**
+ * A typed range's behavior: how to parse/format literal bounds on the wire,
+ * plus optional model↔DB transforms applied to each bound (percent scaling,
+ * money cents↔dollars).
+ */
+interface RangeTypeSpec {
+  parse: (s: string) => any
+  format: (v: any) => string
+  boundGet?: (v: any) => any
+  boundSet?: (v: any) => any
+}
+
+function mapRangeBounds(r: PgRange<any>, fn?: (v: any) => any): PgRange<any> {
+  if (!fn) return r
+  return {
+    ...r,
+    lower: r.lower === null || r.lower === undefined ? null : fn(r.lower),
+    upper: r.upper === null || r.upper === undefined ? null : fn(r.upper),
+  }
+}
+
+/** Shared engine behind Attr.range.* — parse/serialize + per-bound casts. */
+function typedRangeAttr(spec: RangeTypeSpec, config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'range' } {
+  return {
+    _isAttr: true,
+    _type: 'range' as const,
+    get: (raw): PgRange<any> | null => {
+      if (raw === null || raw === undefined) return null
+      const r = typeof raw === 'object' ? (raw as PgRange<any>) : parsePgRange(String(raw), spec.parse)
+      return mapRangeBounds(r, spec.boundGet)
+    },
+    set: (val): string | null => {
+      if (val === null || val === undefined) return null
+      if (typeof val === 'string') return val // raw literal passthrough
+      return serializePgRange(mapRangeBounds(val as PgRange<any>, spec.boundSet), spec.format)
+    },
+    ...config,
+  }
+}
+
+/** Serializes a numeric bound in plain decimal notation (never '1e-7'). */
+const formatNumericBound = (v: number): string => numberToDecimalString(v) ?? String(v)
+
+const NUMERIC_RANGE_SPEC: RangeTypeSpec = {
+  parse: Number,
+  format: formatNumericBound,
+}
+
+const DATE_RANGE_SPEC: RangeTypeSpec = {
+  parse: (s) => new Date(s),
+  format: (d: Date) => `"${d.toISOString()}"`,
+}
+
+const PERCENT_RANGE_SPEC: RangeTypeSpec = {
+  parse: Number,
+  format: formatNumericBound,
+  boundGet: (v) => scaleExact(v, 2),   // fraction → percent, exactly
+  boundSet: (v) => scaleExact(v, -2),  // percent → fraction, exactly
+}
+
+const MONEY_RANGE_SPEC: RangeTypeSpec = {
+  parse: Number,
+  format: formatNumericBound,
+  boundGet: (v) => scaleExact(v, -2),  // cents → dollars
+  boundSet: (v) => {                   // dollars → cents, half-away-from-zero
+    const s = typeof v === 'number' ? numberToDecimalString(v) : typeof v === 'string' ? v : null
+    if (s === null) return null
+    const cents = decimalToScaledBigInt(s, 2)
+    return cents === null ? null : Number(cents)
+  },
+}
+
+/** Fallback parse of a PG array literal: '{a,b,"c d"}' → ['a','b','c d']. */
+function parsePgArrayLiteral(raw: unknown): unknown[] {
+  const s = String(raw).trim()
+  if (!s.startsWith('{') || !s.endsWith('}')) {
+    throw new Error(`Invalid Postgres array literal: ${JSON.stringify(raw)}`)
+  }
+  const inner = s.slice(1, -1)
+  return inner === '' ? [] : inner
+    .match(/("([^"\\]|\\.)*"|[^,]+)/g)!
+    .map((p) => p.replace(/^"(.*)"$/, '$1').replace(/\\(.)/g, '$1'))
+}
+
+/** Shared engine behind Attr.array.* — element-wise scalar casts both ways. */
+function typedArrayAttr(scalar: AttrConfig, config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'array' } {
+  return {
+    _isAttr: true,
+    _type: 'array' as const,
+    get: (raw): unknown[] | null => {
+      if (raw === null || raw === undefined) return null
+      const arr = Array.isArray(raw) ? raw : parsePgArrayLiteral(raw)
+      return arr.map((v) => scalar.get!(v))
+    },
+    set: (val): unknown[] | null => {
+      if (val === null || val === undefined) return null
+      if (!Array.isArray(val)) {
+        throw new TypeError(`Attr.array: expected an array, got ${JSON.stringify(val)}`)
+      }
+      return val.map((v) => scalar.set!(v))
+    },
+    ...config,
+  }
+}
+
 /**
  * Attr — the declarative field transformation system.
  *
@@ -176,18 +365,24 @@ export const Attr = {
    *   asset.toJpg()            // sets assetType = 'jpg', returns instance
    */
   enum<T extends Record<string, number>>(values: T): AttrEnumConfig<T> {
-    const inverse: Record<number, string> = {}
+    // Null-prototype lookup maps: `values['toString']` must never resolve to
+    // Object.prototype.toString and store a native function in the column.
+    const lookup: Record<string, number> = Object.assign(Object.create(null), values)
+    const inverse: Record<number, string> = Object.create(null)
     for (const [k, v] of Object.entries(values)) inverse[v] = k
     return {
       _isAttr: true as const,
       _type: 'enum',
       values,
-      get: (raw: number | null | undefined) =>
-        raw === null || raw === undefined ? null : (inverse[raw] ?? raw),
+      get: (raw: number | null | undefined) => {
+        if (raw === null || raw === undefined) return null
+        if (typeof raw === 'number' && Number.isNaN(raw)) return null
+        return inverse[raw] ?? raw
+      },
       set: (val: string | number | null | undefined) => {
         if (val === null || val === undefined) return null
-        if (typeof val === 'number') return val
-        const numeric = (values as Record<string, number>)[val as string]
+        if (typeof val === 'number') return Number.isNaN(val) ? null : val
+        const numeric = lookup[val as string]
         return numeric !== undefined ? numeric : val
       },
     }
@@ -269,7 +464,9 @@ export const Attr = {
       }
     }
 
-    const inverse: Record<string | number, string> = {}
+    // Null-prototype lookup maps — see Attr.enum for why.
+    const lookup: Record<string, number | string> = Object.assign(Object.create(null), values)
+    const inverse: Record<string | number, string> = Object.create(null)
     for (const [k, v] of Object.entries(values)) inverse[v] = k
 
     return {
@@ -278,11 +475,15 @@ export const Attr = {
       values,
       ...(initial !== undefined ? { initial, default: initial } : {}),
       transitions: transitions as Record<string, StateTransition>,
-      get: (raw: number | string | null | undefined) =>
-        raw === null || raw === undefined ? null : (inverse[raw] ?? raw),
+      get: (raw: number | string | null | undefined) => {
+        if (raw === null || raw === undefined) return null
+        if (typeof raw === 'number' && Number.isNaN(raw)) return null
+        return inverse[raw] ?? raw
+      },
       set: (val: string | number | null | undefined) => {
         if (val === null || val === undefined) return null
-        const stored = values[val as string]
+        if (typeof val === 'number') return Number.isNaN(val) ? null : val
+        const stored = lookup[val as string]
         return stored !== undefined ? stored : val
       },
       ...rest,
@@ -328,25 +529,31 @@ export const Attr = {
   },
 
   /**
-   * Explicit integer attr — Number() coercion on both sides.
+   * Explicit integer attr — lenient numeric coercion, NaN-proof.
+   * Numbers and numeric strings pass; NaN, ±∞, '', whitespace, unparseable
+   * strings, and non-numeric types all cast to null. NaN can never enter
+   * the record or the database.
+   * Optional `min`/`max` bounds become validators (see PG_INT4_MIN/MAX).
    */
-  integer(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig {
+  integer(config: Partial<Omit<AttrConfig, '_isAttr'>> & NumericBounds = {}): AttrConfig {
     return {
       _isAttr: true,
-      get: (raw) => (raw === null || raw === undefined ? null : Number(raw)),
-      set: (val) => (val === null || val === undefined ? null : Number(val)),
-      ...config,
+      get: (raw) => toFiniteNumber(raw),
+      set: (val) => toFiniteNumber(val),
+      ...withBounds(config),
     }
   },
 
   /**
-   * Explicit boolean attr.
+   * Explicit boolean attr. String forms of false — '0', 'f', 'false', 'off'
+   * (any case, so Postgres text 'f' reads correctly) — cast to false;
+   * '' casts to null; everything else follows JS truthiness.
    */
   boolean(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig {
     return {
       _isAttr: true,
-      get: (raw) => (raw === null || raw === undefined ? null : Boolean(raw)),
-      set: (val) => (val === null || val === undefined ? null : Boolean(val)),
+      get: (raw) => toBooleanValue(raw),
+      set: (val) => toBooleanValue(val),
       ...config,
     }
   },
@@ -387,18 +594,8 @@ export const Attr = {
   date(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig {
     return {
       _isAttr: true,
-      get: (raw): Date | null => {
-        if (raw === null || raw === undefined) return null
-        if (raw instanceof Date) return raw
-        const d = new Date(raw as string | number)
-        return isNaN(d.getTime()) ? null : d
-      },
-      set: (val): Date | string | null => {
-        if (val === null || val === undefined) return null
-        if (val instanceof Date) return val
-        const d = new Date(val as string | number)
-        return isNaN(d.getTime()) ? null : d
-      },
+      get: (raw): Date | null => toDateValue(raw),
+      set: (val): Date | null => toDateValue(val),
       ...config,
     }
   },
@@ -414,21 +611,17 @@ export const Attr = {
    *   static quantity = Attr.int()
    *   order.quantity = 3      // ✓
    *   order.quantity = 3.5    // ✗ throws TypeError
-   *   order.quantity = '12'   // ✓ numeric strings accepted → 12
+   *   order.quantity = '12'   // ✓ canonical integer strings accepted → 12
+   *   order.quantity = ''     // → null (blank casts to nil, Ruby-style)
+   *   order.quantity = '0x1F' // ✗ throws — only canonical digits, no hex/exponent
+   *   order.quantity = NaN    // → null (NaN is never a value)
    */
-  int(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig {
+  int(config: Partial<Omit<AttrConfig, '_isAttr'>> & NumericBounds = {}): AttrConfig {
     return {
       _isAttr: true,
-      get: (raw) => (raw === null || raw === undefined ? null : Number(raw)),
-      set: (val) => {
-        if (val === null || val === undefined) return null
-        const n = typeof val === 'string' ? Number(val) : val
-        if (typeof n !== 'number' || !Number.isSafeInteger(n)) {
-          throw new TypeError(`Attr.int: ${JSON.stringify(val)} is not a safe integer`)
-        }
-        return n
-      },
-      ...config,
+      get: (raw) => toFiniteNumber(raw),
+      set: (val) => toStrictInt(val, 'Attr.int'),
+      ...withBounds(config),
     }
   },
 
@@ -437,7 +630,9 @@ export const Attr = {
    *
    * The column stores integer minor units (the classic no-float-drift rule).
    * Reads give you major units as a number; writes accept major units and
-   * round to the nearest cent. Assigning a non-finite value throws.
+   * round half-away-from-zero to the nearest cent using exact decimal-string
+   * math (no float drift at any magnitude). NaN, '', and unparseable strings
+   * cast to null; non-number/string types throw.
    *
    *   // schema: priceCents: integer('price_cents')
    *   static price = Attr.money('priceCents')
@@ -469,21 +664,26 @@ export const Attr = {
       ...(currencyColumn ? { _currencyColumn: currencyColumn } : {}),
       get: (raw): number | null => {
         if (raw === null || raw === undefined) return null
-        return Number(raw) / 100
+        // Exact decimal-point shift: cents → dollars with no float division.
+        // NaN or garbage in the column reads as null, never NaN.
+        return scaleExact(typeof raw === 'bigint' ? raw.toString() : raw as number | string, -2)
       },
       set: (val): number | null => {
         if (val === null || val === undefined) return null
-        const n = typeof val === 'string' ? Number(val) : val
-        if (typeof n !== 'number' || !Number.isFinite(n)) {
-          throw new TypeError(`Attr.money: ${JSON.stringify(val)} is not a finite number`)
+        if (typeof val !== 'number' && typeof val !== 'string') {
+          throw new TypeError(`Attr.money: ${JSON.stringify(val)} is not a number`)
         }
-        // Epsilon-nudge: 1.005 * 100 is 100.4999... in binary floats
-        const sign = n < 0 ? -1 : 1
-        const c = sign * Math.round((Math.abs(n) + Number.EPSILON) * 100)
-        if (!Number.isSafeInteger(c)) {
-          throw new TypeError(`Attr.money: ${n} exceeds safe integer cents`)
+        // Decimal-string rounding: `8.165 * 100` is 816.4999… in binary
+        // floats at any magnitude past ~2, so the multiply-then-round trick
+        // silently loses cents. String(8.165) is exactly '8.165' (shortest
+        // round-trip repr), and rounding THAT is exact — see decimal.ts.
+        const s = toDecimalString(val)
+        if (s === null) return null // NaN / '' / unparseable → null, never NaN
+        const cents = decimalToScaledBigInt(s, 2)!
+        if (cents > BigInt(Number.MAX_SAFE_INTEGER) || cents < -BigInt(Number.MAX_SAFE_INTEGER)) {
+          throw new TypeError(`Attr.money: ${s} exceeds safe integer cents`)
         }
-        return c
+        return Number(cents)
       },
       ...rest,
     }
@@ -501,23 +701,24 @@ export const Attr = {
    * So SQL aggregation stays fraction-math (`avg(conversion_rate)`) while
    * every read/write at the model layer is already in display units.
    */
-  percent(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'percent' } {
+  percent(config: Partial<Omit<AttrConfig, '_isAttr'>> & NumericBounds = {}): AttrConfig & { _type: 'percent' } {
     return {
       _isAttr: true,
       _type: 'percent' as const,
       get: (raw): number | null => {
         if (raw === null || raw === undefined) return null
-        return Number(raw) * 100
+        // Exact shift: 0.153 → 15.3, not 15.299999999999999. Basis-point
+        // precision (15.37 → 0.1537) survives the round trip.
+        return scaleExact(typeof raw === 'bigint' ? raw.toString() : raw as number | string, 2)
       },
       set: (val): number | null => {
         if (val === null || val === undefined) return null
-        const n = typeof val === 'string' ? Number(val) : val
-        if (typeof n !== 'number' || !Number.isFinite(n)) {
-          throw new TypeError(`Attr.percent: ${JSON.stringify(val)} is not a finite number`)
+        if (typeof val !== 'number' && typeof val !== 'string') {
+          throw new TypeError(`Attr.percent: ${JSON.stringify(val)} is not a number`)
         }
-        return n / 100
+        return scaleExact(val, -2) // NaN / '' / unparseable → null, never NaN
       },
-      ...config,
+      ...withBounds(config),
     }
   },
 
@@ -529,20 +730,13 @@ export const Attr = {
    *   static spread = Attr.bps()
    *   loan.spread = 250        // stored as 250
    */
-  bps(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'bps' } {
+  bps(config: Partial<Omit<AttrConfig, '_isAttr'>> & NumericBounds = {}): AttrConfig & { _type: 'bps' } {
     return {
       _isAttr: true,
       _type: 'bps' as const,
-      get: (raw) => (raw === null || raw === undefined ? null : Number(raw)),
-      set: (val) => {
-        if (val === null || val === undefined) return null
-        const n = typeof val === 'string' ? Number(val) : val
-        if (typeof n !== 'number' || !Number.isSafeInteger(n)) {
-          throw new TypeError(`Attr.bps: ${JSON.stringify(val)} is not a safe integer`)
-        }
-        return n
-      },
-      ...config,
+      get: (raw) => toFiniteNumber(raw),
+      set: (val) => toStrictInt(val, 'Attr.bps'),
+      ...withBounds(config),
     }
   },
 
@@ -553,20 +747,13 @@ export const Attr = {
    *   static leverage = Attr.multiple()
    *   deal.leverage = 2.5
    */
-  multiple(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'multiple' } {
+  multiple(config: Partial<Omit<AttrConfig, '_isAttr'>> & NumericBounds = {}): AttrConfig & { _type: 'multiple' } {
     return {
       _isAttr: true,
       _type: 'multiple' as const,
-      get: (raw): number | null => {
-        if (raw === null || raw === undefined) return null
-        const n = Number(raw)
-        return isNaN(n) ? null : n
-      },
-      set: (val): string | null => {
-        if (val === null || val === undefined) return null
-        return String(val)
-      },
-      ...config,
+      get: (raw): number | null => toFiniteNumber(raw),
+      set: (val): string | null => toDecimalString(val),
+      ...withBounds(config),
     }
   },
 
@@ -576,111 +763,70 @@ export const Attr = {
    *
    *   static termDays = Attr.days()
    */
-  days(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'days' } {
+  days(config: Partial<Omit<AttrConfig, '_isAttr'>> & NumericBounds = {}): AttrConfig & { _type: 'days' } {
     return {
       _isAttr: true,
       _type: 'days' as const,
-      get: (raw) => (raw === null || raw === undefined ? null : Number(raw)),
-      set: (val) => {
-        if (val === null || val === undefined) return null
-        const n = typeof val === 'string' ? Number(val) : val
-        if (typeof n !== 'number' || !Number.isSafeInteger(n)) {
-          throw new TypeError(`Attr.days: ${JSON.stringify(val)} is not a safe integer`)
-        }
-        return n
-      },
-      ...config,
+      get: (raw) => toFiniteNumber(raw),
+      set: (val) => toStrictInt(val, 'Attr.days'),
+      ...withBounds(config),
     }
   },
 
   /**
-   * Postgres range attr (`int4range`, `int8range`, `numrange`).
-   * The driver returns range columns as literals like '[1,10)'; this parses
-   * them into a structured object and serializes on write.
+   * Postgres range attrs (`int4range`, `int8range`, `numrange`, `tstzrange`).
+   * The driver returns range columns as literals like '[1,10)'; these parse
+   * them into a structured PgRange and serialize on write.
    *
-   *   // schema: seats: customType numrange
-   *   static seats = Attr.range()
-   *   venue.seats               // → { lower: 1, upper: 10, lowerInclusive: true, upperInclusive: false }
+   * `Attr.range()` is the plain numeric range. Typed variants live on the
+   * namespace and run each bound through the matching scalar cast:
+   *
+   *   static seats       = Attr.range()            // numrange / int4range
+   *   static seatBlocks  = Attr.range.integer()    // int4range / int8range
+   *   static bookedAt    = Attr.range.date()       // tstzrange, bounds are Dates
+   *   static targetRate  = Attr.range.percent()    // numrange of fractions ↔ percents
+   *   static priceBand   = Attr.range.money()      // numrange of cents ↔ dollars
+   *
+   *   venue.seats                // → { lower: 1, upper: 10, lowerInclusive: true, upperInclusive: false }
    *   venue.seats = { lower: 5, upper: 20, lowerInclusive: true, upperInclusive: false }
    */
-  range(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'range' } {
-    return {
-      _isAttr: true,
-      _type: 'range' as const,
-      get: (raw): PgRange | null => {
-        if (raw === null || raw === undefined) return null
-        if (typeof raw === 'object') return raw as PgRange // already parsed
-        return parsePgRange(String(raw), Number)
-      },
-      set: (val): string | null => {
-        if (val === null || val === undefined) return null
-        if (typeof val === 'string') return val // raw literal passthrough
-        return serializePgRange(val as PgRange, String)
-      },
-      ...config,
+  range: Object.assign(
+    (config: Partial<Omit<AttrConfig, '_isAttr'>> = {}) => typedRangeAttr(NUMERIC_RANGE_SPEC, config),
+    {
+      /** Integer range (`int4range` / `int8range`). */
+      integer: (config: Partial<Omit<AttrConfig, '_isAttr'>> = {}) => typedRangeAttr(NUMERIC_RANGE_SPEC, config),
+      /** Numeric range (`numrange`) — same as Attr.range(). */
+      decimal: (config: Partial<Omit<AttrConfig, '_isAttr'>> = {}) => typedRangeAttr(NUMERIC_RANGE_SPEC, config),
+      /** Timestamp range (`tstzrange`) — bounds are JS Dates. */
+      date: (config: Partial<Omit<AttrConfig, '_isAttr'>> = {}) => typedRangeAttr(DATE_RANGE_SPEC, config),
+      /** Fraction-stored, percent-exposed `numrange` (exact ×100 scaling). */
+      percent: (config: Partial<Omit<AttrConfig, '_isAttr'>> = {}) => typedRangeAttr(PERCENT_RANGE_SPEC, config),
+      /** Cents-stored, dollars-exposed `numrange` (exact money rounding). */
+      money: (config: Partial<Omit<AttrConfig, '_isAttr'>> = {}) => typedRangeAttr(MONEY_RANGE_SPEC, config),
     }
-  },
+  ),
 
   /**
-   * Postgres timestamp range attr (`tstzrange`). Bounds are JS Dates.
+   * Postgres timestamp range attr (`tstzrange`). Alias of Attr.range.date().
    *
    *   static bookedDuring = Attr.dateRange()
    *   booking.bookedDuring   // → { lower: Date, upper: Date, ... }
    */
   dateRange(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'range' } {
-    return {
-      _isAttr: true,
-      _type: 'range' as const,
-      get: (raw): PgRange<Date> | null => {
-        if (raw === null || raw === undefined) return null
-        if (typeof raw === 'object') return raw as PgRange<Date>
-        return parsePgRange(String(raw), (s) => new Date(s))
-      },
-      set: (val): string | null => {
-        if (val === null || val === undefined) return null
-        if (typeof val === 'string') return val
-        return serializePgRange(val as PgRange<Date>, (d) => `"${d.toISOString()}"`)
-      },
-      ...config,
-    }
+    return typedRangeAttr(DATE_RANGE_SPEC, config)
   },
 
   /**
-   * Percent range — a Postgres `numrange` of FRACTIONS (0–1) exposed as a
-   * range of PERCENTS (0–100) on the model. The "% range" type:
+   * Percent range — alias of Attr.range.percent(). A Postgres `numrange` of
+   * FRACTIONS (0–1) exposed as a range of PERCENTS (0–100) on the model:
    *
-   *   // schema: targetRate: customType numrange
    *   static targetRate = Attr.percentRange()
    *   campaign.targetRate = { lower: 2.5, upper: 10, lowerInclusive: true, upperInclusive: false }
    *   // stored as '[0.025,0.1)' — fraction math in SQL, percent at the model
    *   campaign.targetRate.upper   // → 10
    */
   percentRange(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'range' } {
-    return {
-      _isAttr: true,
-      _type: 'range' as const,
-      get: (raw): PgRange | null => {
-        if (raw === null || raw === undefined) return null
-        const r = typeof raw === 'object' ? (raw as PgRange) : parsePgRange(String(raw), Number)
-        return {
-          ...r,
-          lower: r.lower === null ? null : r.lower * 100,
-          upper: r.upper === null ? null : r.upper * 100,
-        }
-      },
-      set: (val): string | null => {
-        if (val === null || val === undefined) return null
-        if (typeof val === 'string') return val
-        const r = val as PgRange
-        const scaled: PgRange = {
-          ...r,
-          lower: r.lower === null ? null : r.lower / 100,
-          upper: r.upper === null ? null : r.upper / 100,
-        }
-        return serializePgRange(scaled, String)
-      },
-      ...config,
-    }
+    return typedRangeAttr(PERCENT_RANGE_SPEC, config)
   },
 
   /**
@@ -723,66 +869,92 @@ export const Attr = {
    * parses most array columns to JS arrays — this attr normalizes both
    * directions and optionally transforms each element.
    *
-   *   static tags = Attr.array()                       // string[] passthrough
-   *   static scores = Attr.array({ element: Number }) // '{"1","2"}' → [1, 2]
+   * Typed variants on the namespace run every element through the matching
+   * scalar cast in BOTH directions (so `Attr.array.boolean()` turns
+   * `['false','t']` into `[false, true]`, and `Attr.array.money()` stores
+   * dollars as integer cents per element):
+   *
+   *   static tags     = Attr.array()                    // passthrough
+   *   static scores   = Attr.array.integer()            // '{"1","2"}' → [1, 2]
+   *   static flags    = Attr.array.boolean()
+   *   static touched  = Attr.array.date()
+   *   static tiers    = Attr.array.money()
+   *   static custom   = Attr.array({ element: v => Number(v) })
    */
-  array(
-    config: Partial<Omit<AttrConfig, '_isAttr'>> & { element?: (v: any) => any } = {}
-  ): AttrConfig & { _type: 'array' } {
-    const { element, ...rest } = config
-    return {
-      _isAttr: true,
-      _type: 'array' as const,
-      get: (raw): unknown[] | null => {
-        if (raw === null || raw === undefined) return null
-        let arr: unknown[]
-        if (Array.isArray(raw)) {
-          arr = raw
-        } else {
-          // Fallback literal parse: '{a,b,"c d"}'
-          const s = String(raw).trim()
-          if (!s.startsWith('{') || !s.endsWith('}')) {
-            throw new Error(`Invalid Postgres array literal: ${JSON.stringify(raw)}`)
+  array: Object.assign(
+    (config: Partial<Omit<AttrConfig, '_isAttr'>> & { element?: (v: any) => any } = {}): AttrConfig & { _type: 'array' } => {
+      const { element, ...rest } = config
+      return {
+        _isAttr: true,
+        _type: 'array' as const,
+        get: (raw): unknown[] | null => {
+          if (raw === null || raw === undefined) return null
+          const arr = Array.isArray(raw) ? raw : parsePgArrayLiteral(raw)
+          // arr.map(element) would forward the index as element's 2nd arg —
+          // Attr.array({ element: parseInt }) must not hit the radix trap.
+          return element ? arr.map((v) => element(v)) : arr
+        },
+        set: (val): unknown[] | null => {
+          if (val === null || val === undefined) return null
+          if (!Array.isArray(val)) {
+            throw new TypeError(`Attr.array: expected an array, got ${JSON.stringify(val)}`)
           }
-          const inner = s.slice(1, -1)
-          arr = inner === '' ? [] : inner
-            .match(/("([^"\\]|\\.)*"|[^,]+)/g)!
-            .map((p) => p.replace(/^"(.*)"$/, '$1').replace(/\\(.)/g, '$1'))
-        }
-        return element ? arr.map(element) : arr
-      },
-      set: (val): unknown[] | null => {
-        if (val === null || val === undefined) return null
-        if (!Array.isArray(val)) {
-          throw new TypeError(`Attr.array: expected an array, got ${JSON.stringify(val)}`)
-        }
-        return val // drizzle/node-postgres serialize JS arrays natively
-      },
-      ...rest,
+          return val // drizzle/node-postgres serialize JS arrays natively
+        },
+        ...rest,
+      }
+    },
+    {
+      /** `text[]` — each element cast through Attr.string. */
+      string: (config: Partial<Omit<AttrConfig, '_isAttr'>> = {}) => typedArrayAttr(Attr.string(), config),
+      /** `integer[]` — lenient numeric elements, NaN→null. */
+      integer: (config: Partial<Omit<AttrConfig, '_isAttr'>> = {}) => typedArrayAttr(Attr.integer(), config),
+      /** `integer[]` — strict elements, throws on non-integers. */
+      int: (config: Partial<Omit<AttrConfig, '_isAttr'>> = {}) => typedArrayAttr(Attr.int(), config),
+      /** `boolean[]` — 'f'/'false'/'0' elements read as false. */
+      boolean: (config: Partial<Omit<AttrConfig, '_isAttr'>> = {}) => typedArrayAttr(Attr.boolean(), config),
+      /** `timestamp[]` — elements are JS Dates. */
+      date: (config: Partial<Omit<AttrConfig, '_isAttr'>> = {}) => typedArrayAttr(Attr.date(), config),
+      /** `numeric[]` — full-precision strings in the DB, numbers on the model. */
+      decimal: (config: Partial<Omit<AttrConfig, '_isAttr'>> = {}) => typedArrayAttr(Attr.decimal(), config),
+      /** `integer[]` of cents ↔ dollars on the model. */
+      money: (config: Partial<Omit<AttrConfig, '_isAttr'>> = {}) => typedArrayAttr(Attr.money(), config),
+      /** `doublePrecision[]` of fractions ↔ percents on the model. */
+      percent: (config: Partial<Omit<AttrConfig, '_isAttr'>> = {}) => typedArrayAttr(Attr.percent(), config),
+      /** `jsonb[]` / `text[]` of JSON documents. */
+      json: (config: Partial<Omit<AttrConfig, '_isAttr'>> = {}) => typedArrayAttr(Attr.json(), config),
     }
-  },
+  ),
 
   /**
    * Decimal/numeric attr — stores as string (full precision), reads as number.
-   * Use for money, rates, or any column that must avoid floating-point drift.
+   * Use for rates or any column that must avoid floating-point drift.
    *
    *   static taxRate = Attr.decimal()
    *   product.taxRate   // → 0.2 (number, read-safe)
    *   product.taxRate = 0.2  // stored as '0.2' string
+   *
+   * Writes only accept decimal syntax: numbers become their exact shortest
+   * decimal string, decimal strings are canonicalized digit-for-digit
+   * (arbitrary precision preserved), and NaN / '' / garbage cast to null —
+   * the string 'NaN' can never reach a numeric column (PG would accept it!).
+   *
+   * Reading as a JS number rounds past ~17 significant digits. When the
+   * column's full precision matters, `Attr.decimal({ exact: true })` reads
+   * the canonical string instead — compare with your own decimal library.
    */
-  decimal(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig {
+  decimal(config: Partial<Omit<AttrConfig, '_isAttr'>> & NumericBounds & { exact?: boolean } = {}): AttrConfig {
+    const { exact, ...rest } = config
     return {
       _isAttr: true,
-      get: (raw): number | null => {
-        if (raw === null || raw === undefined) return null
-        const n = Number(raw)
-        return isNaN(n) ? null : n
-      },
-      set: (val): string | null => {
-        if (val === null || val === undefined) return null
-        return String(val)
-      },
-      ...config,
+      get: exact
+        ? (raw): string | null => {
+            if (raw === null || raw === undefined) return null
+            return toDecimalString(typeof raw === 'bigint' ? raw.toString() : raw)
+          }
+        : (raw): number | null => toFiniteNumber(raw),
+      set: (val): string | null => toDecimalString(val),
+      ...withBounds(rest),
     }
   },
 } as const

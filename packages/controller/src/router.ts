@@ -82,7 +82,9 @@ export function buildRouter<TContext = Record<string, any>>(
       const parentId = params[s.paramName]
       if (parentId === undefined) throw new BadRequest(`Missing scope param: ${s.paramName}`)
       const id = Number(parentId)
-      if (isNaN(id)) throw new BadRequest(`${s.paramName} must be a number`)
+      // '' would coerce to 0 and silently scope to id 0 — reject it with
+      // NaN and ±Infinity.
+      if (parentId === '' || !Number.isFinite(id)) throw new BadRequest(`${s.paramName} must be a number`)
       rel = rel.where({ [s.field]: id })
     }
     return rel
