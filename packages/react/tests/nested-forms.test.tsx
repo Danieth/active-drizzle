@@ -8,7 +8,7 @@
  */
 import React from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import {
   FormSession,
   createFormHandle,
@@ -394,6 +394,208 @@ describe('nested-nested forms', () => {
     expect(asset._key).toBe('new:1')
     expect(asset.liens).toBeUndefined()                       // raw array never rides
     expect(asset.liensAttributes).toEqual([{ holder: 'First Bank', _key: 'new:1' }])
+  })
+})
+
+// ── Permit-governed nested arrays: the abilities mask locks the tree ─────────
+
+describe('permit-governed nested arrays (self-locking)', () => {
+  it("abilities `assetsAttributes: 'view'` → no Add/Remove, read-only rows, nothing in the payload", async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const session = new FormSession({
+      draft: { id: 1, amount: '100', assets: [{ id: 7, name: 'Truck', value: '1' }] },
+      mode: 'edit',
+      abilities: { amount: 'edit', assetsAttributes: 'view' },
+      submit: submitSpy,
+    })
+    const loan: any = createFormHandle(session, { fieldMeta: FIELD_META as any })
+    renderAssets(loan)
+
+    expect(screen.queryByRole('button', { name: 'Add asset' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Remove/ })).toBeNull()
+    expect(screen.queryByRole('textbox', { name: 'name' })).toBeNull()   // view presenter
+    expect(screen.getByText('Truck')).toBeTruthy()
+
+    // Programmatic mutations are no-ops too, and the payload carries nothing
+    const mgr: any = session.getNested('assets')
+    mgr.add({ name: 'sneaky' })
+    mgr.remove('id:7')
+    expect(mgr.visible()).toHaveLength(1)
+    expect(mgr.attributesPayload()).toBeNull()
+  })
+
+  it('an envelope that narrows the mask locks the array LIVE (post-transition self-locking)', async () => {
+    const { handle: loan, session } = makeHandle()
+    renderAssets(loan)
+    expect(screen.getByRole('button', { name: 'Add asset' })).toBeTruthy()
+    expect(screen.getAllByRole('textbox', { name: 'name' }).length).toBe(2)
+
+    act(() => session.applyEnvelope({ abilities: { amount: 'view', assetsAttributes: 'view' } }))
+
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Add asset' })).toBeNull())
+    expect(screen.queryByRole('button', { name: /Remove/ })).toBeNull()
+    expect(screen.queryByRole('textbox', { name: 'name' })).toBeNull()
+    expect(screen.getByText('Truck')).toBeTruthy()                       // still visible, read-only
+  })
+
+  it('a save the server partially STRIPPED is never silent: base error + console.warn', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({
+      ok: true,
+      envelope: {
+        record: { id: 1, amount: '250' },
+        issues: [{ field: 'assetsAttributes', code: 'forbidden' }],
+      },
+    }))
+    const { session } = makeHandle({ submit: submitSpy })
+    session.setValue('amount', '250')
+
+    expect(await session.submit()).toBe(true)                            // flat save DID succeed
+    expect(session.baseErrors().join(' ')).toContain('assetsAttributes') // the strip is visible
+    expect(warn).toHaveBeenCalledOnce()
+    warn.mockRestore()
+  })
+})
+
+// ── Nested-nested lifecycle: settle recursion + rehydrate sync ───────────────
+
+const DEEP_META = {
+  name: { kind: 'string' },
+  assets: {
+    kind: 'nested',
+    fields: {
+      name: { kind: 'string' },
+      liens: { kind: 'nested', fields: { holder: { kind: 'string' } } },
+    },
+  },
+}
+
+/** Headless deep form: parent session + handles, managers registered. */
+function makeDeep(opts: { draft?: any; submit?: (p: any) => Promise<SubmitResult> } = {}) {
+  const session = new FormSession({
+    draft: opts.draft ?? { id: 1, name: 'Loan', assets: [{ id: 7, name: 'Truck', liens: [] }] },
+    mode: 'edit', abilities: null,
+    ...(opts.submit ? { submit: opts.submit } : {}),
+  })
+  const loan: any = createFormHandle(session, { fieldMeta: DEEP_META as any })
+  void loan.assets   // registers the assets manager
+  return { session, loan }
+}
+
+describe('nested-nested lifecycle', () => {
+  it('a saved NEW grandchild settles (re-keys) — the next save does NOT re-create it', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({
+      ok: true,
+      envelope: {
+        record: {
+          id: 1, name: 'Loan',
+          assets: [{ id: 7, name: 'Truck', liens: [{ id: 51, holder: 'First Bank' }] }],
+        },
+      },
+    }))
+    const { session, loan } = makeDeep({ submit: submitSpy })
+
+    const asset = loan.assets.forms[0]
+    void asset.liens                             // registers the grandchild manager
+    asset.liens.add({ holder: 'First Bank' })
+
+    expect(await session.submit()).toBe(true)
+    const first = submitSpy.mock.calls[0]![0].data
+    expect(first.assetsAttributes).toEqual([
+      { id: 7, liensAttributes: [{ holder: 'First Bank', _key: 'new:1' }] },
+    ])
+
+    // Settle proof: grandchild adopted its server id and the form is clean
+    const gcMgr: any = (session.getNested('assets') as any).visible()[0].session.getNested('liens')
+    expect(gcMgr.visible()[0].key).toBe('id:51')
+    expect(session.isDirty()).toBe(false)
+
+    // The old bug: this second save re-sent { holder, _key } → duplicate row
+    expect(await session.submit()).toBe(true)
+    expect(submitSpy.mock.calls[1]![0].data).toEqual({})
+  })
+
+  it('NEW parent form: children + grandchildren fold on create, then fully settle', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({
+      ok: true,
+      envelope: {
+        record: {
+          id: 9, name: 'Fresh',
+          assets: [{ id: 70, name: 'Crane', liens: [{ id: 80, holder: 'Second Bank' }] }],
+        },
+      },
+    }))
+    const { session, loan } = makeDeep({
+      draft: { name: 'Fresh' },                 // new-record draft: no assets key at all
+      submit: submitSpy,
+    })
+
+    loan.assets.add({ name: 'Crane' })
+    const asset = loan.assets.forms[0]
+    void asset.liens
+    asset.liens.add({ holder: 'Second Bank' })
+
+    expect(await session.submit()).toBe(true)
+    const data = submitSpy.mock.calls[0]![0].data
+    expect(data.assetsAttributes).toEqual([
+      { name: 'Crane', liensAttributes: [{ holder: 'Second Bank', _key: 'new:1' }], _key: 'new:1' },
+    ])
+
+    // Everything re-keyed against the create response, nothing left to send
+    const mgr: any = session.getNested('assets')
+    expect(mgr.visible()[0].key).toBe('id:70')
+    expect(mgr.visible()[0].session.getNested('liens').visible()[0].key).toBe('id:80')
+    expect(session.isDirty()).toBe(false)
+    await session.submit()
+    expect(submitSpy.mock.calls[1]![0].data).toEqual({})
+  })
+
+  it('a 422 addressed to a GRANDCHILD routes through the middle session and is visible', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({
+      ok: false, status: 422,
+      errors: { 'assets[id:7].liens[new:1].holder': ['is not a lienholder'] },
+    }))
+    const { session, loan } = makeDeep({ submit: submitSpy })
+    const asset = loan.assets.forms[0]
+    void asset.liens
+    asset.liens.add({ holder: 'Bogus' })
+
+    expect(await session.submit()).toBe(false)
+    const gc: any = (session.getNested('assets') as any).visible()[0].session
+      .getNested('liens').visible()[0].session
+    expect(gc.allErrors().holder).toEqual(['is not a lienholder'])
+    expect(gc.visibleErrors('holder')).toEqual(['is not a lienholder'])  // shown, not just stored
+    // Nothing dead-ended as a flat unrenderable key on the middle session
+    const mid: any = (session.getNested('assets') as any).visible()[0].session
+    expect(mid.allErrors()['liens[new:1].holder']).toBeUndefined()
+  })
+
+  it('rehydrate: a CLEAN form syncs child rows to fresh server truth (rows added/changed elsewhere)', () => {
+    const { session } = makeDeep()
+    session.applyEnvelope({
+      record: {
+        id: 1, name: 'Loan',
+        assets: [
+          { id: 7, name: 'Truck XL', liens: [] },     // renamed elsewhere
+          { id: 12, name: 'Trailer', liens: [] },     // added elsewhere
+        ],
+      },
+    })
+    const mgr: any = session.getNested('assets')
+    expect(mgr.visible().map((c: any) => c.key)).toEqual(['id:7', 'id:12'])
+    expect(mgr.visible()[0].session.draft.name).toBe('Truck XL')
+    expect(session.isDirty()).toBe(false)
+  })
+
+  it('rehydrate: a manager with UNSAVED child edits is never clobbered', () => {
+    const { session, loan } = makeDeep()
+    loan.assets.add({ name: 'My unsaved row' })
+    session.applyEnvelope({
+      record: { id: 1, name: 'Loan', assets: [{ id: 7, name: 'Server change', liens: [] }] },
+    })
+    const mgr: any = session.getNested('assets')
+    // Local new row survives; the server's rename did NOT overwrite the array
+    expect(mgr.visible().map((c: any) => c.session.draft.name)).toEqual(['Truck', 'My unsaved row'])
   })
 })
 

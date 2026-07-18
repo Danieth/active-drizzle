@@ -200,4 +200,70 @@ describe('buildRecordEnvelope', () => {
     expect(env.abilities.secret).toBeUndefined()  // not exposed ⇒ absent, period
     expect(env.record.secret).toBeUndefined()
   })
+
+  it('acceptsNested assocs get a `<name>Attributes` verdict from the same permit', () => {
+    const model = makeModel()
+    ;(model as any).notes = { _type: 'hasMany', options: { acceptsNested: true } }
+    ;(model as any).activities = { _type: 'hasMany', options: {} }   // NOT acceptsNested
+    const record = makeRecord({ id: 1, amount: 1, status: 'DRAFT' })
+
+    const allowed: any = {
+      get: { expose: ['id', 'amount'], abilities: true },
+      update: { permit: ['amount', 'notesAttributes'] },
+    }
+    expect(buildRecordEnvelope(record, model, allowed, ctx, ctrl).abilities['notesAttributes']).toBe('edit')
+
+    const denied: any = {
+      get: { expose: ['id', 'amount'], abilities: true },
+      update: { permit: ['amount'] },
+    }
+    const env = buildRecordEnvelope(record, model, denied, ctx, ctrl)
+    expect(env.abilities['notesAttributes']).toBe('view')             // governed, locked
+    expect(env.abilities['activitiesAttributes']).toBeUndefined()     // plain hasMany: ungoverned
+  })
+})
+
+// ── PATCH envelope carries the GET includes ──────────────────────────────────
+
+describe('save-response includes', () => {
+  it('the PATCH envelope reloads with get.include — nested rows echo back WITH ids', async () => {
+    const record = makeRecord({ id: 1, amount: 100, status: 'DRAFT', updatedAt: new Date(1000) })
+    const withNotes = makeRecord({
+      id: 1, amount: 250, status: 'DRAFT',
+      notes: [{ id: 51, body: 'saved child' }], updatedAt: new Date(1000),
+    })
+    const rel: any = {
+      where: vi.fn()
+        .mockReturnValueOnce({ first: vi.fn().mockResolvedValue(record), includes: vi.fn().mockReturnThis() })
+        .mockReturnValue({ includes: vi.fn().mockReturnThis(), first: vi.fn().mockResolvedValue(withNotes) }),
+    }
+    const config: any = {
+      get: { expose: ['id', 'amount', 'status', 'internalNote'], abilities: true, include: ['notes'] },
+      update: envelopeConfig.update,
+    }
+    const res = await defaultUpdate(rel, makeModel(), config, 1, { amount: 250 }, ctx, ctrl)
+    // Without the reload the client can never settle new rows → duplicates
+    expect(res.record.notes).toEqual([{ id: 51, body: 'saved child' }])
+  })
+})
+
+// ── Create: forbidden issues (same contract as update) ───────────────────────
+
+describe('create with envelope', () => {
+  it('reports stripped non-permitted fields as forbidden issues', async () => {
+    const model = makeModel()
+    ;(model as any).create = vi.fn(async (data: any) => makeRecord({ id: 9, status: 'DRAFT', ...data }))
+    const config: any = {
+      get: { expose: ['id', 'amount', 'status'], abilities: true },
+      create: { permit: ['amount'] },
+    }
+    const { defaultCreate } = await import('../src/crud-handlers.js')
+    const res = await defaultCreate(
+      {} as any, model, config,
+      { amount: 5, notesAttributes: [{ body: 'dropped' }] },
+      ctx, {}, ctrl,
+    )
+    expect(res.record.id).toBe(9)
+    expect(res.issues).toEqual([{ field: 'notesAttributes', code: 'forbidden' }])
+  })
 })

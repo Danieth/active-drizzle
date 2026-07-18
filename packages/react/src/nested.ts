@@ -15,6 +15,15 @@
  */
 import { FormSession } from './form-session.js'
 
+/** A view-only abilities mask covering every data field on a child draft. */
+function viewMaskOf(draft: any): Record<string, 'view'> {
+  const mask: Record<string, 'view'> = {}
+  for (const k of Object.keys(draft ?? {})) {
+    if (typeof draft[k] !== 'function' && !k.startsWith('_')) mask[k] = 'view'
+  }
+  return mask
+}
+
 export interface NestedChild {
   /** Stable identity for React keys and error routing: 'id:7' or 'new:3'. */
   key: string
@@ -33,6 +42,8 @@ export class NestedArrayManager {
   private nestedKeys: Set<string>
   /** When set, move() rewrites this field on every child (0-based). */
   private positionField?: string
+  /** Envelope said `<name>Attributes: 'view'` — rows render read-only, no mutations. */
+  private locked = false
 
   constructor(
     parent: FormSession<any>,
@@ -63,12 +74,30 @@ export class NestedArrayManager {
   private makeChildSession(draft: any, isNew: boolean): FormSession {
     return new FormSession({
       draft,
+      // null (all-editable) until the parent's envelope locks the array —
+      // then a view-only mask over the row's own fields
+      abilities: this.locked ? viewMaskOf(draft) : null,
       mode: isNew ? 'new' : 'edit',
-      abilities: null,                       // child masks ride the parent's projection
       ...(this.validateChild ? { validate: this.validateChild } : {}),
       // no transport: children NEVER fetch or submit — the parent owns the wire
     })
   }
+
+  /**
+   * The parent envelope's verdict for `<name>Attributes`. Locked rows render
+   * through their view presenters (a view-only mask over each child) and
+   * add/remove/move become no-ops — the same self-locking the flat fields get.
+   */
+  setLocked(locked: boolean): void {
+    if (locked === this.locked) return
+    this.locked = locked
+    for (const child of this.children) {
+      child.session.setAbilities(locked ? viewMaskOf(child.session.draft) : null)
+    }
+    this.parent.notifyExternal(this.name)
+  }
+
+  isLocked(): boolean { return this.locked }
 
   /** Children currently in the form — removed rows are gone from the UI. */
   visible(): NestedChild[] {
@@ -80,7 +109,8 @@ export class NestedArrayManager {
     return this.children
   }
 
-  add(defaults: Record<string, any> = {}): NestedChild {
+  add(defaults: Record<string, any> = {}): NestedChild | null {
+    if (this.locked) return null
     const child: NestedChild = {
       key: `new:${++this.seq}`,
       session: this.makeChildSession({ ...defaults }, true),
@@ -98,6 +128,7 @@ export class NestedArrayManager {
    * to its new index — the diffs ride the next submit like any other edit.
    */
   move(key: string, toIndex: number): void {
+    if (this.locked) return
     const visible = this.visible()
     const from = visible.findIndex(c => c.key === key)
     if (from === -1) return
@@ -119,6 +150,7 @@ export class NestedArrayManager {
 
   /** Persisted rows mark `_destroy`; new rows vanish entirely. */
   remove(key: string): void {
+    if (this.locked) return
     const idx = this.children.findIndex(c => c.key === key)
     if (idx === -1) return
     const child = this.children[idx]!
@@ -132,6 +164,7 @@ export class NestedArrayManager {
    * child has anything to say (so clean submits stay clean).
    */
   attributesPayload(): Array<Record<string, any>> | null {
+    if (this.locked) return null   // never send what the mask forbids
     const out: Array<Record<string, any>> = []
     for (const child of this.children) {
       const draft: any = child.session.draft
@@ -187,27 +220,76 @@ export class NestedArrayManager {
     return true
   }
 
-  /** After a successful parent submit, children settle onto their new baselines. */
+  /**
+   * After a successful parent submit, children settle onto their new
+   * baselines — RECURSIVELY. Every child is matched to its saved server row
+   * (persisted rows by id, new rows adopt fresh rows in order of appearance)
+   * and that row is handed to the child's own nested managers, so saved
+   * grandchildren re-key/drop too instead of staying `isNew` and being
+   * re-created by the next save.
+   */
   commitBaselines(savedRows?: any[]): void {
     // Drop destroyed rows and re-key new rows against the server's response
     this.children = this.children.filter(c => !c.destroyed)
-    if (savedRows) {
-      // Best effort: match still-new children to returned rows by order of appearance
-      const knownIds = new Set(
-        this.children.filter(c => !c.isNew).map(c => (c.session.draft as any).id),
+    const byId = new Map<any, any>()
+    if (savedRows) for (const r of savedRows) if (r?.id != null) byId.set(r.id, r)
+    const knownIds = new Set(
+      this.children.filter(c => !c.isNew).map(c => (c.session.draft as any).id),
+    )
+    const fresh = (savedRows ?? []).filter(r => r?.id != null && !knownIds.has(r.id))
+    if (!savedRows && this.children.some(c => c.isNew)) {
+      // Without the server echoing this association we cannot adopt the new
+      // rows' ids — the next save would re-create them. Loud in dev.
+      console.warn(
+        `[active-drizzle] "${this.name}" has new rows but the save response did not `
+        + `include "${this.name}" — add it to the controller's include so new rows `
+        + `adopt their server ids (otherwise the next save duplicates them).`,
       )
-      const fresh = savedRows.filter(r => r?.id != null && !knownIds.has(r.id))
-      let i = 0
-      for (const child of this.children) {
-        if (!child.isNew) continue
-        const row = fresh[i++]
-        if (!row) break
-        ;(child.session.draft as any).id = row.id
-        child.isNew = false
-        child.key = `id:${row.id}`
-      }
     }
-    for (const child of this.children) child.session.resetBaseline()
+    let i = 0
+    for (const child of this.children) {
+      let row: any
+      if (child.isNew) {
+        row = fresh[i++]
+        if (row) {
+          ;(child.session.draft as any).id = row.id
+          child.isNew = false
+          child.key = `id:${row.id}`
+        }
+      } else {
+        row = byId.get((child.session.draft as any).id)
+      }
+      // Grandchildren settle FIRST against the child's saved row, then the
+      // child's own baseline snapshots the fully-settled state
+      child.session.settleNested(row)
+      child.session.resetBaseline()
+    }
+    this.parent.notifyExternal(this.name)
+  }
+
+  /**
+   * Server truth arrived outside the submit path (refetch/rehydrate) and the
+   * caller verified no local edits are pending — rebuild the rows to match.
+   * Sessions for rows that still exist are REUSED (touched state, React
+   * identity) with fresh values folded in via applyEnvelope, which recurses
+   * into clean grandchild managers the same way.
+   */
+  syncFromServer(rows: any[]): void {
+    this.children = rows.map(row => {
+      const existing = this.children.find(
+        c => !c.isNew && row?.id != null && (c.session.draft as any).id === row.id,
+      )
+      if (existing) {
+        existing.session.applyEnvelope({ record: row })
+        return existing
+      }
+      return {
+        key: row?.id != null ? `id:${row.id}` : `new:${++this.seq}`,
+        session: this.makeChildSession({ ...row }, row?.id == null),
+        isNew: row?.id == null,
+        destroyed: false,
+      }
+    })
     this.parent.notifyExternal(this.name)
   }
 }

@@ -235,12 +235,20 @@ function generateControllerFile(
       writableFields = ctrl.crudConfig.get.expose.filter(f => !NEVER_WRITABLE.has(f))
     }
 
-    // Separate regular fields from attachment fields
+    // Separate regular fields from attachment fields and nested-attribute
+    // entries — `notesAttributes` in a permit is a WRITE SURFACE for the
+    // association, not a column, so it types as a nested rows array
     const attachmentNames = new Set((ctrl.attachments ?? []).map(a => a.name))
-    const regularWritable = writableFields.filter(f => !attachmentNames.has(f))
+    const nestedAttrNames = new Set(
+      model.associations
+        .filter(a => a.acceptsNested)
+        .map(a => `${a.propertyName}Attributes`),
+    )
+    const regularWritable = writableFields.filter(f => !attachmentNames.has(f) && !nestedAttrNames.has(f))
     const attachableWritable = writableFields.filter(f => attachmentNames.has(f))
+    const nestedWritable = writableFields.filter(f => nestedAttrNames.has(f))
 
-    if (regularWritable.length > 0 || attachableWritable.length > 0) {
+    if (regularWritable.length > 0 || attachableWritable.length > 0 || nestedWritable.length > 0) {
       L.push(`/** Only permit-listed fields — attempting .set() with any other key is a compile error. */`)
       const parts: string[] = []
       if (regularWritable.length > 0) {
@@ -255,6 +263,9 @@ function generateControllerFile(
         } else {
           attachParts.push(`${name}AssetIds?: number[]`)
         }
+      }
+      for (const name of nestedWritable) {
+        attachParts.push(`${name}?: Array<Record<string, any> & { id?: number; _destroy?: boolean; _key?: string }>`)
       }
       if (regularWritable.length > 0 && attachParts.length > 0) {
         L.push(`export type ${modelName}Write = ${parts[0]} & { ${attachParts.join('; ')} }`)
@@ -315,8 +326,31 @@ function generateControllerFile(
       // with the child model's field meta inlined, plus orderBy for DnD when
       // the association declares an order — <deal.notes>{note => …} just works
       const nestedEntries: string[] = []
+      // Fail-closed gate: a nested form ships only when the controller can
+      // actually ACCEPT the writes. A dynamic (record-aware) permit extracts
+      // as undefined → emit, the runtime abilities mask governs. Both permits
+      // statically known and neither containing `<assoc>Attributes` → the
+      // server would strip every nested write, so emitting an editable array
+      // would be a lie — skip it and say so at build time.
+      const staticCreatePermit = ctrl.crudConfig?.create?.permit
+      const staticUpdatePermit = ctrl.crudConfig?.update?.permit
+      const anyPermitDynamic =
+        (ctrl.crudConfig?.create !== undefined && staticCreatePermit === undefined) ||
+        (ctrl.crudConfig?.update !== undefined && staticUpdatePermit === undefined)
       for (const assoc of model.associations) {
         if (!assoc.acceptsNested) continue
+        const attrsKey = `${assoc.propertyName}Attributes`
+        const staticallyPermitted =
+          (staticCreatePermit ?? []).includes(attrsKey) || (staticUpdatePermit ?? []).includes(attrsKey)
+        if (!staticallyPermitted && !anyPermitDynamic) {
+          console.warn(
+            `[active-drizzle codegen] ${model.className}.${assoc.propertyName} accepts nested `
+            + `attributes but ${ctrl.className}'s permit never includes '${attrsKey}' — the server `
+            + `would strip every nested write, so the nested form was NOT generated. `
+            + `Add '${attrsKey}' to the permit to enable it.`,
+          )
+          continue
+        }
         const childTable = assoc.resolvedTable ?? assoc.explicitTable ?? pluralize(assoc.propertyName)
         const childModel = projectMeta?.models.find(m => m.tableName === childTable)
         if (!childModel) continue

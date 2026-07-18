@@ -16,6 +16,17 @@ export interface RecordEnvelope {
   issues?: Array<{ field: string; code: string }>
 }
 
+/** acceptsNestedAttributesFor association names (duck-typed, no core dep). */
+function collectNestedAssocs(model: any): string[] {
+  const out: string[] = []
+  for (const key of Object.getOwnPropertyNames(model)) {
+    const marker = (model as any)[key]
+    if (marker && typeof marker === 'object' && marker._type === 'hasMany'
+      && marker.options?.acceptsNested === true) out.push(key)
+  }
+  return out
+}
+
 /** All Attr.state event names declared on the model (duck-typed, no core dep). */
 function collectStateEvents(model: any): string[] {
   const events: string[] = []
@@ -57,6 +68,13 @@ export function buildRecordEnvelope(
   const abilities: Record<string, 'edit' | 'view'> = {}
   for (const f of expose) {
     abilities[f] = editable.has(f) ? 'edit' : 'view'
+  }
+  // Nested write surfaces are governed like any field: `<assoc>Attributes`
+  // gets an edit/view verdict from the SAME resolved permit, so the client
+  // locks Add/Remove/child inputs instead of submitting into a silent strip
+  for (const assoc of collectNestedAssocs(model)) {
+    const key = `${assoc}Attributes`
+    abilities[key] = editable.has(key) ? 'edit' : 'view'
   }
 
   const can: Record<string, boolean> = {}
@@ -248,7 +266,19 @@ export async function defaultCreate(
     ? config.create.permit(ctx, ctrl, draft)
     : config.create?.permit
   await _autoAttach(record, model, rawInput, createPermit)
-  if (usesEnvelope(config)) return buildRecordEnvelope(record, model, config, ctx, ctrl)
+  if (usesEnvelope(config)) {
+    // Same stripped-field reporting as update — a create that silently drops
+    // notesAttributes is exactly as invisible as an update that does
+    const editable = new Set(Object.keys(permitted))
+    const issues = Object.keys(rawInput ?? {})
+      .filter(k => !editable.has(k))
+      .map(field => ({ field, code: 'forbidden' }))
+    const pk = typeof model?.primaryKey === 'string' ? model.primaryKey : 'id'
+    const pkVal = (record as any)[pk] ?? record._attributes?.[pk]
+    return buildRecordEnvelope(
+      await reloadWithIncludes(relation, config, pkVal, record), model, config, ctx, ctrl, issues,
+    )
+  }
   return record
 }
 
@@ -302,10 +332,29 @@ export async function defaultUpdate(
       .map(field => ({ field, code: 'forbidden' }))
     // PATCH response = GET envelope — abilities recomputed on the SAVED
     // record, so a permit that narrowed after a transition re-masks the
-    // same JSX read-only (post-transition self-locking).
-    return buildRecordEnvelope(record, model, config, ctx, ctrl, issues)
+    // same JSX read-only (post-transition self-locking). The GET includes
+    // ride too: without them, freshly created nested rows come back without
+    // ids and the client can never settle them (next save = duplicates).
+    return buildRecordEnvelope(
+      await reloadWithIncludes(relation, config, id, record), model, config, ctx, ctrl, issues,
+    )
   }
   return record
+}
+
+/**
+ * Re-fetch a saved record with the controller's GET includes so the response
+ * envelope carries eager-loaded associations — nested-attribute saves need
+ * the children (with ids) echoed back. Falls back to the bare record.
+ */
+async function reloadWithIncludes(relation: any, config: CrudConfig, id: any, record: any): Promise<any> {
+  const includes = config.get?.include ?? []
+  if (!includes.length) return record
+  try {
+    return (await relation.where({ id }).includes(...includes).first()) ?? record
+  } catch {
+    return record
+  }
 }
 
 // ── Destroy ───────────────────────────────────────────────────────────────────

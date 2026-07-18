@@ -160,11 +160,29 @@ handle with a render-prop — keys are internal, never written by you:
   on the server runtime that already processes it transactionally.
 - **Errors route by identity** — a 422 addressed `assets[new:3].name` lands
   on exactly the right child form, even for rows that don't exist in the
-  database yet. Invalid children block the parent submit.
-- After a successful save, new rows adopt their server ids and re-key.
+  database yet — at any depth (`assets[id:7].liens[new:1].holder` routes
+  through the middle session to the grandchild). Invalid children — and
+  grandchildren — block the parent submit, and a blocked submit is never
+  silent: the attempt propagates down, so every invalid row shows its
+  errors even if it was never touched.
+- After a successful save, the whole tree **settles**: new rows adopt their
+  server ids and re-key — recursively, so a saved grandchild is never
+  re-created by the next save. (This needs the association in the
+  controller's `get.include` so the save response echoes the children; the
+  runtime warns in dev when it can't settle.)
 - **Nested-nested works** — a child form can carry its own nested arrays;
   grandchildren fold as `liensAttributes` inside the child's payload, and
   the server's recursive save processes the whole tree in one transaction.
+- **Permit-governed** — the controller must permit `assetsAttributes` or the
+  server strips every nested write (codegen refuses to emit the nested form
+  when a static permit provably never allows it). With a record-aware
+  permit, the envelope's `abilities['assetsAttributes']` verdict locks and
+  unlocks the array live: `view` hides Add/Remove and renders every row
+  through its view presenters — the array self-locks with the rest of the
+  form after a transition.
+- A background refetch **syncs clean rows** to fresh server truth (children
+  added or changed elsewhere appear), but never clobbers an array holding
+  unsaved local edits — the same rule the flat draft follows.
 - **Drag-and-drop reordering** — declare `orderBy: 'position'` on the nested
   meta and wire any DnD library's drop handler to
   `loan.assets.move(key, toIndex)`: the rows reorder, every child's position

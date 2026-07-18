@@ -82,6 +82,8 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     routeServerError(path: string, msgs: string[]): boolean
     commitBaselines(savedRows?: any[]): void
     markSubmitAttempted(): void
+    syncFromServer(rows: any[]): void
+    setLocked(locked: boolean): void
   }>()
 
   private readonly validateFn: (draft: T) => Record<string, string[]>
@@ -157,8 +159,11 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     routeServerError(path: string, msgs: string[]): boolean
     commitBaselines(savedRows?: any[]): void
     markSubmitAttempted(): void
+    syncFromServer(rows: any[]): void
+    setLocked(locked: boolean): void
   }): void {
     this.nested.set(name, manager)
+    manager.setLocked(!this.canEditNested(name))
   }
 
   getNested(name: string): unknown { return this.nested.get(name) }
@@ -166,9 +171,14 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   /** External components (nested managers) bump a field's channel. */
   notifyExternal(field: string): void { this.notify(field) }
 
-  /** Server errors injected from outside (nested error routing). */
+  /**
+   * Server errors injected from outside (nested error routing). Runs through
+   * refieldErrors so a path addressed DEEPER (`liens[new:1].holder` arriving
+   * at the middle session of a nested-nested form) routes onward to the
+   * grandchild instead of dying as an unrenderable flat key.
+   */
   applyExternalErrors(errors: Record<string, string[]>): void {
-    this.serverErrors = { ...this.serverErrors, ...errors }
+    this.serverErrors = { ...this.serverErrors, ...this.refieldErrors(errors) }
     // These arrived from a submit attempt — make them visible immediately
     this.submitAttempted = true
     this.notifyAll()
@@ -184,6 +194,20 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     this.submitAttempted = true
     for (const manager of this.nested.values()) manager.markSubmitAttempted()
     this.notifyAll()
+  }
+
+  /**
+   * Post-save settle for this session's nested managers, given the saved
+   * record. Each manager drops destroyed rows, re-keys new rows against the
+   * server's echo, and recurses into ITS children the same way — without
+   * this, a saved new grandchild stays `isNew` and is re-created (duplicated)
+   * by every subsequent save.
+   */
+  settleNested(record?: Record<string, any>): void {
+    for (const [name, manager] of this.nested) {
+      const saved = record?.[name]
+      manager.commitBaselines(Array.isArray(saved) ? saved : undefined)
+    }
   }
 
   /** Re-snapshot the baseline (post-save settle). Stale 422s don't linger. */
@@ -208,6 +232,23 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   /** Server verdict for an Attr.state event; client may only narrow, never widen. */
   can(event: string): boolean {
     return this.canMap[event] === true
+  }
+
+  /**
+   * Edit verdict for a nested attribute array — the envelope governs it as
+   * `<name>Attributes` in the abilities mask. An ABSENT key means the mask
+   * doesn't govern this array (older server / plain include) → editable;
+   * the server-side permit still strips and reports either way.
+   */
+  canEditNested(name: string): boolean {
+    if (this.abilities === null) return true
+    return this.abilities[`${name}Attributes`] !== 'view'
+  }
+
+  /** Replace the abilities mask (nested lock propagation from a parent). */
+  setAbilities(abilities: Record<string, Ability> | null): void {
+    this.abilities = abilities
+    this.notifyAll()
   }
 
   getStatus(): SessionStatus { return this.status }
@@ -328,11 +369,9 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     if (result.ok) {
       this.serverErrors = {}
       if (result.envelope) this.applyEnvelope(result.envelope)
-      // Children settle: destroyed rows drop, new rows adopt server ids
-      for (const [name, manager] of this.nested) {
-        const savedRows = result.envelope?.record?.[name]
-        manager.commitBaselines(Array.isArray(savedRows) ? savedRows : undefined)
-      }
+      // Children settle: destroyed rows drop, new rows adopt server ids —
+      // recursively, so grandchildren re-key too (settleNested)
+      this.settleNested(result.envelope?.record)
       this.baseline = this.snapshotDraft()
       this.status = 'saved'
       this.notifyAll()
@@ -420,10 +459,40 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
           Object.defineProperty(this.draft, k, { value: v, writable: true, enumerable: true, configurable: true })
         }
       }
+      // Nested arrays: a manager with NO pending local edits syncs to the
+      // server's rows (a refetch picked up children added/changed elsewhere).
+      // A manager holding unsaved child edits is left alone — the same
+      // never-clobber rule the flat draft gets. The submit path is unaffected:
+      // its managers are still dirty here, and settleNested() handles them.
+      for (const [name, manager] of this.nested) {
+        const rows = (envelope.record as any)[name]
+        if (Array.isArray(rows) && manager.attributesPayload() === null) {
+          manager.syncFromServer(rows)
+        }
+      }
     }
-    if (envelope.abilities !== undefined) this.abilities = envelope.abilities ?? null
+    if (envelope.abilities !== undefined) {
+      this.abilities = envelope.abilities ?? null
+      // Nested arrays lock/unlock with the fresh mask (self-locking, C14)
+      for (const [name, manager] of this.nested) {
+        manager.setLocked(!this.canEditNested(name))
+      }
+    }
     if (envelope.can !== undefined) this.canMap = envelope.can ?? {}
     this.serverIssues = envelope.issues ?? []
+    // A save that silently dropped fields is a permit/UI mismatch — never
+    // invisible. Loud in the console for the developer, on base for the user.
+    const stripped = this.serverIssues.filter(i => i.code === 'forbidden').map(i => i.field)
+    if (stripped.length > 0) {
+      console.warn(
+        `[active-drizzle] the server stripped non-permitted fields from this save: `
+        + `${stripped.join(', ')} — permit them in the controller or stop rendering them editable.`,
+      )
+      this.serverErrors = {
+        ...this.serverErrors,
+        base: [...(this.serverErrors['base'] ?? []), `Some changes were not permitted and were not saved: ${stripped.join(', ')}`],
+      }
+    }
     this.baseline = this.snapshotDraft()
     this.notifyAll()
   }

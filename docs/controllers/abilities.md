@@ -69,15 +69,47 @@ below), so the generated UI can't hide a permit bug.
 - **`can[event]`** — server-computed verdict for every
   [`Attr.state`](/models/state-machines) event, with full data. Generated
   client `can()` only ever narrows this.
+- **Nested arrays are governed too**: every `acceptsNestedAttributesFor`
+  association gets an `"<assoc>Attributes": "edit" | "view"` entry from the
+  same resolved permit. `view` locks the whole array client-side —
+  Add/Remove disappear, rows render through their view presenters, and the
+  client sends nothing for it. The generated nested form only exists at all
+  when the permit can accept the writes (codegen refuses to emit an editable
+  array the server would always strip).
+
+## Nested writes ride the permit
+
+`notesAttributes` is a **permitted write surface** like any field:
+
+```ts
+update: { permit: ['name', 'amount', 'notesAttributes'] }
+```
+
+Omit it and the server strips every nested write (reported as a `forbidden`
+issue). A record-aware permit locks the association exactly like a scalar:
+`deal.isDraft() ? [...EDITABLE, 'notesAttributes'] : []` means notes freeze
+with the rest of the form after submission.
 
 ## Stripped writes are reported
 
-When the envelope is on, a PATCH containing non-permitted fields still strips
-them (server-authoritative), and the response carries:
+When the envelope is on, a PATCH **or POST** containing non-permitted fields
+still strips them (server-authoritative), and the response carries:
 
 ```jsonc
 { …envelope, "issues": [{ "field": "amount", "code": "forbidden" }] }
 ```
+
+The generated client never swallows these: they surface as a base error and
+a console warning, so a permit/UI mismatch cannot hide.
+
+## Save responses echo the GET includes
+
+The PATCH/POST envelope reloads the record with `get.include` before
+serializing. This is what lets the client **settle** nested rows: freshly
+created children come back with their ids, new rows re-key, and a second
+save sends nothing. A controller with nested forms should always include
+the association in `get.include` — without the echo the client warns in dev
+that new rows cannot adopt their server ids.
 
 ## `_event` — submit as transition
 
@@ -120,12 +152,15 @@ PATCH <base>/:id
   →   the same envelope, recomputed against the SAVED record
 POST <base>                → the same envelope (when abilities is enabled)
 
-record     expose-filtered serialization (+ get includes); pk always present
+record     expose-filtered serialization (+ get includes — save responses
+           reload with them, so nested children echo back WITH ids)
 abilities  { [field]: 'edit' | 'view' } — edit iff permitted for THIS user on
-           THIS record; view iff exposed; absent otherwise
+           THIS record; view iff exposed; absent otherwise. acceptsNested
+           associations appear as '<assoc>Attributes' entries governed by
+           the same permit
 can        { [stateEvent]: boolean } — server-computed with full data
-issues     [{ field, code: 'forbidden' }] — present when a PATCH contained
-           stripped non-permitted fields
+issues     [{ field, code: 'forbidden' }] — present when a PATCH/POST
+           contained stripped non-permitted fields
 
 Errors: 401/403 (auth) · 404 ·
         422 { errors: { [field | 'base' | 'assoc[id:N|new:K].field']: string[] } }

@@ -164,20 +164,42 @@ export class Note extends ApplicationRecord {
       schema: project.extractSchema(),
       models: [project.extractModel('Deal.model.ts'), project.extractModel('Note.model.ts')],
     }
-    const ctrl: CtrlMeta = {
+    const makeCtrl = (crudConfig: any): CtrlMeta => ({
       filePath: '/src/Deal.ctrl.ts', className: 'DealController', basePath: '/deals',
       scopes: [], kind: 'crud', modelClass: 'Deal', mutations: [], actions: [],
-      crudConfig: {
-        get: { expose: ['id', 'name'], abilities: true, include: ['notes'] },
-        update: { permit: ['name'] }, create: { permit: ['name'] },
-      },
-    } as CtrlMeta
-    const out = generateReactHooks({ controllers: [ctrl] } as CtrlProjectMeta, projectMeta, '/out')
-      .find(f => f.filePath.includes('deal.gen'))!.content
+      crudConfig,
+    } as CtrlMeta)
+    const gen = (crudConfig: any) =>
+      generateReactHooks({ controllers: [makeCtrl(crudConfig)] } as CtrlProjectMeta, projectMeta, '/out')
+        .find(f => f.filePath.includes('deal.gen'))!.content
 
+    // Permitted: the nested form ships, and Write types the rows array
+    const out = gen({
+      get: { expose: ['id', 'name'], abilities: true, include: ['notes'] },
+      update: { permit: ['name', 'notesAttributes'] }, create: { permit: ['name', 'notesAttributes'] },
+    })
     expect(out).toContain(`notes: { kind: 'nested', orderBy: 'position', fields: {`)
     expect(out).toContain(`body: { kind: 'string', label: "Note" }`)
     expect(out).toContain(`position: { kind: 'integer' }`)
+    expect(out).toContain(`notesAttributes?: Array<Record<string, any> & { id?: number; _destroy?: boolean; _key?: string }>`)
+    expect(out).not.toContain(`'notesAttributes'>`)   // never a Pick key — it isn't a column
+
+    // Fail-closed gate: both permits static and neither includes
+    // notesAttributes → the server would strip every nested write, so the
+    // editable nested form is NOT generated
+    const gated = gen({
+      get: { expose: ['id', 'name'], abilities: true, include: ['notes'] },
+      update: { permit: ['name'] }, create: { permit: ['name'] },
+    })
+    expect(gated).not.toContain(`kind: 'nested'`)
+
+    // A DYNAMIC (record-aware) permit could allow it at runtime → emit;
+    // the envelope's abilities mask governs per record
+    const dynamic = gen({
+      get: { expose: ['id', 'name'], abilities: true, include: ['notes'] },
+      update: {}, create: { permit: ['name'] },   // update.permit extracted as undefined
+    })
+    expect(dynamic).toContain(`notes: { kind: 'nested'`)
   })
 })
 

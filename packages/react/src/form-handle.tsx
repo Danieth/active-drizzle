@@ -149,11 +149,14 @@ export function createFormHandle<T extends Record<string, any>>(
     const childHandle = (child: NestedChild): NestedFormHandle => {
       let h = childHandles.get(child.key)
       if (h) return h
-      const RemoveComponent: FC<{ children?: ReactNode; className?: string }> = ({ children, className }) => (
-        <button type="button" {...(className !== undefined ? { className } : {})} onClick={() => manager.remove(child.key)}>
-          {children ?? 'Remove'}
-        </button>
-      )
+      const RemoveComponent: FC<{ children?: ReactNode; className?: string }> = ({ children, className }) => {
+        if (manager.isLocked()) return null
+        return (
+          <button type="button" {...(className !== undefined ? { className } : {})} onClick={() => manager.remove(child.key)}>
+            {children ?? 'Remove'}
+          </button>
+        )
+      }
       RemoveComponent.displayName = `AdRemove(${child.key})`
       h = createFormHandle(child.session as FormSession<any>, {
         fieldMeta: (meta.fields ?? {}) as Record<string, Record<string, any>>,
@@ -179,11 +182,20 @@ export function createFormHandle<T extends Record<string, any>>(
     }
     ;(ArrayComponent as any).displayName = `AdArray(${name})`
 
-    const AddComponent: FC<{ defaults?: Record<string, any>; children?: ReactNode; className?: string }> = ({ defaults, children, className }) => (
-      <button type="button" {...(className !== undefined ? { className } : {})} onClick={() => manager.add(defaults)}>
-        {children ?? 'Add'}
-      </button>
-    )
+    const AddComponent: FC<{ defaults?: Record<string, any>; children?: ReactNode; className?: string }> = ({ defaults, children, className }) => {
+      // Subscribes so a post-save envelope that locks the array hides Add live
+      useSyncExternalStore(
+        (cb) => session.subscribe(name, cb),
+        () => session.fieldVersion(name),
+        () => session.fieldVersion(name),
+      )
+      if (manager.isLocked()) return null
+      return (
+        <button type="button" {...(className !== undefined ? { className } : {})} onClick={() => manager.add(defaults)}>
+          {children ?? 'Add'}
+        </button>
+      )
+    }
     AddComponent.displayName = `AdAdd(${name})`
 
     const arrayHandle = ArrayComponent as ArrayFieldHandle
