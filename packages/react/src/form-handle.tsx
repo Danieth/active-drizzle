@@ -59,9 +59,14 @@ export type ArrayFieldHandle = FC<{ children: (child: NestedFormHandle) => React
   Add: FC<{ defaults?: Record<string, any>; children?: ReactNode }>
 }
 
-export type FormHandle<T extends Record<string, any> = Record<string, any>> = {
-  [K in keyof T & string]: FieldComponent
-} & {
+/**
+ * The non-field surface of a handle — generated typed handles compose this
+ * with per-field TypedFieldComponents:
+ *
+ *   type LoanFormHandle = FormHandleApi<LoanClient> &
+ *     { amount: TypedFieldComponent<'money'>; status: TypedFieldComponent<'state'> }
+ */
+export interface FormHandleApi<T extends Record<string, any> = Record<string, any>> {
   $session: FormSession<T>
   $draft: T
   $errors: Record<string, string[]>
@@ -70,10 +75,29 @@ export type FormHandle<T extends Record<string, any> = Record<string, any>> = {
   $version: string | null
   $submit: (opts?: { event?: string }) => Promise<boolean>
   $can: (event: string) => boolean
-  Form: FC<{ children?: ReactNode; onSuccess?: () => void }>
+  Form: FC<{ children?: ReactNode; onSuccess?: () => void; autosave?: boolean }>
   Submit: FC<{ children?: ReactNode; event?: string }>
   BaseErrors: FC
 }
+
+/** Field props narrowed by the field's kind — presenter names are gated. */
+export interface TypedFieldProps<K extends string> {
+  edit?: boolean | import('./presenters.js').PresenterNameFor<K>
+  view?: import('./presenters.js').PresenterNameFor<K>
+  label?: string
+  help?: string
+  props?: Record<string, any>
+}
+
+export type TypedFieldComponent<K extends string> = FC<TypedFieldProps<K>> & {
+  readonly errors: string[]
+  readonly meta: Record<string, any>
+  readonly value: any
+}
+
+export type FormHandle<T extends Record<string, any> = Record<string, any>> = {
+  [K in keyof T & string]: FieldComponent
+} & FormHandleApi<T>
 
 /** Resolve per-discriminant copy: meta.copy = { by, [LABEL]: overrides }. */
 function resolveCopy(meta: Record<string, any>, draft: any): Record<string, any> {

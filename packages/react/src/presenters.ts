@@ -65,6 +65,41 @@ export interface PresenterDef {
   component: ComponentType<PresenterProps>
 }
 
+/**
+ * The compile-time half of the presenter registry. Augment it with your
+ * presenter names and the kind(s) they accept:
+ *
+ *   declare module '@active-drizzle/react' {
+ *     interface AdPresenterKinds {
+ *       moneyInput: 'money'
+ *       moneyText: 'money'
+ *       switch: 'boolean'
+ *       badge: '*'                     // accepts every kind
+ *     }
+ *   }
+ *
+ * Generated typed handles then constrain `<loan.amount edit="…">` to
+ * presenters whose kind matches the field — a wrong pairing is a COMPILE
+ * error. Without augmentation the gate stays open (plain `string`), so
+ * adoption is incremental and nothing breaks.
+ */
+export interface AdPresenterKinds {}
+
+/**
+ * Presenter names legal for a field of kind K:
+ * exact kind matches, multi-kind unions containing K, and '*' presenters.
+ * Ungated (string) until AdPresenterKinds is augmented.
+ */
+export type PresenterNameFor<K extends string> =
+  keyof AdPresenterKinds extends never
+    ? string
+    : {
+        [P in keyof AdPresenterKinds & string]:
+          '*' extends AdPresenterKinds[P] ? P
+          : K extends AdPresenterKinds[P] ? P
+          : never
+      }[keyof AdPresenterKinds & string]
+
 const registry = new Map<string, PresenterDef>()
 let kindDefaults: Record<string, { edit?: string; view?: string }> = {}
 

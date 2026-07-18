@@ -97,17 +97,33 @@ function generateControllerFile(
   const needsQuery    = hasGetActions(ctrl) || ctrl.kind === 'crud'
   const needsMutation = hasMutationActions(ctrl) || ctrl.mutations.length > 0 || ctrl.kind === 'crud' || ctrl.kind === 'singleton' || ctrl.attachable
 
+  // Forms envelope → typed handle + wired useEditForm/useNewForm
+  const envelopeEnabled = ctrl.kind === 'crud'
+    && Boolean(ctrl.crudConfig?.get?.abilities)
+    && Boolean(ctrl.crudConfig?.get?.expose?.length)
+
   const rqImports: string[] = []
   if (needsQuery) rqImports.push('useQuery', 'useInfiniteQuery')
   if (needsMutation) rqImports.push('useMutation')
+  if (envelopeEnabled) rqImports.push('useQueryClient')
 
   if (rqImports.length) {
     L.push(`import { ${[...new Set(rqImports)].join(', ')} } from '@tanstack/react-query'`)
   }
 
+  if (envelopeEnabled) {
+    L.push(`import { useRef } from 'react'`)
+  }
+
   if (!isPlain) {
-    L.push(`import { ClientModel, modelCacheKeys } from '@active-drizzle/react'`)
-    L.push(`import type { SearchState } from '@active-drizzle/react'`)
+    const adImports = ['ClientModel', 'modelCacheKeys']
+    const adTypeImports = ['SearchState']
+    if (envelopeEnabled) {
+      adImports.push('FormSession', 'createFormHandle', 'parseControllerError')
+      adTypeImports.push('FormHandleApi', 'TypedFieldComponent', 'SubmitResult')
+    }
+    L.push(`import { ${adImports.join(', ')} } from '@active-drizzle/react'`)
+    L.push(`import type { ${adTypeImports.join(', ')} } from '@active-drizzle/react'`)
   }
 
   if (ctrl.attachable) {
@@ -355,6 +371,11 @@ function generateControllerFile(
       ?? pluralize(lcFirst(ctrl.modelClass!))
     L.push(`export const ${lcFirst(ctrl.modelClass!)}Keys = modelCacheKeys<${scopeType}>('${resourceName}')`)
     L.push('')
+
+    // ── Typed form handle + wired hooks (envelope controllers only) ────────
+    if (envelopeEnabled) {
+      emitFormHooks(L, ctrl, model, projectMeta!, stateProjection, modelName, scopeFields, scopeType)
+    }
   }
 
   // ── Attachment metadata constant (if @attachable) ────────────────────────
@@ -643,6 +664,142 @@ function toFileName(className: string): string {
  * Controller projection field set: permit-listed write fields ∪ get/index includes ∪ id.
  * Validations ship to this Client iff deps ⊆ this set.
  */
+/** Attr kind for a projected field: meta kind → state/enum → column type. */
+function fieldKind(
+  field: string,
+  model: ModelMeta,
+  colTypes: Map<string, string>,
+): string {
+  const metaKind = model.fieldMeta?.[field]?.kind
+  if (metaKind) return metaKind
+  if (model.states?.some(s => s.propertyName === field)) return 'state'
+  if (model.enums?.some(e => e.propertyName === field)) return 'enum'
+  const t = colTypes.get(field)
+  switch (t) {
+    case 'integer': case 'smallint': case 'bigint':
+    case 'serial': case 'smallserial': case 'bigserial':
+      return 'integer'
+    case 'decimal': case 'numeric': case 'real': case 'doublePrecision':
+      return 'decimal'
+    case 'boolean': return 'boolean'
+    case 'date': case 'timestamp': case 'timestamptz': return 'date'
+    case 'json': case 'jsonb': return 'json'
+    default: return 'string'
+  }
+}
+
+/**
+ * Emits the typed FormHandle + wired useEditForm/useNewForm for an envelope
+ * controller. Field props are TypedFieldComponent<kind> — with an augmented
+ * AdPresenterKinds, a wrong presenter/kind pairing is a compile error.
+ */
+function emitFormHooks(
+  L: string[],
+  ctrl: CtrlMeta,
+  model: ModelMeta,
+  projectMeta: ProjectMeta,
+  projection: Set<string>,
+  modelName: string,
+  scopeFields: string[],
+  scopeType: string,
+): void {
+  const clientKey = toClientKey(ctrl)
+  const keysName = `${lcFirst(modelName)}Keys`
+  const colTypes = new Map(
+    (projectMeta.schema.tables[model.tableName]?.columns ?? []).map(c => [c.name, c.type as string]),
+  )
+  const fields = [...projection]
+    .filter(f => colTypes.has(f) || model.fieldMeta?.[f] || model.states?.some(s => s.propertyName === f))
+    .sort()
+
+  L.push(`/** Per-field typed handle — presenter names are kind-gated via AdPresenterKinds. */`)
+  L.push(`export type ${modelName}FormHandle = FormHandleApi<${modelName}Client> & {`)
+  for (const f of fields) {
+    L.push(`  ${f}: TypedFieldComponent<'${fieldKind(f, model, colTypes)}'>`)
+  }
+  L.push(`}`)
+  L.push('')
+
+  const hasScopes = scopeFields.length > 0
+  const scopesParam = hasScopes ? `, scopes: ${scopeType}` : ''
+  const scopesArg = hasScopes ? 'scopes' : '({} as Record<string, never>)'
+  const scopeSpread = hasScopes ? '...scopes, ' : ''
+
+  // Shared transport: PATCH the diff (+_event/version), refresh caches,
+  // map errors to the FormSession contract
+  L.push(`function _${lcFirst(modelName)}SubmitResult(e: unknown): SubmitResult {`)
+  L.push(`  const parsed = parseControllerError(e)`)
+  L.push(`  const status = parsed?.isValidation ? 422`)
+  L.push(`    : parsed?.isUnauthorized ? 401`)
+  L.push(`    : parsed?.isForbidden ? 403`)
+  L.push(`    : parsed?.code === 'CONFLICT' ? 409`)
+  L.push(`    : 500`)
+  L.push(`  return { ok: false, status, ...(parsed?.fields ? { errors: parsed.fields } : {}) }`)
+  L.push(`}`)
+  L.push('')
+
+  L.push(`/** Envelope-wired edit form: GET → handle; submit PATCHes the diff (+version/_event). */`)
+  L.push(`export function use${modelName}EditForm(id: number${scopesParam}): { status: 'loading' | 'error' | 'ready'; form: ${modelName}FormHandle | null } {`)
+  L.push(`  const qc = useQueryClient()`)
+  L.push(`  const _scopes = ${scopesArg}`)
+  L.push(`  const query = useQuery({`)
+  L.push(`    queryKey: ${keysName}.detail(id, _scopes as any),`)
+  L.push(`    queryFn: () => client.${clientKey}.get({ ${scopeSpread}id }),`)
+  L.push(`  })`)
+  L.push(`  const ref = useRef<${modelName}FormHandle | null>(null)`)
+  L.push(`  if (!ref.current && query.data) {`)
+  L.push(`    const payload: any = query.data`)
+  L.push(`    const draft = new ${modelName}Client(payload.record ?? payload)`)
+  L.push(`    const session = new FormSession({`)
+  L.push(`      draft: draft as any,`)
+  L.push(`      mode: 'edit',`)
+  L.push(`      abilities: payload.abilities ?? null,`)
+  L.push(`      can: payload.can ?? null,`)
+  L.push(`      version: payload.version ?? null,`)
+  L.push(`      submit: async ({ data, version, _event }) => {`)
+  L.push(`        try {`)
+  L.push(`          const res: any = await client.${clientKey}.update({`)
+  L.push(`            ${scopeSpread}id,`)
+  L.push(`            data: _event ? { ...data, _event } : data,`)
+  L.push(`            ...(version ? { version } : {}),`)
+  L.push(`          })`)
+  L.push(`          qc.invalidateQueries({ queryKey: ${keysName}.root(_scopes as any) })`)
+  L.push(`          return { ok: true, ...(res?.abilities ? { envelope: res } : {}) }`)
+  L.push(`        } catch (e) { return _${lcFirst(modelName)}SubmitResult(e) }`)
+  L.push(`      },`)
+  L.push(`    })`)
+  L.push(`    ref.current = createFormHandle(session, { fieldMeta: (${modelName}Client as any).fieldMeta ?? {} }) as unknown as ${modelName}FormHandle`)
+  L.push(`  }`)
+  L.push(`  return { status: query.isError ? 'error' : ref.current ? 'ready' : 'loading', form: ref.current }`)
+  L.push(`}`)
+  L.push('')
+
+  L.push(`/** New-record form: defaults draft; submit POSTs to create. */`)
+  L.push(`export function use${modelName}NewForm(${hasScopes ? `scopes: ${scopeType}` : ''}): { status: 'ready'; form: ${modelName}FormHandle } {`)
+  L.push(`  const qc = useQueryClient()`)
+  L.push(`  const _scopes = ${scopesArg}`)
+  L.push(`  const ref = useRef<${modelName}FormHandle | null>(null)`)
+  L.push(`  if (!ref.current) {`)
+  L.push(`    const draft = new ${modelName}Client({})`)
+  L.push(`    const session = new FormSession({`)
+  L.push(`      draft: draft as any,`)
+  L.push(`      mode: 'new',`)
+  L.push(`      abilities: null,`)
+  L.push(`      submit: async ({ data }) => {`)
+  L.push(`        try {`)
+  L.push(`          const res: any = await client.${clientKey}.create({ ${scopeSpread}data })`)
+  L.push(`          qc.invalidateQueries({ queryKey: ${keysName}.root(_scopes as any) })`)
+  L.push(`          return { ok: true, ...(res?.abilities ? { envelope: res } : {}) }`)
+  L.push(`        } catch (e) { return _${lcFirst(modelName)}SubmitResult(e) }`)
+  L.push(`      },`)
+  L.push(`    })`)
+  L.push(`    ref.current = createFormHandle(session, { fieldMeta: (${modelName}Client as any).fieldMeta ?? {} }) as unknown as ${modelName}FormHandle`)
+  L.push(`  }`)
+  L.push(`  return { status: 'ready', form: ref.current }`)
+  L.push(`}`)
+  L.push('')
+}
+
 /**
  * True when `body` calls a `this.<method>()` that the generated controller
  * Client will not have. Property READS (`this.amount`) are fine — only calls

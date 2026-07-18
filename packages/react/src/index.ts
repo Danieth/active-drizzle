@@ -35,6 +35,8 @@ export {
   getPresenter,
   clearPresenters,
   resolvePresenter,
+  type AdPresenterKinds,
+  type PresenterNameFor,
   type PresenterProps,
   type PresenterDef,
   type PresenterBind,
@@ -43,8 +45,11 @@ export {
 export {
   createFormHandle,
   type FormHandle,
+  type FormHandleApi,
   type FieldComponent,
   type FieldProps,
+  type TypedFieldProps,
+  type TypedFieldComponent,
   type ArrayFieldHandle,
   type NestedFormHandle,
 } from './form-handle.js'
