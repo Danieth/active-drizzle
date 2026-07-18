@@ -255,6 +255,71 @@ funnel.conversionRate          // → 15.3
 
 SQL like `avg(conversion_rate)` stays fraction-math; every model read/write is already in display units.
 
+## `Attr.bps`, `Attr.multiple`, `Attr.days` — domain kinds
+
+Small, strict constructors for recurring financial/temporal shapes. Each is a
+**kind marker** for presenters plus honest coercion:
+
+```ts
+static spread   = Attr.bps()        // integer basis points — '250 bps'
+static leverage = Attr.multiple()   // string-backed numeric ratio — '2.5x'
+static termDays = Attr.days()       // integer day count — '90 days'
+```
+
+`bps` and `days` reject non-integers at assignment (like `Attr.int`);
+`multiple` stores full-precision strings (like `Attr.decimal`).
+
+## Presentational meta — the field describes itself
+
+Every `Attr.*` accepts presentational metadata: pure data about the field,
+extracted at build time and shipped to generated Clients. The backend model
+becomes the single source of labels, help text, and per-variant copy.
+
+```ts
+static amount = Attr.money('amountCents', {
+  label: 'Requested Loan Amount',
+  help:  'Enter the total loan amount you are seeking.',
+  info:  'This figure is shared with lenders after submission.',
+
+  copy: {                          // per-discriminant overrides
+    by: 'facilityType',            // must name an enum/state Attr on this model
+    REVOLVING_CREDIT: { label: 'Requested Facility Size' },
+  },
+
+  presentIf:  (r) => r.purpose !== 'NEW',   // pure record-predicates
+  requiredIf: (r) => r.purpose !== 'NEW',
+  lockedIf:   (r) => r.isArchived(),        // record STATE only — never roles
+
+  presenters: { view: 'moneyText', edit: 'moneyInput' },  // default presenter names
+
+  meta: { icon: 'dollar', priority: 1 },    // open extension bag — yours
+})
+```
+
+The rules, all enforced by codegen (fail-closed):
+
+- **`label` / `help` / `info` must be string literals** — computed values
+  can't be extracted for the client and fail the build.
+- **`copy.by` must name an enum/state Attr** on the model, and override keys
+  must be its labels. Typos are build errors, not silent fallbacks.
+- **Predicates are dep-inferred** like `@validate` bodies. Unprovable ⇒ build
+  error. A predicate reading something that isn't a model field (a role, a
+  user) is a build error with a pointed message: role/identity conditions
+  live on the controller.
+- **`meta:` is an open bag for your app's keys** — static data only
+  (functions or references fail the build). Type your custom keys once via
+  declaration merging:
+
+  ```ts
+  declare module '@active-drizzle/core' {
+    interface AttrCustomMeta { regulatoryDisclosure?: string }
+  }
+  ```
+
+Generated Clients expose it all as `static fieldMeta` — filtered to each
+controller's [projection](/controllers/abilities), with predicates included
+only when their deps fit it.
+
 ## Ranges, multiranges, and arrays
 
 First-class support for Postgres' exotic types. Ranges parse the wire literal into a structured object:

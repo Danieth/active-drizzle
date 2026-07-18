@@ -7,6 +7,7 @@ const modelSidebar = [
     items: [
       { text: 'Overview', link: '/models/overview' },
       { text: 'Attributes & Enums', link: '/models/attributes' },
+      { text: 'State Machines', link: '/models/state-machines' },
       { text: 'Associations', link: '/models/associations' },
       { text: 'File Attachments', link: '/models/attachments' },
       { text: 'STI', link: '/models/sti' },
@@ -99,6 +100,7 @@ export default defineConfig({
             { text: 'Overview', link: '/controllers/overview' },
             { text: 'Routing & URL Structure', link: '/controllers/routing' },
             { text: 'CRUD Actions', link: '/controllers/crud-actions' },
+            { text: 'Abilities & Forms Envelope', link: '/controllers/abilities' },
             { text: 'Scopes & Permit', link: '/controllers/decorators' },
             { text: 'Custom Mutations', link: '/controllers/decorators#mutation' },
             { text: 'Actions & Endpoints', link: '/controllers/actions' },

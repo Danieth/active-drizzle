@@ -117,7 +117,9 @@ ensureTransitionAllowed() {
 
 ## Client projection filtering (deps)
 
-Codegen **infers** which fields each `@validate` method reads (`this.amount`, destructuring, own-method calls). A validation is shipped to a generated Client **only if every dep fits that controller's projection** (permit ∪ includes).
+Codegen **infers** which fields each `@validate` method reads (`this.amount`, destructuring, own-method calls). A validation is shipped to a generated Client **only if every dep fits that controller's projection**.
+
+The projection is the controller's [`expose` list](/controllers/abilities) when declared — the read ceiling. **Data availability, not editability, is the boundary**: a rule reading a view-only field still runs client-side, because the draft carries that field. Controllers without `expose` fall back to permit ∪ includes.
 
 ```ts
 @validate()  // deps inferred: { amount, adminCap }
@@ -139,7 +141,18 @@ checkWeird() {
 }
 ```
 
-Never fail open: unprovable deps are refused, not silently omitted.
+Never fail open: unprovable deps are refused, not silently omitted. Casts don't
+evade analysis either — `(this as any)[key]` is refused exactly like
+`this[key]`.
+
+### Sibling method calls stay server-side
+
+A validator that calls another instance method (`this.capExceeded()`) infers
+deps **through** the call — but it never ships to a *controller* Client,
+because controller Clients don't carry your instance methods. It runs
+server-side; the client learns the result as a 422. (Model-level Clients do
+carry your methods, so the same validator ships there.) To make a rule
+client-runnable everywhere, inline the logic in the validator body.
 
 ## `errors` API
 
