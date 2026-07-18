@@ -27,6 +27,21 @@ function collectNestedAssocs(model: any): string[] {
   return out
 }
 
+/**
+ * Top-level association names from an `include` config, which may mix strings
+ * and nested-object forms: `['notes', { activities: ['x'] }]` → ['notes',
+ * 'activities']. Used to build the serialization `only` set (the nested
+ * detail rides along inside each association's own serialization).
+ */
+function topLevelIncludeNames(includes: any[]): string[] {
+  const names: string[] = []
+  for (const inc of includes) {
+    if (typeof inc === 'string') names.push(inc)
+    else if (inc && typeof inc === 'object') names.push(...Object.keys(inc))
+  }
+  return names
+}
+
 /** All Attr.state event names declared on the model (duck-typed, no core dep). */
 function collectStateEvents(model: any): string[] {
   const events: string[] = []
@@ -86,7 +101,7 @@ export function buildRecordEnvelope(
   // the client can never PATCH back (mirrors codegen, which always projects id)
   const pk = typeof model?.primaryKey === 'string' ? model.primaryKey : 'id'
   const serialized = typeof record.toJSON === 'function'
-    ? record.toJSON({ only: [...new Set([pk, ...expose, ...includes])] })
+    ? record.toJSON({ only: [...new Set([pk, ...expose, ...topLevelIncludeNames(includes)])] })
     : record
 
   const envelope: RecordEnvelope = {
@@ -213,7 +228,7 @@ export async function defaultIndex(
     ? data.map((r: any) => {
         if (typeof r.toJSON !== 'function') return r
         const pk = typeof model?.primaryKey === 'string' ? model.primaryKey : 'id'
-        return r.toJSON({ only: [...new Set([pk, ...expose, ...(idx.include ?? [])])] })
+        return r.toJSON({ only: [...new Set([pk, ...expose, ...topLevelIncludeNames(idx.include ?? [])])] })
       })
     : data
 
@@ -247,7 +262,7 @@ export async function defaultGet(
 
   if (usesEnvelope(config)) return buildRecordEnvelope(record, model, config, ctx, ctrl)
   if (config.get?.expose?.length && typeof record.toJSON === 'function') {
-    return record.toJSON({ only: [...config.get.expose, ...includes] })
+    return record.toJSON({ only: [...config.get.expose, ...topLevelIncludeNames(includes)] })
   }
   return record
 }

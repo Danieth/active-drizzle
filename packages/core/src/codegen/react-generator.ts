@@ -50,12 +50,16 @@ export function generateReactHooks(
 ): GeneratedReactFile[] {
   const files: GeneratedReactFile[] = []
 
+  // Client namespaces that actually exist — an instant nested write only
+  // ships when the child resource has a controller to hit
+  const controllerKeys = new Set(ctrlProject.controllers.map(toClientKey))
+
   for (const ctrl of ctrlProject.controllers) {
     const model = ctrl.modelClass
       ? (projectMeta?.models.find(m => m.className === ctrl.modelClass) ?? null)
       : null
 
-    const content = generateControllerFile(ctrl, model, projectMeta, outputDir)
+    const content = generateControllerFile(ctrl, model, projectMeta, outputDir, controllerKeys)
     const fileName = `${toFileName(ctrl.className)}.gen.ts`
 
     files.push({ filePath: join(outputDir, fileName), content })
@@ -84,8 +88,12 @@ function generateControllerFile(
   model: ModelMeta | null,
   projectMeta: ProjectMeta | null,
   outputDir: string,
+  controllerKeys: Set<string> = new Set(),
 ): string {
   const L: string[] = []
+  // Instant nested resources discovered while rendering meta — the hook wires
+  // a transport for each (child controller's create/update/destroy)
+  const instantResources = new Set<string>()
 
   L.push('// AUTO-GENERATED — DO NOT EDIT')
   L.push('// Source: active-drizzle react codegen')
@@ -126,13 +134,9 @@ function generateControllerFile(
         (model.propertyValidationAnalysis?.[prop]?.foreignRefs?.length ?? 0) === 0,
       )
     : []
-  const nestedChildModels = model
-    ? model.associations
-        .filter(a => a.acceptsNested)
-        .map(a => projectMeta?.models.find(m =>
-          m.tableName === (a.resolvedTable ?? a.explicitTable ?? pluralize(a.propertyName))))
-        .filter((m): m is ModelMeta => Boolean(m))
-    : []
+  // Every nested model reachable transitively (grandchildren included) — a
+  // deep child that ships a Validates rule still needs the import emitted
+  const nestedChildModels = collectNestedModelsDeep(model, projectMeta)
   const needsValidates = shippablePropValidations.some(
     ([prop]) => model?.propertyValidationAnalysis?.[prop]?.usesValidates,
   ) || nestedChildModels.some(cm =>
@@ -351,44 +355,11 @@ function generateControllerFile(
           )
           continue
         }
-        const childTable = assoc.resolvedTable ?? assoc.explicitTable ?? pluralize(assoc.propertyName)
-        const childModel = projectMeta?.models.find(m => m.tableName === childTable)
-        if (!childModel) continue
-        const childCols = projectMeta?.schema.tables[childModel.tableName]?.columns ?? []
-        const childColTypes = new Map(childCols.map(c => [c.name, c.type as string]))
-        // Fields the server-side sanitizer strips must not be advertised as
-        // editable: the parent fk (forced server-side) and the STI
-        // discriminator `type` never appear in child meta
-        const parentFk = assoc.foreignKey ?? `${pluralize.singular(model.tableName)}Id`
-        const fieldParts: string[] = []
-        for (const col of childCols) {
-          if (col.primaryKey) continue
-          if (col.name === parentFk || col.name === 'type') continue
-          const cm = childModel.fieldMeta?.[col.name]
-          const kind = cm?.semantic ?? cm?.kind ?? fieldKind(col.name, childModel, childColTypes)
-          const label = cm?.label ? `, label: ${JSON.stringify(cm.label)}` : ''
-          fieldParts.push(`${col.name}: { kind: '${kind}'${label} }`)
-        }
-        const orderBy = assoc.order && typeof assoc.order === 'object' ? Object.keys(assoc.order)[0] : undefined
-        // Rails' allow_destroy: destroy is an explicit model-level opt-in;
-        // the meta carries the verdict so the runtime hides Remove for
-        // persisted rows when destroying is off
-        const acceptsOpt = (assoc.options as any)?.acceptsNested
-        const allowDestroy = typeof acceptsOpt === 'object' && acceptsOpt?.allowDestroy === true
-        // Child rows validate client-side with the SAME shippable rules the
-        // child model declares — an empty Note.body errors in the form, not
-        // as a server 422 round-trip (#7 in the audit)
-        const childShippable = Object.entries(childModel.propertyValidations ?? {}).filter(([p]) =>
-          (childModel.propertyValidationAnalysis?.[p]?.foreignRefs?.length ?? 0) === 0,
-        )
-        let validatePart = ''
-        if (childShippable.length > 0) {
-          const runs = childShippable.map(([p, code]) => `_run('${p}', (${code}), (d as any).${p})`).join('; ')
-          validatePart = `, validate: (d: any) => { const e: Record<string, string[]> = {}; const _push = (f: string, m: unknown) => { if (typeof m === 'string' && m.trim()) (e[f] ??= []).push(m.trim()) }; const _run = (f: string, v: any, val: any) => { const l = Array.isArray(v) ? v : [v]; for (const fn of l) { if (typeof fn !== 'function') continue; try { _push(f, fn(val, d, f)) } catch { /* server-only gate */ } } }; ${runs}; return e }`
-        }
-        nestedEntries.push(
-          `    ${assoc.propertyName}: { kind: 'nested', allowDestroy: ${allowDestroy}${orderBy ? `, orderBy: '${orderBy}'` : ''}${validatePart}, fields: { ${fieldParts.join(', ')} } },`,
-        )
+        // Recursive: the entry inlines the child's fields AND any grandchild
+        // nested arrays, to arbitrary depth (cycle-guarded by table name)
+        const entry = renderNestedMetaEntry(assoc, model.tableName, projectMeta, new Set([model.tableName]),
+          { controllerKeys, sink: instantResources })
+        if (entry) nestedEntries.push(`    ${entry},`)
       }
       // Every field the typed handle declares gets a meta entry — a handle
       // field whose meta lookup comes up empty would promise presenters the
@@ -535,7 +506,7 @@ function generateControllerFile(
 
     // ── Typed form handle + wired hooks (envelope controllers only) ────────
     if (envelopeEnabled) {
-      emitFormHooks(L, ctrl, model, projectMeta!, stateProjection, modelName, scopeFields, scopeType)
+      emitFormHooks(L, ctrl, model, projectMeta!, stateProjection, modelName, scopeFields, scopeType, instantResources)
     }
   }
 
@@ -840,6 +811,109 @@ function toFileName(className: string): string {
  * semantic presenters (emailInput) and base-kind presenters (text) are legal
  * at typed call sites. Then meta kind → state/enum → column type.
  */
+/** Resolve the child model an acceptsNested association points at. */
+function nestedChildModel(assoc: any, projectMeta: ProjectMeta | null): ModelMeta | null {
+  const table = assoc.resolvedTable ?? assoc.explicitTable ?? pluralize(assoc.propertyName)
+  return projectMeta?.models.find(m => m.tableName === table) ?? null
+}
+
+/**
+ * Every model reachable through acceptsNested from `root` — transitively, so
+ * grandchildren and deeper count. Used to decide which runtime imports the
+ * generated file needs (e.g. Validates when a deep child ships a validator).
+ * Cycle-safe via `seen`.
+ */
+function collectNestedModelsDeep(
+  root: ModelMeta | null,
+  projectMeta: ProjectMeta | null,
+  seen: Set<string> = new Set(),
+): ModelMeta[] {
+  if (!root || seen.has(root.tableName)) return []
+  seen.add(root.tableName)
+  const out: ModelMeta[] = []
+  for (const a of root.associations ?? []) {
+    if (!a.acceptsNested) continue
+    const child = nestedChildModel(a, projectMeta)
+    if (!child || seen.has(child.tableName)) continue
+    out.push(child, ...collectNestedModelsDeep(child, projectMeta, seen))
+  }
+  return out
+}
+
+/**
+ * One `<assoc>: { kind: 'nested', … }` meta entry — RECURSIVELY. The child's
+ * own acceptsNested associations become grandchild `kind: 'nested'` entries
+ * nested inside its `fields`, to arbitrary depth. `visited` (owner table
+ * names down this branch) breaks self-referential cycles: a category whose
+ * children are categories emits one level, then truncates with a warning.
+ *
+ * Server-forced fields never appear as editable child inputs: the primary
+ * key, the parent foreign key, and the STI discriminator `type` are omitted
+ * (the server sanitizer strips them anyway).
+ */
+function renderNestedMetaEntry(
+  assoc: any,
+  ownerTableName: string,
+  projectMeta: ProjectMeta | null,
+  visited: Set<string>,
+  instantCtx?: { controllerKeys: Set<string>; sink: Set<string> },
+): string | null {
+  const childModel = nestedChildModel(assoc, projectMeta)
+  if (!childModel) return null
+  const childTable = childModel.tableName
+  const childCols = projectMeta?.schema.tables[childTable]?.columns ?? []
+  const childColTypes = new Map(childCols.map(c => [c.name, c.type as string]))
+  const parentFk = assoc.foreignKey ?? `${pluralize.singular(ownerTableName)}Id`
+
+  const parts: string[] = []
+  for (const col of childCols) {
+    if (col.primaryKey) continue
+    if (col.name === parentFk || col.name === 'type') continue
+    const cm = childModel.fieldMeta?.[col.name]
+    const kind = cm?.semantic ?? cm?.kind ?? fieldKind(col.name, childModel, childColTypes)
+    const label = cm?.label ? `, label: ${JSON.stringify(cm.label)}` : ''
+    parts.push(`${col.name}: { kind: '${kind}'${label} }`)
+  }
+
+  // Grandchildren — recurse, guarding cycles
+  const nextVisited = new Set(visited).add(childTable)
+  for (const grand of childModel.associations ?? []) {
+    if (!grand.acceptsNested) continue
+    const grandModel = nestedChildModel(grand, projectMeta)
+    if (!grandModel) continue
+    if (nextVisited.has(grandModel.tableName)) {
+      console.warn(
+        `[active-drizzle codegen] nested cycle at ${childModel.className}.${grand.propertyName} `
+        + `→ ${grandModel.tableName}; deeper nesting truncated (the runtime still handles any `
+        + `depth you author by hand).`,
+      )
+      continue
+    }
+    const grandEntry = renderNestedMetaEntry(grand, childTable, projectMeta, nextVisited, instantCtx)
+    if (grandEntry) parts.push(grandEntry)
+  }
+
+  const orderBy = assoc.order && typeof assoc.order === 'object' ? Object.keys(assoc.order)[0] : undefined
+  const acceptsOpt = (assoc.options as any)?.acceptsNested
+  const allowDestroy = typeof acceptsOpt === 'object' && acceptsOpt?.allowDestroy === true
+  // Instant nested writes: opted in on the association AND a controller exists
+  // for the child resource. resource = the child's client namespace; foreignKey
+  // is forced server-side so the widget never sends it.
+  const instantOptedIn = typeof acceptsOpt === 'object' && acceptsOpt?.instant === true
+  const instantOn = instantOptedIn && Boolean(instantCtx?.controllerKeys.has(childTable))
+  if (instantOn) instantCtx!.sink.add(childTable)
+  const instantPart = instantOn ? `, instant: true, resource: '${childTable}', foreignKey: '${parentFk}'` : ''
+  const childShippable = Object.entries(childModel.propertyValidations ?? {}).filter(([p]) =>
+    (childModel.propertyValidationAnalysis?.[p]?.foreignRefs?.length ?? 0) === 0,
+  )
+  let validatePart = ''
+  if (childShippable.length > 0) {
+    const runs = childShippable.map(([p, code]) => `_run('${p}', (${code}), (d as any).${p})`).join('; ')
+    validatePart = `, validate: (d: any) => { const e: Record<string, string[]> = {}; const _push = (f: string, m: unknown) => { if (typeof m === 'string' && m.trim()) (e[f] ??= []).push(m.trim()) }; const _run = (f: string, v: any, val: any) => { const l = Array.isArray(v) ? v : [v]; for (const fn of l) { if (typeof fn !== 'function') continue; try { _push(f, fn(val, d, f)) } catch { /* server-only gate */ } } }; ${runs}; return e }`
+  }
+  return `${assoc.propertyName}: { kind: 'nested', allowDestroy: ${allowDestroy}${instantPart}${orderBy ? `, orderBy: '${orderBy}'` : ''}${validatePart}, fields: { ${parts.join(', ')} } }`
+}
+
 function fieldKind(
   field: string,
   model: ModelMeta,
@@ -882,6 +956,7 @@ function emitFormHooks(
   modelName: string,
   scopeFields: string[],
   scopeType: string,
+  instantResources: Set<string> = new Set(),
 ): void {
   const clientKey = toClientKey(ctrl)
   const keysName = `${lcFirst(modelName)}Keys`
@@ -923,6 +998,24 @@ function emitFormHooks(
   L.push(`}`)
   L.push('')
 
+  // Instant nested transports — one per child resource that opted in. Each
+  // maps to the child controller's create/update/destroy; the nested manager
+  // fires these optimistically when the parent row is already persisted.
+  const transportsName = `_${lcFirst(modelName)}NestedTransports`
+  if (instantResources.size > 0) {
+    L.push(`const ${transportsName} = {`)
+    for (const resource of instantResources) {
+      L.push(`  ${resource}: {`)
+      L.push(`    create: (data: any) => client.${resource}.create({ data }).then((row: any) => ({ ok: true, row })).catch(() => ({ ok: false })),`)
+      L.push(`    update: (id: any, data: any) => client.${resource}.update({ id, data }).then((row: any) => ({ ok: true, row })).catch(() => ({ ok: false })),`)
+      L.push(`    destroy: (id: any) => client.${resource}.destroy({ id }).then(() => ({ ok: true })).catch(() => ({ ok: false })),`)
+      L.push(`  },`)
+    }
+    L.push(`}`)
+    L.push('')
+  }
+  const transportsLine = instantResources.size > 0 ? `    nestedTransports: ${transportsName},` : null
+
   // Generated hooks are THIN wiring — identity keying, refetch rehydration,
   // and StrictMode safety live in useGeneratedForm (tested in the package)
   L.push(`/** Envelope-wired edit form. Session is keyed by id: navigating between records rebuilds; refetches rehydrate a CLEAN draft (dirty edits are never clobbered). */`)
@@ -939,6 +1032,7 @@ function emitFormHooks(
   L.push(`    data: query.data ?? null,`)
   L.push(`    makeDraft: (r) => new ${modelName}Client(r),`)
   L.push(`    fieldMeta: (${modelName}Client as any).fieldMeta ?? {},`)
+  if (transportsLine) L.push(transportsLine)
   L.push(`    submit: async ({ data, _event }) => {`)
   L.push(`      try {`)
   L.push(`        const res: any = await client.${clientKey}.update({ ${scopeSpread}id, data: _event ? { ...data, _event } : data })`)
@@ -962,6 +1056,7 @@ function emitFormHooks(
   L.push(`    data: null,`)
   L.push(`    makeDraft: (r) => new ${modelName}Client(r),`)
   L.push(`    fieldMeta: (${modelName}Client as any).fieldMeta ?? {},`)
+  if (transportsLine) L.push(transportsLine)
   L.push(`    submit: async ({ data }) => {`)
   L.push(`      try {`)
   L.push(`        const res: any = await client.${clientKey}.create({ ${scopeSpread}data })`)

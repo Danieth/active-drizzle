@@ -204,6 +204,75 @@ export class Note extends ApplicationRecord {
     })
     expect(dynamic).toContain(`notes: { kind: 'nested'`)
   })
+
+  it('nests to ARBITRARY DEPTH — a grandchild array emits inside the child fields', () => {
+    const schema = `
+import { pgTable, serial, integer, text } from 'drizzle-orm/pg-core'
+export const deals = pgTable('deals', { id: serial('id').primaryKey(), name: text('name') })
+export const notes = pgTable('notes', {
+  id: serial('id').primaryKey(), dealId: integer('deal_id'), body: text('body'),
+})
+export const reactions = pgTable('reactions', {
+  id: serial('id').primaryKey(), noteId: integer('note_id'), userId: integer('user_id'), kind: text('kind'),
+})
+`
+    const dealModel = `
+import { ApplicationRecord, model, hasMany } from 'active-drizzle'
+@model('deals')
+export class Deal extends ApplicationRecord {
+  static notes = hasMany('notes', { acceptsNested: { allowDestroy: true } })
+}
+`
+    const noteModel = `
+import { ApplicationRecord, model, Attr, hasMany } from 'active-drizzle'
+@model('notes')
+export class Note extends ApplicationRecord {
+  static body = Attr.string({ label: 'Note' })
+  static reactions = hasMany('reactions', { acceptsNested: { allowDestroy: true } })
+}
+`
+    const reactionModel = `
+import { ApplicationRecord, model, Attr } from 'active-drizzle'
+@model('reactions')
+export class Reaction extends ApplicationRecord {
+  static kind = Attr.string({ label: 'Kind' })
+}
+`
+    const project = createTestProject({
+      schema,
+      models: { 'Deal.model.ts': dealModel, 'Note.model.ts': noteModel, 'Reaction.model.ts': reactionModel },
+    })
+    const projectMeta: ProjectMeta = {
+      schema: project.extractSchema(),
+      models: [
+        project.extractModel('Deal.model.ts'),
+        project.extractModel('Note.model.ts'),
+        project.extractModel('Reaction.model.ts'),
+      ],
+    }
+    const ctrl: CtrlMeta = {
+      filePath: '/src/Deal.ctrl.ts', className: 'DealController', basePath: '/deals',
+      scopes: [], kind: 'crud', modelClass: 'Deal', mutations: [], actions: [],
+      crudConfig: {
+        get: { expose: ['id', 'name'], abilities: true, include: ['notes'] },
+        update: { permit: ['name', 'notesAttributes'] }, create: { permit: ['name', 'notesAttributes'] },
+      },
+    } as CtrlMeta
+    const out = generateReactHooks({ controllers: [ctrl] } as CtrlProjectMeta, projectMeta, '/out')
+      .find(f => f.filePath.includes('deal.gen'))!.content
+
+    // The reactions grandchild nests INSIDE the notes fields object
+    expect(out).toContain(`reactions: { kind: 'nested'`)
+    expect(out).toContain(`kind: { kind: 'string', label: "Kind" }`)
+    // Server-forced fields stripped at BOTH levels
+    expect(out).not.toContain(`dealId:`)
+    expect(out).not.toContain(`noteId:`)
+    // Structural: reactions appears after the notes 'kind: nested' opener
+    const notesIdx = out.indexOf(`notes: { kind: 'nested'`)
+    const reactionsIdx = out.indexOf(`reactions: { kind: 'nested'`)
+    expect(notesIdx).toBeGreaterThanOrEqual(0)
+    expect(reactionsIdx).toBeGreaterThan(notesIdx)   // nested within, not a sibling
+  })
 })
 
 describe('review findings — write types and state typing', () => {

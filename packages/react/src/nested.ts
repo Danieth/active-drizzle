@@ -15,6 +15,18 @@
  */
 import { FormSession } from './form-session.js'
 
+/**
+ * The child resource's own write endpoints, used for INSTANT nested writes
+ * (when the parent row is already persisted). Wired by the generated hook
+ * from the child controller's client. `create` returns the saved row (with
+ * its new id) so the optimistic row can adopt it.
+ */
+export interface NestedTransport {
+  create(data: Record<string, any>): Promise<{ ok: boolean; row?: Record<string, any> }>
+  update(id: any, data: Record<string, any>): Promise<{ ok: boolean; row?: Record<string, any> }>
+  destroy(id: any): Promise<{ ok: boolean }>
+}
+
 /** A view-only abilities mask covering every data field on a child draft. */
 function viewMaskOf(draft: any): Record<string, 'view'> {
   const mask: Record<string, 'view'> = {}
@@ -51,6 +63,16 @@ export class NestedArrayManager {
    * nothing. Defaults true for hand-rolled meta; generated meta is explicit.
    */
   readonly allowDestroy: boolean
+  /**
+   * Instant mode: when the PARENT row is persisted, a row change hits the
+   * child's own controller immediately (optimistic, rolled back on failure)
+   * instead of staging into the parent save. When the parent is still new
+   * (no id) it stages like any nested row and becomes instant after the
+   * parent save settles the row an id.
+   */
+  private instant = false
+  private transport?: NestedTransport
+  private foreignKey?: string
 
   constructor(
     parent: FormSession<any>,
@@ -61,11 +83,17 @@ export class NestedArrayManager {
       nestedKeys?: string[]
       positionField?: string
       allowDestroy?: boolean
+      instant?: boolean
+      transport?: NestedTransport
+      foreignKey?: string
     } = {},
   ) {
     this.parent = parent
     this.name = name
     this.allowDestroy = opts.allowDestroy !== false
+    this.instant = Boolean(opts.instant)
+    if (opts.transport) this.transport = opts.transport
+    if (opts.foreignKey) this.foreignKey = opts.foreignKey
     this.nestedKeys = new Set(opts.nestedKeys ?? [])
     if (opts.positionField) this.positionField = opts.positionField
     if (opts.validate) this.validateChild = opts.validate
@@ -118,6 +146,19 @@ export class NestedArrayManager {
     return this.children
   }
 
+  /** The parent row's id — present once the parent is persisted. */
+  private parentId(): any { return (this.parent.draft as any)?.id }
+
+  /** Instant writes fire only when opted in AND the parent row exists. */
+  isInstant(): boolean {
+    return this.instant && Boolean(this.transport) && this.parentId() != null
+  }
+
+  /** Flat snapshot of visible rows for compact custom widgets (reactions). */
+  rows(): Array<{ key: string; isNew: boolean; data: Record<string, any> }> {
+    return this.visible().map(c => ({ key: c.key, isNew: c.isNew, data: { ...(c.session.draft as any) } }))
+  }
+
   add(defaults: Record<string, any> = {}): NestedChild | null {
     if (this.locked) return null
     const child: NestedChild = {
@@ -128,7 +169,54 @@ export class NestedArrayManager {
     }
     this.children.push(child)
     this.parent.notifyExternal(this.name)
+    // Instant: persist immediately and adopt the server id; on failure the
+    // optimistic row is removed. When the parent is still new, this no-ops
+    // and the row stages into the parent save.
+    if (this.isInstant()) void this.instantCreate(child)
     return child
+  }
+
+  private async instantCreate(child: NestedChild): Promise<void> {
+    const payload = { ...(child.session.draft as any) }
+    delete payload.id
+    if (this.foreignKey) payload[this.foreignKey] = this.parentId()
+    let res: { ok: boolean; row?: Record<string, any> }
+    try { res = await this.transport!.create(payload) } catch { res = { ok: false } }
+    if (res.ok && res.row?.id != null) {
+      ;(child.session.draft as any).id = res.row.id
+      child.isNew = false
+      child.key = `id:${res.row.id}`
+      child.session.resetBaseline()
+    } else {
+      const i = this.children.indexOf(child)
+      if (i !== -1) this.children.splice(i, 1)   // rollback the optimistic add
+    }
+    this.parent.notifyExternal(this.name)
+  }
+
+  /**
+   * Change fields on a row. Instant when eligible (optimistic + rollback);
+   * otherwise the change stays on the child draft and rides the parent save.
+   * `patch` is the op a reactions toggle uses to flip `kind`.
+   */
+  patch(key: string, data: Record<string, any>): void {
+    const child = this.children.find(c => c.key === key)
+    if (!child || this.locked) return
+    const before: Record<string, any> = {}
+    for (const k of Object.keys(data)) before[k] = (child.session.draft as any)[k]
+    for (const [k, v] of Object.entries(data)) child.session.setValue(k, v)
+    this.parent.notifyExternal(this.name)
+    if (this.isInstant() && !child.isNew) {
+      void (async () => {
+        let ok = false
+        try { ok = (await this.transport!.update((child.session.draft as any).id, data)).ok } catch { ok = false }
+        if (ok) { child.session.resetBaseline() }
+        else {
+          for (const [k, v] of Object.entries(before)) child.session.setValue(k, v)   // rollback
+          this.parent.notifyExternal(this.name)
+        }
+      })()
+    }
   }
 
   /**
@@ -147,14 +235,27 @@ export class NestedArrayManager {
     visible.splice(clamped, 0, child!)
     // Rebuild the full list preserving destroyed rows at the tail
     this.children = [...visible, ...this.children.filter(c => c.destroyed)]
+    const moved: NestedChild[] = []
     if (this.positionField) {
       visible.forEach((c, i) => {
         if ((c.session.draft as any)[this.positionField!] !== i) {
           c.session.setValue(this.positionField!, i)
+          moved.push(c)
         }
       })
     }
     this.parent.notifyExternal(this.name)
+    // Instant reorder: push each changed position to the server now. Persisted
+    // rows only — new rows carry their position into the parent save.
+    if (this.isInstant() && this.positionField) {
+      for (const c of moved) {
+        if (c.isNew) continue
+        const pos = (c.session.draft as any)[this.positionField!]
+        void this.transport!.update((c.session.draft as any).id, { [this.positionField!]: pos })
+          .then(r => { if (r.ok) c.session.resetBaseline() })
+          .catch(() => { /* next explicit save reconciles */ })
+      }
+    }
   }
 
   /** Persisted rows mark `_destroy`; new rows vanish entirely. */
@@ -163,9 +264,21 @@ export class NestedArrayManager {
     const idx = this.children.findIndex(c => c.key === key)
     if (idx === -1) return
     const child = this.children[idx]!
-    if (child.isNew) this.children.splice(idx, 1)
-    else if (this.allowDestroy) child.destroyed = true
-    else return   // destroying persisted rows is not opted in — no-op
+    if (child.isNew) { this.children.splice(idx, 1); this.parent.notifyExternal(this.name); return }
+    if (!this.allowDestroy) return   // destroying persisted rows is not opted in — no-op
+    // Instant: delete on the server now and drop the row (optimistic, with
+    // rollback). Otherwise mark _destroy so it rides the parent save.
+    if (this.isInstant()) {
+      this.children.splice(idx, 1)
+      this.parent.notifyExternal(this.name)
+      void (async () => {
+        let ok = false
+        try { ok = (await this.transport!.destroy((child.session.draft as any).id)).ok } catch { ok = false }
+        if (!ok) { this.children.splice(idx, 0, child); this.parent.notifyExternal(this.name) }  // rollback
+      })()
+      return
+    }
+    child.destroyed = true
     this.parent.notifyExternal(this.name)
   }
 

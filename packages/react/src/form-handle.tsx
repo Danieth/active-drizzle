@@ -63,6 +63,16 @@ export type ArrayFieldHandle = FC<{ children: (child: NestedFormHandle) => React
   add: (defaults?: Record<string, any>) => void
   /** Reorder for drag-and-drop: wire your DnD lib's onDrop to move(key, toIndex). */
   move: (key: string, toIndex: number) => void
+  /** Flat snapshot of visible rows — for compact custom widgets (e.g. reactions). */
+  rows: Array<{ key: string; isNew: boolean; data: Record<string, any> }>
+  /** Change fields on a row; instant when the parent is persisted, else staged. */
+  patch: (key: string, data: Record<string, any>) => void
+  /** Remove a row; instant delete when the parent is persisted, else staged. */
+  remove: (key: string) => void
+  /** True when writes hit the backend immediately (parent persisted + instant meta). */
+  instant: boolean
+  /** Subscribe to row changes (for custom widgets that read `rows`). */
+  use: () => void
   Add: FC<{ defaults?: Record<string, any>; children?: ReactNode; className?: string }>
 }
 
@@ -121,18 +131,22 @@ export function createFormHandle<T extends Record<string, any>>(
     fieldMeta?: Record<string, Record<string, any>>
     /** Extra members merged into the handle (used for nested child handles). */
     extras?: Record<string, any>
+    /** Instant nested transports keyed by child resource (from the generated hook). */
+    nestedTransports?: Record<string, import('./nested.js').NestedTransport>
   } = {},
 ): FormHandle<T> {
   const fieldMeta: Record<string, Record<string, any>> =
     options.fieldMeta
     ?? ((session.draft as any)?.constructor?.fieldMeta as Record<string, Record<string, any>>)
     ?? {}
+  const nestedTransports = options.nestedTransports ?? {}
 
   const cache = new Map<string, any>()
 
   // ── Nested attribute arrays: meta kind 'nested' → ArrayFieldHandle ───────
   const makeArrayHandle = (name: string, meta: Record<string, any>): ArrayFieldHandle => {
     const childFields = (meta.fields ?? {}) as Record<string, Record<string, any>>
+    const instantTransport = meta.instant && meta.resource ? nestedTransports[meta.resource] : undefined
     const manager = new NestedArrayManager(
       session,
       name,
@@ -142,6 +156,7 @@ export function createFormHandle<T extends Record<string, any>>(
         nestedKeys: Object.keys(childFields).filter(k => childFields[k]?.kind === 'nested'),
         ...(meta.orderBy ? { positionField: meta.orderBy } : {}),
         ...(meta.allowDestroy !== undefined ? { allowDestroy: Boolean(meta.allowDestroy) } : {}),
+        ...(instantTransport ? { instant: true, transport: instantTransport, foreignKey: meta.foreignKey } : {}),
       },
     )
     session.registerNested(name, manager)
@@ -162,9 +177,11 @@ export function createFormHandle<T extends Record<string, any>>(
         )
       }
       RemoveComponent.displayName = `AdRemove(${child.key})`
+      // Grandchild instant transports flow down too (a note's reactions)
       h = createFormHandle(child.session as FormSession<any>, {
         fieldMeta: (meta.fields ?? {}) as Record<string, Record<string, any>>,
         extras: { key: child.key, isNew: child.isNew, Remove: RemoveComponent },
+        nestedTransports,
       }) as NestedFormHandle
       childHandles.set(child.key, h)
       return h
@@ -205,8 +222,20 @@ export function createFormHandle<T extends Record<string, any>>(
     const arrayHandle = ArrayComponent as ArrayFieldHandle
     Object.defineProperties(arrayHandle, {
       forms: { get: () => manager.visible().map(childHandle) },
+      rows: { get: () => manager.rows() },
+      instant: { get: () => manager.isInstant() },
       add: { value: (defaults?: Record<string, any>) => { manager.add(defaults) } },
+      patch: { value: (key: string, data: Record<string, any>) => { manager.patch(key, data) } },
+      remove: { value: (key: string) => { manager.remove(key) } },
       move: { value: (key: string, toIndex: number) => { manager.move(key, toIndex) } },
+      // A hook custom widgets call to re-render on row changes (reactions bar)
+      use: { value: () => {
+        useSyncExternalStore(
+          (cb) => session.subscribe(name, cb),
+          () => session.fieldVersion(name),
+          () => session.fieldVersion(name),
+        )
+      } },
       Add: { value: AddComponent },
     })
     return arrayHandle

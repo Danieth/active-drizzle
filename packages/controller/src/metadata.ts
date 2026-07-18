@@ -19,6 +19,13 @@ export const ATTACHABLE_META  = Symbol('ad:attachable')
 
 // ── Shape definitions ─────────────────────────────────────────────────────────
 
+/**
+ * An eager-load spec: a bare association name, or a nested object for
+ * grandchildren — `'notes'` or `{ notes: ['reactions'] }` (deal → notes →
+ * reactions). Lowered to drizzle's relational `with` shape by the runtime.
+ */
+export type IncludeSpec = string | Record<string, any>
+
 export interface ControllerMeta {
   path?: string
 }
@@ -36,7 +43,7 @@ export interface IndexConfig {
   sortable?: string[]
   defaultSort?: { field: string; dir: 'asc' | 'desc' }
   filterable?: string[]
-  include?: string[]
+  include?: IncludeSpec[]
   perPage?: number
   maxPerPage?: number
 }
@@ -70,7 +77,7 @@ export interface WriteConfig {
 
 /** Read-side config for @crud get (and singleton get). */
 export interface GetConfig {
-  include?: string[]
+  include?: IncludeSpec[]
   /**
    * Serialization ceiling: ONLY these fields leave the server for this
    * controller. Omitting `expose` keeps today's behavior (all fields) but
@@ -123,7 +130,7 @@ export interface SingletonConfig {
   findOrCreate?: boolean
   defaultValues?: Record<string, any>
   update?: Omit<WriteConfig, 'autoSet'>
-  get?: { include?: string[] }
+  get?: { include?: IncludeSpec[] }
 }
 
 export interface CrudMeta {

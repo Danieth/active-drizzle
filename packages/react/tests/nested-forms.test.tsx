@@ -15,8 +15,10 @@ import {
   registerPresenter,
   setDefaultPresenters,
   clearPresenters,
+  NestedArrayManager,
   type PresenterProps,
   type SubmitResult,
+  type NestedTransport,
 } from '../src/index.js'
 
 function TextInput({ value, bind, errors }: PresenterProps) {
@@ -398,6 +400,78 @@ describe('nested-nested forms', () => {
 })
 
 // ── allow_destroy: destroying persisted rows is a model-level opt-in ─────────
+
+// ── Instant nested writes: optimistic + persisted-parent gating ──────────────
+
+describe('instant nested writes', () => {
+  const flush = () => new Promise(r => setTimeout(r, 0))
+
+  function makeInstant(parentDraft: any) {
+    const calls: any[] = []
+    const transport: NestedTransport = {
+      create: async (data) => { calls.push(['create', data]); return { ok: true, row: { id: 99, ...data } } },
+      update: async (id, data) => { calls.push(['update', id, data]); return { ok: true, row: { id, ...data } } },
+      destroy: async (id) => { calls.push(['destroy', id]); return { ok: true } },
+    }
+    const parent = new FormSession({ draft: parentDraft, mode: 'edit', abilities: null })
+    const mgr = new NestedArrayManager(parent, 'reactions', parentDraft.reactions, {
+      instant: true, transport, foreignKey: 'noteId',
+    })
+    return { mgr, calls, transport }
+  }
+
+  it('parent PERSISTED: add fires create, adopts the server id, re-keys', async () => {
+    const { mgr, calls } = makeInstant({ id: 7, reactions: [] })
+    expect(mgr.isInstant()).toBe(true)
+    mgr.add({ userId: 2, kind: 'like' })
+    expect(mgr.rows()).toHaveLength(1)                  // optimistic immediately
+    await flush()
+    expect(calls[0]).toEqual(['create', { userId: 2, kind: 'like', noteId: 7 }])  // fk forced
+    expect(mgr.rows()[0]!.key).toBe('id:99')            // adopted server id
+    expect(mgr.rows()[0]!.isNew).toBe(false)
+  })
+
+  it('parent PERSISTED: patch fires update; rollback restores on failure', async () => {
+    const { mgr } = makeInstant({ id: 7, reactions: [{ id: 5, noteId: 7, userId: 2, kind: 'like' }] })
+    // Failing transport for this case
+    ;(mgr as any).transport = {
+      create: async () => ({ ok: false }),
+      update: async () => ({ ok: false }),
+      destroy: async () => ({ ok: false }),
+    }
+    mgr.patch('id:5', { kind: 'dislike' })
+    expect(mgr.rows()[0]!.data.kind).toBe('dislike')   // optimistic
+    await flush()
+    expect(mgr.rows()[0]!.data.kind).toBe('like')       // rolled back
+  })
+
+  it('parent PERSISTED: remove fires destroy and drops the row', async () => {
+    const { mgr, calls } = makeInstant({ id: 7, reactions: [{ id: 5, noteId: 7, userId: 2, kind: 'like' }] })
+    mgr.remove('id:5')
+    expect(mgr.rows()).toHaveLength(0)                   // optimistic
+    await flush()
+    expect(calls[0]).toEqual(['destroy', 5])
+  })
+
+  it('parent NEW (no id): add STAGES — no transport call, rides the parent save', async () => {
+    const { mgr, calls } = makeInstant({ reactions: [] })   // no id
+    expect(mgr.isInstant()).toBe(false)
+    mgr.add({ userId: 2, kind: 'like' })
+    await flush()
+    expect(calls).toHaveLength(0)                        // nothing hit the wire
+    // The staged row folds into the parent payload as usual
+    expect(mgr.attributesPayload()).toEqual([{ userId: 2, kind: 'like', _key: 'new:1' }])
+  })
+
+  it('create failure rolls the optimistic row back out', async () => {
+    const { mgr } = makeInstant({ id: 7, reactions: [] })
+    ;(mgr as any).transport = { create: async () => ({ ok: false }), update: async () => ({ ok: false }), destroy: async () => ({ ok: false }) }
+    mgr.add({ userId: 2, kind: 'like' })
+    expect(mgr.rows()).toHaveLength(1)
+    await flush()
+    expect(mgr.rows()).toHaveLength(0)                   // rolled back
+  })
+})
 
 describe('allowDestroy gating', () => {
   const metaNoDestroy = { ...FIELD_META, assets: { ...FIELD_META.assets, allowDestroy: false } }

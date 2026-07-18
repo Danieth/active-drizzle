@@ -113,7 +113,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
         this._includes[a as string] = true
       } else if (typeof a === 'object' && a !== null) {
         for (const [k, v] of Object.entries(a)) {
-          this._includes[k] = v
+          this._includes[k] = _toDrizzleWith(v)
         }
       }
     }
@@ -881,6 +881,35 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Normalizes an include spec value into drizzle's nested relational `with`
+ * shape. Accepts the ergonomic forms and lowers them:
+ *   true                        → true
+ *   ['reactions']               → { with: { reactions: true } }
+ *   ['reactions', { user: 1 }]  → { with: { reactions: true, user: {…} } }
+ *   { reactions: ['user'] }     → { with: { reactions: { with: { user: true } } } }
+ * so `deal.includes({ notes: ['reactions'] })` eager-loads grandchildren.
+ */
+function _toDrizzleWith(spec: any): any {
+  if (spec === true || spec == null) return true
+  if (Array.isArray(spec)) {
+    const w: Record<string, any> = {}
+    for (const item of spec) {
+      if (typeof item === 'string') w[item] = true
+      else if (item && typeof item === 'object') for (const [k, v] of Object.entries(item)) w[k] = _toDrizzleWith(v)
+    }
+    return { with: w }
+  }
+  if (typeof spec === 'object') {
+    // Already a drizzle config ({ with, where, … }) — pass through untouched
+    if ('with' in spec || 'where' in spec || 'columns' in spec || 'orderBy' in spec) return spec
+    const w: Record<string, any> = {}
+    for (const [k, v] of Object.entries(spec)) w[k] = _toDrizzleWith(v)
+    return { with: w }
+  }
+  return true
+}
 
 function _isPlainObject(val: unknown): val is Record<string, unknown> {
   return (

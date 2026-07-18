@@ -295,6 +295,26 @@ describe('Relation as value in where() → sub-query', () => {
 
 // ── _clone immutability ─────────────────────────────────────────────────────
 
+describe('Relation.includes() — nested eager-load normalization', () => {
+  it('lowers ergonomic forms to drizzle nested `with` shape', () => {
+    const rel = new Relation(Post)
+      .includes('title', { status: true }, { comments: ['reactions'] } as any)
+    // The normalized shape passed straight to drizzle's `with`
+    expect((rel as any)._includes).toEqual({
+      title: true,
+      status: true,
+      comments: { with: { reactions: true } },   // grandchild lowered
+    })
+  })
+
+  it('deeper nesting: { a: { b: ["c"] } } → nested with all the way down', () => {
+    const rel = new Relation(Post).includes({ a: { b: ['c'] } } as any)
+    expect((rel as any)._includes).toEqual({
+      a: { with: { b: { with: { c: true } } } },
+    })
+  })
+})
+
 describe('Relation._clone()', () => {
   it('produces an independent copy that does not mutate the original', () => {
     const original = new Relation(Post).where({ status: 'draft' }).limit(5)

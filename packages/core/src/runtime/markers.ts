@@ -32,8 +32,13 @@ export type HasManyOptions = {
    * Create/Update types. Destroying children through nesting is a separate
    * opt-in (Rails' allow_destroy): `acceptsNested: { allowDestroy: true }`.
    * Bare `true` accepts creates and updates only.
+   *
+   * `instant: true` makes the generated nested form commit a row change
+   * IMMEDIATELY (optimistic, via the child's own controller) when the parent
+   * row is already persisted — and fall back to staging into the parent save
+   * when the parent is still new. Requires a controller for the child model.
    */
-  acceptsNested?: boolean | { allowDestroy?: boolean }
+  acceptsNested?: boolean | { allowDestroy?: boolean; instant?: boolean }
 }
 
 export type HasOneOptions = Omit<HasManyOptions, 'through' | 'source'>

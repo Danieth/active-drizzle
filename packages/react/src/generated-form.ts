@@ -32,6 +32,8 @@ export interface UseGeneratedFormOptions<T extends Record<string, any>> {
   fieldMeta?: Record<string, Record<string, any>>
   submit?: (payload: SubmitPayload) => Promise<SubmitResult>
   validate?: (draft: T) => Record<string, string[]>
+  /** Instant nested transports keyed by child resource (for instant nested writes). */
+  nestedTransports?: Record<string, import('./nested.js').NestedTransport>
 }
 
 /** Normalize a payload into envelope shape. */
@@ -66,7 +68,10 @@ export function useGeneratedForm<T extends Record<string, any>>(
       ...(opts.submit ? { submit: opts.submit } : {}),
       ...(opts.validate ? { validate: opts.validate } : {}),
     })
-    const handle = createFormHandle(session, opts.fieldMeta ? { fieldMeta: opts.fieldMeta } : {})
+    const handle = createFormHandle(session, {
+      ...(opts.fieldMeta ? { fieldMeta: opts.fieldMeta } : {}),
+      ...(opts.nestedTransports ? { nestedTransports: opts.nestedTransports } : {}),
+    })
     active = { key: opts.formKey, session, handle }
     appliedRef.current = opts.data
     setBuilt(active)
