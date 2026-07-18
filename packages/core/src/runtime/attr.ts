@@ -62,6 +62,97 @@ export type AttrEnumConfig<T extends Record<string, number> = Record<string, num
 }
 
 /**
+ * A single legal move in an Attr.state machine.
+ * `from: '*'` means the event is legal from every state.
+ * `if` is a pure guard over the record — return false to block the event.
+ * `message` customises the error shown when the guard (or state) blocks a save.
+ */
+export interface StateTransition<S extends string = string> {
+  from: readonly S[] | '*'
+  to: S
+  if?: (record: any) => boolean
+  message?: string
+}
+
+/**
+ * Extended config for Attr.state — an enum plus a transition graph.
+ * The Proxy synthesises is<Label>(), can<Event>() and <event>() methods,
+ * and ApplicationRecord.validate() enforces transition legality on save.
+ */
+export type AttrStateConfig = AttrConfig & {
+  readonly _isAttr: true
+  readonly _type: 'state'
+  readonly values: Record<string, number | string>
+  readonly initial?: string
+  readonly transitions: Record<string, StateTransition>
+}
+
+/** Labels of a states declaration — array form or hash form. */
+type StateLabel<S> = S extends readonly string[] ? S[number] : keyof S & string
+
+/**
+ * Instance members that a transition event may never shadow.
+ * Attr.state() throws at definition time on collision — fail-closed, so a
+ * transition named `save` can't silently become unreachable behind the
+ * prototype method of the same name.
+ */
+const RESERVED_EVENT_NAMES = new Set([
+  'save', 'update', 'destroy', 'delete', 'validate', 'isValid', 'isInvalid',
+  'reload', 'toJSON', 'inspect', 'errors', 'attributes', 'changes',
+  'previousChanges', 'restoreAttributes', 'isChanged', 'changedFields',
+  'can', 'advance', 'attach', 'detach', 'replace', 'reorder',
+  'isNewRecord', 'constructor', 'then',
+])
+
+/**
+ * Can `event` fire from `fromLabel` on `record` right now?
+ * Returns a reason string when blocked (used for save-time error messages).
+ */
+export function stateCanFire(
+  config: AttrStateConfig,
+  fromLabel: string | null | undefined,
+  event: string,
+  record: any,
+): { ok: true } | { ok: false; reason: string } {
+  const t = config.transitions[event]
+  if (!t) return { ok: false, reason: `unknown event '${event}'` }
+  if (fromLabel !== null && fromLabel !== undefined && t.from !== '*' && !t.from.includes(fromLabel)) {
+    return { ok: false, reason: t.message ?? `cannot ${event} from '${fromLabel}'` }
+  }
+  if (t.if && !t.if(record)) {
+    return { ok: false, reason: t.message ?? `${event} is not allowed right now` }
+  }
+  return { ok: true }
+}
+
+/**
+ * Is the move `fromLabel → toLabel` legal via ANY event on `record`?
+ * Used by save-time validation to police direct assignment
+ * (`record.status = 'approved'` without calling an event method).
+ */
+export function stateLegalMove(
+  config: AttrStateConfig,
+  fromLabel: string | null | undefined,
+  toLabel: string,
+  record: any,
+): { ok: true } | { ok: false; reason: string } {
+  // Records that predate the machine (null state) may enter it anywhere.
+  if (fromLabel === null || fromLabel === undefined) return { ok: true }
+  if (fromLabel === toLabel) return { ok: true }
+  let blockedReason: string | null = null
+  for (const [event, t] of Object.entries(config.transitions)) {
+    if (t.to !== toLabel) continue
+    const res = stateCanFire(config, fromLabel, event, record)
+    if (res.ok) return { ok: true }
+    blockedReason = res.reason
+  }
+  return {
+    ok: false,
+    reason: blockedReason ?? `cannot transition from '${fromLabel}' to '${toLabel}'`,
+  }
+}
+
+/**
  * Attr — the declarative field transformation system.
  *
  * Each Attr.* call returns a plain config object that the ApplicationRecord
@@ -99,6 +190,102 @@ export const Attr = {
         const numeric = (values as Record<string, number>)[val as string]
         return numeric !== undefined ? numeric : val
       },
+    }
+  },
+
+  /**
+   * State machine attr — an enum with a transition graph.
+   *
+   * States map labels to stored values (integer hash like Attr.enum, or an
+   * array of strings for text columns). Transitions name the legal moves;
+   * guards (`if`) are pure predicates over the record.
+   *
+   *   static status = Attr.state({
+   *     states: { draft: 0, submitted: 1, approved: 2, rejected: 3 } as const,
+   *     initial: 'draft',
+   *     transitions: {
+   *       submit:  { from: ['draft'],     to: 'submitted' },
+   *       approve: { from: ['submitted'], to: 'approved', if: r => r.amount != null },
+   *       reject:  { from: ['submitted'], to: 'rejected' },
+   *       reopen:  { from: '*',           to: 'draft' },
+   *     },
+   *   })
+   *
+   * What the record gains (all synthesized — nothing to write):
+   *
+   *   loan.status               // → 'draft' (label, like Attr.enum)
+   *   loan.isDraft()            // → true
+   *   loan.can('submit')        // → boolean (state ∈ from AND guard passes)
+   *   loan.canSubmit()          // → same, per-event sugar
+   *   loan.submit()             // assigns 'submitted' if legal → true, else false (no save)
+   *   await loan.advance('submit')  // submit() + save() in one call → boolean
+   *
+   * Direct assignment stays legal (`loan.status = 'approved'`) — the Attr
+   * contract is assign-anything-validate-on-save. validate() rejects moves
+   * with no legal transition path, so an illegal jump can never persist.
+   *
+   * `initial` doubles as the column default on INSERT. New records skip
+   * transition validation (creation may start in any state, e.g. imports).
+   */
+  state<
+    const S extends Record<string, number | string> | readonly string[],
+    const T extends Record<string, StateTransition<StateLabel<S>>>,
+  >(
+    config: {
+      states: S
+      initial?: StateLabel<S>
+      transitions: T
+    } & Partial<Omit<AttrConfig, '_isAttr'>>
+  ): AttrStateConfig {
+    const { states, initial, transitions, ...rest } = config
+
+    // Normalize: array form → identity mapping (label stored as itself)
+    const values: Record<string, number | string> = Array.isArray(states)
+      ? Object.fromEntries((states as readonly string[]).map(s => [s, s]))
+      : { ...(states as Record<string, number | string>) }
+
+    const labels = new Set(Object.keys(values))
+
+    // ── Definition-time validation — fail loudly at class-load, not at runtime
+    if (labels.size === 0) {
+      throw new Error(`Attr.state: 'states' must declare at least one state`)
+    }
+    if (initial !== undefined && !labels.has(initial)) {
+      throw new Error(`Attr.state: initial '${initial}' is not a declared state`)
+    }
+    for (const [event, t] of Object.entries(transitions as Record<string, StateTransition>)) {
+      if (RESERVED_EVENT_NAMES.has(event)) {
+        throw new Error(`Attr.state: event '${event}' collides with a built-in record member — rename the transition`)
+      }
+      if (!labels.has(t.to)) {
+        throw new Error(`Attr.state: transition '${event}' targets unknown state '${t.to}'`)
+      }
+      if (t.from !== '*') {
+        for (const f of t.from) {
+          if (!labels.has(f)) {
+            throw new Error(`Attr.state: transition '${event}' allows unknown state '${f}' in 'from'`)
+          }
+        }
+      }
+    }
+
+    const inverse: Record<string | number, string> = {}
+    for (const [k, v] of Object.entries(values)) inverse[v] = k
+
+    return {
+      _isAttr: true as const,
+      _type: 'state' as const,
+      values,
+      ...(initial !== undefined ? { initial, default: initial } : {}),
+      transitions: transitions as Record<string, StateTransition>,
+      get: (raw: number | string | null | undefined) =>
+        raw === null || raw === undefined ? null : (inverse[raw] ?? raw),
+      set: (val: string | number | null | undefined) => {
+        if (val === null || val === undefined) return null
+        const stored = values[val as string]
+        return stored !== undefined ? stored : val
+      },
+      ...rest,
     }
   },
 

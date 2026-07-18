@@ -3,7 +3,8 @@ import { eq, and, inArray, sql } from 'drizzle-orm'
 import { Relation } from './relation.js'
 import { getExecutor, getSchema, MODEL_REGISTRY, transaction, transactionContext, afterCommitQueue, AbortChain, RecordNotFound } from './boot.js'
 import { runHooks, collectHooks } from './hooks.js'
-import type { AttrEnumConfig } from './attr.js'
+import type { AttrEnumConfig, AttrStateConfig } from './attr.js'
+import { stateCanFire, stateLegalMove } from './attr.js'
 import {
   ValidationErrors,
   createValidationErrors,
@@ -205,7 +206,67 @@ export class ApplicationRecord {
       if (msg !== null) this.errors.add('base', msg)
     }
 
+    // Attr.state transition legality — direct assignment is allowed, but a
+    // move with no legal transition path can never persist. New records skip
+    // the check: creation may start in any state (imports, seeds, tests).
+    if (!this.isNewRecord) {
+      for (const key of Object.getOwnPropertyNames(ctor)) {
+        const stateCfg = ctor[key] as AttrStateConfig | undefined
+        if (stateCfg?._type !== 'state') continue
+        const change = this._changes.get(key)
+        if (!change) continue
+        const fromLabel = change.was as string | null | undefined       // display label (set trap stores get(was))
+        const toLabel = stateCfg.get!(change.is) as string              // raw stored → label
+        const res = stateLegalMove(stateCfg, fromLabel, toLabel, this)
+        if (!res.ok) this.errors.add(key, res.reason)
+      }
+    }
+
     return this.errors.isEmpty()
+  }
+
+  // ── State machine (Attr.state) ──────────────────────────────────────────
+
+  /**
+   * Can `event` fire right now? Checks the current state against the
+   * transition's `from` set and runs its guard. False for unknown events.
+   * Sugar: `record.canSubmit()` is synthesized per event by the Proxy.
+   */
+  can(event: string): boolean {
+    const ctor = this.constructor as any
+    for (const key of Object.getOwnPropertyNames(ctor)) {
+      const cfg = ctor[key] as AttrStateConfig | undefined
+      if (cfg?._type !== 'state' || !(event in cfg.transitions)) continue
+      return stateCanFire(cfg, (this as any)[key], event, this).ok
+    }
+    return false
+  }
+
+  /**
+   * Fire `event` AND persist — the one-liner for "move the machine forward":
+   *
+   *   await loan.advance('submit')   // → true when transitioned + saved
+   *
+   * Illegal event → false immediately, with the reason on `errors` and no
+   * DB round-trip. Legal event → assigns the target state and runs the full
+   * save() pipeline (validations + lifecycle hooks).
+   * For assign-without-save, call the synthesized event method: `loan.submit()`.
+   */
+  async advance(event: string): Promise<boolean> {
+    const ctor = this.constructor as any
+    for (const key of Object.getOwnPropertyNames(ctor)) {
+      const cfg = ctor[key] as AttrStateConfig | undefined
+      if (cfg?._type !== 'state' || !(event in cfg.transitions)) continue
+      const res = stateCanFire(cfg, (this as any)[key], event, this)
+      if (!res.ok) {
+        this.errors.add(key, res.reason)
+        return false
+      }
+      ;(this as any)[key] = cfg.transitions[event]!.to
+      return this.save()
+    }
+    this.errors.add('base', `unknown event '${event}'`)
+    return false
   }
 
   /** Runs validate(); returns true when valid. */
@@ -1078,13 +1139,33 @@ function _wrapRecord<T extends ApplicationRecord>(record: T): T {
         return _resolveAssociation(assocMarker, prop, target, ctor)
       }
 
-      // ── is<Label>() and to<Label>() from Attr.enum ──────────────────────
+      // ── State machine synthetics from Attr.state ────────────────────────
+      // canSubmit() → can('submit'); submit() → assign target state if legal.
+      for (const [stateProp, stateCfg] of Object.entries(ctor) as [string, any][]) {
+        if (stateCfg?._type !== 'state') continue
+        if (prop.length > 3 && prop.startsWith('can')) {
+          const eventKey = prop[3]!.toLowerCase() + prop.slice(4)
+          if (eventKey in stateCfg.transitions) {
+            return () => stateCanFire(stateCfg, (receiver as any)[stateProp], eventKey, receiver).ok
+          }
+        }
+        if (prop in stateCfg.transitions) {
+          return () => {
+            const res = stateCanFire(stateCfg, (receiver as any)[stateProp], prop, receiver)
+            if (!res.ok) return false
+            ;(receiver as any)[stateProp] = stateCfg.transitions[prop].to
+            return true
+          }
+        }
+      }
+
+      // ── is<Label>() and to<Label>() from Attr.enum / Attr.state ─────────
       if (prop.length > 2) {
         const prefix = prop.slice(0, 2)
         if (prefix === 'is' || prefix === 'to') {
           const labelKey = prop[2]!.toLowerCase() + prop.slice(3)
           for (const [enumProp, enumConfig] of Object.entries(ctor) as [string, any][]) {
-            if (enumConfig?._type !== 'enum') continue
+            if (enumConfig?._type !== 'enum' && enumConfig?._type !== 'state') continue
             if (!(labelKey in (enumConfig as AttrEnumConfig).values)) continue
             if (prefix === 'is') {
               return () => {
