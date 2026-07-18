@@ -103,10 +103,109 @@ Other guarantees, all tested:
 - A keystroke re-renders one field, not the form (per-field subscriptions;
   only predicate-bearing fields watch the whole session).
 
-## Wiring transports
+## Autosave — the commit policy
 
-`useForm` is transport-agnostic — generated controller hooks will wire the
-GET envelope and PATCH for you; until then (and in tests) inject anything:
+Presenters declare their natural **commit moment** at registration (discrete
+inputs like toggles: `commit: 'change'`; continuous inputs: `'blur'`). The
+*context* decides what commit does:
+
+- `<loan.Form>` — commits **stage**; Submit sends the batch.
+- `<loan.Form autosave>` — every commit sends a **single-field PATCH**.
+- A field with **no Form at all** — autosave by definition. The handle owns
+  the transport; a toggle is one line:
+
+```tsx
+<loan.isPublished edit />   // flip → optimistic → PATCH → rollback on failure
+```
+
+Autosave is optimistic with rollback, gated by the field's own validators
+(a locally-invalid value never PATCHes), and exposes per-field
+`saving | saved | error` through the presenter's `state` prop — a
+spinner-in-the-switch is one prop read. Two footguns are handled for you:
+a blur into an element marked `data-ad-cancel` skips the commit (the classic
+autosave-races-the-Cancel-button bug), and commits are suppressed during IME
+composition, firing once at composition end.
+
+## Nested forms — `accepts_nested_attributes_for`, unfurled
+
+Mark the association meta `kind: 'nested'` and the field becomes an array
+handle with a render-prop — keys are internal, never written by you:
+
+```tsx
+<loan.Form>
+  <loan.assets>
+    {(asset) => (<>
+      <asset.name edit />
+      <asset.value edit />
+      <asset.Remove />
+    </>)}
+  </loan.assets>
+  <loan.assets.Add defaults={{ value: 0 }}>Add asset</loan.assets.Add>
+  <loan.Submit>Save</loan.Submit>
+</loan.Form>
+```
+
+- **Identity keys** — persisted rows key on `id`, new rows on an ephemeral
+  `_key`. Removing a middle row can never shift a sibling's state.
+- **Remove semantics** — persisted rows mark `_destroy`; new rows vanish.
+- **One PATCH** — submit folds child changes into `assetsAttributes:
+  [{ id, ...diff } | { id, _destroy: true } | { ...fields, _key }]`, landing
+  on the server runtime that already processes it transactionally.
+- **Errors route by identity** — a 422 addressed `assets[new:3].name` lands
+  on exactly the right child form, even for rows that don't exist in the
+  database yet. Invalid children block the parent submit.
+- After a successful save, new rows adopt their server ids and re-key.
+
+## Generated hooks — the zero-wiring path
+
+For an [envelope controller](/controllers/abilities), codegen emits a fully
+wired, fully typed surface:
+
+```tsx
+import { useLoanEditForm } from './_generated'
+
+const { status, form: loan } = useLoanEditForm(id)
+if (status !== 'ready') return <Spinner />
+
+<loan.Form>
+  <loan.amount edit />        {/* TypedFieldComponent<'money'> */}
+  <loan.Submit event="submit">Submit application</loan.Submit>
+</loan.Form>
+```
+
+`useLoanEditForm` fetches the GET envelope through the generated client,
+builds the Client draft + FormSession, PATCHes the diff (+`version`,
++`_event`) on submit, invalidates the model's cache keys, and maps transport
+failures onto the session (422 → fields, 401 → draft-preserving
+re-auth state, 409 → conflict message). `useLoanNewForm` does the same over
+`create` with a defaults draft.
+
+## The presenter kind gate — compile-time wiring checks
+
+Tell TypeScript what your presenters accept, once:
+
+```ts
+declare module '@active-drizzle/react' {
+  interface AdPresenterKinds {
+    moneyInput: 'money'
+    moneyText: 'money'
+    switch: 'boolean'
+    badge: '*'                 // any kind
+  }
+}
+```
+
+Generated handles then constrain every call site:
+`<loan.amount edit="switch" />` is a **compile error** — `amount` is a
+`money` field and `switch` only accepts `boolean`. Until you augment the
+interface, the gate stays open (plain strings), so adoption is incremental.
+The `requires` gate (presenter demands meta the Attr doesn't declare) backs
+this up with a loud dev-mode error.
+
+## Wiring transports manually
+
+`useForm` stays transport-agnostic for tests, storybooks, and non-generated
+paths — inject anything:
 
 ```tsx
 const loan = useEditForm({
@@ -118,9 +217,3 @@ const loan = useEditForm({
   },
 })
 ```
-
-## Coming next
-
-Autosave contexts (`<loan.Form autosave>` and standalone fields), nested
-attribute arrays (`loan.assets` with render-prop unfurl and `_key`-routed
-errors), and generated typed handles per controller.

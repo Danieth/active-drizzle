@@ -216,8 +216,16 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
 
   // ── Errors ────────────────────────────────────────────────────────────────
 
-  /** ALL current errors: client validate() ∪ server errors, deduped. */
+  private errorsCache: { version: number; errors: Record<string, string[]> } | null = null
+
+  /**
+   * ALL current errors: client validate() ∪ server errors, deduped.
+   * Memoized per session version — every rendered field calls this, and
+   * re-running the full validate() N times per keystroke adds up.
+   */
   allErrors(): Record<string, string[]> {
+    const version = this.globalVersion
+    if (this.errorsCache?.version === version) return this.errorsCache.errors
     const client = this.validateFn(this.draft) ?? {}
     const merged: Record<string, string[]> = {}
     for (const src of [client, this.serverErrors]) {
@@ -226,6 +234,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
         for (const m of msgs) if (!list.includes(m)) list.push(m)
       }
     }
+    this.errorsCache = { version, errors: merged }
     return merged
   }
 
