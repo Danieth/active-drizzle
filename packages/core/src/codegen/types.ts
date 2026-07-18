@@ -100,6 +100,25 @@ export type EnumGroupMeta = {
   range: [number, number]
 }
 
+/** One transition edge in an Attr.state machine. */
+export type StateTransitionMeta = {
+  event: string                       // e.g. 'submit'
+  from: string[] | '*'
+  to: string
+  guardSource: string | null          // `if:` arrow-fn source text, for client emission
+  guardDeps: string[] | null          // inferred record-field deps of the guard
+  guardDepsError: string | null       // refusal message when the guard is unanalyzable
+  message: string | null              // custom block message
+}
+
+/** An Attr.state declaration — enum values plus the transition graph. */
+export type StateMeta = {
+  propertyName: string                // e.g. 'status'
+  values: Record<string, number | string>
+  initial: string | null
+  transitions: StateTransitionMeta[]
+}
+
 export type ScopeMeta = {
   name: string
   parameters: Array<{ name: string; type: string }>
@@ -141,6 +160,7 @@ export type ModelMeta = {
   associations: AssociationMeta[]
   enums: EnumMeta[]
   enumGroups: EnumGroupMeta[]
+  states: StateMeta[]
   scopes: ScopeMeta[]
   hooks: HookMeta[]
   instanceMethods: InstanceMethodMeta[]

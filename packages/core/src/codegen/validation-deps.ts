@@ -84,13 +84,46 @@ export function inferValidationDeps(
   method: MethodDeclaration,
   classDecl: ClassDeclaration,
 ): DepsInference {
+  return inferCallableDeps(method, classDecl, {
+    name: method.getName(),
+    hint: 'Declare @validate({ deps: [...] }) or simplify the body.',
+  })
+}
+
+/**
+ * Dep inference for record-predicates written as arrow/function expressions:
+ * `Attr.state` transition guards, and (later) presentIf/requiredIf/lockedIf.
+ * The first parameter is the record — its member reads are the deps:
+ *
+ *   if: (r) => r.amount != null            → deps: ['amount']
+ *   if: ({ amount, purpose }) => …          → deps: ['amount', 'purpose']
+ *
+ * Same fail-closed rules as @validate bodies: computed access, escaping
+ * receivers, and unanalyzable constructs refuse rather than guess.
+ */
+export function inferPredicateDeps(
+  fn: Node,
+  classDecl: ClassDeclaration,
+  label = 'predicate',
+): DepsInference {
+  return inferCallableDeps(fn, classDecl, {
+    name: label,
+    hint: 'Declare explicit deps or simplify the predicate.',
+  })
+}
+
+function inferCallableDeps(
+  root: Node,
+  classDecl: ClassDeclaration,
+  opts: { name: string; hint: string },
+): DepsInference {
   const deps = new Set<string>()
   const visiting = new Set<string>()
-  const aliases = new Set<string>() // identifiers that alias `this`
+  const aliases = new Set<string>() // identifiers that alias `this` (or the predicate's record param)
 
   const refuse = (reason: string): DepsInference => ({
     ok: false,
-    error: `can't infer deps for "${method.getName()}": ${reason}. Declare @validate({ deps: [...] }) or simplify the body.`,
+    error: `can't infer deps for "${opts.name}": ${reason}. ${opts.hint}`,
   })
 
   const walkMethod = (m: MethodDeclaration): string | null => {
@@ -224,9 +257,46 @@ export function inferValidationDeps(
     return false
   }
 
-  const err = walkMethod(method)
-  if (err) return refuse(err)
-  return { ok: true, deps: [...deps].sort(), source: 'inferred' }
+  // ── Entry: method roots recurse via walkMethod; predicate roots register
+  // their record param as a `this`-alias, then walk the body (block or bare
+  // expression — arrow shorthand bodies are legal).
+  if (Node.isMethodDeclaration(root)) {
+    const err = walkMethod(root)
+    if (err) return refuse(err)
+    return { ok: true, deps: [...deps].sort(), source: 'inferred' }
+  }
+
+  if (Node.isArrowFunction(root) || Node.isFunctionExpression(root)) {
+    const param = root.getParameters()[0]
+    if (param) {
+      const nameNode = param.getNameNode()
+      if (Node.isIdentifier(nameNode)) {
+        aliases.add(nameNode.getText())
+      } else if (Node.isObjectBindingPattern(nameNode)) {
+        // ({ amount, purpose }) => … — the destructured names ARE the deps
+        for (const el of nameNode.getElements()) {
+          const prop = el.getPropertyNameNode()?.getText() ?? el.getName()
+          if (prop && !NON_FIELD_THIS_MEMBERS.has(prop)) deps.add(prop)
+        }
+      } else {
+        return refuse('unsupported parameter pattern')
+      }
+    }
+    const body = root.getBody()
+    const err = Node.isBlock(body)
+      ? (() => {
+          for (const stmt of body.getStatements()) {
+            const e = walkStatement(stmt)
+            if (e) return e
+          }
+          return null
+        })()
+      : walkNodeSubtree(body)
+    if (err) return refuse(err)
+    return { ok: true, deps: [...deps].sort(), source: 'inferred' }
+  }
+
+  return refuse('unsupported callable form')
 }
 
 function isThisExpression(node: Node): boolean {
@@ -238,8 +308,9 @@ function isThisExpression(node: Node): boolean {
  * `(this)`, `this as any`, `this!`, `this satisfies X`, `<any>this`.
  * Without this, `(this as any)[key]` would evade the computed-access refusal —
  * a fail-open hole. Casting away the type must never cast away the analysis.
+ * (Also used by the extractor to see through `{...} as const`.)
  */
-function unwrapExpression(node: Node): Node {
+export function unwrapExpression(node: Node): Node {
   let cur = node
   for (;;) {
     if (Node.isParenthesizedExpression(cur) || Node.isAsExpression(cur) || Node.isNonNullExpression(cur)) {

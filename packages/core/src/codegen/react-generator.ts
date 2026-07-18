@@ -236,6 +236,36 @@ function generateControllerFile(
       }
     }
 
+    // Attr.state: per-label predicates + can(event). Guards ship only when
+    // provable AND their deps fit THIS controller's projection — otherwise
+    // can() fail-closes to false (the server's abilities/can map is truth).
+    const stateProjection = controllerProjectionFields(ctrl, model, writableFields)
+    if ((model.states ?? []).length) {
+      L.push('')
+      for (const st of model.states ?? []) {
+        for (const label of Object.keys(st.values)) {
+          L.push(`  ${lcFirst(st.propertyName)}Is${capitalize(label)}() { return this.${st.propertyName} === '${label}' }`)
+        }
+      }
+      const stateTransitions = (model.states ?? []).flatMap(st => st.transitions.map(t => ({ st, t })))
+      if (stateTransitions.length) {
+        L.push(`  can(event: string): boolean {`)
+        for (const { st, t } of stateTransitions) {
+          const fromCheck = t.from === '*'
+            ? 'true'
+            : `(${JSON.stringify(t.from)} as readonly string[]).includes(String((this as any).${st.propertyName}))`
+          let guardCheck = 'true'
+          if (t.guardSource) {
+            const provable = t.guardDeps && !t.guardDepsError && depsFitProjection(t.guardDeps, stateProjection)
+            guardCheck = provable ? `Boolean((${t.guardSource})(this as any))` : 'false'
+          }
+          L.push(`    if (event === '${t.event}') return ${fromCheck} && ${guardCheck}`)
+        }
+        L.push(`    return false`)
+        L.push(`  }`)
+      }
+    }
+
     // Projection-scoped validate(): only validations whose deps fit this controller's
     // permit ∪ includes. Server still runs the full set on the merged record.
     //
@@ -249,6 +279,12 @@ function generateControllerFile(
       for (const label of Object.keys(e.values)) {
         clientCallable.add(`${lcFirst(e.propertyName)}Is${capitalize(label)}`)
       }
+    }
+    for (const st of model.states ?? []) {
+      for (const label of Object.keys(st.values)) {
+        clientCallable.add(`${lcFirst(st.propertyName)}Is${capitalize(label)}`)
+      }
+      if (st.transitions.length) clientCallable.add('can')
     }
     const projection = controllerProjectionFields(ctrl, model, writableFields)
     const clientValidations = (model.instanceMethods ?? []).filter(m =>

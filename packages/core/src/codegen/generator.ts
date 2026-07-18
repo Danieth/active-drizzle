@@ -104,6 +104,27 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta): stri
     lines.push(`    is${capitalize(group.propertyName)}(): boolean`);
   }
 
+  // Attr.state: label union field, is<Label>(), can()/can<Event>()/advance(),
+  // and per-event assign-only methods.
+  for (const st of model.states) {
+    const labels = Object.keys(st.values);
+    const labelUnion = labels.map(l => `'${l}'`).join(' | ') || 'never';
+    lines.push(`    ${st.propertyName}: ${labelUnion} | null`);
+    for (const key of labels) {
+      lines.push(`    is${capitalize(key)}(): boolean`);
+      lines.push(`    to${capitalize(key)}(): ${recordName}`);
+    }
+    if (st.transitions.length > 0) {
+      const eventUnion = st.transitions.map(t => `'${t.event}'`).join(' | ');
+      lines.push(`    can(event: ${eventUnion}): boolean`);
+      lines.push(`    advance(event: ${eventUnion}): Promise<boolean>`);
+      for (const t of st.transitions) {
+        lines.push(`    can${capitalize(t.event)}(): boolean`);
+        lines.push(`    ${t.event}(): boolean`);
+      }
+    }
+  }
+
   if (table) {
     for (const col of table.columns) {
       if (col.primaryKey) continue;
@@ -157,6 +178,16 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta): stri
     lines.push(`    const ${enumDef.propertyName}: { ${Object.entries(enumDef.values).map(([k, v]) => `${k}: ${v}`).join('; ')} }`);
   }
 
+  for (const st of model.states) {
+    const valuePairs = Object.entries(st.values)
+      .map(([k, v]) => `${k}: ${typeof v === 'string' ? `'${v}'` : v}`)
+      .join('; ');
+    const transitionPairs = st.transitions
+      .map(t => `${t.event}: { from: ${t.from === '*' ? `'*'` : JSON.stringify(t.from)}; to: '${t.to}' }`)
+      .join('; ');
+    lines.push(`    const ${st.propertyName}: { values: { ${valuePairs} }; initial: ${st.initial ? `'${st.initial}'` : 'null'}; transitions: { ${transitionPairs} } }`);
+  }
+
   // Client class type declaration (implementation lives in .gen.ts)
   lines.push(`    class Client {`);
   if (table) {
@@ -186,6 +217,10 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta): stri
   lines.push(`      isChanged(): boolean`);
   lines.push(`      restoreAttributes(): void`);
   lines.push(`      validate(path?: string): Record<string, string[]>`);
+  const clientEvents = model.states.flatMap(st => st.transitions.map(t => t.event));
+  if (clientEvents.length > 0) {
+    lines.push(`      can(event: ${clientEvents.map(e => `'${e}'`).join(' | ')}): boolean`);
+  }
   lines.push(`    }`);
 
   lines.push(`  }`);
@@ -373,6 +408,31 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta): s
   lines.push(`    Object.assign(this, JSON.parse(JSON.stringify(this._initial)));`);
   lines.push(`  }`);
   lines.push('');
+
+  // Attr.state → client can(event): from-state check + guards that are
+  // provable AND whose deps fit this model's projection. Fail-closed: a guard
+  // the client can't evaluate makes can() return false — the server-computed
+  // answer is the source of truth, the client only ever narrows.
+  if (model.states.some(st => st.transitions.length > 0)) {
+    const clientProjection = modelProjectionFields(model, project);
+    lines.push(`  can(event: string): boolean {`);
+    for (const st of model.states) {
+      for (const t of st.transitions) {
+        const fromCheck = t.from === '*'
+          ? 'true'
+          : `(${JSON.stringify(t.from)} as readonly string[]).includes(String((this as any).${st.propertyName}))`;
+        let guardCheck = 'true';
+        if (t.guardSource) {
+          const provable = t.guardDeps && !t.guardDepsError && depsFitProjection(t.guardDeps, clientProjection);
+          guardCheck = provable ? `Boolean((${t.guardSource})(this as any))` : 'false';
+        }
+        lines.push(`    if (event === '${t.event}') return ${fromCheck} && ${guardCheck};`);
+      }
+    }
+    lines.push(`    return false;`);
+    lines.push(`  }`);
+    lines.push('');
+  }
 
   lines.push(`  validate(path = ''): Record<string, string[]> {`);
   lines.push(`    let errors: Record<string, string[]> = {};`);
@@ -692,6 +752,21 @@ export function generateDocs(project: ProjectMeta): string {
       for (const e of model.enums) {
         const vals = Object.entries(e.values).map(([k, v]) => `\`${k}\` → ${v}`).join(', ');
         lines.push(`- **\`${e.propertyName}\`**: ${vals}`);
+      }
+      lines.push('');
+    }
+
+    // State machines
+    if (model.states.length > 0) {
+      lines.push('### State Machines');
+      for (const st of model.states) {
+        const vals = Object.entries(st.values).map(([k, v]) => `\`${k}\` → ${v}`).join(', ');
+        lines.push(`- **\`${st.propertyName}\`**: ${vals}${st.initial ? ` (initial: \`${st.initial}\`)` : ''}`);
+        for (const t of st.transitions) {
+          const from = t.from === '*' ? '*' : t.from.map(f => `\`${f}\``).join(', ');
+          const guard = t.guardSource ? ` — guard: \`${t.guardSource}\`` : '';
+          lines.push(`  - \`${t.event}\`: ${from} → \`${t.to}\`${guard}`);
+        }
       }
       lines.push('');
     }

@@ -20,9 +20,41 @@ export function validate(project: ProjectMeta, validateOnly?: Set<string>): Diag
     validateAttrSetTypes(model, project, diagnostics);
     validateSti(model, project, diagnostics);
     validateValidationDeps(model, project, diagnostics);
+    validateStateMachines(model, diagnostics);
   }
 
   return diagnostics;
+}
+
+/**
+ * Attr.state machines: unprovable guards are build errors (the client can()
+ * would silently fail-closed forever — force explicit deps or a simpler
+ * guard), and the graph must reference only declared states. The runtime
+ * throws on the same graph errors at class load; checking here too surfaces
+ * them at build time with a file path.
+ */
+function validateStateMachines(model: ModelMeta, out: Diagnostic[]) {
+  for (const st of model.states) {
+    const labels = new Set(Object.keys(st.values));
+    if (st.initial && !labels.has(st.initial)) {
+      out.push(err(model.filePath, `Attr.state "${st.propertyName}": initial '${st.initial}' is not a declared state`));
+    }
+    for (const t of st.transitions) {
+      if (t.guardDepsError) {
+        out.push(err(model.filePath, t.guardDepsError));
+      }
+      if (t.to && !labels.has(t.to)) {
+        out.push(err(model.filePath, `Attr.state "${st.propertyName}": transition '${t.event}' targets unknown state '${t.to}'`));
+      }
+      if (t.from !== '*') {
+        for (const f of t.from) {
+          if (!labels.has(f)) {
+            out.push(err(model.filePath, `Attr.state "${st.propertyName}": transition '${t.event}' allows unknown state '${f}' in 'from'`));
+          }
+        }
+      }
+    }
+  }
 }
 
 function err(modelFile: string, message: string, suggestion?: string): Diagnostic {

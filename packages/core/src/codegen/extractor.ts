@@ -14,11 +14,13 @@ import type {
   AssociationMeta,
   EnumMeta,
   EnumGroupMeta,
+  StateMeta,
+  StateTransitionMeta,
   ScopeMeta,
   HookMeta,
   InstanceMethodMeta,
 } from './types.js';
-import { resolveValidationDeps, parseDeclaredDeps } from './validation-deps.js';
+import { resolveValidationDeps, parseDeclaredDeps, inferPredicateDeps, unwrapExpression } from './validation-deps.js';
 
 // ---------------------------------------------------------------------------
 // extractSchema
@@ -252,6 +254,7 @@ export function extractModel(project: Project, modelPath: string): ModelMeta {
 
   const associations = extractAssociations(classDecl);
   const { enums, enumGroups } = extractEnums(classDecl);
+  const states = extractStates(classDecl);
   const scopes = extractScopes(classDecl);
   const hooks = extractHooks(classDecl);
   const instanceMethods = extractInstanceMethods(classDecl);
@@ -269,6 +272,7 @@ export function extractModel(project: Project, modelPath: string): ModelMeta {
     associations,
     enums,
     enumGroups,
+    states,
     scopes,
     hooks,
     instanceMethods,
@@ -359,8 +363,10 @@ function extractEnums(classDecl: ClassDeclaration): { enums: EnumMeta[], enumGro
     const fnName = init.getExpression().getText();
     const propertyName = prop.getName();
 
-    if (fnName === 'defineEnum') {
-      const arg = init.getArguments()[0];
+    // defineEnum(...) and Attr.enum(...) are the same declaration in two dialects.
+    // unwrapExpression sees through `{...} as const`.
+    if (fnName === 'defineEnum' || fnName === 'Attr.enum') {
+      const arg = init.getArguments()[0] && unwrapExpression(init.getArguments()[0]!);
       if (arg && Node.isObjectLiteralExpression(arg)) {
         const raw = parseObjectLiteral(arg);
         enums.push({ propertyName, values: raw as Record<string, number> });
@@ -378,6 +384,129 @@ function extractEnums(classDecl: ClassDeclaration): { enums: EnumMeta[], enumGro
   }
 
   return { enums, enumGroups };
+}
+
+/**
+ * Extracts Attr.state declarations — states, initial, and the transition
+ * graph. Guards (`if:`) run through predicate dep inference so the client
+ * can() only ships guards whose deps are provable; unprovable guards carry
+ * guardDepsError and the validator turns that into a build error unless the
+ * transition declares explicit `deps: [...]`.
+ */
+function extractStates(classDecl: ClassDeclaration): StateMeta[] {
+  const result: StateMeta[] = [];
+
+  for (const prop of classDecl.getStaticProperties()) {
+    if (!Node.isPropertyDeclaration(prop)) continue;
+    const init = prop.getInitializer();
+    if (!init || !Node.isCallExpression(init)) continue;
+    if (init.getExpression().getText() !== 'Attr.state') continue;
+
+    const configArg = init.getArguments()[0] && unwrapExpression(init.getArguments()[0]!);
+    if (!configArg || !Node.isObjectLiteralExpression(configArg)) continue;
+
+    // states: { draft: 0, ... } as const   OR   ['open', 'closed']
+    let values: Record<string, number | string> = {};
+    const statesProp = configArg.getProperty('states');
+    if (Node.isPropertyAssignment(statesProp)) {
+      const statesInit = statesProp.getInitializer() && unwrapExpression(statesProp.getInitializer()!);
+      if (statesInit && Node.isObjectLiteralExpression(statesInit)) {
+        values = parseObjectLiteral(statesInit) as Record<string, number | string>;
+      } else if (statesInit && Node.isArrayLiteralExpression(statesInit)) {
+        for (const el of statesInit.getElements()) {
+          if (Node.isStringLiteral(el)) values[el.getLiteralValue()] = el.getLiteralValue();
+        }
+      }
+    }
+
+    // initial: 'draft'
+    let initial: string | null = null;
+    const initialProp = configArg.getProperty('initial');
+    if (Node.isPropertyAssignment(initialProp)) {
+      const v = initialProp.getInitializer();
+      if (v && Node.isStringLiteral(v)) initial = v.getLiteralValue();
+    }
+
+    // transitions: { submit: { from: [...], to: '...', if: r => ..., message, deps } }
+    const transitions: StateTransitionMeta[] = [];
+    const transProp = configArg.getProperty('transitions');
+    if (Node.isPropertyAssignment(transProp)) {
+      const transInit = transProp.getInitializer() && unwrapExpression(transProp.getInitializer()!);
+      if (transInit && Node.isObjectLiteralExpression(transInit)) {
+        for (const t of transInit.getProperties()) {
+          if (!Node.isPropertyAssignment(t)) continue;
+          const event = t.getName().replace(/^['"]|['"]$/g, '');
+          const tInit = t.getInitializer() && unwrapExpression(t.getInitializer()!);
+          if (!tInit || !Node.isObjectLiteralExpression(tInit)) continue;
+
+          let from: string[] | '*' = [];
+          const fromProp = tInit.getProperty('from');
+          if (Node.isPropertyAssignment(fromProp)) {
+            const fv = fromProp.getInitializer() && unwrapExpression(fromProp.getInitializer()!);
+            if (fv && Node.isStringLiteral(fv) && fv.getLiteralValue() === '*') from = '*';
+            else if (fv && Node.isArrayLiteralExpression(fv)) {
+              from = fv.getElements().filter(Node.isStringLiteral).map(e => e.getLiteralValue());
+            }
+          }
+
+          let to = '';
+          const toProp = tInit.getProperty('to');
+          if (Node.isPropertyAssignment(toProp)) {
+            const tv = toProp.getInitializer();
+            if (tv && Node.isStringLiteral(tv)) to = tv.getLiteralValue();
+          }
+
+          let message: string | null = null;
+          const msgProp = tInit.getProperty('message');
+          if (Node.isPropertyAssignment(msgProp)) {
+            const mv = msgProp.getInitializer();
+            if (mv && Node.isStringLiteral(mv)) message = mv.getLiteralValue();
+          }
+
+          // Explicit deps escape hatch for unanalyzable guards
+          let declaredDeps: string[] | null = null;
+          const depsProp = tInit.getProperty('deps');
+          if (Node.isPropertyAssignment(depsProp)) {
+            const dv = depsProp.getInitializer();
+            if (dv && Node.isArrayLiteralExpression(dv)) {
+              declaredDeps = dv.getElements().filter(Node.isStringLiteral).map(e => e.getLiteralValue());
+            }
+          }
+
+          let guardSource: string | null = null;
+          let guardDeps: string[] | null = null;
+          let guardDepsError: string | null = null;
+          const ifProp = tInit.getProperty('if');
+          if (Node.isPropertyAssignment(ifProp)) {
+            const g = ifProp.getInitializer() && unwrapExpression(ifProp.getInitializer()!);
+            if (g && (Node.isArrowFunction(g) || Node.isFunctionExpression(g))) {
+              guardSource = g.getText();
+              const inferred = inferPredicateDeps(g, classDecl, `${prop.getName()}.${event} guard`);
+              if (inferred.ok) {
+                guardDeps = inferred.deps;
+              } else if (declaredDeps) {
+                guardDeps = [...new Set(declaredDeps)].sort();
+              } else {
+                guardDepsError = inferred.error;
+              }
+            } else if (g) {
+              guardSource = g.getText();
+              guardDepsError = declaredDeps
+                ? null
+                : `can't infer deps for "${prop.getName()}.${event} guard": guard is not an inline function. Declare deps: [...] on the transition.`;
+              if (declaredDeps) guardDeps = [...new Set(declaredDeps)].sort();
+            }
+          }
+
+          transitions.push({ event, from, to, guardSource, guardDeps, guardDepsError, message });
+        }
+      }
+    }
+
+    result.push({ propertyName: prop.getName(), values, initial, transitions });
+  }
+
+  return result;
 }
 
 function extractScopes(classDecl: ClassDeclaration): ScopeMeta[] {
