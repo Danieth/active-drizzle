@@ -39,3 +39,4 @@ Thumbs.db
 .vscode/settings.json
 .idea/
 *.local
+.claude/worktrees/
