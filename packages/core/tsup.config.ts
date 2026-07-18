@@ -3,6 +3,7 @@ import { defineConfig } from 'tsup'
 export default defineConfig({
   entry: {
     index: 'src/index.ts',
+    validators: 'src/runtime/validators.ts',
     'vite/index': 'src/vite/index.ts',
   },
   format: ['esm', 'cjs'],

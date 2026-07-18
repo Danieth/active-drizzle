@@ -43,9 +43,13 @@ export class ClientModel<
 
   constructor(attrs: TAttrs) {
     this._attrs = Object.freeze({ ...attrs })
-    // Spread attrs onto `this` so `model.name` works without explicit getters.
-    // The generated `declare` statements give TypeScript visibility into this.
-    Object.assign(this, this._attrs)
+    // Define attrs onto `this` so `model.name` works without explicit getters.
+    // defineProperty (not Object.assign) — assignment would invoke prototype
+    // accessors like `get id()` and throw; defining shadows them cleanly and
+    // stays writable so form drafts can mutate.
+    for (const [k, v] of Object.entries(this._attrs)) {
+      Object.defineProperty(this, k, { value: v, writable: true, enumerable: true, configurable: true })
+    }
   }
 
   /** Create a typed instance from a plain server payload. */

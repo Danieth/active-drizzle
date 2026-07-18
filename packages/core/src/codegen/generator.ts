@@ -776,6 +776,12 @@ export function renderFieldMeta(
     // to the base kind ('email' → 'string') when no semantic default exists
     if (m.semantic) parts.push(`kind: '${m.semantic}'`);
     else if (m.kind) parts.push(`kind: '${m.kind}'`);
+    // Enum/state fields carry their labels so select presenters can
+    // enumerate options straight from meta
+    const enumDef = model.enums.find(e => e.propertyName === prop);
+    const stateDef = model.states.find(st => st.propertyName === prop);
+    const labels = enumDef ? Object.keys(enumDef.values) : stateDef ? Object.keys(stateDef.values) : null;
+    if (labels) parts.push(`options: ${JSON.stringify(labels)}`);
     if (m.label !== null) parts.push(`label: ${JSON.stringify(m.label)}`);
     if (m.help !== null) parts.push(`help: ${JSON.stringify(m.help)}`);
     if (m.info !== null) parts.push(`info: ${JSON.stringify(m.info)}`);

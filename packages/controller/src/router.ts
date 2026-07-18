@@ -619,11 +619,13 @@ function httpToOrpc(e: HttpError): ORPCError<string, unknown> {
     401: 'UNAUTHORIZED',
     403: 'FORBIDDEN',
     404: 'NOT_FOUND',
+    409: 'CONFLICT',
     422: 'UNPROCESSABLE_ENTITY',
   }
   const code = STATUS_TO_CODE[e.status] ?? 'INTERNAL_SERVER_ERROR'
   const data = e instanceof ValidationError ? { errors: e.errors } : undefined
-  return new ORPCError(code, { message: e.message, data })
+  // status explicitly — cross-package ORPCError copies don't all derive it from code
+  return new ORPCError(code, { status: e.status, message: e.message, data })
 }
 
 function buildUpdatePermit(

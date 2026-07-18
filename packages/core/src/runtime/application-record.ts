@@ -206,7 +206,25 @@ export class ApplicationRecord {
   // ── Constructor ─────────────────────────────────────────────────────────
 
   constructor(attributes: Record<string, any> = {}, isNew = true) {
-    this._attributes    = attributes
+    if (isNew) {
+      // Constructor input for NEW records is model-space ('high', dollars) —
+      // run it through each Attr's set() so _attributes always holds raw DB
+      // values. Without this, Deal.create({ priority: 'high', amount: 480 })
+      // would write the label string and dollar units straight to the DB.
+      const ctor = this.constructor as any
+      const raw: Record<string, any> = {}
+      for (const [k, v] of Object.entries(attributes)) {
+        const attr = ctor[k] as AttrConfig | undefined
+        if (attr?._isAttr === true && typeof attr.set === 'function') {
+          raw[(attr as any)._column ?? k] = attr.set(v)
+        } else {
+          raw[k] = v
+        }
+      }
+      this._attributes = raw
+    } else {
+      this._attributes = attributes
+    }
     this.isNewRecord    = isNew
     ;(this as any)._previousChanges = null  // initialized so proxy set trap uses Reflect.set
     return _wrapRecord(this)
@@ -1035,12 +1053,30 @@ function _resolveAssociation(marker: any, prop: string, target: any, ctor: any):
  * Note: for `habtm`, `marker.table` is the JOIN table — target is always inferred
  * from the property name.
  */
+const _warnedMissingModels = new Set<string>()
+
+function _warnMissingModel(table: string, prop: string): null {
+  // Fail LOUD, once: the classic footgun is an association target whose
+  // module was never imported — ESM elides unused imports, so the @model
+  // decorator never ran and the registry never heard of it.
+  if (!_warnedMissingModels.has(table)) {
+    _warnedMissingModels.add(table)
+    console.warn(
+      `[active-drizzle] Association "${prop}" points at table "${table}" but no model is registered for it. ` +
+      `If the model exists, its module was probably never evaluated — unused imports are elided by bundlers. ` +
+      `Import your models for their side effects (e.g. a models/index.ts barrel) before using associations.`,
+    )
+  }
+  return null
+}
+
 function _findModelByMarker(marker: any, prop: string): any {
   const reg = MODEL_REGISTRY
 
   // For belongsTo / hasMany / hasOne: marker.table is the TARGET table (if explicit)
   if (marker._type !== 'habtm' && marker.table) {
-    return Object.values(reg).find((m: any) => m._activeDrizzleTableName === marker.table) ?? null
+    return Object.values(reg).find((m: any) => m._activeDrizzleTableName === marker.table)
+      ?? _warnMissingModel(marker.table, prop)
   }
 
   // Infer from property name: direct table-name lookup first (precise), then class name.
