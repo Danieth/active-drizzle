@@ -329,8 +329,21 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta): s
     }
   }
 
+  // Property validators ship iff every identifier they reference resolves in
+  // a client (graceful degradation: foreign refs stay server-only). Validates
+  // is the sanctioned exception — its import is emitted below.
+  const shippableValidations = Object.entries(model.propertyValidations).filter(
+    ([prop]) => (model.propertyValidationAnalysis?.[prop]?.foreignRefs?.length ?? 0) === 0,
+  );
+  const needsValidates = shippableValidations.some(
+    ([prop]) => model.propertyValidationAnalysis?.[prop]?.usesValidates,
+  );
+
   lines.push(`// AUTO-GENERATED — do not edit manually`);
   lines.push(`import { ${model.className} as _${model.className} } from './${model.className}.model.js'`);
+  if (needsValidates) {
+    lines.push(`import { Validates } from 'active-drizzle'`);
+  }
   for (const [cls, basename] of assocImports) {
     lines.push(`import { ${cls} as _${cls} } from './${basename}.js'`);
   }
@@ -455,12 +468,20 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta): s
   lines.push(`      if (!t) return;`);
   lines.push(`      (errors[field] = errors[field] || []).push(t);`);
   lines.push(`    };`);
+  // Validators receive (value, draft, field) — record-gates (if/unless) run
+  // against the projected draft when they can. A gate touching something this
+  // client doesn't have (unpermitted field, server-only method) THROWS here;
+  // the catch degrades that validator to a no-op and the server stays
+  // authoritative. Never a browser crash, never a false block.
   lines.push(`    const _run = (field: string, validators: any, value: any) => {`);
   lines.push(`      const list = Array.isArray(validators) ? validators : [validators];`);
-  lines.push(`      for (const fn of list) { if (typeof fn === 'function') _push(field, fn(value)); }`);
+  lines.push(`      for (const fn of list) {`);
+  lines.push(`        if (typeof fn !== 'function') continue;`);
+  lines.push(`        try { _push(field, fn(value, this, field)); } catch { /* server-only gate — degrade */ }`);
+  lines.push(`      }`);
   lines.push(`    };`);
 
-  for (const [prop, code] of Object.entries(model.propertyValidations)) {
+  for (const [prop, code] of shippableValidations) {
     lines.push(`    { const _v = (this as any).${prop}; _run(path ? \`\${path}.${prop}\` : '${prop}', (${code}), _v); }`);
   }
 
@@ -744,12 +765,17 @@ export function generateGlobals(_project: ProjectMeta): string {
 export function renderFieldMeta(
   model: ModelMeta,
   projection: Set<string>,
+  /** Extra literal entries appended into the object (e.g. attachment fields). */
+  extraEntries: string[] = [],
 ): string | null {
-  const entries: string[] = [];
+  const entries: string[] = [...extraEntries];
   for (const [prop, m] of Object.entries(model.fieldMeta ?? {})) {
     if (!projection.has(prop)) continue;
     const parts: string[] = [];
-    if (m.kind) parts.push(`kind: '${m.kind}'`);
+    // Semantic refinement wins at runtime — presenter resolution falls back
+    // to the base kind ('email' → 'string') when no semantic default exists
+    if (m.semantic) parts.push(`kind: '${m.semantic}'`);
+    else if (m.kind) parts.push(`kind: '${m.kind}'`);
     if (m.label !== null) parts.push(`label: ${JSON.stringify(m.label)}`);
     if (m.help !== null) parts.push(`help: ${JSON.stringify(m.help)}`);
     if (m.info !== null) parts.push(`info: ${JSON.stringify(m.info)}`);

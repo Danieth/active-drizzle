@@ -169,7 +169,10 @@ class AssetClient {
     };
     const _run = (field: string, validators: any, value: any) => {
       const list = Array.isArray(validators) ? validators : [validators];
-      for (const fn of list) { if (typeof fn === 'function') _push(field, fn(value)); }
+      for (const fn of list) {
+        if (typeof fn !== 'function') continue;
+        try { _push(field, fn(value, this, field)); } catch { /* server-only gate — degrade */ }
+      }
     };
     if ((this as any).business) {
       errors = { ...errors, ...(this as any).business.validate(path ? \`\${path}.business\` : 'business') };

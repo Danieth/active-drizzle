@@ -32,6 +32,8 @@ export interface FieldProps {
   view?: string
   label?: string
   help?: string
+  /** Passed through to the presenter via overrides — Tailwind/etc. just works. */
+  className?: string
   /** Extra props passed through to the presenter. */
   props?: Record<string, any>
 }
@@ -56,7 +58,9 @@ export type NestedFormHandle = FormHandle & {
 export type ArrayFieldHandle = FC<{ children: (child: NestedFormHandle) => ReactNode }> & {
   forms: NestedFormHandle[]
   add: (defaults?: Record<string, any>) => void
-  Add: FC<{ defaults?: Record<string, any>; children?: ReactNode }>
+  /** Reorder for drag-and-drop: wire your DnD lib's onDrop to move(key, toIndex). */
+  move: (key: string, toIndex: number) => void
+  Add: FC<{ defaults?: Record<string, any>; children?: ReactNode; className?: string }>
 }
 
 /**
@@ -86,6 +90,7 @@ export interface TypedFieldProps<K extends string> {
   view?: import('./presenters.js').PresenterNameFor<K>
   label?: string
   help?: string
+  className?: string
   props?: Record<string, any>
 }
 
@@ -125,11 +130,16 @@ export function createFormHandle<T extends Record<string, any>>(
 
   // ── Nested attribute arrays: meta kind 'nested' → ArrayFieldHandle ───────
   const makeArrayHandle = (name: string, meta: Record<string, any>): ArrayFieldHandle => {
+    const childFields = (meta.fields ?? {}) as Record<string, Record<string, any>>
     const manager = new NestedArrayManager(
       session,
       name,
       (session.draft as any)[name],
-      meta.validate ? { validate: meta.validate } : {},
+      {
+        ...(meta.validate ? { validate: meta.validate } : {}),
+        nestedKeys: Object.keys(childFields).filter(k => childFields[k]?.kind === 'nested'),
+        ...(meta.orderBy ? { positionField: meta.orderBy } : {}),
+      },
     )
     session.registerNested(name, manager)
 
@@ -137,8 +147,8 @@ export function createFormHandle<T extends Record<string, any>>(
     const childHandle = (child: NestedChild): NestedFormHandle => {
       let h = childHandles.get(child.key)
       if (h) return h
-      const RemoveComponent: FC<{ children?: ReactNode }> = ({ children }) => (
-        <button type="button" onClick={() => manager.remove(child.key)}>
+      const RemoveComponent: FC<{ children?: ReactNode; className?: string }> = ({ children, className }) => (
+        <button type="button" {...(className !== undefined ? { className } : {})} onClick={() => manager.remove(child.key)}>
           {children ?? 'Remove'}
         </button>
       )
@@ -167,8 +177,8 @@ export function createFormHandle<T extends Record<string, any>>(
     }
     ;(ArrayComponent as any).displayName = `AdArray(${name})`
 
-    const AddComponent: FC<{ defaults?: Record<string, any>; children?: ReactNode }> = ({ defaults, children }) => (
-      <button type="button" onClick={() => manager.add(defaults)}>
+    const AddComponent: FC<{ defaults?: Record<string, any>; children?: ReactNode; className?: string }> = ({ defaults, children, className }) => (
+      <button type="button" {...(className !== undefined ? { className } : {})} onClick={() => manager.add(defaults)}>
         {children ?? 'Add'}
       </button>
     )
@@ -178,6 +188,7 @@ export function createFormHandle<T extends Record<string, any>>(
     Object.defineProperties(arrayHandle, {
       forms: { get: () => manager.visible().map(childHandle) },
       add: { value: (defaults?: Record<string, any>) => { manager.add(defaults) } },
+      move: { value: (key: string, toIndex: number) => { manager.move(key, toIndex) } },
       Add: { value: AddComponent },
     })
     return arrayHandle
@@ -224,24 +235,35 @@ export function createFormHandle<T extends Record<string, any>>(
       if (!resolved) return null
       checkRequiredMeta(resolved.name, resolved.def, field, meta)
 
+      // Attachment fields READ the loaded asset payload but WRITE the
+      // `<name>AssetId(s)` column the controller actually permits — the
+      // presenter deals in assets, the wire deals in ids, nobody wires it
+      const isAttachment = meta.kind === 'attachmentOne' || meta.kind === 'attachmentMany'
+      const writeField = !isAttachment ? field
+        : meta.kind === 'attachmentOne' ? `${field}AssetId` : `${field}AssetIds`
+
       const commitMoment = resolved.def.commit ?? 'blur'
       const bind: PresenterBind = {
         name: field,
         onChange: (value: any) => {
-          session.setValue(field, value)
+          // Presenters may pass an asset object/array or raw id(s)
+          const written = !isAttachment ? value
+            : Array.isArray(value) ? value.map((v: any) => v?.id ?? v)
+            : value?.id ?? value
+          session.setValue(writeField, written)
           // Discrete inputs (toggle/select) commit on change — instant
           // autosave in autosave contexts, staged + errors-visible otherwise
-          if (commitMoment === 'change') void session.commitField(field, commitMode)
+          if (commitMoment === 'change') void session.commitField(writeField, commitMode)
         },
-        onCommit: () => void session.commitField(field, commitMode),
+        onCommit: () => void session.commitField(writeField, commitMode),
         onBlur: (e?: { relatedTarget?: any }) => {
           // C10: blur fires before a Cancel button's click — a blur INTO an
           // element marked data-ad-cancel must not autosave first
           const cancelIntent = Boolean(
             e?.relatedTarget?.closest?.('[data-ad-cancel]') ?? e?.relatedTarget?.dataset?.adCancel,
           )
-          if (cancelIntent) session.touch(field)
-          else void session.commitField(field, commitMode)
+          if (cancelIntent) session.touch(writeField)
+          else void session.commitField(writeField, commitMode)
         },
         onCompositionStart: () => session.beginComposition(field),
         onCompositionEnd: () => {
@@ -255,6 +277,7 @@ export function createFormHandle<T extends Record<string, any>>(
       const overrides: Record<string, any> = { ...(props.props ?? {}) }
       if (props.label !== undefined) overrides.label = props.label
       if (props.help !== undefined) overrides.help = props.help
+      if (props.className !== undefined) overrides.className = props.className
 
       const Component = resolved.def.component
       return (
@@ -280,9 +303,10 @@ export function createFormHandle<T extends Record<string, any>>(
     return Field as FieldComponent
   }
 
-  const FormComponent: FC<{ children?: ReactNode; onSuccess?: () => void; autosave?: boolean }> = ({ children, onSuccess, autosave }) => (
+  const FormComponent: FC<{ children?: ReactNode; onSuccess?: () => void; autosave?: boolean; className?: string }> = ({ children, onSuccess, autosave, className }) => (
     <FormModeContext.Provider value={autosave ? 'autosave' : 'stage'}>
       <form
+        {...(className !== undefined ? { className } : {})}
         onSubmit={(e) => {
           e.preventDefault()
           void session.submit().then((ok) => { if (ok) onSuccess?.() })
@@ -294,7 +318,7 @@ export function createFormHandle<T extends Record<string, any>>(
   )
   FormComponent.displayName = 'AdForm'
 
-  const SubmitComponent: FC<{ children?: ReactNode; event?: string }> = ({ children, event }) => {
+  const SubmitComponent: FC<{ children?: ReactNode; event?: string; className?: string }> = ({ children, event, className }) => {
     useSyncExternalStore(
       (cb) => session.subscribe('*', cb),
       () => session.fieldVersion('*'),
@@ -306,6 +330,7 @@ export function createFormHandle<T extends Record<string, any>>(
     return (
       <button
         type="button"
+        {...(className !== undefined ? { className } : {})}
         disabled={disabled}
         onClick={() => void session.submit(event !== undefined ? { event } : {})}
       >
@@ -315,7 +340,7 @@ export function createFormHandle<T extends Record<string, any>>(
   }
   SubmitComponent.displayName = 'AdSubmit'
 
-  const BaseErrorsComponent: FC = () => {
+  const BaseErrorsComponent: FC<{ className?: string }> = ({ className }) => {
     useSyncExternalStore(
       (cb) => session.subscribe('*', cb),
       () => session.fieldVersion('*'),
@@ -324,7 +349,7 @@ export function createFormHandle<T extends Record<string, any>>(
     const base = session.baseErrors()
     if (base.length === 0) return null
     return (
-      <div role="alert">
+      <div role="alert" {...(className !== undefined ? { className } : {})}>
         {base.map((msg, i) => <p key={i}>{msg}</p>)}
       </div>
     )

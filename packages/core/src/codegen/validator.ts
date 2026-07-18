@@ -22,6 +22,7 @@ export function validate(project: ProjectMeta, validateOnly?: Set<string>): Diag
     validateValidationDeps(model, project, diagnostics);
     validateStateMachines(model, diagnostics);
     validateFieldMeta(model, project, diagnostics);
+    validatePropertyValidatorShippability(model, diagnostics);
   }
 
   return diagnostics;
@@ -322,6 +323,22 @@ function validateSti(model: ModelMeta, project: ProjectMeta, out: Diagnostic[]) 
  * - copy.by must name an enum/state Attr on the model, and override keys
  *   must be labels of that discriminant
  */
+/**
+ * Property validators referencing identifiers a client can't resolve stay
+ * server-only (graceful degradation, not a browser ReferenceError). That's
+ * safe but easy to miss — warn with the culprit so DRY-minded authors can
+ * switch to Validates.* or inline the logic and get client validation back.
+ */
+function validatePropertyValidatorShippability(model: ModelMeta, out: Diagnostic[]) {
+  for (const [prop, analysis] of Object.entries(model.propertyValidationAnalysis ?? {})) {
+    if (analysis.foreignRefs.length === 0) continue
+    out.push(warn(
+      model.filePath,
+      `validator for "${prop}" references ${analysis.foreignRefs.map(r => `'${r}'`).join(', ')} — it will run server-only. Use Validates.* or inline the logic to ship it to clients.`,
+    ))
+  }
+}
+
 function validateFieldMeta(model: ModelMeta, project: ProjectMeta, out: Diagnostic[]) {
   const table = project.schema.tables[model.tableName];
   const modelFields = new Set<string>([

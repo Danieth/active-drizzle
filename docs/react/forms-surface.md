@@ -155,6 +155,13 @@ handle with a render-prop — keys are internal, never written by you:
   on exactly the right child form, even for rows that don't exist in the
   database yet. Invalid children block the parent submit.
 - After a successful save, new rows adopt their server ids and re-key.
+- **Nested-nested works** — a child form can carry its own nested arrays;
+  grandchildren fold as `liensAttributes` inside the child's payload, and
+  the server's recursive save processes the whole tree in one transaction.
+- **Drag-and-drop reordering** — declare `orderBy: 'position'` on the nested
+  meta and wire any DnD library's drop handler to
+  `loan.assets.move(key, toIndex)`: the rows reorder, every child's position
+  rewrites, and the diffs ride the next submit like any other edit.
 
 ## Generated hooks — the zero-wiring path
 
@@ -179,6 +186,62 @@ builds the Client draft + FormSession, PATCHes the diff (+`version`,
 failures onto the session (422 → fields, 401 → draft-preserving
 re-auth state, 409 → conflict message). `useLoanNewForm` does the same over
 `create` with a defaults draft.
+
+## Files are fields
+
+`@attachable` controllers make attachments first-class form fields. The
+generated meta carries the upload contract, and writes automatically target
+the permitted `<name>AssetId` column — the presenter deals in assets, the
+wire deals in ids, nobody wires it:
+
+```tsx
+<loan.contract edit />
+// meta: { kind: 'attachmentOne', accepts: 'application/pdf', maxSize: 5242880 }
+// value: the loaded asset payload   ·   bind.onChange(asset) → writes contractAssetId
+```
+
+An upload presenter renders a correct dropzone from `meta.accepts`/`maxSize`
+alone, calls the existing upload hooks to presign + upload, then hands the
+ready asset to `bind.onChange`. `attachmentMany` fields write
+`<name>AssetIds` arrays.
+
+## Styling — it's just your components
+
+Presenters are your components, so Tailwind (or anything) works the obvious
+way. Three layers:
+
+1. **In the presenter** — bake your design system in once.
+2. **At the call site** — `className` passes through on every field and
+   every built-in: `<loan.amount edit className="w-full rounded" />`,
+   `<loan.Form className="space-y-4">`, `<loan.Submit className="btn" />`.
+3. **Per instance** — `props={{ ... }}` forwards arbitrary props.
+
+AD ships zero CSS and zero markup opinions beyond `<form>`/`<button>`
+semantics on its built-ins.
+
+## Validators travel — `Validates.*` runs in the browser
+
+The [declarative validators](/hooks/validators) ship to generated Clients
+automatically: codegen detects `Validates.*` in an Attr's `validates:`,
+emits the import, and the same rule runs as-you-type client-side and again
+server-side. Three safety rules make this DRY *and* safe:
+
+- **App helpers stay server-only.** A validator referencing anything a
+  client can't resolve (`validates: v => myHelper(v)`) is excluded from the
+  client with a build **warning** naming the culprit — graceful degradation,
+  never a browser ReferenceError. Use `Validates.*` or inline the logic to
+  ship it.
+- **Record gates degrade.** `Validates.presence({ if: (r) => r.isAdmin() })`
+  where the gate touches something outside this client's projection throws
+  client-side — the generated runner catches it and skips that rule. The
+  server remains authoritative; the client never crashes and never
+  false-blocks.
+- **Semantic kinds for free.** `Validates.email()` / `url()` / `uuid()`
+  refine the field's kind: typed handles emit
+  `TypedFieldComponent<'email' | 'string'>`, so both `emailInput` and plain
+  `text` presenters are legal, and runtime resolution falls back to the
+  string defaults until you register something prettier. One registration
+  upgrades every email field in the app.
 
 ## The presenter kind gate — compile-time wiring checks
 

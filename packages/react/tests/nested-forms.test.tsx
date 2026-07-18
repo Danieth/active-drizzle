@@ -249,3 +249,113 @@ describe('post-save settle', () => {
     expect(session.isDirty()).toBe(false)                // fully settled
   })
 })
+
+// ── Nested-nested: grandchildren fold through the child session ──────────────
+
+describe('nested-nested forms', () => {
+  it('a NEW child with its own nested array folds grandchildren as <name>Attributes', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const meta = {
+      amount: { kind: 'string' },
+      assets: {
+        kind: 'nested',
+        fields: {
+          name: { kind: 'string' },
+          liens: {                       // grandchild array
+            kind: 'nested',
+            fields: { holder: { kind: 'string' } },
+          },
+        },
+      },
+    }
+    const session = new FormSession({
+      draft: { id: 1, amount: '100', assets: [] },
+      mode: 'edit', abilities: null, version: 'v1', submit: submitSpy,
+    })
+    const loan: any = createFormHandle(session, { fieldMeta: meta as any })
+
+    render(
+      <loan.Form>
+        <loan.assets>
+          {(asset: any) => (
+            <>
+              <asset.name edit />
+              <asset.liens>
+                {(lien: any) => <lien.holder edit />}
+              </asset.liens>
+              <asset.liens.Add>Add lien</asset.liens.Add>
+            </>
+          )}
+        </loan.assets>
+        <loan.assets.Add>Add asset</loan.assets.Add>
+        <loan.Submit>Save</loan.Submit>
+      </loan.Form>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add asset' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'name' }), { target: { value: 'Truck' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add lien' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'holder' }), { target: { value: 'First Bank' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(submitSpy).toHaveBeenCalledTimes(1))
+    const data = submitSpy.mock.calls[0]![0].data
+    expect(data.assetsAttributes).toHaveLength(1)
+    const asset = data.assetsAttributes[0]
+    expect(asset.name).toBe('Truck')
+    expect(asset._key).toBe('new:1')
+    expect(asset.liens).toBeUndefined()                       // raw array never rides
+    expect(asset.liensAttributes).toEqual([{ holder: 'First Bank', _key: 'new:1' }])
+  })
+})
+
+// ── Drag-and-drop reordering ─────────────────────────────────────────────────
+
+describe('move() reordering', () => {
+  it('moves a row and rewrites position fields; diffs ride the submit', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const meta = {
+      assets: {
+        kind: 'nested',
+        orderBy: 'position',
+        fields: { name: { kind: 'string' }, position: { kind: 'integer' } },
+      },
+    }
+    const session = new FormSession({
+      draft: {
+        id: 1,
+        assets: [
+          { id: 7, name: 'A', position: 0 },
+          { id: 8, name: 'B', position: 1 },
+          { id: 9, name: 'C', position: 2 },
+        ],
+      },
+      mode: 'edit', abilities: null, version: 'v1', submit: submitSpy,
+    })
+    const loan: any = createFormHandle(session, { fieldMeta: meta as any })
+
+    render(
+      <loan.Form>
+        <loan.assets>{(a: any) => <a.name view="textView" />}</loan.assets>
+        <loan.Submit>Save</loan.Submit>
+      </loan.Form>,
+    )
+
+    // DnD lib calls this on drop: move C to the front
+    loan.assets.move('id:9', 0)
+
+    // Visual order updated
+    await waitFor(() => {
+      const texts = screen.getAllByText(/^[ABC]$/).map(el => el.textContent)
+      expect(texts).toEqual(['C', 'A', 'B'])
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(submitSpy).toHaveBeenCalledTimes(1))
+    expect(submitSpy.mock.calls[0]![0].data.assetsAttributes).toEqual([
+      { id: 9, position: 0 },
+      { id: 7, position: 1 },
+      { id: 8, position: 2 },
+    ])
+  })
+})

@@ -522,3 +522,106 @@ describe('M4 — autosave', () => {
     expect(submitSpy.mock.calls[0]![0].data).toEqual({ amount: 'にほ' })
   })
 })
+
+// ── Authorization degradation + DX batch ─────────────────────────────────────
+
+describe('authorization-safe validation', () => {
+  it('a validator gate touching an unavailable field degrades — never crashes, never blocks', async () => {
+    // Simulates a generated Client whose validate() has a validator whose
+    // if-gate reads a server-only method: the generated try/catch swallows
+    // it. Here we go further: even a validate() that THROWS wholesale must
+    // not break rendering or submit.
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const validate = (d: any): Record<string, string[]> => {
+      // e.g. Validates.presence({ if: (r) => r.isAdminApproved() }) where
+      // isAdminApproved is server-only → TypeError client-side
+      return (d as any).isAdminApproved() ? { amount: ['blocked'] } : {}
+    }
+    const { handle: loan, session } = makeHandle({ submit: submitSpy, validate })
+
+    render(<loan.Form><loan.amount edit /><loan.Submit>Save</loan.Submit></loan.Form>)
+    // Rendering with the throwing validator: no crash, no phantom errors
+    expect(screen.getByRole('textbox')).toBeTruthy()
+    expect(session.allErrors()).toEqual({})
+
+    // Submit proceeds — the server is the authority for that rule
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '5' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(submitSpy).toHaveBeenCalledTimes(1))
+  })
+})
+
+describe('semantic kind fallback', () => {
+  it('an email field renders with string defaults until an email presenter is registered', () => {
+    const meta = { contact: { kind: 'email', label: 'Contact' } }
+    const session = new FormSession({
+      draft: { id: 1, contact: 'a@b.co' }, mode: 'edit', abilities: null,
+    })
+    const handle: any = createFormHandle(session, { fieldMeta: meta })
+    // Only string presenters registered (beforeEach) — email falls back
+    render(<handle.contact edit />)
+    expect((screen.getByRole('textbox') as HTMLInputElement).value).toBe('a@b.co')
+
+    // Registering a semantic presenter takes over via defaults
+    registerPresenter('emailInput', {
+      kind: 'email',
+      component: ({ value, bind }: PresenterProps) => (
+        <input type="email" aria-label="email-special" value={value ?? ''} onChange={e => bind.onChange(e.target.value)} />
+      ),
+    })
+    setDefaultPresenters({ email: { edit: 'emailInput' } })
+    const handle2: any = createFormHandle(session, { fieldMeta: meta })
+    render(<handle2.contact edit />)
+    expect(screen.getByLabelText('email-special')).toBeTruthy()
+  })
+})
+
+describe('attachment fields', () => {
+  it('reads the asset payload but writes <name>AssetId', () => {
+    registerPresenter('filePick', {
+      kind: 'attachmentOne',
+      commit: 'change',
+      component: ({ value, bind, meta }: PresenterProps) => (
+        <button data-accepts={meta.accepts} onClick={() => bind.onChange({ id: 42, filename: 'x.pdf' })}>
+          {value?.filename ?? 'Upload'}
+        </button>
+      ),
+    })
+    setDefaultPresenters({ attachmentOne: { edit: 'filePick' } })
+
+    const meta = { contract: { kind: 'attachmentOne', accepts: 'application/pdf', maxSize: 1000 } }
+    const session = new FormSession({
+      draft: { id: 1, contract: { id: 7, filename: 'old.pdf' } },
+      mode: 'edit', abilities: null,
+    })
+    const handle: any = createFormHandle(session, { fieldMeta: meta })
+    render(<handle.contract edit />)
+
+    const btn = screen.getByRole('button', { name: 'old.pdf' })
+    expect(btn.getAttribute('data-accepts')).toBe('application/pdf')  // upload contract from meta
+
+    fireEvent.click(btn)
+    // The write went to the permitted column, as a raw id
+    expect(session.getValue('contractAssetId')).toBe(42)
+    expect(session.changedData()).toEqual({ contractAssetId: 42 })
+  })
+})
+
+describe('className passthrough', () => {
+  it('field className reaches the presenter; Form/Submit take standard classes', () => {
+    registerPresenter('classy', {
+      kind: '*',
+      component: ({ overrides }: PresenterProps) => <i className={overrides.className}>x</i>,
+    })
+    const { handle: loan } = makeHandle()
+    const { container } = render(
+      <loan.Form className="space-y-4">
+        <loan.amount edit="classy" className="w-full rounded border" />
+        <loan.Submit className="btn btn-primary">Save</loan.Submit>
+      </loan.Form>,
+    )
+    expect(container.querySelector('form')!.className).toBe('space-y-4')
+    expect(container.querySelector('i')!.className).toBe('w-full rounded border')
+    expect(screen.getByRole('button', { name: 'Save' }).className).toBe('btn btn-primary')
+  })
+})

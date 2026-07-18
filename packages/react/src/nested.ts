@@ -29,15 +29,25 @@ export class NestedArrayManager {
   private children: NestedChild[] = []
   private seq = 0
   private validateChild?: (draft: any) => Record<string, string[]>
+  /** Child fields that are THEMSELVES nested arrays (nested-nested). */
+  private nestedKeys: Set<string>
+  /** When set, move() rewrites this field on every child (0-based). */
+  private positionField?: string
 
   constructor(
     parent: FormSession<any>,
     name: string,
     initial: any[] | undefined,
-    opts: { validate?: (draft: any) => Record<string, string[]> } = {},
+    opts: {
+      validate?: (draft: any) => Record<string, string[]>
+      nestedKeys?: string[]
+      positionField?: string
+    } = {},
   ) {
     this.parent = parent
     this.name = name
+    this.nestedKeys = new Set(opts.nestedKeys ?? [])
+    if (opts.positionField) this.positionField = opts.positionField
     if (opts.validate) this.validateChild = opts.validate
     for (const row of initial ?? []) {
       const draft = { ...row }
@@ -82,6 +92,31 @@ export class NestedArrayManager {
     return child
   }
 
+  /**
+   * Reorder for drag-and-drop: moves the child to `toIndex` among VISIBLE
+   * rows. With a positionField configured, every child's position rewrites
+   * to its new index — the diffs ride the next submit like any other edit.
+   */
+  move(key: string, toIndex: number): void {
+    const visible = this.visible()
+    const from = visible.findIndex(c => c.key === key)
+    if (from === -1) return
+    const clamped = Math.max(0, Math.min(toIndex, visible.length - 1))
+    if (from === clamped) return
+    const [child] = visible.splice(from, 1)
+    visible.splice(clamped, 0, child!)
+    // Rebuild the full list preserving destroyed rows at the tail
+    this.children = [...visible, ...this.children.filter(c => c.destroyed)]
+    if (this.positionField) {
+      visible.forEach((c, i) => {
+        if ((c.session.draft as any)[this.positionField!] !== i) {
+          c.session.setValue(this.positionField!, i)
+        }
+      })
+    }
+    this.parent.notifyExternal(this.name)
+  }
+
   /** Persisted rows mark `_destroy`; new rows vanish entirely. */
   remove(key: string): void {
     const idx = this.children.findIndex(c => c.key === key)
@@ -104,8 +139,12 @@ export class NestedArrayManager {
         out.push({ id: draft.id, _destroy: true })
       } else if (child.isNew) {
         const data = { ...child.session.changedData() }
-        // A brand-new row's ENTIRE draft is its diff (baseline was the defaults)
+        // A brand-new row's ENTIRE draft is its diff (baseline was the
+        // defaults) — except raw grandchild arrays: those fold as
+        // <name>Attributes via the child session (nested-nested), never
+        // as a fake column
         for (const [k, v] of Object.entries(draft)) {
+          if (this.nestedKeys.has(k) || child.session.getNested(k)) continue
           if (typeof v !== 'function' && data[k] === undefined && v !== undefined) data[k] = v
         }
         delete data.id

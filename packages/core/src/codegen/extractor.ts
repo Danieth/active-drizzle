@@ -19,6 +19,7 @@ import type {
   StateMeta,
   StateTransitionMeta,
   FieldMetaEntry,
+  PropertyValidationAnalysis,
   ScopeMeta,
   HookMeta,
   InstanceMethodMeta,
@@ -262,7 +263,7 @@ export function extractModel(project: Project, modelPath: string): ModelMeta {
   const scopes = extractScopes(classDecl);
   const hooks = extractHooks(classDecl);
   const instanceMethods = extractInstanceMethods(classDecl);
-  const propertyValidations = extractPropertyValidations(classDecl);
+  const { sources: propertyValidations, analysis: propertyValidationAnalysis } = extractPropertyValidations(classDecl);
   const propertyDefaults = extractPropertyDefaults(classDecl);
   const attrSetReturnTypes = extractAttrSetReturnTypes(classDecl);
 
@@ -282,6 +283,7 @@ export function extractModel(project: Project, modelPath: string): ModelMeta {
     hooks,
     instanceMethods,
     propertyValidations,
+    propertyValidationAnalysis,
     propertyDefaults,
     attrSetReturnTypes,
   };
@@ -541,8 +543,13 @@ function extractFieldMeta(classDecl: ClassDeclaration): Record<string, FieldMeta
       copy: null, presenters: null,
       presentIf: null, requiredIf: null, lockedIf: null,
       extraSource: null,
+      semantic: null,
       errors: [],
     };
+
+    // Semantic refinement: Validates.email/url/uuid in the validators makes
+    // the field targetable by semantic presenters (emailInput over text)
+    entry.semantic = detectSemantic(init.getText());
 
     // The config object is the last object-literal argument (Attr.money takes
     // (column, config); most others take (config)).
@@ -820,8 +827,72 @@ function extractInstanceMethods(classDecl: ClassDeclaration): InstanceMethodMeta
   return result;
 }
 
-function extractPropertyValidations(classDecl: ClassDeclaration): Record<string, string> {
-  const result: Record<string, string> = {};
+/** Identifiers that exist in any client runtime — never "foreign". */
+const CLIENT_SAFE_GLOBALS = new Set([
+  'String', 'Number', 'Boolean', 'Array', 'Object', 'Math', 'JSON', 'Date',
+  'RegExp', 'Map', 'Set', 'Symbol', 'BigInt', 'Intl', 'URL', 'Error',
+  'TypeError', 'RangeError', 'isNaN', 'isFinite', 'parseInt', 'parseFloat',
+  'undefined', 'NaN', 'Infinity', 'console', 'structuredClone',
+]);
+
+/**
+ * Shippability analysis for a validator expression: which identifiers would
+ * be unresolved in a generated client? `Validates` is special-cased (the
+ * generators emit its import); anything else foreign means the validator
+ * stays server-only — graceful degradation instead of a browser
+ * ReferenceError, with a build warning naming the culprit.
+ */
+function analyzeValidatorExpr(init: Node): PropertyValidationAnalysis {
+  const declared = new Set<string>();
+  // The initializer itself is often the arrow fn — its params count too
+  for (const d of [init, ...init.getDescendants()]) {
+    if (Node.isArrowFunction(d) || Node.isFunctionExpression(d)) {
+      for (const p of d.getParameters()) {
+        const nn = p.getNameNode();
+        if (Node.isIdentifier(nn)) declared.add(nn.getText());
+        else if (Node.isObjectBindingPattern(nn)) {
+          for (const el of nn.getElements()) declared.add(el.getName());
+        }
+      }
+    }
+    if (Node.isVariableDeclaration(d)) {
+      const nn = d.getNameNode();
+      if (Node.isIdentifier(nn)) declared.add(nn.getText());
+    }
+  }
+
+  let usesValidates = false;
+  const foreign = new Set<string>();
+  const nodes = Node.isIdentifier(init) ? [init] : init.getDescendants();
+  for (const n of nodes) {
+    if (!Node.isIdentifier(n)) continue;
+    const parent = n.getParent();
+    // Property NAMES aren't references: x.foo, { foo: 1 }, method shorthand
+    if (parent && Node.isPropertyAccessExpression(parent) && parent.getNameNode() === n) continue;
+    if (parent && Node.isPropertyAssignment(parent) && parent.getNameNode() === n) continue;
+    if (parent && Node.isBindingElement(parent)) continue;
+    const name = n.getText();
+    if (name === 'Validates') { usesValidates = true; continue; }
+    if (declared.has(name) || CLIENT_SAFE_GLOBALS.has(name)) continue;
+    foreign.add(name);
+  }
+  return { usesValidates, foreignRefs: [...foreign].sort() };
+}
+
+/** Semantic refinement from Validates usage in a validator source. */
+function detectSemantic(source: string): string | null {
+  if (/\bValidates\.email\s*\(/.test(source)) return 'email';
+  if (/\bValidates\.url\s*\(/.test(source)) return 'url';
+  if (/\bValidates\.uuid\s*\(/.test(source)) return 'uuid';
+  return null;
+}
+
+function extractPropertyValidations(classDecl: ClassDeclaration): {
+  sources: Record<string, string>
+  analysis: Record<string, PropertyValidationAnalysis>
+} {
+  const sources: Record<string, string> = {};
+  const analysis: Record<string, PropertyValidationAnalysis> = {};
   for (const prop of classDecl.getStaticProperties()) {
     if (!Node.isPropertyDeclaration(prop)) continue;
     const init = prop.getInitializer();
@@ -835,10 +906,11 @@ function extractPropertyValidations(classDecl: ClassDeclaration): Record<string,
       const initializer = validateProp.getInitializer();
       if (!initializer) continue;
       // Store source text — array or single function both serialize fine for client emission
-      result[prop.getName()] = initializer.getText();
+      sources[prop.getName()] = initializer.getText();
+      analysis[prop.getName()] = analyzeValidatorExpr(initializer);
     }
   }
-  return result;
+  return { sources, analysis };
 }
 
 function extractPropertyDefaults(classDecl: ClassDeclaration): Record<string, string> {

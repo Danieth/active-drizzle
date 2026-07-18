@@ -115,6 +115,24 @@ function generateControllerFile(
     L.push(`import { useRef } from 'react'`)
   }
 
+  // Which property validators ship to THIS client — projection-scoped AND
+  // free of foreign identifiers — and whether any reference the Validates
+  // factories (import emitted below, precisely when used)
+  const earlyCreatePermit = ctrl.crudConfig?.create?.permit ?? []
+  const earlyUpdatePermit = ctrl.crudConfig?.update?.permit ?? earlyCreatePermit
+  const earlyProjection = model
+    ? controllerProjectionFields(ctrl, model, [...new Set([...earlyCreatePermit, ...earlyUpdatePermit])])
+    : new Set<string>()
+  const shippablePropValidations = model
+    ? Object.entries(model.propertyValidations ?? {}).filter(([prop]) =>
+        earlyProjection.has(prop) &&
+        (model.propertyValidationAnalysis?.[prop]?.foreignRefs?.length ?? 0) === 0,
+      )
+    : []
+  const needsValidates = shippablePropValidations.some(
+    ([prop]) => model?.propertyValidationAnalysis?.[prop]?.usesValidates,
+  )
+
   if (!isPlain) {
     const adImports = ['ClientModel', 'modelCacheKeys']
     const adTypeImports = ['SearchState']
@@ -122,6 +140,7 @@ function generateControllerFile(
       adImports.push('FormSession', 'createFormHandle', 'parseControllerError')
       adTypeImports.push('FormHandleApi', 'TypedFieldComponent', 'SubmitResult')
     }
+    if (needsValidates) adImports.push('Validates')
     L.push(`import { ${adImports.join(', ')} } from '@active-drizzle/react'`)
     L.push(`import type { ${adTypeImports.join(', ')} } from '@active-drizzle/react'`)
   }
@@ -257,7 +276,20 @@ function generateControllerFile(
     // predicates ship only when their deps fit it.
     const stateProjection = controllerProjectionFields(ctrl, model, writableFields)
     {
-      const metaSource = renderFieldMeta(model, stateProjection)
+      // Attachments are first-class fields: their meta carries the upload
+      // contract (accepts/maxSize/access) so an upload presenter can render
+      // a correct dropzone from meta alone
+      const attachmentEntries = (ctrl.attachments ?? []).map(att => {
+        const parts = [
+          `kind: '${att.kind === 'many' ? 'attachmentMany' : 'attachmentOne'}'`,
+          `accepts: ${att.accepts ? `'${att.accepts}'` : 'undefined'}`,
+          `maxSize: ${att.maxSize ?? 'undefined'}`,
+          `access: '${att.access}'`,
+          ...(att.kind === 'many' && att.max ? [`max: ${att.max}`] : []),
+        ]
+        return `    ${att.name}: { ${parts.join(', ')} },`
+      })
+      const metaSource = renderFieldMeta(model, stateProjection, attachmentEntries)
       if (metaSource) {
         L.push('')
         L.push(`  static fieldMeta = ${metaSource} as const`)
@@ -322,9 +354,9 @@ function generateControllerFile(
       depsFitProjection(m.validationDeps, projection) &&
       !bodyCallsUnavailableMethods(m.body, clientCallable)
     )
-    const clientPropValidations = Object.entries(model.propertyValidations ?? {}).filter(([prop]) =>
-      projection.has(prop)
-    )
+    // Projection-scoped + shippable (no foreign identifiers) — computed once
+    // up top so the Validates import matches exactly what's emitted here
+    const clientPropValidations = shippablePropValidations
 
     if (clientValidations.length > 0 || clientPropValidations.length > 0) {
       L.push('')
@@ -337,9 +369,15 @@ function generateControllerFile(
       L.push(`      if (!t) return`)
       L.push(`      ;(errors[field] ??= []).push(t)`)
       L.push(`    }`)
+      // Validators receive (value, draft, field). A record-gate touching
+      // something this projection doesn't carry throws — caught and degraded
+      // to a no-op; the server stays authoritative. Never a browser crash.
       L.push(`    const _run = (field: string, validators: any, value: any) => {`)
       L.push(`      const list = Array.isArray(validators) ? validators : [validators]`)
-      L.push(`      for (const fn of list) if (typeof fn === 'function') _push(field, fn(value))`)
+      L.push(`      for (const fn of list) {`)
+      L.push(`        if (typeof fn !== 'function') continue`)
+      L.push(`        try { _push(field, fn(value, this, field)) } catch { /* server-only gate */ }`)
+      L.push(`      }`)
       L.push(`    }`)
       for (const [prop, code] of clientPropValidations) {
         L.push(`    _run('${prop}', (${code}), (this as any).${prop})`)
@@ -664,12 +702,22 @@ function toFileName(className: string): string {
  * Controller projection field set: permit-listed write fields ∪ get/index includes ∪ id.
  * Validations ship to this Client iff deps ⊆ this set.
  */
-/** Attr kind for a projected field: meta kind → state/enum → column type. */
+/**
+ * Attr kind for a projected field: semantic refinement (email/url/uuid from
+ * Validates.*) unions with the base kind — `'email' | 'string'` — so BOTH
+ * semantic presenters (emailInput) and base-kind presenters (text) are legal
+ * at typed call sites. Then meta kind → state/enum → column type.
+ */
 function fieldKind(
   field: string,
   model: ModelMeta,
   colTypes: Map<string, string>,
 ): string {
+  const semantic = model.fieldMeta?.[field]?.semantic
+  if (semantic) {
+    const base = model.fieldMeta?.[field]?.kind ?? 'string'
+    return `${semantic}' | '${base}`   // caller wraps in quotes → 'email' | 'string'
+  }
   const metaKind = model.fieldMeta?.[field]?.kind
   if (metaKind) return metaKind
   if (model.states?.some(s => s.propertyName === field)) return 'state'
@@ -711,11 +759,18 @@ function emitFormHooks(
   const fields = [...projection]
     .filter(f => colTypes.has(f) || model.fieldMeta?.[f] || model.states?.some(s => s.propertyName === f))
     .sort()
+  const attachmentFields = (ctrl.attachments ?? []).map(a => ({
+    name: a.name,
+    kind: a.kind === 'many' ? 'attachmentMany' : 'attachmentOne',
+  }))
 
   L.push(`/** Per-field typed handle — presenter names are kind-gated via AdPresenterKinds. */`)
   L.push(`export type ${modelName}FormHandle = FormHandleApi<${modelName}Client> & {`)
   for (const f of fields) {
     L.push(`  ${f}: TypedFieldComponent<'${fieldKind(f, model, colTypes)}'>`)
+  }
+  for (const a of attachmentFields) {
+    L.push(`  ${a.name}: TypedFieldComponent<'${a.kind}'>`)
   }
   L.push(`}`)
   L.push('')

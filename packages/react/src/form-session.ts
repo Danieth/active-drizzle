@@ -219,6 +219,20 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   private errorsCache: { version: number; errors: Record<string, string[]> } | null = null
 
   /**
+   * Client validation, defensively: a validator that throws (e.g. a gate
+   * reading something this projection doesn't carry) must never break
+   * rendering OR block submit — it degrades to {} and the server stays
+   * authoritative for that rule.
+   */
+  private clientValidate(): Record<string, string[]> {
+    try {
+      return this.validateFn(this.draft) ?? {}
+    } catch {
+      return {}
+    }
+  }
+
+  /**
    * ALL current errors: client validate() ∪ server errors, deduped.
    * Memoized per session version — every rendered field calls this, and
    * re-running the full validate() N times per keystroke adds up.
@@ -226,7 +240,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   allErrors(): Record<string, string[]> {
     const version = this.globalVersion
     if (this.errorsCache?.version === version) return this.errorsCache.errors
-    const client = this.validateFn(this.draft) ?? {}
+    const client = this.clientValidate()
     const merged: Record<string, string[]> = {}
     for (const src of [client, this.serverErrors]) {
       for (const [field, msgs] of Object.entries(src)) {
@@ -263,7 +277,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   async submit(opts: { event?: string } = {}): Promise<boolean> {
     this.submitAttempted = true
 
-    const clientErrors = { ...(this.validateFn(this.draft) ?? {}) }
+    const clientErrors = { ...this.clientValidate() }
     // Children gate the parent: an invalid row blocks the whole submit
     for (const manager of this.nested.values()) {
       Object.assign(clientErrors, manager.errors())

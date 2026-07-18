@@ -140,8 +140,26 @@ export type FieldMetaEntry = {
   lockedIf: FieldPredicateMeta | null
   /** Open `meta: {}` bag — source text of the object literal (static data only). */
   extraSource: string | null
+  /**
+   * Semantic refinement detected from Validates.* usage ('email' | 'url' |
+   * 'uuid') — typed handles emit the kind union `'email' | 'string'` so both
+   * semantic and base-kind presenters are legal.
+   */
+  semantic: string | null
   /** Extraction problems — validator turns these into build errors. */
   errors: string[]
+}
+
+/** Shippability analysis for one property-validator expression. */
+export type PropertyValidationAnalysis = {
+  /** References the Validates.* factories — generators emit the import. */
+  usesValidates: boolean
+  /**
+   * Free identifiers that would be unresolved in a generated client
+   * (app helpers, imports). Non-empty ⇒ the validator stays server-only
+   * (graceful degradation) and the validator emits a warning.
+   */
+  foreignRefs: string[]
 }
 
 export type ScopeMeta = {
@@ -191,6 +209,7 @@ export type ModelMeta = {
   hooks: HookMeta[]
   instanceMethods: InstanceMethodMeta[]
   propertyValidations: Record<string, string> // propertyName -> validation function source
+  propertyValidationAnalysis: Record<string, PropertyValidationAnalysis> // propertyName -> shippability
   propertyDefaults: Record<string, string>    // propertyName -> default value source (JS expression)
   attrSetReturnTypes: Record<string, string>  // propertyName -> inferred return type of set() fn (e.g. 'number', 'string')
 }

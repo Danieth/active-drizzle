@@ -1,3 +1,7 @@
+// Validators — re-exported so generated controller Clients can import the
+// Validates factories from the package they already depend on
+export { Validates, isBlank } from '@active-drizzle/core'
+
 // Client model + cache keys
 export {
   ClientModel,

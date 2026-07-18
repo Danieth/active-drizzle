@@ -103,6 +103,18 @@ export type PresenterNameFor<K extends string> =
 const registry = new Map<string, PresenterDef>()
 let kindDefaults: Record<string, { edit?: string; view?: string }> = {}
 
+/**
+ * Semantic kinds degrade to their base kind when nothing more specific is
+ * registered: an 'email' field renders with the 'string' defaults until the
+ * app registers an emailInput. Pretty presenters are one registration away;
+ * zero registrations still work.
+ */
+const KIND_FALLBACKS: Record<string, string> = {
+  email: 'string',
+  url: 'string',
+  uuid: 'string',
+}
+
 export function registerPresenter(name: string, def: PresenterDef): void {
   registry.set(name, def)
 }
@@ -146,7 +158,10 @@ export function resolvePresenter(opts: {
 }): ResolvedPresenter | null {
   const { field, kind, meta } = opts
   const metaPresenters = (meta?.presenters ?? {}) as { edit?: string; view?: string }
-  const defaults = kind ? (kindDefaults[kind] ?? {}) : {}
+  const fallbackKind = kind ? KIND_FALLBACKS[kind] : undefined
+  const defaults = kind
+    ? { ...(fallbackKind ? kindDefaults[fallbackKind] : {}), ...(kindDefaults[kind] ?? {}) }
+    : {}
 
   // Edit path — only when the call site opted in AND the mask/lock allow it
   if (opts.edit !== undefined && opts.edit !== false && opts.canEdit && !opts.locked) {
@@ -178,7 +193,10 @@ function lookup(name: string, field: string, kind: string | null): PresenterDef 
   }
   if (kind) {
     const accepted = Array.isArray(def.kind) ? def.kind : [def.kind]
-    if (!accepted.includes(kind) && !accepted.includes('*')) {
+    const fallback = KIND_FALLBACKS[kind]
+    const matches = accepted.includes(kind) || accepted.includes('*')
+      || (fallback !== undefined && accepted.includes(fallback))
+    if (!matches) {
       throw new Error(
         `Presenter "${name}" accepts kind ${accepted.map(k => `'${k}'`).join('|')} but field "${field}" is '${kind}'`,
       )
