@@ -44,14 +44,16 @@ export interface IndexConfig {
 export interface WriteConfig {
   /**
    * Allowed fields for mass assignment.
-   * Can also be a function `(ctx, ctrl) => string[]` for role-based field permissions.
+   * Can also be a function `(ctx, ctrl, record) => string[]` for role- AND
+   * record-state-aware field permissions. `record` is the loaded record on
+   * update, and a defaults-draft instance on create — so DRAFT-only editing
+   * is one line:
    *
    * @example
-   * permit: (_ctx, ctrl) => ctrl.state.canAdmin
-   *   ? ['name', 'budget', 'status']
-   *   : ['name']
+   * permit: (_ctx, ctrl, loan) =>
+   *   loan.isDraft() ? ['amount', 'termMonths'] : []
    */
-  permit?: string[] | ((ctx: any, ctrl: any) => string[])
+  permit?: string[] | ((ctx: any, ctrl: any, record?: any) => string[])
   restrict?: string[]
   /**
    * Fields that are always set from context/state, bypassing user input.
@@ -64,6 +66,30 @@ export interface WriteConfig {
    * }
    */
   autoSet?: Record<string, (ctx: any, ctrl?: any) => any>
+}
+
+/** Read-side config for @crud get (and singleton get). */
+export interface GetConfig {
+  include?: string[]
+  /**
+   * Serialization ceiling: ONLY these fields leave the server for this
+   * controller. Omitting `expose` keeps today's behavior (all fields) but
+   * also disables the abilities envelope — Forms require an explicit ceiling.
+   */
+  expose?: string[]
+  /**
+   * When true, get/update respond with the Forms envelope instead of the
+   * bare record:
+   *
+   *   { record, abilities, can, version }
+   *
+   * abilities[f] = 'edit' iff f ∈ permit(ctx, ctrl, record) (update config),
+   * else 'view' iff f ∈ expose, else absent. `can` maps every Attr.state
+   * event to a server-computed boolean. `version` is the optimistic-lock
+   * token (from updatedAt), echoed on PATCH; mismatch ⇒ 409.
+   * Requires `expose`.
+   */
+  abilities?: boolean
 }
 
 export interface CrudConfig {
@@ -83,7 +109,7 @@ export interface CrudConfig {
   scopeBy?: (ctrl: any) => Record<string, any>
   create?: WriteConfig
   update?: Omit<WriteConfig, 'autoSet'>
-  get?: { include?: string[] }
+  get?: GetConfig
 }
 
 export interface SingletonConfig {

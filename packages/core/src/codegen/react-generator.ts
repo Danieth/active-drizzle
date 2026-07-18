@@ -663,14 +663,23 @@ function controllerProjectionFields(
   model: ModelMeta,
   writableFields: string[],
 ): Set<string> {
+  // `expose` is the read ceiling — when declared, it IS the projection.
+  // Data availability (what the client can SEE), not editability, is the
+  // correct fail-closed boundary for shipping validators/guards/predicates:
+  // a rule reading a view-only field can still run client-side because the
+  // draft carries that field.
+  const expose = ctrl.crudConfig?.get?.expose
+  if (expose?.length) {
+    const fields = new Set<string>(['id', ...expose])
+    for (const inc of ctrl.crudConfig?.get?.include ?? []) fields.add(inc)
+    for (const inc of ctrl.crudConfig?.index?.include ?? []) fields.add(inc)
+    return fields
+  }
+
+  // Legacy fallback (no expose declared): permit ∪ includes
   const fields = new Set<string>(['id', ...writableFields])
   for (const inc of ctrl.crudConfig?.get?.include ?? []) fields.add(inc)
   for (const inc of ctrl.crudConfig?.index?.include ?? []) fields.add(inc)
-  // Association property names from the model that are included
-  for (const a of model.associations) {
-    if (fields.has(a.propertyName)) continue
-    // also allow association name if listed in includes
-  }
   return fields
 }
 

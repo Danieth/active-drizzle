@@ -277,6 +277,17 @@ describe('controller Clients ship validators by projection', () => {
     expect(borrower).toContain(`'amount' + ''`)
   })
 
+  it('expose is the ceiling: a validator reading a VIEW-ONLY field still ships when expose covers it', () => {
+    // Decision 1a.1 — data availability, not editability, is the boundary.
+    // Borrower can only EDIT amount, but can SEE adminCap (view) → the cap
+    // rule runs client-side because the draft carries both fields.
+    const ctrl = makeCtrl('BorrowerLoanController', ['amount'])
+    ;(ctrl as any).crudConfig.get = { expose: ['id', 'amount', 'adminCap'], abilities: true }
+    const files = reactFileFor(loanModelClean, [ctrl])
+    const borrower = Object.entries(files).find(([p]) => p.toLowerCase().includes('borrower'))![1]
+    expect(borrower).toContain('amount exceeds the admin cap')
+  })
+
   it('sibling-helper validator NEVER ships to a controller Client (method unavailable there)', () => {
     // Even the admin projection covers the deps — but the emitted Client has no
     // capExceeded() method, so shipping the body would throw in the browser.

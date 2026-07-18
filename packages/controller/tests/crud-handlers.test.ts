@@ -24,7 +24,8 @@ describe('defaultUpdate permit context', () => {
 
     await defaultUpdate(relation, { name: 'Campaign' }, config, 1, { name: 'after', secret: 'dont-allow' }, ctx, ctrl)
 
-    expect(permitFn).toHaveBeenCalledWith(ctx, ctrl)
+    // permit now receives (ctx, ctrl, record) — record-state-aware permits
+    expect(permitFn).toHaveBeenCalledWith(ctx, ctrl, record)
     expect(record.name).toBe('after')
     expect(record.secret).toBe('before-secret')
   })

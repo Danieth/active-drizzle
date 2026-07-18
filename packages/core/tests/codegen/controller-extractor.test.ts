@@ -258,3 +258,47 @@ describe('extractControllers — attachment metadata from model', () => {
     expect(ctrl.attachments).toBeUndefined()
   })
 })
+
+// ── @crud config: nested AST parse (expose / abilities / permit) ─────────────
+
+describe('extractControllers — nested @crud config', () => {
+  it('parses get.expose / get.abilities / get.include with real nesting', () => {
+    const project = makeProject(`
+      import { controller, crud } from '@active-drizzle/controller'
+      class Campaign {}
+
+      @controller()
+      @crud(Campaign, {
+        get: { expose: ['id', 'name', 'budget'], abilities: true, include: ['team'] },
+        update: { permit: ['name', 'budget'] },
+        create: { permit: ['name'] },
+      })
+      class CampaignController {}
+    `)
+
+    const ctrl = extractControllers(project, ['/src/campaign.ctrl.ts']).controllers[0]!
+    expect(ctrl.crudConfig?.get?.expose).toEqual(['id', 'name', 'budget'])
+    expect(ctrl.crudConfig?.get?.abilities).toBe(true)
+    expect(ctrl.crudConfig?.get?.include).toEqual(['team'])
+    expect(ctrl.crudConfig?.update?.permit).toEqual(['name', 'budget'])
+    expect(ctrl.crudConfig?.create?.permit).toEqual(['name'])
+  })
+
+  it('a dynamic permit fn extracts as undefined (fail-closed: expose is the projection)', () => {
+    const project = makeProject(`
+      import { controller, crud } from '@active-drizzle/controller'
+      class Campaign {}
+
+      @controller()
+      @crud(Campaign, {
+        get: { expose: ['id', 'name'], abilities: true },
+        update: { permit: (ctx, ctrl, r) => (r.isDraft() ? ['name'] : []) },
+      })
+      class CampaignController {}
+    `)
+
+    const ctrl = extractControllers(project, ['/src/campaign.ctrl.ts']).controllers[0]!
+    expect(ctrl.crudConfig?.update?.permit).toBeUndefined()
+    expect(ctrl.crudConfig?.get?.expose).toEqual(['id', 'name'])
+  })
+})

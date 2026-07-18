@@ -3,8 +3,95 @@
  * These are the 12-step index, get, create, update, destroy implementations.
  * Controllers that define their own methods override these automatically.
  */
-import { BadRequest, NotFound, toValidationError } from './errors.js'
+import { BadRequest, Conflict, NotFound, ValidationError, toValidationError } from './errors.js'
 import type { CrudConfig, IndexConfig } from './metadata.js'
+
+// ── Forms envelope (expose / abilities / can / version) ───────────────────────
+
+export interface RecordEnvelope {
+  record: Record<string, any>
+  abilities: Record<string, 'edit' | 'view'>
+  can: Record<string, boolean>
+  version: string | null
+  /** Non-fatal write problems, e.g. stripped non-permitted fields. */
+  issues?: Array<{ field: string; code: string }>
+}
+
+/** Optimistic-lock token — derived from updatedAt when the column exists. */
+export function versionOf(record: any): string | null {
+  const u = record?.updatedAt ?? record?._attributes?.updatedAt
+  if (!u) return null
+  const t = u instanceof Date ? u.getTime() : new Date(u).getTime()
+  return Number.isFinite(t) ? String(t) : null
+}
+
+/** All Attr.state event names declared on the model (duck-typed, no core dep). */
+function collectStateEvents(model: any): string[] {
+  const events: string[] = []
+  for (const key of Object.getOwnPropertyNames(model)) {
+    const cfg = (model as any)[key]
+    if (cfg && typeof cfg === 'object' && cfg._type === 'state' && cfg.transitions) {
+      events.push(...Object.keys(cfg.transitions))
+    }
+  }
+  return events
+}
+
+/**
+ * Builds the Forms envelope for a record:
+ *   { record, abilities, can, version }
+ *
+ * - record: serialized through the `expose` ceiling (+ get includes)
+ * - abilities: 'edit' iff field ∈ update-permit resolved against THIS record;
+ *   'view' iff field ∈ expose; absent otherwise. The mask only narrows the
+ *   ceiling — the UI consumes permissions, it never creates them.
+ * - can: server-computed verdict per Attr.state event (full data, no
+ *   projection problem — the client's own can() only ever narrows this)
+ * - version: optimistic-lock token
+ */
+export function buildRecordEnvelope(
+  record: any,
+  model: any,
+  config: CrudConfig,
+  ctx: any,
+  ctrl: any,
+  issues?: Array<{ field: string; code: string }>,
+): RecordEnvelope {
+  const expose = config.get?.expose ?? []
+  const includes = config.get?.include ?? []
+
+  const permitRaw = config.update?.permit
+  const resolvedPermit = typeof permitRaw === 'function' ? permitRaw(ctx, ctrl, record) : (permitRaw ?? [])
+  const editable = new Set(resolvedPermit)
+
+  const abilities: Record<string, 'edit' | 'view'> = {}
+  for (const f of expose) {
+    abilities[f] = editable.has(f) ? 'edit' : 'view'
+  }
+
+  const can: Record<string, boolean> = {}
+  for (const event of collectStateEvents(model)) {
+    can[event] = typeof record.can === 'function' ? Boolean(record.can(event)) : false
+  }
+
+  const serialized = typeof record.toJSON === 'function'
+    ? record.toJSON({ only: [...expose, ...includes] })
+    : record
+
+  const envelope: RecordEnvelope = {
+    record: serialized,
+    abilities,
+    can,
+    version: versionOf(record),
+  }
+  if (issues && issues.length > 0) envelope.issues = issues
+  return envelope
+}
+
+/** True when this controller responds with the Forms envelope. */
+export function usesEnvelope(config: CrudConfig): boolean {
+  return Boolean(config.get?.abilities && config.get?.expose?.length)
+}
 
 export interface PaginationResult {
   page: number
@@ -127,12 +214,19 @@ export async function defaultGet(
   model: any,
   config: CrudConfig,
   id: number | string,
+  ctx?: any,
+  ctrl?: any,
 ): Promise<any> {
   const includes = config.get?.include ?? []
   let rel = relation.where({ id })
   if (includes.length) rel = rel.includes(...includes)
   const record = await rel.first()
   if (!record) throw new NotFound(model.name)
+
+  if (usesEnvelope(config)) return buildRecordEnvelope(record, model, config, ctx, ctrl)
+  if (config.get?.expose?.length && typeof record.toJSON === 'function') {
+    return record.toJSON({ only: [...config.get.expose, ...includes] })
+  }
   return record
 }
 
@@ -149,7 +243,9 @@ export async function defaultCreate(
   /** Controller instance — passed to permit/autoSet functions that accept it. */
   ctrl?: any,
 ): Promise<any> {
-  const permitted = buildPermittedData(rawInput, config.create, ctx, model, ctrl)
+  // Record-aware permit on create receives a defaults-draft instance
+  const draft = typeof model === 'function' ? new (model as any)({}, true) : undefined
+  const permitted = buildPermittedData(rawInput, config.create, ctx, model, ctrl, draft)
   // Scope overrides are applied AFTER permit — they cannot be excluded or overridden
   const record = await model.create({ ...permitted, ...scopeOverrides })
   // ApplicationRecord.create returns the instance even if save failed.
@@ -157,9 +253,10 @@ export async function defaultCreate(
   if (record.isNewRecord) throw toValidationError(record.errors)
   // Auto-attach: resolve permit list before passing (may be a function)
   const createPermit = typeof config.create?.permit === 'function'
-    ? config.create.permit(ctx, ctrl)
+    ? config.create.permit(ctx, ctrl, draft)
     : config.create?.permit
   await _autoAttach(record, model, rawInput, createPermit)
+  if (usesEnvelope(config)) return buildRecordEnvelope(record, model, config, ctx, ctrl)
   return record
 }
 
@@ -174,20 +271,59 @@ export async function defaultUpdate(
   ctx: any,
   /** Controller instance — passed to permit functions that accept it. */
   ctrl?: any,
+  /** Optimistic-lock token echoed by the client (envelope controllers). */
+  version?: string,
 ): Promise<any> {
   const record = await relation.where({ id }).first()
   if (!record) throw new NotFound(model.name)
-  const permitted = buildPermittedData(rawInput, config.update, ctx, model, ctrl)
+
+  const envelope = usesEnvelope(config)
+
+  // Optimistic locking: a stale token means the record changed under the
+  // form — 409, never a silent overwrite.
+  if (envelope && version !== undefined && version !== null) {
+    const current = versionOf(record)
+    if (current !== null && current !== String(version)) {
+      throw new Conflict()
+    }
+  }
+
+  // `_event` rides the PATCH but is a state-machine instruction, not a field
+  const { _event, ...fields } = rawInput ?? {}
+
+  const permitted = buildPermittedData(fields, config.update, ctx, model, ctrl, record)
   for (const [k, v] of Object.entries(permitted)) {
     (record as any)[k] = v
   }
+
+  // Fire the transition in the SAME save as the field diff — there is no
+  // saved-but-not-transitioned limbo. Guard failure ⇒ 422 transition_blocked.
+  if (_event) {
+    const fired = typeof (record as any)[_event] === 'function' ? (record as any)[_event]() : false
+    if (!fired) {
+      throw new ValidationError({ base: [`transition_blocked: cannot ${String(_event)} right now`] })
+    }
+  }
+
   if (!(await record.save())) throw toValidationError(record.errors)
   // Auto-attach: resolve permit list before passing (may be a function)
   const updatePermitRaw = config.update?.permit ?? config.create?.permit
   const updatePermit = typeof updatePermitRaw === 'function'
-    ? updatePermitRaw(ctx, ctrl)
+    ? updatePermitRaw(ctx, ctrl, record)
     : updatePermitRaw
   await _autoAttach(record, model, rawInput, updatePermit)
+
+  if (envelope) {
+    // Report stripped fields so the generated UI can't hide a permit bug
+    const editable = new Set(Object.keys(permitted))
+    const issues = Object.keys(fields)
+      .filter(k => !editable.has(k) && k in fields)
+      .map(field => ({ field, code: 'forbidden' }))
+    // PATCH response = GET envelope — abilities recomputed on the SAVED
+    // record, so a permit that narrowed after a transition re-masks the
+    // same JSX read-only (post-transition self-locking).
+    return buildRecordEnvelope(record, model, config, ctx, ctrl, issues)
+  }
   return record
 }
 
@@ -210,18 +346,20 @@ const ALWAYS_EXCLUDED = ['id', 'createdAt', 'updatedAt', 'created_at', 'updated_
 function buildPermittedData(
   input: Record<string, any>,
   writeConfig: {
-    permit?: string[] | ((ctx: any, ctrl: any) => string[])
+    permit?: string[] | ((ctx: any, ctrl: any, record?: any) => string[])
     restrict?: string[]
     autoSet?: Record<string, (ctx: any, ctrl?: any) => any>
   } | undefined,
   ctx: any,
   model: any,
   ctrl?: any,
+  /** Loaded record (update) or defaults-draft (create) — for record-state-aware permits. */
+  record?: any,
 ): Record<string, any> {
   const { permit, restrict, autoSet } = writeConfig ?? {}
 
-  // permit can be a static list or a dynamic function (e.g., for role-based field access)
-  const resolvedPermit = typeof permit === 'function' ? permit(ctx, ctrl) : permit
+  // permit can be a static list or a dynamic function (role- and record-state-aware)
+  const resolvedPermit = typeof permit === 'function' ? permit(ctx, ctrl, record) : permit
 
   let allowed: Set<string>
   if (resolvedPermit) {

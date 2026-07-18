@@ -38,6 +38,15 @@ export class ValidationError extends HttpError {
   }
 }
 
+/**
+ * Optimistic-lock failure: the client's `version` token no longer matches
+ * the record. The client should refetch, re-apply, and retry — never
+ * silently overwrite.
+ */
+export class Conflict extends HttpError {
+  constructor(message = 'Record has changed since it was loaded') { super(409, message) }
+}
+
 /** Convert a model's `.errors` map (or ValidationErrors) to a ValidationError. */
 export function toValidationError(
   modelErrors: Record<string, string[]> | { all(): Record<string, string[]> },

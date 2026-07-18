@@ -92,7 +92,7 @@ function extractController(cls: ClassDeclaration, filePath: string): CtrlMeta | 
       modelClass = args[0]!.getText().trim()
     }
     if (args.length > 1) {
-      crudConfig = parseObjectLiteral(args[1]!) as CtrlCrudConfig
+      crudConfig = parseConfigObject(args[1]!) as CtrlCrudConfig
     }
   } else if (singletonDec) {
     kind = 'singleton'
@@ -324,6 +324,57 @@ function evaluateNumericExpression(node: Node): number | undefined {
  * and array-of-string values from a ts-morph Node.
  * Does NOT handle nested objects (just returns the raw text for those).
  */
+/**
+ * AST-recursive config parse — unlike the flat regex fallback below, this
+ * preserves NESTING, so `get: { expose: [...], abilities: true }` lands at
+ * `crudConfig.get.expose`. expose is a serialization ceiling; parsing it
+ * imprecisely would be a security bug, so this walks the real tree.
+ * Functions (permit fns, autoSet, scopeBy) are recorded as `undefined` —
+ * codegen treats a dynamic permit as "no static writable fields" and relies
+ * on `expose` for the projection, which is exactly the fail-closed default.
+ */
+function parseConfigObject(node: Node): Record<string, any> {
+  const result: Record<string, any> = {}
+  const obj = unwrapAs(node)
+  if (!Node.isObjectLiteralExpression(obj)) return result
+
+  for (const prop of obj.getProperties()) {
+    if (!Node.isPropertyAssignment(prop)) continue
+    const key = prop.getName().replace(/^['"]|['"]$/g, '')
+    const init = prop.getInitializer()
+    if (!init) continue
+    const v = unwrapAs(init)
+
+    if (Node.isObjectLiteralExpression(v)) {
+      result[key] = parseConfigObject(v)
+    } else if (Node.isArrayLiteralExpression(v)) {
+      result[key] = v.getElements()
+        .map(e => unwrapAs(e))
+        .filter(Node.isStringLiteral)
+        .map(e => e.getLiteralValue())
+    } else if (Node.isStringLiteral(v)) {
+      result[key] = v.getLiteralValue()
+    } else if (Node.isNumericLiteral(v)) {
+      result[key] = Number(v.getLiteralValue())
+    } else if (v.getText() === 'true') {
+      result[key] = true
+    } else if (v.getText() === 'false') {
+      result[key] = false
+    }
+    // functions and anything else: intentionally omitted (see doc comment)
+  }
+  return result
+}
+
+/** Strips `as const` / parens so `['a'] as const` parses like `['a']`. */
+function unwrapAs(node: Node): Node {
+  let cur = node
+  while (Node.isAsExpression(cur) || Node.isParenthesizedExpression(cur) || Node.isNonNullExpression(cur)) {
+    cur = cur.getExpression()
+  }
+  return cur
+}
+
 function parseObjectLiteral(node: Node): Record<string, any> {
   const result: Record<string, any> = {}
   const text = node.getText()

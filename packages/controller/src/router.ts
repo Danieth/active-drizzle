@@ -194,7 +194,7 @@ export function buildRouter<TContext = Record<string, any>>(
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'get',
         async (ctrl) => {
           if (typeof ctrl.get === 'function') return ctrl.get()
-          return defaultGet(ctrl.relation, model, config, (input as any).id)
+          return defaultGet(ctrl.relation, model, config, (input as any).id, context, ctrl)
         },
         undefined,
         config.scopeBy,
@@ -224,13 +224,18 @@ export function buildRouter<TContext = Record<string, any>>(
 
     // UPDATE
     router.update = builder.input(
-      z.object({ ...scopeSchema, id: z.number().int().positive(), data: z.record(z.string(), z.any()) }).passthrough()
+      z.object({
+        ...scopeSchema,
+        id: z.number().int().positive(),
+        data: z.record(z.string(), z.any()),
+        version: z.string().optional(),   // optimistic-lock token (envelope controllers)
+      }).passthrough()
     ).handler(async ({ input, context }) => {
       const rel = buildScopedRelation(model, input as any)
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'update',
         async (ctrl) => {
           if (typeof ctrl.update === 'function') return ctrl.update()
-          return defaultUpdate(ctrl.relation, model, config, (input as any).id, (input as any).data, context, ctrl)
+          return defaultUpdate(ctrl.relation, model, config, (input as any).id, (input as any).data, context, ctrl, (input as any).version)
         },
         undefined,
         config.scopeBy,

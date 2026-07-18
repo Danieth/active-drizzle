@@ -31,7 +31,13 @@ export interface CtrlCrudConfig {
   index?: CtrlIndexConfig
   create?: CtrlWriteConfig
   update?: Omit<CtrlWriteConfig, 'autoSet'>
-  get?: { include?: string[] }
+  get?: {
+    include?: string[]
+    /** Serialization ceiling — when present it IS the client projection. */
+    expose?: string[]
+    /** Forms envelope enabled ({ record, abilities, can, version }). */
+    abilities?: boolean
+  }
 }
 
 export interface CtrlMutationMeta {
