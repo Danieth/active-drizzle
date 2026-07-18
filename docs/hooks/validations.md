@@ -2,6 +2,8 @@
 
 ActiveDrizzle offers two validation mechanisms: synchronous `@validate` (runs client and server) and asynchronous `@serverValidate` (server only).
 
+For the Rails-style declarative set — `Validates.presence({ if: (r) => r.isDraft() })`, `length`, `numericality`, `uniqueness`, and friends — see [Declarative Validators](/hooks/validators).
+
 ## `@validate` — synchronous
 
 ```ts

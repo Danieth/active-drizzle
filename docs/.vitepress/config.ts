@@ -7,6 +7,7 @@ const modelSidebar = [
     items: [
       { text: 'Overview', link: '/models/overview' },
       { text: 'Attributes & Enums', link: '/models/attributes' },
+      { text: 'Arrays, Ranges & Timezones', link: '/models/typed-attrs' },
       { text: 'State Machines', link: '/models/state-machines' },
       { text: 'Associations', link: '/models/associations' },
       { text: 'File Attachments', link: '/models/attachments' },
@@ -30,6 +31,7 @@ const modelSidebar = [
     items: [
       { text: 'Create, Update, Destroy', link: '/mutations/overview' },
       { text: 'Validations', link: '/hooks/validations' },
+      { text: 'Declarative Validators', link: '/hooks/validators' },
       { text: 'Transactions', link: '/mutations/transactions' },
       { text: 'Nested Attributes', link: '/mutations/nested-attributes' },
     ],
