@@ -119,6 +119,31 @@ export type StateMeta = {
   transitions: StateTransitionMeta[]
 }
 
+/** A record-predicate (presentIf/requiredIf/lockedIf) lifted from an Attr. */
+export type FieldPredicateMeta = {
+  source: string                      // arrow-fn source text, for client inlining
+  deps: string[] | null               // inferred record-field deps
+  depsError: string | null            // refusal message when unanalyzable
+}
+
+/** Presentational meta lifted from one Attr declaration. */
+export type FieldMetaEntry = {
+  kind: string | null                 // Attr constructor: 'money' | 'enum' | 'state' | 'string' | …
+  label: string | null
+  help: string | null
+  info: string | null
+  /** copy: { by, <LABEL>: {…} } — by-discriminant overrides, all literals. */
+  copy: { by: string; overrides: Record<string, Record<string, string>> } | null
+  presenters: { view?: string; edit?: string } | null
+  presentIf: FieldPredicateMeta | null
+  requiredIf: FieldPredicateMeta | null
+  lockedIf: FieldPredicateMeta | null
+  /** Open `meta: {}` bag — source text of the object literal (static data only). */
+  extraSource: string | null
+  /** Extraction problems — validator turns these into build errors. */
+  errors: string[]
+}
+
 export type ScopeMeta = {
   name: string
   parameters: Array<{ name: string; type: string }>
@@ -161,6 +186,7 @@ export type ModelMeta = {
   enums: EnumMeta[]
   enumGroups: EnumGroupMeta[]
   states: StateMeta[]
+  fieldMeta: Record<string, FieldMetaEntry>   // propertyName → presentational meta
   scopes: ScopeMeta[]
   hooks: HookMeta[]
   instanceMethods: InstanceMethodMeta[]

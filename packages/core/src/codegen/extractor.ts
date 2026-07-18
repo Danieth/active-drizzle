@@ -1,9 +1,11 @@
 import {
   Project,
   Node,
+  SyntaxKind,
   CallExpression,
   ClassDeclaration,
   SourceFile,
+  type ObjectLiteralExpression,
 } from 'ts-morph';
 import type {
   ModelMeta,
@@ -16,6 +18,7 @@ import type {
   EnumGroupMeta,
   StateMeta,
   StateTransitionMeta,
+  FieldMetaEntry,
   ScopeMeta,
   HookMeta,
   InstanceMethodMeta,
@@ -255,6 +258,7 @@ export function extractModel(project: Project, modelPath: string): ModelMeta {
   const associations = extractAssociations(classDecl);
   const { enums, enumGroups } = extractEnums(classDecl);
   const states = extractStates(classDecl);
+  const fieldMeta = extractFieldMeta(classDecl);
   const scopes = extractScopes(classDecl);
   const hooks = extractHooks(classDecl);
   const instanceMethods = extractInstanceMethods(classDecl);
@@ -273,6 +277,7 @@ export function extractModel(project: Project, modelPath: string): ModelMeta {
     enums,
     enumGroups,
     states,
+    fieldMeta,
     scopes,
     hooks,
     instanceMethods,
@@ -507,6 +512,197 @@ function extractStates(classDecl: ClassDeclaration): StateMeta[] {
   }
 
   return result;
+}
+
+/** Meta keys handled explicitly by extractFieldMeta. */
+const META_KEYS = new Set(['label', 'help', 'info', 'copy', 'presenters', 'presentIf', 'requiredIf', 'lockedIf', 'meta'])
+
+/**
+ * Lifts presentational meta off every Attr.* declaration: label/help/info
+ * (string literals only), copy-by-discriminant, default presenter names,
+ * record-predicates (dep-inferred, fail-closed), and the open `meta:` bag
+ * (static data only — functions or identifier references are extraction
+ * errors the validator turns into build failures).
+ */
+function extractFieldMeta(classDecl: ClassDeclaration): Record<string, FieldMetaEntry> {
+  const result: Record<string, FieldMetaEntry> = {};
+
+  for (const prop of classDecl.getStaticProperties()) {
+    if (!Node.isPropertyDeclaration(prop)) continue;
+    const init = prop.getInitializer();
+    if (!init || !Node.isCallExpression(init)) continue;
+    const fnName = init.getExpression().getText();
+    if (!fnName.startsWith('Attr.')) continue;
+
+    const propertyName = prop.getName();
+    const entry: FieldMetaEntry = {
+      kind: fnName.slice('Attr.'.length) || null,
+      label: null, help: null, info: null,
+      copy: null, presenters: null,
+      presentIf: null, requiredIf: null, lockedIf: null,
+      extraSource: null,
+      errors: [],
+    };
+
+    // The config object is the last object-literal argument (Attr.money takes
+    // (column, config); most others take (config)).
+    let config: Node | undefined;
+    for (const arg of init.getArguments()) {
+      const unwrapped = unwrapExpression(arg);
+      if (Node.isObjectLiteralExpression(unwrapped)) config = unwrapped;
+    }
+    if (!config || !Node.isObjectLiteralExpression(config)) {
+      if (entry.kind) result[propertyName] = entry;
+      continue;
+    }
+    const cfg: ObjectLiteralExpression = config;
+
+    const stringMeta = (key: 'label' | 'help' | 'info') => {
+      const p = cfg.getProperty(key);
+      if (!p) return;
+      if (Node.isPropertyAssignment(p)) {
+        const v = p.getInitializer();
+        if (v && Node.isStringLiteral(v)) { entry[key] = v.getLiteralValue(); return; }
+        if (v && Node.isNoSubstitutionTemplateLiteral(v)) { entry[key] = v.getLiteralValue(); return; }
+      }
+      entry.errors.push(`Attr meta "${propertyName}.${key}" must be a string literal — computed values can't be extracted for the client`);
+    };
+    stringMeta('label');
+    stringMeta('help');
+    stringMeta('info');
+
+    // copy: { by: 'facilityType', LABEL: { label: '…', help: '…' } }
+    const copyProp = cfg.getProperty('copy');
+    if (Node.isPropertyAssignment(copyProp)) {
+      const cv = copyProp.getInitializer() && unwrapExpression(copyProp.getInitializer()!);
+      if (cv && Node.isObjectLiteralExpression(cv)) {
+        let by: string | null = null;
+        const overrides: Record<string, Record<string, string>> = {};
+        for (const p of cv.getProperties()) {
+          if (!Node.isPropertyAssignment(p)) continue;
+          const key = p.getName().replace(/^['"]|['"]$/g, '');
+          const v = p.getInitializer();
+          if (key === 'by') {
+            if (v && Node.isStringLiteral(v)) by = v.getLiteralValue();
+            else entry.errors.push(`Attr meta "${propertyName}.copy.by" must be a string literal`);
+            continue;
+          }
+          if (v && Node.isObjectLiteralExpression(v)) {
+            const inner: Record<string, string> = {};
+            for (const ip of v.getProperties()) {
+              if (!Node.isPropertyAssignment(ip)) continue;
+              const iv = ip.getInitializer();
+              if (iv && Node.isStringLiteral(iv)) inner[ip.getName().replace(/^['"]|['"]$/g, '')] = iv.getLiteralValue();
+              else entry.errors.push(`Attr meta "${propertyName}.copy.${key}" values must be string literals`);
+            }
+            overrides[key] = inner;
+          } else {
+            entry.errors.push(`Attr meta "${propertyName}.copy.${key}" must be an object of string literals`);
+          }
+        }
+        if (by) entry.copy = { by, overrides };
+        else entry.errors.push(`Attr meta "${propertyName}.copy" requires a 'by' key naming an enum/state Attr`);
+      }
+    }
+
+    // presenters: { view: 'moneyText', edit: 'moneyInput' }
+    const presProp = cfg.getProperty('presenters');
+    if (Node.isPropertyAssignment(presProp)) {
+      const pv = presProp.getInitializer() && unwrapExpression(presProp.getInitializer()!);
+      if (pv && Node.isObjectLiteralExpression(pv)) {
+        const presenters: { view?: string; edit?: string } = {};
+        for (const p of pv.getProperties()) {
+          if (!Node.isPropertyAssignment(p)) continue;
+          const key = p.getName();
+          const v = p.getInitializer();
+          if ((key === 'view' || key === 'edit') && v && Node.isStringLiteral(v)) {
+            presenters[key] = v.getLiteralValue();
+          }
+        }
+        if (presenters.view || presenters.edit) entry.presenters = presenters;
+      }
+    }
+
+    // Record-predicates — dep-inferred, fail-closed
+    for (const predKey of ['presentIf', 'requiredIf', 'lockedIf'] as const) {
+      const p = cfg.getProperty(predKey);
+      if (!Node.isPropertyAssignment(p)) continue;
+      const fn = p.getInitializer() && unwrapExpression(p.getInitializer()!);
+      if (fn && (Node.isArrowFunction(fn) || Node.isFunctionExpression(fn))) {
+        const inferred = inferPredicateDeps(fn, classDecl, `${propertyName}.${predKey}`);
+        entry[predKey] = inferred.ok
+          ? { source: fn.getText(), deps: inferred.deps, depsError: null }
+          : { source: fn.getText(), deps: null, depsError: inferred.error };
+      } else if (fn) {
+        entry[predKey] = {
+          source: fn.getText(),
+          deps: null,
+          depsError: `can't infer deps for "${propertyName}.${predKey}": must be an inline arrow function over the record`,
+        };
+      }
+    }
+
+    // Open meta bag — static data only
+    const metaProp = cfg.getProperty('meta');
+    if (Node.isPropertyAssignment(metaProp)) {
+      const mv = metaProp.getInitializer() && unwrapExpression(metaProp.getInitializer()!);
+      if (mv && Node.isObjectLiteralExpression(mv)) {
+        const bad = findNonSerializable(mv);
+        if (bad) {
+          entry.errors.push(`Attr meta "${propertyName}.meta" must be static data — found ${bad} (functions and references can't ship as meta)`);
+        } else {
+          entry.extraSource = mv.getText();
+        }
+      } else {
+        entry.errors.push(`Attr meta "${propertyName}.meta" must be an inline object literal`);
+      }
+    }
+
+    result[propertyName] = entry;
+  }
+
+  return result;
+}
+
+/**
+ * Returns a description of the first non-static-serializable node inside an
+ * object/array literal tree, or null when everything is plain data.
+ * Allowed: string/number/boolean/null literals, template strings without
+ * substitutions, nested object/array literals, unary minus on numbers.
+ */
+function findNonSerializable(node: Node): string | null {
+  if (Node.isObjectLiteralExpression(node)) {
+    for (const p of node.getProperties()) {
+      if (!Node.isPropertyAssignment(p)) return `'${p.getText().slice(0, 30)}' (shorthand/spread)`;
+      const v = p.getInitializer();
+      if (!v) continue;
+      const bad = findNonSerializable(unwrapExpression(v));
+      if (bad) return bad;
+    }
+    return null;
+  }
+  if (Node.isArrayLiteralExpression(node)) {
+    for (const el of node.getElements()) {
+      const bad = findNonSerializable(unwrapExpression(el));
+      if (bad) return bad;
+    }
+    return null;
+  }
+  if (
+    Node.isStringLiteral(node) ||
+    Node.isNumericLiteral(node) ||
+    Node.isNoSubstitutionTemplateLiteral(node) ||
+    node.getKind() === SyntaxKind.TrueKeyword ||
+    node.getKind() === SyntaxKind.FalseKeyword ||
+    node.getKind() === SyntaxKind.NullKeyword
+  ) {
+    return null;
+  }
+  if (Node.isPrefixUnaryExpression(node)) {
+    const operand = node.getOperand();
+    if (Node.isNumericLiteral(operand)) return null;
+  }
+  return `\`${node.getText().slice(0, 40)}\``;
 }
 
 function extractScopes(classDecl: ClassDeclaration): ScopeMeta[] {

@@ -21,6 +21,7 @@ export function validate(project: ProjectMeta, validateOnly?: Set<string>): Diag
     validateSti(model, project, diagnostics);
     validateValidationDeps(model, project, diagnostics);
     validateStateMachines(model, diagnostics);
+    validateFieldMeta(model, project, diagnostics);
   }
 
   return diagnostics;
@@ -311,6 +312,69 @@ function validateSti(model: ModelMeta, project: ProjectMeta, out: Diagnostic[]) 
  * Fail-loud: every @validate method must have provable deps (inferred or declared).
  * Never ship a Client validation whose field reads we can't prove.
  */
+/**
+ * Attr presentational meta gates — all fail-closed:
+ * - extraction errors (non-literal label, functions in the meta bag) → error
+ * - unprovable presentIf/requiredIf/lockedIf deps → error
+ * - predicate deps that aren't model fields → error (the role-in-model ban:
+ *   a predicate reading `currentUser`/`role` is identity logic, which lives
+ *   exclusively on the controller)
+ * - copy.by must name an enum/state Attr on the model, and override keys
+ *   must be labels of that discriminant
+ */
+function validateFieldMeta(model: ModelMeta, project: ProjectMeta, out: Diagnostic[]) {
+  const table = project.schema.tables[model.tableName];
+  const modelFields = new Set<string>([
+    ...(table?.columns.map(c => c.name) ?? []),
+    ...Object.keys(model.fieldMeta ?? {}),
+    ...model.enums.map(e => e.propertyName),
+    ...model.states.map(s => s.propertyName),
+  ]);
+  const discriminants = new Map<string, Set<string>>();
+  for (const e of model.enums) discriminants.set(e.propertyName, new Set(Object.keys(e.values)));
+  for (const s of model.states) discriminants.set(s.propertyName, new Set(Object.keys(s.values)));
+
+  for (const [prop, entry] of Object.entries(model.fieldMeta ?? {})) {
+    for (const msg of entry.errors) out.push(err(model.filePath, msg));
+
+    for (const predKey of ['presentIf', 'requiredIf', 'lockedIf'] as const) {
+      const pred = entry[predKey];
+      if (!pred) continue;
+      if (pred.depsError) {
+        out.push(err(model.filePath, pred.depsError));
+        continue;
+      }
+      for (const dep of pred.deps ?? []) {
+        if (!modelFields.has(dep)) {
+          out.push(err(
+            model.filePath,
+            `"${prop}.${predKey}" reads '${dep}', which is not a field of ${model.className} — role/identity conditions belong on the controller, not the model`,
+          ));
+        }
+      }
+    }
+
+    if (entry.copy) {
+      const labels = discriminants.get(entry.copy.by);
+      if (!labels) {
+        out.push(err(
+          model.filePath,
+          `"${prop}.copy.by" names '${entry.copy.by}', which is not an enum/state Attr on ${model.className}`,
+        ));
+      } else {
+        for (const key of Object.keys(entry.copy.overrides)) {
+          if (!labels.has(key)) {
+            out.push(err(
+              model.filePath,
+              `"${prop}.copy" overrides unknown label '${key}' — '${entry.copy.by}' has: ${[...labels].join(', ')}`,
+            ));
+          }
+        }
+      }
+    }
+  }
+}
+
 function validateValidationDeps(model: ModelMeta, _project: ProjectMeta, out: Diagnostic[]) {
   for (const method of model.instanceMethods) {
     if (!method.isValidation) continue;

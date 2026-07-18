@@ -221,6 +221,9 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta): stri
   if (clientEvents.length > 0) {
     lines.push(`      can(event: ${clientEvents.map(e => `'${e}'`).join(' | ')}): boolean`);
   }
+  if (Object.keys(model.fieldMeta ?? {}).length > 0) {
+    lines.push(`      static fieldMeta: Record<string, unknown>`);
+  }
   lines.push(`    }`);
 
   lines.push(`  }`);
@@ -408,6 +411,16 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta): s
   lines.push(`    Object.assign(this, JSON.parse(JSON.stringify(this._initial)));`);
   lines.push(`  }`);
   lines.push('');
+
+  // Presentational meta — static data + provable predicates, from the Attrs
+  {
+    const metaProjection = modelProjectionFields(model, project);
+    const metaSource = renderFieldMeta(model, metaProjection);
+    if (metaSource) {
+      lines.push(`  static fieldMeta = ${metaSource} as const;`);
+      lines.push('');
+    }
+  }
 
   // Attr.state → client can(event): from-state check + guards that are
   // provable AND whose deps fit this model's projection. Fail-closed: a guard
@@ -719,6 +732,42 @@ export function generateGlobals(_project: ProjectMeta): string {
  *   - Enum value mappings
  *   - Lifecycle hooks with conditions
  */
+/**
+ * Renders a Client's `static fieldMeta` object-literal source.
+ *
+ * Only fields inside `projection` appear at all; predicates ship only when
+ * provable AND their deps fit the projection (a predicate the client can't
+ * evaluate is omitted — the field renders as always-present/never-locked and
+ * the server stays authoritative). The open `meta:` bag is inlined verbatim —
+ * the extractor already proved it's static data.
+ */
+export function renderFieldMeta(
+  model: ModelMeta,
+  projection: Set<string>,
+): string | null {
+  const entries: string[] = [];
+  for (const [prop, m] of Object.entries(model.fieldMeta ?? {})) {
+    if (!projection.has(prop)) continue;
+    const parts: string[] = [];
+    if (m.kind) parts.push(`kind: '${m.kind}'`);
+    if (m.label !== null) parts.push(`label: ${JSON.stringify(m.label)}`);
+    if (m.help !== null) parts.push(`help: ${JSON.stringify(m.help)}`);
+    if (m.info !== null) parts.push(`info: ${JSON.stringify(m.info)}`);
+    if (m.copy) parts.push(`copy: ${JSON.stringify({ by: m.copy.by, ...m.copy.overrides })}`);
+    if (m.presenters) parts.push(`presenters: ${JSON.stringify(m.presenters)}`);
+    for (const predKey of ['presentIf', 'requiredIf', 'lockedIf'] as const) {
+      const pred = m[predKey];
+      if (pred && !pred.depsError && pred.deps && depsFitProjection(pred.deps, projection)) {
+        parts.push(`${predKey}: (${pred.source})`);
+      }
+    }
+    if (m.extraSource) parts.push(`meta: ${m.extraSource}`);
+    if (parts.length > 0) entries.push(`    ${prop}: { ${parts.join(', ')} },`);
+  }
+  if (entries.length === 0) return null;
+  return `{\n${entries.join('\n')}\n  }`;
+}
+
 export function generateDocs(project: ProjectMeta): string {
   const lines: string[] = [
     '# active-drizzle Schema Reference',

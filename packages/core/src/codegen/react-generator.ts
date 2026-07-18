@@ -32,6 +32,7 @@ import pluralize from 'pluralize'
 import type { CtrlProjectMeta, CtrlMeta, CtrlActionMeta, CtrlAttachmentMeta } from './controller-types.js'
 import type { ProjectMeta, ModelMeta, ColumnMeta } from './types.js'
 import { depsFitProjection } from './validation-deps.js'
+import { renderFieldMeta } from './generator.js'
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -236,10 +237,20 @@ function generateControllerFile(
       }
     }
 
+    // Presentational meta — filtered to THIS controller's projection;
+    // predicates ship only when their deps fit it.
+    const stateProjection = controllerProjectionFields(ctrl, model, writableFields)
+    {
+      const metaSource = renderFieldMeta(model, stateProjection)
+      if (metaSource) {
+        L.push('')
+        L.push(`  static fieldMeta = ${metaSource} as const`)
+      }
+    }
+
     // Attr.state: per-label predicates + can(event). Guards ship only when
     // provable AND their deps fit THIS controller's projection — otherwise
     // can() fail-closes to false (the server's abilities/can map is truth).
-    const stateProjection = controllerProjectionFields(ctrl, model, writableFields)
     if ((model.states ?? []).length) {
       L.push('')
       for (const st of model.states ?? []) {

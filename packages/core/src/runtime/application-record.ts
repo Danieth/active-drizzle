@@ -15,11 +15,58 @@ import {
 } from './validation-errors.js'
 
 /**
+ * App-extensible custom meta bag. Augment via declaration merging:
+ *
+ *   declare module '@active-drizzle/core' {
+ *     interface AttrCustomMeta { regulatoryDisclosure?: string }
+ *   }
+ *
+ * Everything in `meta:` must be statically serializable (literals, nested
+ * object/array literals) — codegen extracts it verbatim for the client and
+ * fails the build on functions or identifier references.
+ */
+export interface AttrCustomMeta {
+  [key: string]: unknown
+}
+
+/**
+ * Presentational metadata carried on any Attr — pure data about the FIELD,
+ * extracted at build time and shipped to generated Clients. Layout never
+ * belongs here (a field doesn't know its section or step); role/identity
+ * conditions never belong here either (they live on the controller).
+ */
+export interface AttrPresentationalMeta {
+  /** Human label, e.g. 'Requested Loan Amount'. */
+  label?: string
+  /** Short helper line rendered near the input. */
+  help?: string
+  /** Longer informational copy (tooltips, drawers). */
+  info?: string
+  /**
+   * Per-discriminant copy overrides, keyed by the labels of the enum/state
+   * Attr named in `by`:
+   *
+   *   copy: { by: 'facilityType', REVOLVING_CREDIT: { label: '…' } }
+   */
+  copy?: { by: string } & Record<string, unknown>
+  /** Pure record-predicate: is the field present in the current draft? */
+  presentIf?: (record: any) => boolean
+  /** Pure record-predicate: is the field required right now? */
+  requiredIf?: (record: any) => boolean
+  /** Pure record-STATE lock (never roles — roles live on the controller). */
+  lockedIf?: (record: any) => boolean
+  /** Default presenter names; call sites may override, `edit` is never inferred. */
+  presenters?: { view?: string; edit?: string }
+  /** Open extension bag — static data only, typed via AttrCustomMeta merging. */
+  meta?: AttrCustomMeta
+}
+
+/**
  * The shape every Attr.* config object must satisfy.
  * _isAttr: true distinguishes Attr configs from association markers,
  * class prototypes, and other static properties during validate() loops.
  */
-export interface AttrConfig {
+export interface AttrConfig extends AttrPresentationalMeta {
   readonly _isAttr?: true
   get?: (raw: any) => any
   set?: (val: any) => any

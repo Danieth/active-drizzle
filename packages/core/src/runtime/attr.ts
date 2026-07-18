@@ -522,6 +522,78 @@ export const Attr = {
   },
 
   /**
+   * Basis-points attr — integer bps in the database (no float drift), the
+   * same integer on the model. A kind marker for presenters ('250 bps'),
+   * with strict-integer coercion.
+   *
+   *   static spread = Attr.bps()
+   *   loan.spread = 250        // stored as 250
+   */
+  bps(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'bps' } {
+    return {
+      _isAttr: true,
+      _type: 'bps' as const,
+      get: (raw) => (raw === null || raw === undefined ? null : Number(raw)),
+      set: (val) => {
+        if (val === null || val === undefined) return null
+        const n = typeof val === 'string' ? Number(val) : val
+        if (typeof n !== 'number' || !Number.isSafeInteger(n)) {
+          throw new TypeError(`Attr.bps: ${JSON.stringify(val)} is not a safe integer`)
+        }
+        return n
+      },
+      ...config,
+    }
+  },
+
+  /**
+   * Multiple attr — a ratio like '2.5x'. Stored as a string-backed numeric
+   * (full precision), read as a number. Kind marker for presenters.
+   *
+   *   static leverage = Attr.multiple()
+   *   deal.leverage = 2.5
+   */
+  multiple(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'multiple' } {
+    return {
+      _isAttr: true,
+      _type: 'multiple' as const,
+      get: (raw): number | null => {
+        if (raw === null || raw === undefined) return null
+        const n = Number(raw)
+        return isNaN(n) ? null : n
+      },
+      set: (val): string | null => {
+        if (val === null || val === undefined) return null
+        return String(val)
+      },
+      ...config,
+    }
+  },
+
+  /**
+   * Days attr — an integer count of days. Kind marker for presenters
+   * ('90 days'), strict-integer coercion.
+   *
+   *   static termDays = Attr.days()
+   */
+  days(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'days' } {
+    return {
+      _isAttr: true,
+      _type: 'days' as const,
+      get: (raw) => (raw === null || raw === undefined ? null : Number(raw)),
+      set: (val) => {
+        if (val === null || val === undefined) return null
+        const n = typeof val === 'string' ? Number(val) : val
+        if (typeof n !== 'number' || !Number.isSafeInteger(n)) {
+          throw new TypeError(`Attr.days: ${JSON.stringify(val)} is not a safe integer`)
+        }
+        return n
+      },
+      ...config,
+    }
+  },
+
+  /**
    * Postgres range attr (`int4range`, `int8range`, `numrange`).
    * The driver returns range columns as literals like '[1,10)'; this parses
    * them into a structured object and serializes on write.
