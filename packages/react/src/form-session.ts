@@ -100,6 +100,9 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   /** Write to the draft and notify that field's subscribers. */
   setValue(field: string, value: any): void {
     ;(this.draft as any)[field] = value
+    // Editing again after a settled submit returns the session to ready —
+    // otherwise 'saved'/'error' stick forever and save-indicators lie
+    if (this.status === 'saved' || this.status === 'error') this.status = 'ready'
     this.notify(field)
   }
 
@@ -226,6 +229,14 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
 
     if (result.status === 401 || result.status === 403) {
       this.status = 'unauthenticated'   // draft untouched — re-auth then retry
+    } else if (result.status === 409) {
+      // Optimistic-lock conflict carries no field errors — surface it on base
+      // so the form can tell the user to refresh instead of silently failing
+      this.serverErrors = {
+        base: ['This record was changed by someone else — refresh to see the latest version.'],
+        ...(result.errors ?? {}),
+      }
+      this.status = 'error'
     } else {
       this.serverErrors = this.refieldErrors(result.errors ?? {})
       this.status = 'error'

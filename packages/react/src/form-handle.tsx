@@ -204,6 +204,10 @@ export function createFormHandle<T extends Record<string, any>>(
     get(_t, prop: string | symbol) {
       if (typeof prop !== 'string') return undefined
       switch (prop) {
+        // A civil primitive path — `${handle}` in a log must neither invoke
+        // a component nor throw "cannot convert object to primitive"
+        case 'toString': case 'toLocaleString': return () => '[FormHandle]'
+        case 'valueOf': return () => '[FormHandle]'
         case '$session': return session
         case '$draft': return session.draft
         case '$errors': return session.allErrors()
@@ -215,8 +219,13 @@ export function createFormHandle<T extends Record<string, any>>(
         case 'Form': return FormComponent
         case 'Submit': return SubmitComponent
         case 'BaseErrors': return BaseErrorsComponent
-        // React/JS runtime probes that must not become field components
-        case 'then': case 'toJSON': case '$$typeof': return undefined
+        // React/JS runtime probes that must not become field components.
+        // Without this, `${handle}` would resolve toString to a Field and
+        // invoke a React component as a plain function.
+        case 'then': case 'toJSON': case '$$typeof':
+        case 'constructor': case 'hasOwnProperty': case 'isPrototypeOf':
+        case 'propertyIsEnumerable': case 'displayName':
+          return undefined
       }
       if (prop.startsWith('$') || prop.startsWith('_')) return undefined
       let field = cache.get(prop)

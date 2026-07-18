@@ -357,3 +357,44 @@ describe('registry errors are loud', () => {
     expect(() => render(<loan.amount edit="thickInfo" />)).toThrow(/requires meta 'info'/)
   })
 })
+
+// ── Review-pass regressions ──────────────────────────────────────────────────
+
+describe('handle safety', () => {
+  it('Object.prototype probes never become field components', () => {
+    const { handle: loan } = makeHandle()
+    expect((loan as any).constructor).toBeUndefined()
+    expect((loan as any).hasOwnProperty).toBeUndefined()
+    expect(String(loan)).toBe('[FormHandle]')  // `${handle}` neither invokes a component nor throws
+  })
+})
+
+describe('409 conflict surfaces a message', () => {
+  it('lands on base errors instead of failing silently', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: false, status: 409 }))
+    const { handle: loan } = makeHandle({ submit: submitSpy })
+    render(
+      <loan.Form>
+        <loan.amount edit />
+        <loan.Submit>Save</loan.Submit>
+        <loan.BaseErrors />
+      </loan.Form>,
+    )
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '1' } })
+    fireEvent.click(screen.getByRole('button'))
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('changed by someone else')
+  })
+})
+
+describe('status returns to ready on edit', () => {
+  it('saved → ready when the user types again', async () => {
+    const { handle: loan, session } = makeHandle({ submit: async () => ({ ok: true }) })
+    render(<loan.Form><loan.amount edit /><loan.Submit>Save</loan.Submit></loan.Form>)
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '1' } })
+    fireEvent.click(screen.getByRole('button'))
+    await waitFor(() => expect(session.getStatus()).toBe('saved'))
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '12' } })
+    expect(session.getStatus()).toBe('ready')
+  })
+})

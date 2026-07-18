@@ -74,8 +74,11 @@ export function buildRecordEnvelope(
     can[event] = typeof record.can === 'function' ? Boolean(record.can(event)) : false
   }
 
+  // The primary key always serializes — an envelope without `id` is a record
+  // the client can never PATCH back (mirrors codegen, which always projects id)
+  const pk = typeof model?.primaryKey === 'string' ? model.primaryKey : 'id'
   const serialized = typeof record.toJSON === 'function'
-    ? record.toJSON({ only: [...expose, ...includes] })
+    ? record.toJSON({ only: [...new Set([pk, ...expose, ...includes])] })
     : record
 
   const envelope: RecordEnvelope = {
