@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dealdesk",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev:client", "--prefix", "/Users/danielackerman/work/active-drizzle-demo"],
+      "port": 5199
+    }
+  ]
+}
