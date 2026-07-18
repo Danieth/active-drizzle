@@ -289,7 +289,31 @@ function generateControllerFile(
         ]
         return `    ${att.name}: { ${parts.join(', ')} },`
       })
-      const metaSource = renderFieldMeta(model, stateProjection, attachmentEntries)
+      // acceptsNested associations become nested form arrays: kind 'nested'
+      // with the child model's field meta inlined, plus orderBy for DnD when
+      // the association declares an order — <deal.notes>{note => …} just works
+      const nestedEntries: string[] = []
+      for (const assoc of model.associations) {
+        if (!assoc.acceptsNested) continue
+        const childTable = assoc.resolvedTable ?? assoc.explicitTable ?? pluralize(assoc.propertyName)
+        const childModel = projectMeta?.models.find(m => m.tableName === childTable)
+        if (!childModel) continue
+        const childCols = projectMeta?.schema.tables[childModel.tableName]?.columns ?? []
+        const childColTypes = new Map(childCols.map(c => [c.name, c.type as string]))
+        const fieldParts: string[] = []
+        for (const col of childCols) {
+          if (col.primaryKey) continue
+          const cm = childModel.fieldMeta?.[col.name]
+          const kind = cm?.semantic ?? cm?.kind ?? fieldKind(col.name, childModel, childColTypes)
+          const label = cm?.label ? `, label: ${JSON.stringify(cm.label)}` : ''
+          fieldParts.push(`${col.name}: { kind: '${kind}'${label} }`)
+        }
+        const orderBy = assoc.order && typeof assoc.order === 'object' ? Object.keys(assoc.order)[0] : undefined
+        nestedEntries.push(
+          `    ${assoc.propertyName}: { kind: 'nested'${orderBy ? `, orderBy: '${orderBy}'` : ''}, fields: { ${fieldParts.join(', ')} } },`,
+        )
+      }
+      const metaSource = renderFieldMeta(model, stateProjection, [...attachmentEntries, ...nestedEntries])
       if (metaSource) {
         L.push('')
         L.push(`  static fieldMeta = ${metaSource} as const`)

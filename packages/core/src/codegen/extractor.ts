@@ -992,6 +992,10 @@ function parseObjectLiteral(obj: any): Record<string, unknown> {
     else if (val.getText() === 'false') result[key] = false;
     else if (Node.isArrayLiteralExpression(val)) {
       result[key] = val.getElements().map(e => Node.isStringLiteral(e) ? e.getLiteralValue() : e.getText());
+    } else if (Node.isObjectLiteralExpression(val)) {
+      // Nested objects parse as objects, not source text — association
+      // options like order: { position: 'asc' } depend on this
+      result[key] = parseObjectLiteral(val);
     } else {
       result[key] = val.getText();
     }

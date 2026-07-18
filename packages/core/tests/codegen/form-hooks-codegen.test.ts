@@ -122,3 +122,54 @@ describe('typed form handle emission', () => {
     expect(out).not.toContain('FormSession')
   })
 })
+
+describe('nested meta emission', () => {
+  it('acceptsNested associations emit kind nested with child fields + orderBy', () => {
+    const schema = `
+import { pgTable, serial, integer, text } from 'drizzle-orm/pg-core'
+export const deals = pgTable('deals', {
+  id: serial('id').primaryKey(),
+  name: text('name'),
+})
+export const notes = pgTable('notes', {
+  id: serial('id').primaryKey(),
+  dealId: integer('deal_id'),
+  body: text('body'),
+  position: integer('position'),
+})
+`
+    const dealModel = `
+import { ApplicationRecord, model, Attr, hasMany } from 'active-drizzle'
+@model('deals')
+export class Deal extends ApplicationRecord {
+  static notes = hasMany('notes', { acceptsNested: true, order: { position: 'asc' } })
+}
+`
+    const noteModel = `
+import { ApplicationRecord, model, Attr } from 'active-drizzle'
+@model('notes')
+export class Note extends ApplicationRecord {
+  static body = Attr.string({ label: 'Note' })
+}
+`
+    const project = createTestProject({ schema, models: { 'Deal.model.ts': dealModel, 'Note.model.ts': noteModel } })
+    const projectMeta: ProjectMeta = {
+      schema: project.extractSchema(),
+      models: [project.extractModel('Deal.model.ts'), project.extractModel('Note.model.ts')],
+    }
+    const ctrl: CtrlMeta = {
+      filePath: '/src/Deal.ctrl.ts', className: 'DealController', basePath: '/deals',
+      scopes: [], kind: 'crud', modelClass: 'Deal', mutations: [], actions: [],
+      crudConfig: {
+        get: { expose: ['id', 'name'], abilities: true, include: ['notes'] },
+        update: { permit: ['name'] }, create: { permit: ['name'] },
+      },
+    } as CtrlMeta
+    const out = generateReactHooks({ controllers: [ctrl] } as CtrlProjectMeta, projectMeta, '/out')
+      .find(f => f.filePath.includes('deal.gen'))!.content
+
+    expect(out).toContain(`notes: { kind: 'nested', orderBy: 'position', fields: {`)
+    expect(out).toContain(`body: { kind: 'string', label: "Note" }`)
+    expect(out).toContain(`position: { kind: 'integer' }`)
+  })
+})
