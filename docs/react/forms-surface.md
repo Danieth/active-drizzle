@@ -214,7 +214,7 @@ way. Three layers:
 2. **At the call site** — `className` passes through on every field and
    every built-in: `<loan.amount edit className="w-full rounded" />`,
    `<loan.Form className="space-y-4">`, `<loan.Submit className="btn" />`.
-3. **Per instance** — `props={{ ... }}` forwards arbitrary props.
+3. **Per instance** — the `props` prop forwards arbitrary extras to the presenter.
 
 AD ships zero CSS and zero markup opinions beyond `<form>`/`<button>`
 semantics on its built-ins.
