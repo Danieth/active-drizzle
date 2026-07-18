@@ -45,7 +45,10 @@ export {
   type FormHandle,
   type FieldComponent,
   type FieldProps,
+  type ArrayFieldHandle,
+  type NestedFormHandle,
 } from './form-handle.js'
+export { NestedArrayManager, type NestedChild } from './nested.js'
 export { useForm, useEditForm, useNewForm, type UseFormOptions } from './use-form.js'
 
 // Error utilities

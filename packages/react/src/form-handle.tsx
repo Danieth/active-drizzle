@@ -11,8 +11,9 @@
  * for programmatic reads. Each field subscribes to ITS OWN slice of the
  * FormSession via useSyncExternalStore — a keystroke re-renders one field.
  */
-import React, { createContext, useContext, useSyncExternalStore, type FC, type ReactNode } from 'react'
+import React, { createContext, useContext, useSyncExternalStore, Fragment, type FC, type ReactNode } from 'react'
 import { FormSession, type SessionStatus } from './form-session.js'
+import { NestedArrayManager, type NestedChild } from './nested.js'
 import { resolvePresenter, checkRequiredMeta, type PresenterBind } from './presenters.js'
 
 /**
@@ -39,6 +40,23 @@ export type FieldComponent = FC<FieldProps> & {
   readonly errors: string[]
   readonly meta: Record<string, any>
   readonly value: any
+}
+
+/** A child form handle: full field access plus its identity + Remove. */
+export type NestedFormHandle = FormHandle & {
+  key: string
+  isNew: boolean
+  Remove: FC<{ children?: ReactNode }>
+}
+
+/**
+ * `loan.assets` — callable with a render-prop, plus programmatic access.
+ * Keys are internal (id / ephemeral _key) — the caller never writes `key=`.
+ */
+export type ArrayFieldHandle = FC<{ children: (child: NestedFormHandle) => ReactNode }> & {
+  forms: NestedFormHandle[]
+  add: (defaults?: Record<string, any>) => void
+  Add: FC<{ defaults?: Record<string, any>; children?: ReactNode }>
 }
 
 export type FormHandle<T extends Record<string, any> = Record<string, any>> = {
@@ -68,7 +86,11 @@ function resolveCopy(meta: Record<string, any>, draft: any): Record<string, any>
 
 export function createFormHandle<T extends Record<string, any>>(
   session: FormSession<T>,
-  options: { fieldMeta?: Record<string, Record<string, any>> } = {},
+  options: {
+    fieldMeta?: Record<string, Record<string, any>>
+    /** Extra members merged into the handle (used for nested child handles). */
+    extras?: Record<string, any>
+  } = {},
 ): FormHandle<T> {
   const fieldMeta: Record<string, Record<string, any>> =
     options.fieldMeta
@@ -76,6 +98,66 @@ export function createFormHandle<T extends Record<string, any>>(
     ?? {}
 
   const cache = new Map<string, any>()
+
+  // ── Nested attribute arrays: meta kind 'nested' → ArrayFieldHandle ───────
+  const makeArrayHandle = (name: string, meta: Record<string, any>): ArrayFieldHandle => {
+    const manager = new NestedArrayManager(
+      session,
+      name,
+      (session.draft as any)[name],
+      meta.validate ? { validate: meta.validate } : {},
+    )
+    session.registerNested(name, manager)
+
+    const childHandles = new Map<string, NestedFormHandle>()
+    const childHandle = (child: NestedChild): NestedFormHandle => {
+      let h = childHandles.get(child.key)
+      if (h) return h
+      const RemoveComponent: FC<{ children?: ReactNode }> = ({ children }) => (
+        <button type="button" onClick={() => manager.remove(child.key)}>
+          {children ?? 'Remove'}
+        </button>
+      )
+      RemoveComponent.displayName = `AdRemove(${child.key})`
+      h = createFormHandle(child.session as FormSession<any>, {
+        fieldMeta: (meta.fields ?? {}) as Record<string, Record<string, any>>,
+        extras: { key: child.key, isNew: child.isNew, Remove: RemoveComponent },
+      }) as NestedFormHandle
+      childHandles.set(child.key, h)
+      return h
+    }
+
+    const ArrayComponent: FC<{ children: (child: NestedFormHandle) => ReactNode }> = ({ children }) => {
+      useSyncExternalStore(
+        (cb) => session.subscribe(name, cb),
+        () => session.fieldVersion(name),
+        () => session.fieldVersion(name),
+      )
+      return (
+        <>
+          {manager.visible().map(child => (
+            <Fragment key={child.key}>{children(childHandle(child))}</Fragment>
+          ))}
+        </>
+      )
+    }
+    ;(ArrayComponent as any).displayName = `AdArray(${name})`
+
+    const AddComponent: FC<{ defaults?: Record<string, any>; children?: ReactNode }> = ({ defaults, children }) => (
+      <button type="button" onClick={() => manager.add(defaults)}>
+        {children ?? 'Add'}
+      </button>
+    )
+    AddComponent.displayName = `AdAdd(${name})`
+
+    const arrayHandle = ArrayComponent as ArrayFieldHandle
+    Object.defineProperties(arrayHandle, {
+      forms: { get: () => manager.visible().map(childHandle) },
+      add: { value: (defaults?: Record<string, any>) => { manager.add(defaults) } },
+      Add: { value: AddComponent },
+    })
+    return arrayHandle
+  }
 
   const makeFieldComponent = (field: string): FieldComponent => {
     // A field whose visibility/lock/copy depends on OTHER fields (presentIf,
@@ -254,10 +336,13 @@ export function createFormHandle<T extends Record<string, any>>(
         case 'propertyIsEnumerable': case 'displayName':
           return undefined
       }
+      if (options.extras && prop in options.extras) return options.extras[prop]
       if (prop.startsWith('$') || prop.startsWith('_')) return undefined
       let field = cache.get(prop)
       if (!field) {
-        field = makeFieldComponent(prop)
+        field = fieldMeta[prop]?.kind === 'nested'
+          ? makeArrayHandle(prop, fieldMeta[prop]!)
+          : makeFieldComponent(prop)
         cache.set(prop, field)
       }
       return field

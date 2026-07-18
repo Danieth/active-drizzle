@@ -80,6 +80,14 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   private versions = new Map<string, number>()
   private globalVersion = 0
 
+  /** Nested attribute arrays (accepts_nested_attributes_for client half). */
+  private nested = new Map<string, {
+    attributesPayload(): Array<Record<string, any>> | null
+    errors(): Record<string, string[]>
+    routeServerError(path: string, msgs: string[]): boolean
+    commitBaselines(savedRows?: any[]): void
+  }>()
+
   private readonly validateFn: (draft: T) => Record<string, string[]>
   private readonly submitFn?: (payload: SubmitPayload) => Promise<SubmitResult>
 
@@ -121,9 +129,14 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
 
   isDirty(): boolean {
     const now = this.snapshotDraft()
-    return Object.keys({ ...this.baseline, ...now }).some(
-      k => !valueEquals(this.baseline[k], now[k]),
+    const flatDirty = Object.keys({ ...this.baseline, ...now }).some(
+      k => !this.nested.has(k) && !valueEquals(this.baseline[k], now[k]),
     )
+    if (flatDirty) return true
+    for (const manager of this.nested.values()) {
+      if (manager.attributesPayload() !== null) return true
+    }
+    return false
   }
 
   /** The submit diff — only fields that changed since the baseline. */
@@ -131,9 +144,44 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     const now = this.snapshotDraft()
     const out: Record<string, any> = {}
     for (const k of Object.keys(now)) {
+      if (this.nested.has(k)) continue   // raw child arrays never ride the diff
       if (!valueEquals(this.baseline[k], now[k])) out[k] = now[k]
     }
+    // Nested arrays fold in as <name>Attributes (the server contract)
+    for (const [name, manager] of this.nested) {
+      const payload = manager.attributesPayload()
+      if (payload) out[`${name}Attributes`] = payload
+    }
     return out
+  }
+
+  /** Wire a nested attribute array in (called by the handle on first use). */
+  registerNested(name: string, manager: {
+    attributesPayload(): Array<Record<string, any>> | null
+    errors(): Record<string, string[]>
+    routeServerError(path: string, msgs: string[]): boolean
+    commitBaselines(savedRows?: any[]): void
+  }): void {
+    this.nested.set(name, manager)
+  }
+
+  getNested(name: string): unknown { return this.nested.get(name) }
+
+  /** External components (nested managers) bump a field's channel. */
+  notifyExternal(field: string): void { this.notify(field) }
+
+  /** Server errors injected from outside (nested error routing). */
+  applyExternalErrors(errors: Record<string, string[]>): void {
+    this.serverErrors = { ...this.serverErrors, ...errors }
+    // These arrived from a submit attempt — make them visible immediately
+    this.submitAttempted = true
+    this.notifyAll()
+  }
+
+  /** Re-snapshot the baseline (post-save settle). */
+  resetBaseline(): void {
+    this.baseline = this.snapshotDraft()
+    this.notifyAll()
   }
 
   // ── Permissions ───────────────────────────────────────────────────────────
@@ -206,7 +254,11 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   async submit(opts: { event?: string } = {}): Promise<boolean> {
     this.submitAttempted = true
 
-    const clientErrors = this.validateFn(this.draft) ?? {}
+    const clientErrors = { ...(this.validateFn(this.draft) ?? {}) }
+    // Children gate the parent: an invalid row blocks the whole submit
+    for (const manager of this.nested.values()) {
+      Object.assign(clientErrors, manager.errors())
+    }
     if (Object.keys(clientErrors).length > 0) {
       this.status = 'error'
       this.notifyAll()
@@ -236,6 +288,11 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     if (result.ok) {
       this.serverErrors = {}
       if (result.envelope) this.applyEnvelope(result.envelope)
+      // Children settle: destroyed rows drop, new rows adopt server ids
+      for (const [name, manager] of this.nested) {
+        const savedRows = result.envelope?.record?.[name]
+        manager.commitBaselines(Array.isArray(savedRows) ? savedRows : undefined)
+      }
       this.baseline = this.snapshotDraft()
       this.status = 'saved'
       this.notifyAll()
@@ -333,10 +390,19 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     this.notifyAll()
   }
 
-  /** Server errors on fields this session can't see re-field to base. */
+  /**
+   * Server errors on fields this session can't see re-field to base.
+   * Nested paths (`assets[id:7].value`, `assets[new:3].name`) route to the
+   * owning child session first.
+   */
   private refieldErrors(errors: Record<string, string[]>): Record<string, string[]> {
     const out: Record<string, string[]> = {}
     for (const [field, msgs] of Object.entries(errors)) {
+      let routed = false
+      for (const manager of this.nested.values()) {
+        if (manager.routeServerError(field, msgs)) { routed = true; break }
+      }
+      if (routed) continue
       const key = field === 'base' || this.canView(field) ? field : 'base'
       ;(out[key] ??= []).push(...msgs)
     }

@@ -993,7 +993,9 @@ async function _processNestedAttributes(record: any, ctor: any, snapshot: Record
     const fkField = (marker.options?.foreignKey as string | undefined) ?? `${ownerSingular}Id`
 
     for (const item of nested) {
-      const { _destroy, id, ...fields } = item
+      // _key is the client's ephemeral identity for NEW rows (form error
+      // routing) — never a column, always stripped before create/update
+      const { _destroy, _key, id, ...fields } = item
       if (_destroy && id) {
         const child = await TargetModel.find(id)
         if (child) await child.destroy()
