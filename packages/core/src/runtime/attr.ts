@@ -369,7 +369,14 @@ export const Attr = {
     // Object.prototype.toString and store a native function in the column.
     const lookup: Record<string, number> = Object.assign(Object.create(null), values)
     const inverse: Record<number, string> = Object.create(null)
-    for (const [k, v] of Object.entries(values)) inverse[v] = k
+    for (const [k, v] of Object.entries(values)) {
+      // Duplicate stored values make get() ambiguous (last label silently
+      // wins) — fail at definition time instead.
+      if (inverse[v] !== undefined) {
+        throw new Error(`Attr.enum: labels '${inverse[v]}' and '${k}' both map to ${v}`)
+      }
+      inverse[v] = k
+    }
     return {
       _isAttr: true as const,
       _type: 'enum',
@@ -467,7 +474,12 @@ export const Attr = {
     // Null-prototype lookup maps — see Attr.enum for why.
     const lookup: Record<string, number | string> = Object.assign(Object.create(null), values)
     const inverse: Record<string | number, string> = Object.create(null)
-    for (const [k, v] of Object.entries(values)) inverse[v] = k
+    for (const [k, v] of Object.entries(values)) {
+      if (inverse[v] !== undefined) {
+        throw new Error(`Attr.state: states '${inverse[v]}' and '${k}' both map to ${JSON.stringify(v)}`)
+      }
+      inverse[v] = k
+    }
 
     return {
       _isAttr: true as const,

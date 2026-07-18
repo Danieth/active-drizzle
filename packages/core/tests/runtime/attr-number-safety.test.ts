@@ -593,3 +593,68 @@ describe('boot() rejects reserved dirty-tracking column names', () => {
     expect(() => boot(fakeDb, schema)).not.toThrow()
   })
 })
+
+// ---------------------------------------------------------------------------
+// Round 2 — adversarial absorb-side edges
+// ---------------------------------------------------------------------------
+
+describe('absorb-side string forms (wide-in, narrow-out)', () => {
+  const price = Attr.money()
+
+  it("absorbs '.5', '5.', '+5', and padded strings", () => {
+    expect(price.set!('.5')).toBe(50)
+    expect(price.set!('5.')).toBe(500)
+    expect(price.set!('+19.99')).toBe(1999)
+    expect(price.set!('  8.165  ')).toBe(817)
+    expect(price.set!('007.50')).toBe(750)
+  })
+
+  it('absorbs exponent strings as decimals', () => {
+    expect(price.set!('1e3')).toBe(100000) // $1000
+    expect(price.set!('2.5e-1')).toBe(25)  // $0.25
+  })
+
+  it("locale strings ('1,000.50') are NOT numbers — they cast to null", () => {
+    expect(price.set!('1,000.50')).toBeNull()
+    expect(price.set!('$5')).toBeNull()
+  })
+
+  it('exponent bombs cannot allocate: 1e999999999 → null instantly', () => {
+    const start = Date.now()
+    expect(price.set!('1e999999999')).toBeNull()
+    expect(Attr.decimal().set!('1e999999999')).toBeNull()
+    expect(Attr.integer().set!('1e999999999')).toBeNull() // Number() → Infinity → null
+    expect(Date.now() - start).toBeLessThan(1000)
+  })
+
+  it("strict int absorbs '-0' and '+7' canonically", () => {
+    expect(Object.is(Attr.int().set!('-0'), 0)).toBe(true)
+    expect(Attr.int().set!('+7')).toBe(7)
+    expect(Attr.int().set!('007')).toBe(7)
+  })
+})
+
+describe('enum/state duplicate stored values fail at definition', () => {
+  it('Attr.enum throws — get() would be ambiguous', () => {
+    expect(() => Attr.enum({ draft: 0, pending: 0 } as any)).toThrow(/both map to 0/)
+  })
+
+  it('Attr.state throws the same way', () => {
+    expect(() =>
+      Attr.state({
+        states: { draft: 0, pending: 0 } as any,
+        transitions: {},
+      })
+    ).toThrow(/both map to 0/)
+  })
+
+  it('distinct values still define fine', () => {
+    expect(() => Attr.enum({ draft: 0, sent: 1 } as const)).not.toThrow()
+  })
+})
+
+describe('typed array literals with PG NULL tokens', () => {
+  it("integer elements: literal 'NULL' text coerces to null, not NaN", () => {
+    expect(Attr.array.integer().get!('{1,NULL,3}')).toEqual([1, null, 3])
+  })
+})
