@@ -5,6 +5,7 @@ import { getExecutor, getSchema, MODEL_REGISTRY, transaction, transactionContext
 import { runHooks, collectHooks } from './hooks.js'
 import type { AttrEnumConfig, AttrStateConfig } from './attr.js'
 import { stateCanFire, stateLegalMove } from './attr.js'
+import { reportError, translateDbError } from './error-reporting.js'
 import {
   ValidationErrors,
   createValidationErrors,
@@ -451,83 +452,115 @@ export class ApplicationRecord {
     // Snapshot nested *Attributes data before _attributes is overwritten by the DB row
     const nestedSnapshot = _captureNestedAttributes(this, ctor)
 
-    if (isNew) {
-      const payload: Record<string, any> = {}
-
-      // Start with raw constructor-passed attributes (strips nested *Attributes keys)
-      for (const [k, v] of Object.entries(this._attributes)) {
-        if (_isNestedAttrsKey(k, ctor)) continue
-        payload[k] = v
-      }
-      // _changes override (from proxy set calls after construction)
-      for (const [k, { is }] of this._changes) {
-        if (_isNestedAttrsKey(k, ctor)) continue
-        payload[k] = is
-      }
-
-      // Apply defaults for fields not yet set
-      for (const key of Object.getOwnPropertyNames(ctor)) {
-        const attr = ctor[key] as AttrConfig | undefined
-        if (attr?._isAttr !== true || attr.default === undefined) continue
-        if (key in payload) continue
-        const def = typeof attr.default === 'function' ? attr.default() : attr.default
-        payload[key] = attr.set ? attr.set(def) : def
-      }
-
-      // STI: ensure the discriminator column is always set on INSERT
-      if (ctor.stiType && !('type' in payload)) {
-        payload['type'] = ctor.stiType
-      }
-
-      const [row] = await db.insert(table).values(payload).returning()
-      if (row) this._attributes = row
-    } else {
-      // Strip *Attributes keys before checking if there are real changes
-      const realChanges = Array.from(this._changes.entries()).filter(([k]) => !_isNestedAttrsKey(k, ctor))
-      const hasAnything = realChanges.length > 0 || Object.keys(nestedSnapshot).length > 0
-
-      // Even with no parent changes, autosave still needs to run below
-      if (!hasAnything) {
-        await _autosaveAssociations(this, ctor)
-        return true
-      }
-      if (!_getPkValue(ctor, this._attributes)) throw new Error("Cannot save existing record without a primary key.")
-
-      if (realChanges.length > 0) {
+    // DB phase — database failures land in _handleDbError: raw error to
+    // the onError handlers, translated message onto this.errors.
+    try {
+      if (isNew) {
         const payload: Record<string, any> = {}
-        for (const [k, { is }] of realChanges) payload[k] = is
-        const [row] = await db.update(table).set(payload).where(_buildPkWhere(ctor, table, _getPkValue(ctor, this._attributes))).returning()
+
+        // Start with raw constructor-passed attributes (strips nested *Attributes keys)
+        for (const [k, v] of Object.entries(this._attributes)) {
+          if (_isNestedAttrsKey(k, ctor)) continue
+          payload[k] = v
+        }
+        // _changes override (from proxy set calls after construction)
+        for (const [k, { is }] of this._changes) {
+          if (_isNestedAttrsKey(k, ctor)) continue
+          payload[k] = is
+        }
+
+        // Apply defaults for fields not yet set
+        for (const key of Object.getOwnPropertyNames(ctor)) {
+          const attr = ctor[key] as AttrConfig | undefined
+          if (attr?._isAttr !== true || attr.default === undefined) continue
+          if (key in payload) continue
+          const def = typeof attr.default === 'function' ? attr.default() : attr.default
+          payload[key] = attr.set ? attr.set(def) : def
+        }
+
+        // STI: ensure the discriminator column is always set on INSERT
+        if (ctor.stiType && !('type' in payload)) {
+          payload['type'] = ctor.stiType
+        }
+
+        const [row] = await db.insert(table).values(payload).returning()
         if (row) this._attributes = row
+      } else {
+        // Strip *Attributes keys before checking if there are real changes
+        const realChanges = Array.from(this._changes.entries()).filter(([k]) => !_isNestedAttrsKey(k, ctor))
+        const hasAnything = realChanges.length > 0 || Object.keys(nestedSnapshot).length > 0
+
+        // Even with no parent changes, autosave still needs to run below
+        if (!hasAnything) {
+          await _autosaveAssociations(this, ctor)
+          return true
+        }
+        if (!_getPkValue(ctor, this._attributes)) throw new Error("Cannot save existing record without a primary key.")
+
+        if (realChanges.length > 0) {
+          const payload: Record<string, any> = {}
+          for (const [k, { is }] of realChanges) payload[k] = is
+          const [row] = await db.update(table).set(payload).where(_buildPkWhere(ctor, table, _getPkValue(ctor, this._attributes))).returning()
+          if (row) this._attributes = row
+        }
       }
+
+      ;(this as any)._previousChanges = Object.fromEntries(
+        Array.from(this._changes.entries()).map(([k, { was, is }]) => [k, [was, is]])
+      )
+      this._changes.clear()
+      this.isNewRecord = false
+
+      // Process acceptsNestedAttributesFor associations after parent is persisted
+      await _processNestedAttributes(this, ctor, nestedSnapshot)
+
+      // counterCache: increment parent counter on first create
+      if (isNew) await _adjustCounterCaches(this, ctor, 1)
+
+      // autosave: save any loaded associations that are flagged autosave: true
+      await _autosaveAssociations(this, ctor)
+
+      await runHooks(this, 'afterSave', isNew)
+      await runHooks(this, isNew ? 'afterCreate' : 'afterUpdate', isNew)
+
+      const pendingAfterCommit = afterCommitQueue.getStore()
+      if (pendingAfterCommit !== undefined) {
+        // Inside a transaction — defer afterCommit until after the transaction commits
+        pendingAfterCommit.push(async () => { await runHooks(this, 'afterCommit', isNew) })
+      } else {
+        await runHooks(this, 'afterCommit', isNew)
+      }
+
+      return true
+    } catch (err) {
+      return this._handleDbError(err, isNew ? 'insert' : 'update')
     }
+  }
 
-    ;(this as any)._previousChanges = Object.fromEntries(
-      Array.from(this._changes.entries()).map(([k, { was, is }]) => [k, [was, is]])
-    )
-    this._changes.clear()
-    this.isNewRecord = false
-
-    // Process acceptsNestedAttributesFor associations after parent is persisted
-    await _processNestedAttributes(this, ctor, nestedSnapshot)
-
-    // counterCache: increment parent counter on first create
-    if (isNew) await _adjustCounterCaches(this, ctor, 1)
-
-    // autosave: save any loaded associations that are flagged autosave: true
-    await _autosaveAssociations(this, ctor)
-
-    await runHooks(this, 'afterSave', isNew)
-    await runHooks(this, isNew ? 'afterCreate' : 'afterUpdate', isNew)
-
-    const pendingAfterCommit = afterCommitQueue.getStore()
-    if (pendingAfterCommit !== undefined) {
-      // Inside a transaction — defer afterCommit until after the transaction commits
-      pendingAfterCommit.push(async () => { await runHooks(this, 'afterCommit', isNew) })
-    } else {
-      await runHooks(this, 'afterCommit', isNew)
-    }
-
-    return true
+  /**
+   * The single funnel for database failures during save()/destroy():
+   *
+   *   1. RAW error → reportError() (Rollbar/Sentry/… via onError handlers)
+   *   2. Inside a transaction → rethrow (the tx is aborted; it must roll back)
+   *   3. Recognized PG error → validation-style message on this.errors,
+   *      return false — the exact shape a failed validation already has
+   *   4. Not a DB error → rethrow (programming bugs must not become banners)
+   */
+  private _handleDbError(err: unknown, operation: string): false {
+    if (err instanceof AbortChain) throw err
+    const ctor = this.constructor as any
+    reportError(err, {
+      model: ctor.name,
+      table: (() => { try { return ctor.tableName } catch { return undefined } })(),
+      operation,
+      id: this._attributes?.['id'],
+    })
+    const translated = translateDbError(err)
+    if (!translated) throw err
+    if (transactionContext.getStore()) throw err
+    if (translated.field) this.errors.add(translated.field, translated.message)
+    else this.errors.add('base', translated.friendly)
+    return false
   }
 
   /**
@@ -550,31 +583,35 @@ export class ApplicationRecord {
     if (!table) throw new Error(`Table "${ctor.tableName}" not found.`)
     if (!_getPkValue(ctor, this._attributes)) throw new Error("Cannot destroy record without a primary key.")
 
-    // Cascade destroy: any hasMany with dependent: 'destroy' fires destroy() per record
-    for (const key of Object.getOwnPropertyNames(ctor)) {
-      const marker = ctor[key]
-      if (!marker || typeof marker !== 'object') continue
-      if ((marker._type === 'hasMany' || marker._type === 'hasOne') && marker.options?.dependent === 'destroy') {
-        const assocVal = (this as any)[key]
-        if (assocVal instanceof Relation) {
-          for (const child of await assocVal.load()) {
-            await (child as any).destroy()
+    try {
+      // Cascade destroy: any hasMany with dependent: 'destroy' fires destroy() per record
+      for (const key of Object.getOwnPropertyNames(ctor)) {
+        const marker = ctor[key]
+        if (!marker || typeof marker !== 'object') continue
+        if ((marker._type === 'hasMany' || marker._type === 'hasOne') && marker.options?.dependent === 'destroy') {
+          const assocVal = (this as any)[key]
+          if (assocVal instanceof Relation) {
+            for (const child of await assocVal.load()) {
+              await (child as any).destroy()
+            }
+          } else if (assocVal && typeof (assocVal as any).then === 'function') {
+            const child = await assocVal
+            if (child) await (child as any).destroy()
           }
-        } else if (assocVal && typeof (assocVal as any).then === 'function') {
-          const child = await assocVal
-          if (child) await (child as any).destroy()
         }
       }
+
+      await db.delete(table).where(_buildPkWhere(ctor, table, _getPkValue(ctor, this._attributes)))
+      ;(this as any).isDestroyed = true
+
+      // counterCache: decrement parent counter on destroy
+      await _adjustCounterCaches(this, ctor, -1)
+
+      await runHooks(this, 'afterDestroy', false)
+      return true
+    } catch (err) {
+      return this._handleDbError(err, 'delete')
     }
-
-    await db.delete(table).where(_buildPkWhere(ctor, table, _getPkValue(ctor, this._attributes)))
-    ;(this as any).isDestroyed = true
-
-    // counterCache: decrement parent counter on destroy
-    await _adjustCounterCaches(this, ctor, -1)
-
-    await runHooks(this, 'afterDestroy', false)
-    return true
   }
 
   /**

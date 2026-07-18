@@ -64,7 +64,11 @@ export { useForm, useEditForm, useNewForm, type UseFormOptions } from './use-for
 export {
   parseControllerError,
   applyFormErrors,
+  onClientError,
+  reportClientError,
+  handleControllerError,
   type ParsedControllerError,
+  type ClientErrorHandler,
 } from './errors.js'
 
 // Upload hooks

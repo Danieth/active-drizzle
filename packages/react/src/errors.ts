@@ -89,3 +89,72 @@ export function applyFormErrors(
     form.setFieldMeta(field, (meta: any) => ({ ...meta, errors: messages }))
   }
 }
+
+// ── Pluggable client-side error reporting ──────────────────────────────────
+
+export type ClientErrorHandler = (error: unknown, context: Record<string, unknown>) => void
+
+const _clientHandlers = new Set<ClientErrorHandler>()
+
+/**
+ * Registers a frontend error handler — the browser-side mirror of the
+ * server's `onError`. Wire it to your tracker once at app startup:
+ *
+ *   import { onClientError } from '@active-drizzle/react'
+ *   onClientError((error, context) => Rollbar.error(error, context))
+ *
+ * Returns an unsubscribe function.
+ */
+export function onClientError(handler: ClientErrorHandler): () => void {
+  _clientHandlers.add(handler)
+  return () => _clientHandlers.delete(handler)
+}
+
+/** Fans an error out to every registered handler; console.error fallback. */
+export function reportClientError(error: unknown, context: Record<string, unknown> = {}): void {
+  if (_clientHandlers.size === 0) {
+    console.error('[active-drizzle] unhandled client error:', error, context)
+    return
+  }
+  for (const handler of _clientHandlers) {
+    try {
+      handler(error, context)
+    } catch (handlerErr) {
+      console.error('[active-drizzle] client error handler threw:', handlerErr)
+    }
+  }
+}
+
+/**
+ * The one-call mutation error handler: decides what the USER sees and
+ * reports what the DEVELOPER needs.
+ *
+ *   const create = CampaignController.use({ teamId }).mutateCreate({
+ *     onError: (e) => setBanner(handleControllerError(e, { form })),
+ *   })
+ *
+ * - Validation (422) with a form → field errors applied, returns null
+ *   (nothing to banner — the fields show it)
+ * - Other 4xx → returns the server's message (already user-safe)
+ * - Everything else (500s, network failures) → reports the RAW error via
+ *   onClientError handlers, returns a generic "something went wrong"
+ */
+export function handleControllerError(
+  error: unknown,
+  opts: { form?: { setFieldMeta: (field: string, updater: (meta: any) => any) => void } } = {},
+): string | null {
+  const parsed = parseControllerError(error)
+  if (parsed?.isValidation) {
+    if (opts.form) {
+      applyFormErrors(opts.form, parsed)
+      return null
+    }
+    const first = parsed.fields ? Object.entries(parsed.fields)[0] : undefined
+    return first ? `${first[0]} ${first[1][0]}` : parsed.message
+  }
+  if (parsed && (parsed.isNotFound || parsed.isUnauthorized || parsed.isForbidden || parsed.isBadRequest)) {
+    return parsed.message
+  }
+  reportClientError(error, { code: parsed?.code })
+  return 'Something went wrong. Please try again.'
+}

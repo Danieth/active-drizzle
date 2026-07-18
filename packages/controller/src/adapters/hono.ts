@@ -10,6 +10,7 @@
  */
 import type { RouteRecord } from '../router.js'
 import { serializeError, HttpError } from '../errors.js'
+import { reportError, translateDbError } from '@active-drizzle/core'
 
 type AnyContext = Record<string, any>
 
@@ -59,7 +60,15 @@ export function honoAdapter<TContext = AnyContext>(
           const { status, body } = serializeError(err)
           return Response.json(body, { status })
         }
-        console.error('[active-drizzle] Unhandled controller error:', err)
+        // Raw error to the app's onError handlers (Rollbar/Sentry/…);
+        // a translated, user-safe message in the response.
+        reportError(err, { procedure: route.procedure, method: route.method, path: route.path })
+        const t = translateDbError(err)
+        if (t) {
+          const status = t.kind === 'unavailable' ? 503 : t.kind === 'retryable' ? 409 : 422
+          const body = t.field ? { errors: { [t.field]: [t.message] } } : { error: t.friendly }
+          return Response.json(body, { status })
+        }
         return Response.json({ error: 'Internal server error' }, { status: 500 })
       }
     },

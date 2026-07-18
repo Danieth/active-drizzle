@@ -79,6 +79,7 @@ export default defineConfig({
             { text: 'Project Structure', link: '/guide/project-structure' },
             { text: 'Console', link: '/guide/console' },
             { text: 'Helpers', link: '/guide/helpers' },
+            { text: 'Error Handling', link: '/guide/error-handling' },
           ],
         },
         {
