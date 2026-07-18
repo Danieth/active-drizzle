@@ -234,10 +234,10 @@ export class ApplicationRecord {
       if (!syncFns && !asyncFns) continue
 
       const value = (this as any)[key]
-      for (const msg of runValidators(syncFns, value)) {
+      for (const msg of runValidators(syncFns, value, this, key)) {
         this.errors.add(key, msg)
       }
-      for (const msg of await runAsyncValidators(asyncFns, value)) {
+      for (const msg of await runAsyncValidators(asyncFns, value, this, key)) {
         this.errors.add(key, msg)
       }
     }

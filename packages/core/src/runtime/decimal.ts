@@ -23,6 +23,14 @@ interface DecimalParts {
 }
 
 /** Parses a decimal literal (plain or exponent form) into exact parts. */
+/**
+ * Exponent expansion pads with `'0'.repeat(|exp|)` — an attacker-supplied
+ * '1e999999999' would allocate a gigabyte of zeros. PG numeric itself tops
+ * out at 131072 integer digits, so anything past this cap can't be stored
+ * anyway; treat it as not-a-decimal.
+ */
+const MAX_EXPONENT = 131_072
+
 function parseDecimal(s: string): DecimalParts | null {
   let m = PLAIN_DECIMAL_RE.exec(s)
   let exp = 0
@@ -30,6 +38,7 @@ function parseDecimal(s: string): DecimalParts | null {
     m = EXPONENT_RE.exec(s)
     if (!m) return null
     exp = parseInt(m[4]!, 10)
+    if (!Number.isFinite(exp) || Math.abs(exp) > MAX_EXPONENT) return null
   }
   const [, sign, int = '', frac = ''] = m
   if (int === '' && frac === '') return null // '.', '+', '-', 'e5'

@@ -143,38 +143,50 @@ export function normalizeMessage(message: unknown): string | null {
  * Runs one or many validators. Each must return a non-empty string to record
  * an error, or null/undefined/'' to pass. Empty strings are treated as "no
  * error" (same as null) — callers who want to signal failure must write a message.
+ *
+ * Validators also receive the record and the attr key, so declarative
+ * validators (Validates.presence({ if: r => r.isDraft() }), confirmation,
+ * uniqueness) can see model state. Plain (value) => … validators just
+ * ignore the extra arguments.
  */
-export type AttrValidator = (val: any) => string | null | undefined
+export type AttrValidator = (val: any, record?: any, key?: string) => string | null | undefined
 
 export function runValidators(
   validators: AttrValidator | AttrValidator[] | undefined,
   value: any,
+  record?: any,
+  key?: string,
 ): string[] {
   if (!validators) return []
   const list = Array.isArray(validators) ? validators : [validators]
   const errors: string[] = []
   for (const fn of list) {
     if (typeof fn !== 'function') continue
-    const result = fn(value)
+    const result = fn(value, record, key)
     const msg = normalizeMessage(result)
     if (msg !== null) errors.push(msg)
   }
   return errors
 }
 
+export type AsyncAttrValidator = (
+  val: any,
+  record?: any,
+  key?: string,
+) => Promise<string | null | undefined> | string | null | undefined
+
 export async function runAsyncValidators(
-  validators:
-    | ((val: any) => Promise<string | null | undefined>)
-    | Array<(val: any) => Promise<string | null | undefined>>
-    | undefined,
+  validators: AsyncAttrValidator | AsyncAttrValidator[] | undefined,
   value: any,
+  record?: any,
+  key?: string,
 ): Promise<string[]> {
   if (!validators) return []
   const list = Array.isArray(validators) ? validators : [validators]
   const errors: string[] = []
   for (const fn of list) {
     if (typeof fn !== 'function') continue
-    const result = await fn(value)
+    const result = await fn(value, record, key)
     const msg = normalizeMessage(result)
     if (msg !== null) errors.push(msg)
   }
