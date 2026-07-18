@@ -26,6 +26,7 @@
  */
 
 import type { AsyncAttrValidator, AttrValidator } from './validation-errors.js'
+import { isValidTimezone } from './timezone.js'
 
 /** Options every validator accepts, mirroring Rails' common options. */
 export interface ValidatorOptions {
@@ -311,6 +312,13 @@ function uuid(opts: ValidatorOptions = {}): AttrValidator {
   )
 }
 
+/** IANA timezone id (canonical, alias, or offset — anything Intl accepts). */
+function timezone(opts: ValidatorOptions = {}): AttrValidator {
+  return skipNil(opts, (v) =>
+    isValidTimezone(v) ? null : opts.message ?? 'is not a valid timezone'
+  )
+}
+
 // ── Async / DB-backed ──────────────────────────────────────────────────────
 
 export interface UniquenessOptions extends ValidatorOptions {
@@ -369,6 +377,7 @@ export const Validates = {
   email,
   url,
   uuid,
+  timezone,
   uniqueness,
 } as const
 
@@ -386,5 +395,6 @@ export {
   email,
   url,
   uuid,
+  timezone,
   uniqueness,
 }

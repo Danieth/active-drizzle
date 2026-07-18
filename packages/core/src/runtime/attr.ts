@@ -7,6 +7,7 @@ import {
   toFiniteNumber,
   toStrictInt,
 } from './decimal.js'
+import { canonicalTimezone } from './timezone.js'
 
 /**
  * A parsed Postgres range. Mirrors the wire format `[lower,upper)`:
@@ -608,6 +609,35 @@ export const Attr = {
       _isAttr: true,
       get: (raw): Date | null => toDateValue(raw),
       set: (val): Date | null => toDateValue(val),
+      ...config,
+    }
+  },
+
+  /**
+   * IANA timezone attr — a TEXT column holding a canonical zone id, backed
+   * by the platform's Intl data (no bundled tzdb, never stale).
+   *
+   * Writes absorb any accepted spelling and canonicalize: 'america/new_york'
+   * → 'America/New_York', legacy aliases resolve to modern ids, and unknown
+   * strings cast to null (pair with Validates.timezone() + presence() when
+   * the field is required). Reads are 1:1 — the column already holds the
+   * canonical id.
+   *
+   *   static timezone = Attr.timezone()
+   *   user.timezone = 'america/new_york'   // stored 'America/New_York'
+   *
+   * Using it with Date values (see timezone.ts):
+   *
+   *   formatInTimeZone(order.createdAt, user.timezone)      // wall-clock string
+   *   timeZoneOffsetMinutes(user.timezone)                  // DST-aware offset
+   *   allTimezones()                                        // full picker list
+   */
+  timezone(config: Partial<Omit<AttrConfig, '_isAttr'>> = {}): AttrConfig & { _type: 'timezone' } {
+    return {
+      _isAttr: true,
+      _type: 'timezone' as const,
+      get: (raw): string | null => (typeof raw === 'string' && raw !== '' ? raw : null),
+      set: (val): string | null => canonicalTimezone(val),
       ...config,
     }
   },
