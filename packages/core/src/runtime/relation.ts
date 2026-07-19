@@ -196,10 +196,39 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    */
   public async load(): Promise<TModel[]> {
     const rows = await this._withDefaultScopes()._buildQuery()
+
+    // STI subclass resolution: build the typeValue → subclass map ONCE for the
+    // whole result set instead of scanning MODEL_REGISTRY per row (was O(rows ×
+    // registered models)). `null` when this isn't an STI parent query.
+    const subclassMap = this._buildSubclassMap()
+    if (!subclassMap) {
+      return rows.map((r: any) => new (this._ctor as any)(r, false))
+    }
+
+    const stiCol = this._ctor.stiTypeColumn ?? 'type'
     return rows.map((r: any) => {
-      const SubClass = this._resolveSubclass(r)
-      return new (SubClass ?? this._ctor)(r, false)
+      const typeVal = r[stiCol]
+      const SubClass = (typeVal !== undefined && typeVal !== null ? subclassMap.get(typeVal) : undefined) ?? this._ctor
+      return new (SubClass as any)(r, false)
     })
+  }
+
+  /**
+   * Builds a `typeValue → subclass` map for an STI *parent* query, or returns
+   * `null` when resolution doesn't apply (this relation is already a subclass,
+   * or the table has no registered subclasses). First-registered wins on a
+   * duplicate `stiType`, matching the previous per-row `_resolveSubclass` scan.
+   */
+  protected _buildSubclassMap(): Map<any, any> | null {
+    if (this._ctor.stiType !== undefined) return null   // already querying a subclass
+    const map = new Map<any, any>()
+    for (const cls of Object.values(MODEL_REGISTRY)) {
+      const c = cls as any
+      if (c.stiType !== undefined && c._activeDrizzleTableName === this._tableName) {
+        if (!map.has(c.stiType)) map.set(c.stiType, cls)
+      }
+    }
+    return map.size > 0 ? map : null
   }
 
   /** Alias for load() — `User.where({ active: true }).all()` executes the query. */

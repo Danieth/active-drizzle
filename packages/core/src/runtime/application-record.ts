@@ -95,7 +95,26 @@ export interface AttrConfig extends AttrPresentationalMeta {
  * instances would lose isDraft(), advance(), belongsTo resolution, etc.
  * Subclass declarations shadow the parent's (first hit wins).
  */
+/**
+ * Cache of the flattened static-entry list per constructor. A model's static
+ * shape (Attr configs, association markers, state/enum configs, scope methods)
+ * is fixed once its class body + decorators evaluate at import time, and this
+ * function is only ever called at instance-access / save / validate time — well
+ * after that. Keying by constructor via a WeakMap makes the cache automatically
+ * correct across hot-reloaded classes (a new class = a new key) and test
+ * isolation (each isolated module gets its own WeakMap), and lets the GC reclaim
+ * entries for classes that go away. The base `ApplicationRecord` getters
+ * (`tableName`, …) are excluded by the walk below, so no volatile getter is ever
+ * captured. This removes a full prototype-chain walk + allocation from the
+ * hottest read path (every plain-column access) and from every save/validate.
+ */
+const _staticEntriesCache = new WeakMap<object, Array<[string, any]>>()
+
 export function modelStaticEntries(ctor: any): Array<[string, any]> {
+  if (!ctor) return []
+  const cached = _staticEntriesCache.get(ctor)
+  if (cached) return cached
+
   const out: Array<[string, any]> = []
   const seen = new Set<string>()
   for (let c = ctor; c && c !== ApplicationRecord && c !== Function.prototype; c = Object.getPrototypeOf(c)) {
@@ -105,6 +124,7 @@ export function modelStaticEntries(ctor: any): Array<[string, any]> {
       out.push([key, c[key]])
     }
   }
+  _staticEntriesCache.set(ctor, out)
   return out
 }
 
@@ -1262,10 +1282,11 @@ async function _processHabtmIds(record: any, ctor: any, snapshot: Record<string,
     const idsKey = `${_singularize(prop)}Ids`
     if (!Array.isArray(raw)) throw new NestedAttributesError(idsKey, 'must be an array of ids')
     const desired: number[] = []
+    const desiredSet = new Set<number>()   // O(1) dedup + reused for the diff below
     for (const v of raw) {
       const n = Number(v)
       if (!Number.isInteger(n) || n <= 0) throw new NestedAttributesError(idsKey, `'${String(v)}' is not a valid id`)
-      if (!desired.includes(n)) desired.push(n)
+      if (!desiredSet.has(n)) { desiredSet.add(n); desired.push(n) }
     }
 
     const marker = ctor[prop]
@@ -1294,8 +1315,9 @@ async function _processHabtmIds(record: any, ctor: any, snapshot: Record<string,
     const db = getExecutor()
     const currentRows = await db.select({ _val: joinTargetCol }).from(joinTable).where(eq(joinOwnerCol, ownerId))
     const current: number[] = currentRows.map((r: any) => Number(r._val))
-    const toAdd = desired.filter((id) => !current.includes(id))
-    const toRemove = current.filter((id) => !desired.includes(id))
+    const currentSet = new Set(current)                       // O(1) membership
+    const toAdd = desired.filter((id) => !currentSet.has(id))
+    const toRemove = current.filter((id) => !desiredSet.has(id))
     if (toAdd.length > 0) {
       await db.insert(joinTable).values(toAdd.map((id) => ({ [ownerFk]: ownerId, [targetFk]: id })))
     }

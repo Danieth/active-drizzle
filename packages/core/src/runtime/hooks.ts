@@ -37,8 +37,21 @@ export function registerHook(
 /**
  * Walks the prototype chain and collects hooks from parent → child order,
  * so parent hooks always fire before child hooks.
+ *
+ * Memoized per constructor: hooks are registered by decorators at class-body
+ * evaluation (import time), and collectHooks is only called at save/validate
+ * time (`runHooks` invokes it ~7× per save, twice more in validate). Keying by
+ * constructor via a WeakMap makes it correct across hot reload / test isolation
+ * and lets the GC reclaim entries. Models with zero hooks cache an empty array
+ * and pay nothing thereafter.
  */
+const _hooksCache = new WeakMap<object, HookRegistration[]>()
+
 export function collectHooks(ctor: any): HookRegistration[] {
+  if (!ctor) return []
+  const cached = _hooksCache.get(ctor)
+  if (cached) return cached
+
   const chain: HookRegistration[][] = []
   let current = ctor
   while (current && current !== Function.prototype) {
@@ -47,7 +60,9 @@ export function collectHooks(ctor: any): HookRegistration[] {
     }
     current = Object.getPrototypeOf(current)
   }
-  return chain.flat()
+  const flat = chain.flat()
+  _hooksCache.set(ctor, flat)
+  return flat
 }
 
 /**
