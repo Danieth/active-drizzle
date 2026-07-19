@@ -156,6 +156,45 @@ export interface BoardApi {
   isLoading: boolean
 }
 
+/** One option row in a Sidebar facet group. */
+export interface SidebarOption {
+  value: string
+  /** Disjunctive count under every OTHER active filter — null when the
+   *  controller doesn't declare index.facets. */
+  count: number | null
+  active: boolean
+  /** Multi-select toggle: adds/removes this value from the group's filter. */
+  toggle: () => void
+}
+
+/** One group (= one declared filter) in the Sidebar. */
+export interface SidebarGroup {
+  name: string
+  label: string
+  kind: string
+  /** Facet groups: every DECLARED option, zero-filled — an option that
+   *  matches nothing still renders (count 0), it never vanishes. */
+  options: SidebarOption[]
+  active: boolean
+  value: any
+  set: (v: any) => void
+  clear: () => void
+}
+
+/** What <Surface.Sidebar> hands your presenter — the whole faceted-search
+ *  panel as DATA: groups, live counts, search, clear-all. */
+export interface SidebarApi {
+  groups: SidebarGroup[]
+  /** Number of groups with an active filter. */
+  activeCount: number
+  clearAll: () => void
+  /** Search wiring (present when the index declares search). */
+  search: { q: string; setQ: (q: string) => void } | null
+  /** Total results under the CURRENT narrowing. */
+  total: number | null
+  isLoading: boolean
+}
+
 /** What <Surface.Table> hands your presenter. */
 export interface TableApi {
   columns: Array<{ name: string; label: string; kind: string; sortable: boolean }>
@@ -244,6 +283,20 @@ export interface IndexSurface {
   Items: FC<{ children: (handle: any, row: Record<string, any>) => ReactNode; empty?: ReactNode }>
   Pagination: FC<{ className?: string }>
   One: FC<{ id: number; poll?: { every: number; until?: (r: any) => boolean }; children: (form: any) => ReactNode; loading?: ReactNode }>
+  /**
+   * The faceted-search side panel — the "if you filter by this, counts
+   * become A/B/C" surface, one component. Groups from the declared
+   * filters, counts from the disjunctive facet engine, search included.
+   * Scaffold renders caret-collapsible groups with count badges; per-group
+   * presenters resolve through the filter-presenter registry; the
+   * render-prop hands you the whole SidebarApi.
+   */
+  Sidebar: FC<{
+    groups?: string[]
+    presenters?: Record<string, string | FC<FilterPresenterProps>>
+    children?: (api: SidebarApi) => ReactNode
+    className?: string
+  }>
   /** Error surface — parsed controller error, or nothing while healthy. */
   Error: FC<{ children?: (e: { kind: string; message: string; parsed: any }) => ReactNode; className?: string }>
   /** Empty surface — renders only on an empty page, and knows WHY. */
@@ -502,6 +555,104 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
     }
   }
 
+  // ── Sidebar: the faceted-search panel — ES's killer feature as ONE tag ───
+  // Everything is derived: groups from the declared filters, options from
+  // the enum/state labels, counts from the DISJUNCTIVE facet engine (each
+  // group's counts respond to every OTHER active filter + the live search,
+  // its own filter excluded — so "if you filter by this, counts become
+  // A/B/C" holds no matter which engine answered q: adapter, FTS, ilike).
+  const useSidebarApi = (groupNames?: string[]): SidebarApi => {
+    const { session, meta, query } = useCtx()
+    const state = useSessionState(session)
+    const facets = (query.data as any)?.facets as Record<string, Record<string, number>> | undefined
+    const names = groupNames ?? Object.keys(meta.filters ?? {})
+    const groups: SidebarGroup[] = names.flatMap((name) => {
+      const fm = meta.filters?.[name]
+      if (!fm) return []
+      const raw = state.filters[name]
+      const selected: string[] = Array.isArray(raw) ? raw.map(String) : raw != null && raw !== false ? [String(raw)] : []
+      const counts = facets?.[name]
+      // Only FACET groups synthesize option rows; toggles/ranges/text keep
+      // their widget semantics (options [] → the group body renders the
+      // filter presenter instead of checkbox rows)
+      const declared = fm.kind === 'facet'
+        ? ((fm.options as string[] | undefined) ?? (counts ? Object.keys(counts) : []))
+        : []
+      const options: SidebarOption[] = declared.map((value) => ({
+        value,
+        count: counts ? (counts[value] ?? 0) : null,
+        active: selected.includes(value),
+        toggle: () => {
+          const next = selected.includes(value) ? selected.filter((v) => v !== value) : [...selected, value]
+          session.setFilter(name, next.length ? next : undefined)
+        },
+      }))
+      return [{
+        name,
+        label: fm.label ?? name,
+        kind: fm.kind,
+        options,
+        active: selected.length > 0 || (fm.kind !== 'facet' && raw != null && raw !== false && raw !== ''),
+        value: raw,
+        set: (v: any) => session.setFilter(name, v),
+        clear: () => session.setFilter(name, undefined),
+      }]
+    })
+    return {
+      groups,
+      activeCount: groups.filter((g) => g.active).length,
+      clearAll: () => session.clearFilters(),
+      search: meta.searchable ? { q: state.q ?? '', setQ: (q: string) => session.setQ(q) } : null,
+      total: query.data?.pagination?.totalCount ?? null,
+      isLoading: query.isLoading,
+    }
+  }
+
+  const Sidebar: IndexSurface['Sidebar'] = ({ groups: groupNames, presenters, children, className }) => {
+    const api = useSidebarApi(groupNames)
+    if (children) return <aside data-ad-sidebar="" {...(className !== undefined ? { className } : {})}>{children(api)}</aside>
+    // Scaffold: native <details> carets, checkbox rows with count badges,
+    // zero-count options dimmed (never hidden). A per-group presenter —
+    // passed here or registered for the kind — takes the group body over.
+    return (
+      <aside data-ad-sidebar="" data-ad-scaffold="" {...(className !== undefined ? { className } : {})}>
+        {api.search && (
+          <input type="search" data-ad-sidebar-search="" placeholder="Search…"
+            defaultValue={api.search.q} onChange={(e) => api.search!.setQ(e.target.value)} />
+        )}
+        {api.activeCount > 0 && (
+          <button type="button" data-ad-sidebar-clear="" onClick={api.clearAll}>
+            Clear {api.activeCount} filter{api.activeCount === 1 ? '' : 's'} ✕
+          </button>
+        )}
+        {api.groups.map((g) => {
+          const override = presenters?.[g.name] ?? _filterDefaults[g.kind] ?? _filterDefaults['*']
+          return (
+            <details key={g.name} open data-ad-sidebar-group={g.name}>
+              <summary>{g.label}{g.active ? ' •' : ''}</summary>
+              {override != null ? (
+                <FilterWidget name={g.name} presenter={override} />
+              ) : g.options.length > 0 ? (
+                g.options.map((o) => (
+                  <label key={o.value} data-ad-sidebar-option={o.value}
+                    style={o.count === 0 && !o.active ? { opacity: 0.45 } : undefined}>
+                    <input type="checkbox" checked={o.active} onChange={o.toggle} />
+                    {' '}{o.value}
+                    {o.count != null && <span data-ad-sidebar-count=""> {o.count}</span>}
+                  </label>
+                ))
+              ) : (
+                <FilterWidget name={g.name} />
+              )}
+            </details>
+          )
+        })}
+        {api.total != null && <p data-ad-sidebar-total="">{api.total} result{api.total === 1 ? '' : 's'}</p>}
+      </aside>
+    )
+  }
+  ;(Sidebar as any).displayName = 'AdSidebar'
+
   // ── Error: parsed controller error or nothing (data-to-presenter) ────────
   const ErrorC: IndexSurface['Error'] = ({ children, className }) => {
     const { query } = useCtx()
@@ -700,5 +851,5 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
     queryComponents[qname] = QueryComponent
   }
 
-  return { Index, Search, Filters, Filter, Items, Pagination, One, use, Error: ErrorC, Empty, Board, Chart, Metric, Table, FormSkeleton, ListSkeleton, ...queryComponents }
+  return { Index, Search, Filters, Filter, Items, Pagination, One, use, Sidebar, Error: ErrorC, Empty, Board, Chart, Metric, Table, FormSkeleton, ListSkeleton, ...queryComponents }
 }

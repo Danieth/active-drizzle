@@ -316,6 +316,11 @@ ix.session.setFilter('$or', [{ stage: 'submitted' }, { priority: 'high' }])  // 
 // max 10 branches, no nesting, tier-1 fields only; richer logic = a NAMED filter's apply()
 
 // derived surfaces (all data-to-presenter; scaffold defaults marked data-ad-scaffold):
+<Deals.Sidebar />                                 // FACETED SEARCH PANEL: groups from declared filters,
+//   carets (<details>), zero-filled DISJUNCTIVE counts (need index.facets), multi-select
+//   toggles, search box, clear-all. presenters={{group: name|Component}} per group;
+//   render-prop → SidebarApi { groups:[{name,label,kind,options:[{value,count,active,toggle}],set,clear}],
+//   activeCount, clearAll, search:{q,setQ}|null, total, isLoading }
 <Deals.Board />                                   // Attr.state AS kanban: states=columns, move(row,to)
 <Deals.Board groupBy="priority" />                //   resolves the TRANSITION (_event) or PATCHes the value
 <Deals.Board>{({ columns, move, canMove }) => …}</Deals.Board>   // bring your own DnD

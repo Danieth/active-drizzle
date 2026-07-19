@@ -86,6 +86,9 @@ export {
   type IndexState,
   type BoardApi,
   type TableApi,
+  type SidebarApi,
+  type SidebarGroup,
+  type SidebarOption,
 } from './index-surface.js'
 
 // Error utilities

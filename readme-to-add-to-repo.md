@@ -628,3 +628,30 @@ forging/nesting/cap, forged sort/chart/metric, non-permitted
 mass-assignment, missing required mutation params);
 `runContractProbes(probes, call)` runs them through any transport.
 9 probes generated for the demo controller, 0 failures, live.
+
+## `<Deals.Sidebar/>` — faceted search, one tag (built)
+
+The ES killer feature as a component: "if you filter by this, the other
+counts become A, B, C."
+
+```tsx
+<Deals.Sidebar />                                     // bam: groups, carets, counts, search, clear-all
+<Deals.Sidebar groups={['stage','priority']} />       // pick + order the groups
+<Deals.Sidebar presenters={{ priority: MyPills }} />  // per-group presenter (or register kind defaults)
+<Deals.Sidebar>{({ groups, activeCount, clearAll, search, total }) => …}</Deals.Sidebar>
+```
+
+Everything is derived: groups from the declared filters, options from the
+enum/state labels (ZERO-FILLED — an option matching nothing shows 0,
+dimmed, never vanishes), counts from the disjunctive facet engine (each
+group's numbers respond to every OTHER active filter plus the live
+search, its own filter excluded), option toggles are multi-select
+(arrays → IN). Engine-agnostic by construction: whichever lane answered
+`q` — SearchAdapter, PG FTS, or ilike — the counts follow, because facets
+re-run the SAME narrowing pipeline. The scaffold renders native
+`<details>` carets and checkbox rows with count badges; a registered
+kind-default presenter (the same registry your filter bar uses) takes
+over any group's body automatically. `SidebarApi` is fully exported for
+headless use. Requires `index: { facets: true }` (or a field list) on the
+controller — no facets config → options render count-less, everything
+else still works.
