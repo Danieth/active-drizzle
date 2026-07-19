@@ -4,6 +4,9 @@ import { resolve } from 'path'
 export default defineConfig({
   resolve: {
     alias: {
+      // Subpath exports must come first — the bare-package alias below is a
+      // prefix match and would otherwise mangle them into ".../index.ts/<sub>"
+      '@active-drizzle/core/validators': resolve(__dirname, '../core/src/runtime/validators.ts'),
       '@active-drizzle/core': resolve(__dirname, '../core/src/index.ts'),
       '@active-drizzle/controller': resolve(__dirname, 'src/index.ts'),
       '@active-drizzle/react': resolve(__dirname, '../react/src/index.ts'),
