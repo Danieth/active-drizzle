@@ -139,7 +139,8 @@ function renderArray(arr: unknown[], ctx: Ctx, prefix = ''): string {
 }
 
 function renderObject(obj: Record<string, unknown>, ctx: Ctx): string {
-  const className = obj.constructor && obj.constructor !== Object ? obj.constructor.name : ''
+  // `static name = Attr…` on a model class shadows .name with a non-string
+  const className = obj.constructor && obj.constructor !== Object && typeof obj.constructor.name === 'string' ? obj.constructor.name : ''
   let keys = Object.keys(obj)
   if (ctx.sortKeys) keys = keys.sort()
 

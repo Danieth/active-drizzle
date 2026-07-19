@@ -2,6 +2,7 @@ import util from 'util'
 import { eq, and, inArray, sql, getTableColumns } from 'drizzle-orm'
 import { Relation } from './relation.js'
 import { getExecutor, getSchema, MODEL_REGISTRY, transaction, transactionContext, afterCommitQueue, AbortChain, RecordNotFound } from './boot.js'
+import { modelClassName } from './class-name.js'
 import { runHooks, collectHooks } from './hooks.js'
 import type { AttrEnumConfig, AttrStateConfig } from './attr.js'
 import { stateCanFire, stateLegalMove } from './attr.js'
@@ -93,7 +94,7 @@ export class ApplicationRecord {
   // ── Static table name ──────────────────────────────────────────────────
 
   static get tableName(): string {
-    return (this as any)._activeDrizzleTableName ?? this.name.toLowerCase()
+    return (this as any)._activeDrizzleTableName ?? modelClassName(this).toLowerCase()
   }
 
   /**
@@ -148,7 +149,7 @@ export class ApplicationRecord {
     if (!table) throw new Error(`Table "${(this as any).tableName}" not found. Did you call boot()?`)
     const pkWhereExpr = _buildPkWhere(this as any, table, id)
     const [row] = await getExecutor().select().from(table).where(pkWhereExpr).limit(1)
-    if (!row) throw new RecordNotFound(this.name, id)
+    if (!row) throw new RecordNotFound(modelClassName(this), id)
     return new (this as any)(row, false)
   }
 
@@ -310,8 +311,6 @@ export class ApplicationRecord {
    */
   private _runImplicitSchemaValidations(ctor: any): void {
     if (ctor.implicitValidations === false) return
-    // tableName's fallback reads this.name — which a `static name = Attr…`
-    // shadows with a config object. No resolvable table → nothing to derive.
     let tableName: string | undefined
     try {
       tableName = ctor.tableName
@@ -583,7 +582,7 @@ export class ApplicationRecord {
     if (err instanceof AbortChain) throw err
     const ctor = this.constructor as any
     reportError(err, {
-      model: ctor.name,
+      model: modelClassName(ctor),
       table: (() => { try { return ctor.tableName } catch { return undefined } })(),
       operation,
       id: this._attributes?.['id'],
@@ -661,7 +660,7 @@ export class ApplicationRecord {
     if (!table) throw new Error(`Table "${ctor.tableName}" not found.`)
 
     const [row] = await getExecutor().select().from(table).where(_buildPkWhere(ctor, table, pkVal)).limit(1)
-    if (!row) throw new Error(`${ctor.name} with pk=${JSON.stringify(pkVal)} not found — was it deleted?`)
+    if (!row) throw new Error(`${modelClassName(ctor)} with pk=${JSON.stringify(pkVal)} not found — was it deleted?`)
 
     this._attributes = row
     this._changes.clear()
@@ -749,14 +748,14 @@ export class ApplicationRecord {
    */
   async attach(name: string, assetId: number): Promise<void> {
     const ctor = this.constructor as any
+    const attachableType = modelClassName(ctor)
     const { getAttachmentEntryFromClass } = await import('./attachments.js')
     const entry = getAttachmentEntryFromClass(ctor, name)
-    if (!entry) throw new Error(`No attachment '${name}' declared on ${ctor.name}`)
+    if (!entry) throw new Error(`No attachment '${name}' declared on ${attachableType}`)
     if (this.isNewRecord || this._attributes.id === undefined || this._attributes.id === null) {
-      throw new Error(`Cannot attach '${name}' on unsaved ${ctor.name} record`)
+      throw new Error(`Cannot attach '${name}' on unsaved ${attachableType} record`)
     }
 
-    const attachableType = ctor.name
     const attachableId = this._attributes.id
 
     await _withAttachmentSlotLock(attachableType, attachableId, name, async () => {
@@ -783,7 +782,7 @@ export class ApplicationRecord {
           attachableType, attachableId, name,
         }).count()
         if (count >= entry.max) {
-          throw new Error(`Maximum ${entry.max} attachments for '${name}' on ${ctor.name}`)
+          throw new Error(`Maximum ${entry.max} attachments for '${name}' on ${attachableType}`)
         }
       }
 
@@ -809,10 +808,10 @@ export class ApplicationRecord {
    */
   async detach(name: string, assetId?: number): Promise<void> {
     const ctor = this.constructor as any
+    const attachableType = modelClassName(ctor)
     if (this.isNewRecord || this._attributes.id === undefined || this._attributes.id === null) {
-      throw new Error(`Cannot detach '${name}' on unsaved ${ctor.name} record`)
+      throw new Error(`Cannot detach '${name}' on unsaved ${attachableType} record`)
     }
-    const attachableType = ctor.name
     const attachableId = this._attributes.id
     await _withAttachmentSlotLock(attachableType, attachableId, name, async () => {
       const { Attachment } = await import('./asset.js')
@@ -834,13 +833,13 @@ export class ApplicationRecord {
    */
   async replace(name: string, assetId: number): Promise<void> {
     const ctor = this.constructor as any
+    const attachableType = modelClassName(ctor)
     const { getAttachmentEntryFromClass } = await import('./attachments.js')
     const entry = getAttachmentEntryFromClass(ctor, name)
-    if (!entry) throw new Error(`No attachment '${name}' declared on ${ctor.name}`)
+    if (!entry) throw new Error(`No attachment '${name}' declared on ${attachableType}`)
     if (this.isNewRecord || this._attributes.id === undefined || this._attributes.id === null) {
-      throw new Error(`Cannot replace '${name}' on unsaved ${ctor.name} record`)
+      throw new Error(`Cannot replace '${name}' on unsaved ${attachableType} record`)
     }
-    const attachableType = ctor.name
     const attachableId = this._attributes.id
     
     await _withAttachmentSlotLock(attachableType, attachableId, name, async () => {
@@ -879,10 +878,10 @@ export class ApplicationRecord {
    */
   async reorder(name: string, orderedAssetIds: number[]): Promise<void> {
     const ctor = this.constructor as any
+    const attachableType = modelClassName(ctor)
     if (this.isNewRecord || this._attributes.id === undefined || this._attributes.id === null) {
-      throw new Error(`Cannot reorder '${name}' on unsaved ${ctor.name} record`)
+      throw new Error(`Cannot reorder '${name}' on unsaved ${attachableType} record`)
     }
-    const attachableType = ctor.name
     const attachableId = this._attributes.id
     await _withAttachmentSlotLock(attachableType, attachableId, name, async () => {
       const { Attachment } = await import('./asset.js')
@@ -920,7 +919,7 @@ export class ApplicationRecord {
   // ── Console inspect ──────────────────────────────────────────────────────
 
   [util.inspect.custom](_depth: number, _options: util.InspectOptions): string {
-    const name = this.constructor.name
+    const name = modelClassName(this.constructor)
     const attrs = this.attributes
     const id = attrs['id'] ? `:${attrs['id']}` : ''
     const dirty = this.changedFields()
@@ -965,7 +964,7 @@ function _resolveAssociation(marker: any, prop: string, target: any, ctor: any):
     const ownerType = target._attributes[typeField]
     if (!ownerId || !ownerType) return Promise.resolve(null)
     const PolyTarget = Object.values(MODEL_REGISTRY).find(
-      (m: any) => m.name === ownerType || m._activeDrizzleTableName === ownerType
+      (m: any) => modelClassName(m) === ownerType || m._activeDrizzleTableName === ownerType
     )
     if (!PolyTarget) return Promise.resolve(null)
     return new Relation(PolyTarget).where({ id: ownerId }).first()
@@ -1001,7 +1000,7 @@ function _resolveAssociation(marker: any, prop: string, target: any, ctor: any):
     if (!joinTableObj) return new Relation(TargetModel)
 
     const ownerFk = marker.options?.foreignKey ?? `${_singularize(ctor.tableName)}Id`
-    const targetFk = marker.options?.associationForeignKey ?? `${_singularize(TargetModel._activeDrizzleTableName ?? TargetModel.name.toLowerCase())}Id`
+    const targetFk = marker.options?.associationForeignKey ?? `${_singularize(TargetModel._activeDrizzleTableName ?? modelClassName(TargetModel).toLowerCase())}Id`
 
     const joinOwnerCol = joinTableObj[ownerFk]
     const joinTargetCol = joinTableObj[targetFk]
@@ -1029,7 +1028,7 @@ function _resolveAssociation(marker: any, prop: string, target: any, ctor: any):
       if (!throughTableObj) return new Relation(TargetModel)
 
       const ownerFk = marker.options?.foreignKey ?? `${_singularize(ctor.tableName)}Id`
-      const targetFk = marker.options?.sourceForeignKey ?? `${_singularize(TargetModel._activeDrizzleTableName ?? TargetModel.name.toLowerCase())}Id`
+      const targetFk = marker.options?.sourceForeignKey ?? `${_singularize(TargetModel._activeDrizzleTableName ?? modelClassName(TargetModel).toLowerCase())}Id`
 
       const throughOwnerCol = throughTableObj[ownerFk]
       const throughTargetCol = throughTableObj[targetFk]
@@ -1120,8 +1119,8 @@ function _findModelByMarker(marker: any, prop: string): any {
   const singularCap = singular[0]!.toUpperCase() + singular.slice(1)
 
   return (
-    Object.values(reg).find((m: any) => m.name === capitalized) ??
-    Object.values(reg).find((m: any) => m.name === singularCap) ??
+    Object.values(reg).find((m: any) => modelClassName(m) === capitalized) ??
+    Object.values(reg).find((m: any) => modelClassName(m) === singularCap) ??
     null
   )
 }

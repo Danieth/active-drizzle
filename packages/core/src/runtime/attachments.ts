@@ -9,6 +9,8 @@
  * used at runtime by .attach()/.detach() and at codegen time by the extractor.
  */
 
+import { modelClassName } from './class-name.js'
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface AttachmentOptions {
@@ -158,7 +160,7 @@ export function _wireAttachmentRegistry(registry: Record<string, any>): void {
 
 /** Scans a model class directly (used internally by attach() where the class is already known). */
 export function getAttachmentEntryFromClass(modelClass: any, name: string): AttachmentEntry | undefined {
-  const className: string = modelClass?.name
+  const className = modelClassName(modelClass)
   if (!className) return undefined
   // Check registry first (fast path)
   const registered = ATTACHMENT_REGISTRY.get(className)
