@@ -34,12 +34,21 @@ const FormSubmitContext = createContext<((opts?: { event?: string }) => Promise<
 export interface FieldProps {
   /** absent → view · true → Attr/default edit presenter · string → named override. Never inferred. */
   edit?: boolean | string
-  /** string → named view presenter override. */
-  view?: string
+  /** absent/bare → default view presenter · string → named override. */
+  view?: boolean | string
   label?: string
   help?: string
   /** Passed through to the presenter via overrides — Tailwind/etc. just works. */
   className?: string
+  /**
+   * Field is WAITING on the backend while this predicate holds (a job, an
+   * import, "report generating…"). The presenter renders with
+   * state='waiting' (+ meta.pendingLabel) and its input disables. Pair
+   * with a polling form (`poll: { every, until }`) so the wait resolves.
+   */
+  pendingIf?: (draft: any) => boolean
+  /** Label shown by presenters while pendingIf holds. */
+  pendingLabel?: string
   /** Extra props passed through to the presenter. */
   props?: Record<string, any>
 }
@@ -121,15 +130,21 @@ export interface FormHandleApi<T extends Record<string, any> = Record<string, an
   /** Floating save affordance: saving… / saved ✓ / unsaved / offline / error. */
   SaveStatus: FC<{ className?: string; labels?: Partial<Record<'saving' | 'saved' | 'unsaved' | 'offline' | 'error' | 'conflict' | 'idle', string>> }>
   BaseErrors: FC<{ className?: string }>
+  /** Renders ONLY while the session is in 409 conflict — the render-prop
+   *  receives resolve('reload' | 'overwrite'). Style it however; the
+   *  machinery (withheld token, fresh envelope) is already armed. */
+  Conflict: FC<{ children: (resolve: (mode: 'reload' | 'overwrite') => Promise<boolean>) => ReactNode; className?: string }>
 }
 
 /** Field props narrowed by the field's kind — presenter names are gated. */
 export interface TypedFieldProps<K extends string> {
   edit?: boolean | import('./presenters.js').PresenterNameFor<K>
-  view?: import('./presenters.js').PresenterNameFor<K>
+  view?: boolean | import('./presenters.js').PresenterNameFor<K>
   label?: string
   help?: string
   className?: string
+  pendingIf?: (draft: any) => boolean
+  pendingLabel?: string
   props?: Record<string, any>
 }
 
@@ -373,9 +388,11 @@ export function createFormHandle<T extends Record<string, any>>(
     const dependsOnOthers = Boolean(
       staticMeta.presentIf || staticMeta.requiredIf || staticMeta.lockedIf || staticMeta.copy,
     )
-    const channel = dependsOnOthers ? '*' : dataField
 
     const Field: FC<FieldProps> = (props) => {
+      // pendingIf reads OTHER fields at render time → session-wide channel,
+      // same rule as presentIf/lockedIf (dynamic per call site)
+      const channel = dependsOnOthers || props.pendingIf ? '*' : dataField
       useSyncExternalStore(
         (cb) => session.subscribe(channel, cb),
         () => session.fieldVersion(channel),
@@ -394,7 +411,16 @@ export function createFormHandle<T extends Record<string, any>>(
       }
 
       const rawMeta = fieldMeta[field] ?? {}
-      const meta = resolveCopy(rawMeta, session.draft)
+      let meta = resolveCopy(rawMeta, session.draft)
+
+      // WAITING: the backend owns this field right now (job, import). The
+      // presenter renders with state='waiting' + meta.pendingLabel; input
+      // disables. A throwing predicate degrades to not-waiting.
+      let waiting = false
+      if (typeof props.pendingIf === 'function') {
+        try { waiting = Boolean(props.pendingIf(session.draft)) } catch { waiting = false }
+      }
+      if (props.pendingLabel !== undefined) meta = { ...meta, pendingLabel: props.pendingLabel }
 
       // Visibility: server mask first, then presentIf over the draft (C6:
       // hiding never loses the value — it lives on the draft, not here)
@@ -402,12 +428,15 @@ export function createFormHandle<T extends Record<string, any>>(
       if (typeof meta.presentIf === 'function' && !meta.presentIf(session.draft)) return null
 
       const locked = typeof meta.lockedIf === 'function' && Boolean(meta.lockedIf(session.draft))
+      // Bare `view` (JSX boolean true) means "the DEFAULT view presenter" —
+      // symmetric with bare `edit`; only a STRING names an override
+      const viewOverride = typeof props.view === 'string' ? props.view : undefined
       const resolved = resolvePresenter({
         field,
         kind: meta.kind ?? null,
         meta,
         ...(props.edit !== undefined ? { edit: props.edit } : {}),
-        ...(props.view !== undefined ? { view: props.view } : {}),
+        ...(viewOverride !== undefined ? { view: viewOverride } : {}),
         canEdit: session.canEdit(dataField),
         locked,
       })
@@ -450,7 +479,7 @@ export function createFormHandle<T extends Record<string, any>>(
           session.endComposition(dataField)
           if (commitMoment === 'change') commitViaContext(writeField)
         },
-        disabled: session.getStatus() === 'saving' || session.fieldState(dataField) === 'saving',
+        disabled: waiting || session.getStatus() === 'saving' || session.fieldState(dataField) === 'saving',
       }
 
       const overrides: Record<string, any> = { ...(props.props ?? {}) }
@@ -468,7 +497,9 @@ export function createFormHandle<T extends Record<string, any>>(
           mode={resolved.mode}
           draft={session.draft}
           errors={session.visibleErrors(dataField)}
-          state={session.fieldState(dataField) !== 'ready' ? session.fieldState(dataField) : session.getStatus()}
+          state={waiting ? 'waiting'
+            : session.fieldState(dataField) !== 'ready' ? session.fieldState(dataField)
+            : session.getStatus()}
           dirty={session.fieldDirty(dataField)}
         />
       )
@@ -593,6 +624,21 @@ export function createFormHandle<T extends Record<string, any>>(
   }
   SaveStatusComponent.displayName = 'AdSaveStatus'
 
+  const ConflictComponent: FC<{ children: (resolve: (mode: 'reload' | 'overwrite') => Promise<boolean>) => ReactNode; className?: string }> = ({ children, className }) => {
+    useSyncExternalStore(
+      (cb) => session.subscribe('*', cb),
+      () => session.fieldVersion('*'),
+      () => session.fieldVersion('*'),
+    )
+    if (session.getStatus() !== 'conflict') return null
+    return (
+      <div role="alertdialog" {...(className !== undefined ? { className } : {})}>
+        {children((mode) => session.resolveConflict(mode))}
+      </div>
+    )
+  }
+  ConflictComponent.displayName = 'AdConflict'
+
   const BaseErrorsComponent: FC<{ className?: string }> = ({ className }) => {
     useSyncExternalStore(
       (cb) => session.subscribe('*', cb),
@@ -632,6 +678,7 @@ export function createFormHandle<T extends Record<string, any>>(
         case 'Submit': return SubmitComponent
         case 'SaveStatus': return SaveStatusComponent
         case 'BaseErrors': return BaseErrorsComponent
+        case 'Conflict': return ConflictComponent
         // React/JS runtime probes that must not become field components.
         // Without this, `${handle}` would resolve toString to a Field and
         // invoke a React component as a plain function.

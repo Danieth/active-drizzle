@@ -1,4 +1,4 @@
-import { eq, and, or, inArray, isNull, ilike, desc, asc, sql, type SQL } from 'drizzle-orm'
+import { eq, and, or, inArray, isNull, ilike, desc, asc, gte, lte, gt, lt, ne, sql, type SQL } from 'drizzle-orm'
 import { getExecutor, getSchema, MODEL_REGISTRY, transaction, RecordNotFound } from './boot.js'
 import { modelClassName } from './class-name.js'
 import type { ApplicationRecord } from './application-record.js'
@@ -922,6 +922,17 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
 
       if (Array.isArray(rawVal)) {
         this._where.push(inArray(col, rawVal.map(transform)) as SQL)
+      } else if (_isOperatorObject(rawVal)) {
+        // Range/comparison hash: { amount: { gte: '100', lte: '500' } } —
+        // each bound runs through the SAME Attr codec as equality (money
+        // strings → cents etc.), so filters and forms speak one dialect
+        const OPS: Record<string, (c: any, v: any) => SQL> = { gte, lte, gt, lt, ne } as any
+        for (const [op, bound] of Object.entries(rawVal)) {
+          if (bound === undefined || bound === null || bound === '') continue
+          const fn = OPS[op]
+          if (!fn) throw new Error(`Unknown where operator "${op}" for "${key}" (supported: gte, lte, gt, lt, ne)`)
+          this._where.push(fn(col, transform(bound)))
+        }
       } else {
         this._where.push(eq(col, transform(rawVal)) as SQL)
       }
@@ -986,6 +997,13 @@ function _toDrizzleWith(spec: any): any {
     return { with: w }
   }
   return true
+}
+
+/** { gte/lte/gt/lt/ne } comparison hash — every key must be an operator. */
+function _isOperatorObject(v: any): boolean {
+  if (!v || typeof v !== 'object' || Array.isArray(v) || v instanceof Date) return false
+  const keys = Object.keys(v)
+  return keys.length > 0 && keys.every(k => ['gte', 'lte', 'gt', 'lt', 'ne'].includes(k))
 }
 
 function _isPlainObject(val: unknown): val is Record<string, unknown> {

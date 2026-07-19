@@ -200,6 +200,8 @@ export async function defaultIndex(
   model: any,
   config: CrudConfig,
   params: IndexParams,
+  ctx?: any,
+  ctrl?: any,
 ): Promise<IndexResult> {
   const idx = config.index ?? {}
   let rel = relation
@@ -226,7 +228,7 @@ export async function defaultIndex(
     }
   }
 
-  // 4. Column filters
+  // 4. Column filters (tier 1 — allowlisted, codec-converted)
   const filterableFields = idx.filterable ?? []
   const rawFilters = params.filters ?? {}
   for (const field of filterableFields) {
@@ -235,9 +237,24 @@ export async function defaultIndex(
     const converted = convertFilterValue(model, field, raw)
     rel = rel.where({ [field]: converted })
   }
-  // Reject unknown filter keys
+
+  // 4.2 NAMED filters (tier 2 — product semantics live server-side).
+  // apply() receives the already-scoped relation: narrowing-only by
+  // construction. A falsy value means "filter not engaged" for toggles;
+  // param-shaped filters (ranges etc.) pass their object through.
+  const namedFilters = idx.filters ?? {}
+  for (const [name, def] of Object.entries(namedFilters)) {
+    const value = rawFilters[name]
+    if (value === undefined || value === null || value === false || value === '') continue
+    const applied = def.apply(rel, value, ctx, ctrl)
+    if (applied) rel = applied
+  }
+
+  // Reject undeclared filter keys — never a silent no-op
   for (const key of Object.keys(rawFilters)) {
-    if (!filterableFields.includes(key)) throw new BadRequest(`Cannot filter by '${key}'`)
+    if (!filterableFields.includes(key) && !(key in namedFilters)) {
+      throw new BadRequest(`Cannot filter by '${key}'`)
+    }
   }
 
   // 4.5 Substring search (q ORed across the searchable allowlist).

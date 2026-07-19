@@ -672,6 +672,49 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     }
   }
 
+  // ── Draft parking (navigation survival — DESIGN-cache-coherence §G2) ─────
+
+  /**
+   * The parkable diff, or null when the session is clean (a clean park
+   * CLEARS the slot — self-cleaning after successful submits).
+   */
+  parkableState(): { data: Record<string, any>; baseline: Record<string, any>; version: string | null } | null {
+    const data = this.changedData()
+    if (Object.keys(data).length === 0) return null
+    const baseline: Record<string, any> = {}
+    for (const k of Object.keys(data)) {
+      if (k.endsWith('Attributes')) continue   // nested payloads carry ids/_keys, not baselines
+      baseline[k] = this.baseline[k]
+    }
+    return { data, baseline, version: this.version }
+  }
+
+  /**
+   * Replay a parked diff onto a FRESHLY BUILT session (baseline = the new
+   * envelope). Per flat field, three-way against the STORED baseline:
+   * server unmoved → replay; both converged → skip; server moved → replay
+   * MINE and keep the STALE version token, so the next submit 409s into
+   * the conflict UX — the same withhold rule rehydrate() uses.
+   */
+  restoreParked(parked: { data: Record<string, any>; baseline: Record<string, any>; version: string | null }): void {
+    let conflict = false
+    for (const [k, mine] of Object.entries(parked.data)) {
+      if (k.endsWith('Attributes')) {
+        const name = k.slice(0, -'Attributes'.length)
+        const manager: any = this.nested.get(name)
+        if (manager && typeof manager.restorePayload === 'function') manager.restorePayload(mine)
+        continue
+      }
+      const storedBase = parked.baseline[k]
+      const freshBase = this.baseline[k]
+      if (valueEquals(freshBase, mine)) continue          // converged while away
+      if (!valueEquals(freshBase, storedBase)) conflict = true   // moved under me
+      this.setValue(k, mine)                              // never lose the edit
+    }
+    if (conflict && parked.version != null) this.version = parked.version   // stale on purpose
+    this.notifyAll()
+  }
+
   // ── Optimistic concurrency (409 conflicts) ───────────────────────────────
 
   /** The current lock token (null when the server doesn't version this form). */
@@ -727,6 +770,81 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     this.status = 'ready'
     this.notifyAll()
     return this.submit()
+  }
+
+  /**
+   * REHYDRATE — fold a FRESH same-door envelope into a LIVE, possibly-dirty
+   * session: the three-way merge (DESIGN-cache-coherence §B).
+   *
+   * Per flat field: mine==base → adopt theirs (clean fields track the
+   * server); theirs==base → keep mine (server didn't move); all three
+   * differ → TRUE CONFLICT: keep mine (never eat a keystroke) and WITHHOLD
+   * the fresh version token, so the next submit 409s into the existing
+   * conflict UX — one conflict system. mine==theirs (both arrived at the
+   * same value) settles the baseline silently.
+   *
+   * Nested managers merge by id (their own rehydrate). Ordering guard:
+   * a payload OLDER than the session's known version is ignored entirely
+   * (a slow refetch must never roll back a newer echo).
+   *
+   * Returns true when a conflict was detected (token withheld).
+   */
+  rehydrate(envelope: ServerEnvelope): boolean {
+    // C — monotonicity: version tokens are numeric-comparable by
+    // convention (epoch millis / lock integers)
+    if (envelope.version != null && this.version != null) {
+      const incoming = Number(envelope.version)
+      const known = Number(this.version)
+      if (Number.isFinite(incoming) && Number.isFinite(known) && incoming < known) return false
+    }
+
+    let conflict = false
+    const rec = envelope.record
+    if (rec) {
+      const now = this.snapshotDraft()
+      for (const [k, their] of Object.entries(rec)) {
+        if (this.nested.has(k)) continue
+        const base = this.baseline[k]
+        const mine = now[k]
+        if (valueEquals(mine, base)) {
+          // clean → adopt (accessor-proof, same as applyEnvelope)
+          try {
+            ;(this.draft as any)[k] = their
+          } catch {
+            Object.defineProperty(this.draft, k, { value: their, writable: true, enumerable: true, configurable: true })
+          }
+          this.baseline[k] = their
+        } else if (valueEquals(their, base)) {
+          // server didn't move → my edit stands, baseline stands
+        } else if (valueEquals(their, mine)) {
+          // both converged on the same value → settle silently
+          this.baseline[k] = their
+        } else {
+          conflict = true
+        }
+      }
+      for (const [name, manager] of this.nested) {
+        if (!(name in rec)) continue
+        const m = manager as any
+        if (typeof m.rehydrate === 'function') {
+          if (m.rehydrate((rec as any)[name])) conflict = true
+        } else if (manager.attributesPayload() === null) {
+          manager.syncFromServer((rec as any)[name])
+        }
+      }
+    }
+
+    if (envelope.abilities !== undefined) {
+      this.abilities = envelope.abilities ?? null
+      for (const [name, manager] of this.nested) manager.setLocked(!this.canEditNested(name))
+    }
+    if (envelope.can !== undefined) this.canMap = envelope.can ?? {}
+    // Version adoption ONLY when conflict-free — withholding it is what
+    // guarantees the conflict surfaces (T3): the stale token 409s
+    if (envelope.version !== undefined && !conflict) this.version = envelope.version ?? null
+
+    this.notifyAll()
+    return conflict
   }
 
   /** Fold a server envelope in: new record values, mask, can, version. */

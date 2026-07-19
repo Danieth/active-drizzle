@@ -44,6 +44,29 @@ export interface IndexConfig {
   defaultSort?: { field: string; dir: 'asc' | 'desc' }
   filterable?: string[]
   /**
+   * NAMED filters — product concepts with server-side meaning (Rails-scope-
+   * shaped, presentationally declared). The client only ever sees
+   * { name, label, kind, param shape }; the SEMANTICS live here and can
+   * change without a client redeploy:
+   *
+   *   filters: {
+   *     bigDeals: {
+   *       label: 'Big deals', kind: 'toggle',
+   *       apply: (rel, _on, ctx) => rel.where({ amount: { gte: 50000 } }),
+   *     },
+   *   }
+   *
+   * `apply` receives the ALREADY door-scoped relation — a named filter can
+   * only ever narrow. Allowlisted like everything else: an undeclared
+   * filter key is a BadRequest.
+   */
+  filters?: Record<string, {
+    label?: string
+    /** Presentational kind for the generated widget ('toggle' | 'dateRange' | 'range' | 'text' | …). */
+    kind?: string
+    apply: (rel: any, value: any, ctx?: any, ctrl?: any) => any
+  }>
+  /**
    * Columns the `q` param substring-searches (case-insensitive, ORed):
    *
    *   index: { searchable: ['name', 'email'] }

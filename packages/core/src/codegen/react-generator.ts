@@ -70,6 +70,29 @@ export function generateReactHooks(
     files.push({ filePath: join(outputDir, fileName), content })
   }
 
+  // Cache-coherence edge table — model table -> dependent query-key roots
+  {
+    const invalidates = computeCoherenceEdges(ctrlProject, projectMeta)
+    const lines = [
+      '// AUTO-GENERATED — DO NOT EDIT',
+      '// Cache-coherence edge table (DESIGN-cache-coherence §A): for each',
+      '// mutated MODEL (table name), every query-key family that can be',
+      '// affected — its own doors, doors that EMBED it via includes, and',
+      '// doors downstream of write effects (counterCache/touch/dependent/',
+      '// nested), transitively. Consumed by applyEntityChange.',
+      "import type { CoherenceEdges } from '@active-drizzle/react'",
+      '',
+      'export const coherenceEdges: CoherenceEdges = {',
+      '  invalidates: {',
+      ...Object.entries(invalidates).map(([t, fams]) =>
+        `    ${t}: [${fams.map(f => `'${f}'`).join(', ')}],`),
+      '  },',
+      '}',
+      '',
+    ]
+    files.push({ filePath: join(outputDir, '_coherence.gen.ts'), content: lines.join('\n') })
+  }
+
   // Barrel index — always regenerated
   files.push({
     filePath: join(outputDir, 'index.ts'),
@@ -84,6 +107,122 @@ export function generateReactHooks(
   })
 
   return files
+}
+
+// ── Cache-coherence edge table (DESIGN-cache-coherence §A) ───────────────────
+
+/**
+ * MODEL-keyed invalidation targets: for each table T, the query-key roots
+ * (client keys) of every door that must refetch when a row of T changes.
+ *
+ * Composition: writeSet(T) = {T} ∪ transitive write-effects of mutating T —
+ *   T belongsTo P with `touch`            ⇒ P written
+ *   P hasMany T with `counterCache`       ⇒ P written (create/destroy)
+ *   T hasMany/hasOne C with `dependent`   ⇒ C written (destroy cascade)
+ *   T acceptsNested C                     ⇒ C written (nested payloads)
+ * — then invalidate every door whose model ∈ writeSet OR whose includes
+ * (transitively) reach a table ∈ writeSet.
+ */
+export function computeCoherenceEdges(
+  ctrlProject: CtrlProjectMeta,
+  projectMeta: ProjectMeta | null,
+): Record<string, string[]> {
+  if (!projectMeta) return {}
+  const models = projectMeta.models
+
+  // direct write-effects per table
+  const writes = new Map<string, Set<string>>()
+  const addWrite = (from: string | null | undefined, to: string | null | undefined) => {
+    if (!from || !to || from === to) return
+    if (!writes.has(from)) writes.set(from, new Set())
+    writes.get(from)!.add(to)
+  }
+  const tableOf = (assoc: any): string | null =>
+    (assoc.resolvedTable ?? assoc.explicitTable ?? null)
+  for (const m of models) {
+    for (const a of m.associations) {
+      const target = tableOf(a)
+      if (a.kind === 'belongsTo' && (a.options as any)?.touch) addWrite(m.tableName, target)
+      if (a.kind === 'hasMany' && (a.options as any)?.counterCache) addWrite(target, m.tableName)
+      if ((a.kind === 'hasMany' || a.kind === 'hasOne')
+        && ['destroy', 'delete', 'nullify'].includes(String((a.options as any)?.dependent))) {
+        addWrite(m.tableName, target)
+      }
+      if ((a.kind === 'hasMany' || a.kind === 'hasOne') && a.acceptsNested) addWrite(m.tableName, target)
+    }
+  }
+  // transitive closure of writeSet(T)
+  const writeSet = (t: string): Set<string> => {
+    const out = new Set<string>([t])
+    const stack = [t]
+    while (stack.length) {
+      const cur = stack.pop()!
+      for (const next of writes.get(cur) ?? []) {
+        if (!out.has(next)) { out.add(next); stack.push(next) }
+      }
+    }
+    return out
+  }
+
+  // per-door: the tables its payloads embed (own model + transitive includes)
+  const includeNames = (spec: any[]): string[] => {
+    const names: string[] = []
+    for (const inc of spec) {
+      if (typeof inc === 'string') names.push(inc)
+      else if (inc && typeof inc === 'object') {
+        for (const [k, v] of Object.entries(inc)) {
+          names.push(k)
+          if (Array.isArray(v)) names.push(...includeNames(v))
+        }
+      }
+    }
+    return names
+  }
+  const doorTables = new Map<string, Set<string>>()   // clientKey → tables it serves/embeds
+  for (const ctrl of ctrlProject.controllers) {
+    const model = ctrl.modelClass ? models.find(mm => mm.className === ctrl.modelClass) : null
+    if (!model) continue
+    const key = toKeysResource(ctrl)
+    const tables = doorTables.get(key) ?? new Set<string>()
+    tables.add(model.tableName)
+    // walk include names down the association graph, model by model
+    const walk = (m: ModelMeta, names: string[]) => {
+      for (const name of names) {
+        const assoc = m.associations.find(a => a.propertyName === name)
+        const t = assoc ? tableOf(assoc) : null
+        if (!t) continue
+        tables.add(t)
+      }
+    }
+    const spec = [
+      ...((ctrl.crudConfig?.get?.include as any[]) ?? []),
+      ...((ctrl.crudConfig?.index?.include as any[]) ?? []),
+    ]
+    walk(model, includeNames(spec))
+    // grandchildren: nested include specs already flattened by includeNames;
+    // resolve them against the CHILD models too (best effort by name)
+    for (const name of includeNames(spec)) {
+      for (const cm of models) {
+        const assoc = cm.associations.find(a => a.propertyName === name)
+        const t = assoc ? tableOf(assoc) : null
+        if (t) tables.add(t)
+      }
+    }
+    doorTables.set(key, tables)
+  }
+
+  // invert: table T changed → doors embedding anything in writeSet(T)
+  const invalidates: Record<string, string[]> = {}
+  const allTables = new Set(models.map(m => m.tableName))
+  for (const t of allTables) {
+    const ws = writeSet(t)
+    const targets = new Set<string>()
+    for (const [door, tables] of doorTables) {
+      for (const w of ws) if (tables.has(w)) { targets.add(door); break }
+    }
+    if (targets.size) invalidates[t] = [...targets].sort()
+  }
+  return invalidates
 }
 
 // ── Per-controller file ───────────────────────────────────────────────────────
@@ -137,7 +276,9 @@ function generateControllerFile(
   const rqImports: string[] = []
   if (needsQuery) rqImports.push('useQuery', 'useInfiniteQuery')
   if (needsMutation) rqImports.push('useMutation')
-  if (envelopeEnabled) rqImports.push('useQueryClient')
+  // Coherence fan-out needs the query client wherever mutations exist
+  if (envelopeEnabled || (needsMutation && model)) rqImports.push('useQueryClient')
+  const needsCoherence = Boolean(model) && (needsMutation || envelopeEnabled)
 
   if (rqImports.length) {
     L.push(`import { ${[...new Set(rqImports)].join(', ')} } from '@tanstack/react-query'`)
@@ -178,12 +319,19 @@ function generateControllerFile(
     if (envelopeEnabled) {
       adImports.push('useGeneratedForm', 'parseControllerError')
       adTypeImports.push('FormHandleApi', 'TypedFieldComponent', 'SubmitResult')
+      // Index surface (unscoped controllers): compound components need the
+      // factory + a per-row view session
+      if (ctrl.scopes.length === 0) {
+        adImports.push('createIndexSurface', 'FormSession', 'createFormHandle')
+      }
       // Nested form members type through their handle interfaces
       for (const t of new Set(nestedHandleMembers.map(m => m.handleType))) adTypeImports.push(t)
     }
     if (needsValidates) adImports.push('Validates')
+    if (needsCoherence) adImports.push('applyEntityChange')
     L.push(`import { ${adImports.join(', ')} } from '@active-drizzle/react'`)
     L.push(`import type { ${adTypeImports.join(', ')} } from '@active-drizzle/react'`)
+    if (needsCoherence) L.push(`import { coherenceEdges } from './_coherence.gen'`)
   }
 
   if (ctrl.attachable) {
@@ -592,7 +740,7 @@ function generateControllerFile(
     // Cache keys
     const scopeFields = ctrl.scopes.map(s => s.field)
     const scopeType   = scopeType_fromFields(scopeFields)
-    const resourceName = ctrl.basePath.split('/').pop()?.replace(/:[^/]*/g, '').replace(/\/+$/, '')
+    const resourceName = toKeysResource(ctrl)
       ?? pluralize(lcFirst(ctrl.modelClass!))
     L.push(`export const ${lcFirst(ctrl.modelClass!)}Keys = modelCacheKeys<${scopeType}>('${resourceName}')`)
     L.push('')
@@ -639,7 +787,7 @@ function generateControllerFile(
   // reference the SAME functions; prefer the use* names in new code.
   L.push(`  use: (${scopeParam}) => {`)
   L.push(`    const h = {`)
-  emitUse(L, ctrl, clientKey)
+  emitUse(L, ctrl, clientKey, model?.tableName ?? null)
   L.push(`    }`)
   L.push(`    const aliases = Object.fromEntries(`)
   L.push(`      Object.entries(h).map(([k, v]) => ['use' + k[0]!.toUpperCase() + k.slice(1), v]),`)
@@ -699,10 +847,17 @@ function toBulkMutateName(methodName: string): string {
 
 // ── .use() body ───────────────────────────────────────────────────────────────
 
-function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string): void {
+function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string, tableName: string | null = null): void {
   const modelName   = ctrl.modelClass
   const scopeSpread = ctrl.scopes.length > 0 ? '...scopes, ' : ''
   const keysRef     = modelName ? `${lcFirst(modelName)}Keys` : null
+  // Coherence fan-out on success — every door embedding this model (or a
+  // write-effect downstream of it) refetches; live forms absorb via rehydrate
+  const cohere = (op: string) => tableName
+    ? `, onSuccess: () => applyEntityChange(qc, coherenceEdges, { resource: '${tableName}', op: '${op}' })`
+    : ''
+  const qcOpen  = tableName ? `{ const qc = useQueryClient(); return ` : ''
+  const qcClose = tableName ? ` }` : ''
 
   if (ctrl.kind === 'crud' && modelName) {
     L.push(`    /** Paginated list. Pass search state from use${modelName}Search(). */`)
@@ -723,24 +878,25 @@ function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string): void {
     L.push(`      queryFn:  () => client.${clientKey}.get({ ${scopeSpread}id }),`)
     L.push(`      enabled:  id != null,`)
     L.push(`    }),`)
-    // Standard CRUD mutations — prefixed with 'mutate'
-    L.push(`    mutateCreate:  () => useMutation({ mutationFn: (data: ${modelName}Write) => client.${clientKey}.create({ ${scopeSpread}data }) }),`)
-    L.push(`    mutateUpdate:  () => useMutation({ mutationFn: ({ id, ...data }: { id: number | string } & Partial<${modelName}Write>) => client.${clientKey}.update({ ${scopeSpread}id, data }) }),`)
-    L.push(`    mutateDestroy: () => useMutation({ mutationFn: (id: number | string) => client.${clientKey}.destroy({ ${scopeSpread}id }) }),`)
+    // Standard CRUD mutations — prefixed with 'mutate'. Success routes
+    // through the coherence edge table so EVERY dependent surface refetches
+    L.push(`    mutateCreate:  () => ${qcOpen}useMutation({ mutationFn: (data: ${modelName}Write) => client.${clientKey}.create({ ${scopeSpread}data })${cohere('create')} })${qcClose},`)
+    L.push(`    mutateUpdate:  () => ${qcOpen}useMutation({ mutationFn: ({ id, ...data }: { id: number | string } & Partial<${modelName}Write>) => client.${clientKey}.update({ ${scopeSpread}id, data })${cohere('update')} })${qcClose},`)
+    L.push(`    mutateDestroy: () => ${qcOpen}useMutation({ mutationFn: (id: number | string) => client.${clientKey}.destroy({ ${scopeSpread}id })${cohere('destroy')} })${qcClose},`)
   }
 
   if (ctrl.kind === 'singleton' && modelName) {
     L.push(`    get:          () => useQuery({ queryKey: ${keysRef}!.singleton(scopes), queryFn: () => client.${clientKey}.get({ ${scopeSpread} }) }),`)
-    L.push(`    mutateUpdate: () => useMutation({ mutationFn: (data: ${modelName}Write) => client.${clientKey}.update({ ${scopeSpread}data }) }),`)
+    L.push(`    mutateUpdate: () => ${qcOpen}useMutation({ mutationFn: (data: ${modelName}Write) => client.${clientKey}.update({ ${scopeSpread}data })${cohere('update')} })${qcClose},`)
   }
 
   // @mutation
   for (const mut of ctrl.mutations) {
     const hookName = mut.bulk ? toBulkMutateName(mut.method) : toMutateName(mut.method)
     if (mut.bulk) {
-      L.push(`    ${hookName}: () => useMutation({ mutationFn: (ids: (number | string)[]) => client.${clientKey}.${mut.method}({ ${scopeSpread}ids }) }),`)
+      L.push(`    ${hookName}: () => ${qcOpen}useMutation({ mutationFn: (ids: (number | string)[]) => client.${clientKey}.${mut.method}({ ${scopeSpread}ids })${cohere('update')} })${qcClose},`)
     } else {
-      L.push(`    ${hookName}: () => useMutation({ mutationFn: (id: number | string) => client.${clientKey}.${mut.method}({ ${scopeSpread}id }) }),`)
+      L.push(`    ${hookName}: () => ${qcOpen}useMutation({ mutationFn: (id: number | string) => client.${clientKey}.${mut.method}({ ${scopeSpread}id })${cohere('update')} })${qcClose},`)
     }
   }
 
@@ -1124,12 +1280,19 @@ function emitFormHooks(
   // fires these optimistically when the parent row is already persisted.
   const transportsName = `_${lcFirst(modelName)}NestedTransports`
   if (instantResources.size > 0) {
+    // Module-scope query-client ref — the form hooks stamp it on render so
+    // instant nested writes (which run outside hook context) still fan
+    // coherence invalidation to every dependent surface
+    L.push(`let _adQc: ReturnType<typeof useQueryClient> | null = null`)
+    L.push(`const _adCohere = (resource: string, op: 'create' | 'update' | 'destroy') => {`)
+    L.push(`  if (_adQc) applyEntityChange(_adQc, coherenceEdges, { resource, op })`)
+    L.push(`}`)
     L.push(`const ${transportsName} = {`)
     for (const resource of instantResources) {
       L.push(`  ${resource}: {`)
-      L.push(`    create: (data: any) => client.${resource}.create({ data }).then((row: any) => ({ ok: true, row })).catch(() => ({ ok: false })),`)
-      L.push(`    update: (id: any, data: any) => client.${resource}.update({ id, data }).then((row: any) => ({ ok: true, row })).catch(() => ({ ok: false })),`)
-      L.push(`    destroy: (id: any) => client.${resource}.destroy({ id }).then(() => ({ ok: true })).catch(() => ({ ok: false })),`)
+      L.push(`    create: (data: any) => client.${resource}.create({ data }).then((row: any) => { _adCohere('${resource}', 'create'); return { ok: true, row } }).catch(() => ({ ok: false })),`)
+      L.push(`    update: (id: any, data: any) => client.${resource}.update({ id, data }).then((row: any) => { _adCohere('${resource}', 'update'); return { ok: true, row } }).catch(() => ({ ok: false })),`)
+      L.push(`    destroy: (id: any) => client.${resource}.destroy({ id }).then(() => { _adCohere('${resource}', 'destroy'); return { ok: true } }).catch(() => ({ ok: false })),`)
       L.push(`  },`)
     }
     L.push(`}`)
@@ -1139,18 +1302,25 @@ function emitFormHooks(
 
   // Generated hooks are THIN wiring — identity keying, refetch rehydration,
   // and StrictMode safety live in useGeneratedForm (tested in the package)
-  L.push(`/** Envelope-wired edit form. Session is keyed by id: navigating between records rebuilds; refetches rehydrate a CLEAN draft (dirty edits are never clobbered). */`)
-  L.push(`export function use${modelName}EditForm(id: number${scopesParam}): { status: 'loading' | 'error' | 'ready'; form: ${modelName}FormHandle | null } {`)
+  L.push(`/** Envelope-wired edit form. Session is keyed by id: navigating between records rebuilds; refetches THREE-WAY MERGE into the live draft (clean fields adopt, dirty fields survive, true conflicts route to the 409 story). \`poll\` refetches every N ms until \`until(record)\` is satisfied — pair with a field's pendingIf for backend-job fields. */`)
+  L.push(`export function use${modelName}EditForm(id: number${scopesParam}, opts?: { poll?: { every: number; until?: (record: any) => boolean } }): { status: 'loading' | 'error' | 'ready'; form: ${modelName}FormHandle | null } {`)
   L.push(`  const qc = useQueryClient()`)
+  if (instantResources.size > 0) L.push(`  _adQc = qc`)
   L.push(`  const _scopes = ${scopesArg}`)
   L.push(`  const query = useQuery({`)
   L.push(`    queryKey: ${keysName}.detail(id, _scopes as any),`)
   L.push(`    queryFn: () => client.${clientKey}.get({ ${scopeSpread}id }),`)
+  L.push(`    ...(opts?.poll ? { refetchInterval: (q: any) => {`)
+  L.push(`      const d: any = q.state.data`)
+  L.push(`      const rec = d && typeof d === 'object' && 'record' in d ? d.record : d`)
+  L.push(`      return opts.poll!.until && rec && opts.poll!.until(rec) ? false : opts.poll!.every`)
+  L.push(`    } } : {}),`)
   L.push(`  })`)
   L.push(`  const { form } = useGeneratedForm<${modelName}Client>({`)
   L.push(`    formKey: id,`)
   L.push(`    mode: 'edit',`)
   L.push(`    data: query.data ?? null,`)
+  L.push(`    draftKey: \`${clientKey}:\${id}\`,`)
   L.push(`    makeDraft: (r) => new ${modelName}Client(r),`)
   L.push(`    fieldMeta: (${modelName}Client as any).fieldMeta ?? {},`)
   if (transportsLine) L.push(transportsLine)
@@ -1158,7 +1328,7 @@ function emitFormHooks(
   L.push(`      try {`)
   L.push(`        // _event / _version are protocol keys, not fields — the controller peels them off`)
   L.push(`        const res: any = await client.${clientKey}.update({ ${scopeSpread}id, data: { ...data, ...(_event ? { _event } : {}), ...(_version != null ? { _version } : {}) } })`)
-  L.push(`        qc.invalidateQueries({ queryKey: ${keysName}.root(_scopes as any) })`)
+  L.push(`        applyEntityChange(qc, coherenceEdges, { resource: '${model.tableName}', op: 'update' })`)
   L.push(`        // Envelope responses always flow through so abilities/can re-mask`)
   L.push(`        return { ok: true, ...(res && typeof res === 'object' && 'record' in res ? { envelope: res } : {}) }`)
   L.push(`      } catch (e) { return _${lcFirst(modelName)}SubmitResult(e) }`)
@@ -1180,12 +1350,14 @@ function emitFormHooks(
   L.push(` */`)
   L.push(`export function use${modelName}NewForm(${hasScopes ? `scopes: ${scopeType}` : ''}): { status: 'ready'; form: ${modelName}FormHandle } {`)
   L.push(`  const qc = useQueryClient()`)
+  if (instantResources.size > 0) L.push(`  _adQc = qc`)
   L.push(`  const _scopes = ${scopesArg}`)
   L.push(`  const createdId = useRef<number | string | null>(null)`)
   L.push(`  const { form } = useGeneratedForm<${modelName}Client>({`)
   L.push(`    formKey: 'new',`)
   L.push(`    mode: 'new',`)
   L.push(`    data: null,`)
+  L.push(`    draftKey: '${clientKey}:new',`)
   L.push(`    makeDraft: (r) => new ${modelName}Client(r),`)
   L.push(`    fieldMeta: (${modelName}Client as any).fieldMeta ?? {},`)
   if (transportsLine) L.push(transportsLine)
@@ -1198,7 +1370,7 @@ function emitFormHooks(
   L.push(`          const rid = res && typeof res === 'object' ? ('record' in res ? res.record?.id : res.id) : null`)
   L.push(`          if (rid != null) createdId.current = rid`)
   L.push(`        }`)
-  L.push(`        qc.invalidateQueries({ queryKey: ${keysName}.root(_scopes as any) })`)
+  L.push(`        applyEntityChange(qc, coherenceEdges, { resource: '${model.tableName}', op: 'update' })`)
   L.push(`        return { ok: true, ...(res && typeof res === 'object' && 'record' in res ? { envelope: res } : {}) }`)
   L.push(`      } catch (e) { return _${lcFirst(modelName)}SubmitResult(e) }`)
   L.push(`    },`)
@@ -1206,6 +1378,49 @@ function emitFormHooks(
   L.push(`  return { status: 'ready', form: form as unknown as ${modelName}FormHandle }`)
   L.push(`}`)
   L.push('')
+
+  // ── Compound index surface (unscoped controllers) ───────────────────────
+  // <Deals.Index><Deals.Search/><Deals.Filters/><Deals.Items>{d => ...}
+  // The head is a component: no visible hooks. Filters/search/sort render
+  // from the DECLARED index config; the server allowlists everything.
+  if (ctrl.scopes.length === 0) {
+    const idx = ctrl.crudConfig?.index ?? {}
+    const filterMetaParts: string[] = []
+    for (const f of (idx as any).filterable ?? []) {
+      const kind = fieldKind(f, model, colTypes)
+      const label = JSON.stringify((model.fieldMeta as any)?.[f]?.label ?? capitalize(String(f).replace(/([A-Z])/g, ' $1')))
+      const enumDef = model.enums.find(e => e.propertyName === f)
+      const stateDef = (model.states ?? []).find(s => s.propertyName === f)
+      const labels = enumDef ? Object.keys(enumDef.values) : stateDef ? Object.keys(stateDef.values) : null
+      if (labels) {
+        filterMetaParts.push(`${f}: { kind: 'facet', label: ${label}, options: [${labels.map(l => `'${l}'`).join(', ')}] }`)
+      } else if (kind === 'boolean') {
+        filterMetaParts.push(`${f}: { kind: 'toggle', label: ${label} }`)
+      } else {
+        filterMetaParts.push(`${f}: { kind: 'text', label: ${label} }`)
+      }
+    }
+    const surfaceName = pluralize(modelName)
+    L.push(`/** Compound index surface — the beheaded list page: <${surfaceName}.Index><${surfaceName}.Search/><${surfaceName}.Filters/><${surfaceName}.Items>{(${lcFirst(modelName)}) => ...}</${surfaceName}.Items><${surfaceName}.Pagination/></${surfaceName}.Index>, plus <${surfaceName}.One id={...}>{form => ...} as the context-headed edit form. */`)
+    L.push(`export const ${surfaceName} = createIndexSurface({`)
+    L.push(`  meta: {`)
+    if ((idx as any).sortable?.length) L.push(`    sortable: [${((idx as any).sortable as string[]).map(s => `'${s}'`).join(', ')}],`)
+    if ((idx as any).defaultSort) L.push(`    defaultSort: { field: '${(idx as any).defaultSort.field}', dir: '${(idx as any).defaultSort.dir}' },`)
+    L.push(`    searchable: ${Boolean((idx as any).searchable?.length)},`)
+    if (filterMetaParts.length) L.push(`    filters: { ${filterMetaParts.join(', ')} },`)
+    L.push(`  },`)
+    L.push(`  useIndexQuery: (params) => useQuery({`)
+    L.push(`    queryKey: ${keysName}.list({} as Record<string, never>, params as any),`)
+    L.push(`    queryFn: () => client.${clientKey}.index(params as any),`)
+    L.push(`  }),`)
+    L.push(`  makeRowHandle: (row) => createFormHandle(`)
+    L.push(`    new FormSession({ draft: new ${modelName}Client(row), mode: 'edit', abilities: null }),`)
+    L.push(`    { fieldMeta: (${modelName}Client as any).fieldMeta ?? {} },`)
+    L.push(`  ),`)
+    L.push(`  useEditForm: use${modelName}EditForm,`)
+    L.push(`})`)
+    L.push('')
+  }
 }
 
 /**
@@ -1253,6 +1468,11 @@ function controllerProjectionFields(
  * CampaignController → client.campaigns
  * TeamSettingsController → client.teamSettings
  */
+/** The query-key ROOT for a controller — must match the modelCacheKeys emission. */
+function toKeysResource(ctrl: CtrlMeta): string {
+  return ctrl.basePath.split('/').pop()?.replace(/:[^/]*/g, '').replace(/\/+$/, '') ?? toClientKey(ctrl)
+}
+
 function toClientKey(ctrl: CtrlMeta): string {
   const base = ctrl.className.replace(/Controller$/, '')
   if (ctrl.kind === 'crud' && ctrl.modelClass) {

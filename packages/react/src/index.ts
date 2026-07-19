@@ -62,6 +62,17 @@ export {
 export { NestedArrayManager, NestedOneManager, type NestedChild, type NestedTransport } from './nested.js'
 export { useForm, useEditForm, useNewForm, type UseFormOptions } from './use-form.js'
 export { useGeneratedForm, type UseGeneratedFormOptions } from './generated-form.js'
+export { DraftStore, defaultDraftStore, type ParkedDraft } from './draft-store.js'
+export { applyEntityChange, type CoherenceEdges, type EntityChange, type QueryClientLike } from './coherence.js'
+export {
+  createIndexSurface,
+  IndexSession,
+  type IndexSurface,
+  type IndexSurfaceConfig,
+  type IndexMeta,
+  type IndexFilterMeta,
+  type IndexState,
+} from './index-surface.js'
 
 // Error utilities
 export {

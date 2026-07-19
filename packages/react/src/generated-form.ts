@@ -20,6 +20,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { FormSession, type ServerEnvelope, type SubmitPayload, type SubmitResult } from './form-session.js'
 import { createFormHandle, type FormHandle } from './form-handle.js'
+import { defaultDraftStore } from './draft-store.js'
 
 export interface UseGeneratedFormOptions<T extends Record<string, any>> {
   /** Identity — the session rebuilds when this changes (record id, or 'new'). */
@@ -34,6 +35,13 @@ export interface UseGeneratedFormOptions<T extends Record<string, any>> {
   validate?: (draft: T) => Record<string, string[]>
   /** Instant nested transports keyed by child resource (for instant nested writes). */
   nestedTransports?: Record<string, import('./nested.js').NestedTransport>
+  /**
+   * Draft parking key ("resource:id"). When set, unsaved edits PARK on
+   * unmount and RESTORE (three-way, conflict-aware) on the next mount of
+   * the same key — navigation stops eating drafts. Cleared automatically
+   * when the form leaves clean. Pass nothing to disable.
+   */
+  draftKey?: string
 }
 
 /** Normalize a payload into envelope shape. */
@@ -73,19 +81,36 @@ export function useGeneratedForm<T extends Record<string, any>>(
       ...(opts.fieldMeta ? { fieldMeta: opts.fieldMeta } : {}),
       ...(opts.nestedTransports ? { nestedTransports: opts.nestedTransports } : {}),
     })
+    // Parked draft from a previous visit? Replay it (three-way vs the
+    // fresh baseline; a moved field keeps the stale token → 409 later)
+    if (opts.draftKey) {
+      const parked = defaultDraftStore.take(opts.draftKey)
+      if (parked) session.restoreParked(parked)
+    }
     active = { key: opts.formKey, session, handle }
     appliedRef.current = opts.data
     setBuilt(active)
   }
 
-  // Rehydrate the SAME key on fresh payloads — but never clobber unsaved edits
+  // Park on unmount / key change — a CLEAN session clears the slot
+  const draftKey = opts.draftKey
+  useEffect(() => {
+    if (!active || !draftKey) return
+    const session = active.session
+    return () => { defaultDraftStore.park(draftKey, session.parkableState()) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, draftKey])
+
+  // Rehydrate the SAME key on fresh payloads — the three-way merge: clean
+  // fields adopt the server, dirty fields survive, true conflicts withhold
+  // the version token so the next save 409s into the conflict UX. This
+  // replaced the old all-or-nothing isDirty() gate (which ignored refetches
+  // entirely while ANY field was dirty).
   useEffect(() => {
     if (!active || opts.data == null || active.key !== opts.formKey) return
     if (appliedRef.current === opts.data) return
     appliedRef.current = opts.data
-    if (!active.session.isDirty()) {
-      active.session.applyEnvelope(asEnvelope(opts.data))
-    }
+    active.session.rehydrate(asEnvelope(opts.data))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, opts.data, opts.formKey])
 

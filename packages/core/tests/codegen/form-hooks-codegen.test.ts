@@ -85,14 +85,15 @@ describe('typed form handle emission', () => {
 
   it('wires useEditForm through useGeneratedForm: id-keyed, envelope-fed, _event passthrough', () => {
     const out = generate()
-    expect(out).toContain('export function useLoanEditForm(id: number)')
+    expect(out).toContain('export function useLoanEditForm(id: number, opts?: { poll?:')
     expect(out).toContain('useGeneratedForm<LoanClient>({')
     expect(out).toContain('formKey: id,')
     expect(out).toContain('data: query.data ?? null,')
     expect(out).toContain('makeDraft: (r) => new LoanClient(r),')
     // _event and _version (optimistic lock echo) both ride the PATCH as protocol keys
     expect(out).toContain(`data: { ...data, ...(_event ? { _event } : {}), ...(_version != null ? { _version } : {}) }`)
-    expect(out).toContain('qc.invalidateQueries')
+    // success fans out through the coherence edge table, not a bare root invalidation
+    expect(out).toContain("applyEntityChange(qc, coherenceEdges, { resource: 'loans', op: 'update' })")
     expect(out).toContain(`fieldMeta: (LoanClient as any).fieldMeta`)
     // envelope-shaped responses ALWAYS flow through (abilities re-mask)
     expect(out).toContain(`'record' in res ? { envelope: res }`)

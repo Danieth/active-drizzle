@@ -393,6 +393,83 @@ export class NestedArrayManager {
   }
 
   /**
+   * Replay a PARKED `<name>Attributes` payload (DraftStore restore) —
+   * staging only, NEVER the instant transport (the park captured staged
+   * intent; restoring must not fire network writes):
+   *   { id, ...fields }      → set fields on the matching child
+   *   { id, _destroy: true } → re-mark the destroy
+   *   { _key, ...fields }    → re-create the new row (fresh key)
+   */
+  restorePayload(items: any): void {
+    if (!Array.isArray(items)) return
+    for (const item of items) {
+      if (!item || typeof item !== 'object') continue
+      const { id, _destroy, _key, ...fields } = item
+      if (id != null) {
+        const child = this.children.find(c => !c.isNew && (c.session.draft as any).id === id)
+        if (!child) continue
+        if (_destroy === true) { if (this.allowDestroy) child.destroyed = true; continue }
+        for (const [k, v] of Object.entries(fields)) child.session.setValue(k, v)
+      } else if (!_destroy) {
+        this.children.push({
+          key: `new:${++this.seq}`,
+          session: this.makeChildSession({ ...fields }, true),
+          isNew: true,
+          destroyed: false,
+        })
+      }
+    }
+    this.parent.notifyExternal(this.name)
+  }
+
+  /**
+   * REHYDRATE — merge a fresh same-door row set into live (possibly dirty)
+   * children BY ID (DESIGN-cache-coherence §B). Per row:
+   *   in both            → recurse into the child session's three-way merge
+   *   only incoming      → appeared elsewhere → insert
+   *   only local, persisted, CLEAN  → deleted elsewhere → drop
+   *   only local, persisted, DIRTY  → structural conflict (keep, report)
+   *   local new rows / destroy-marked rows → keep as-is (mine to settle)
+   * Returns true when any child (or structure) conflicted.
+   */
+  rehydrate(rows: any): boolean {
+    if (!Array.isArray(rows)) return false
+    let conflict = false
+    const incomingById = new Map<any, any>()
+    for (const r of rows) if (r?.id != null) incomingById.set(r.id, r)
+
+    const next: NestedChild[] = []
+    for (const child of this.children) {
+      const draft: any = child.session.draft
+      if (child.isNew) { next.push(child); continue }          // mine, unsettled
+      const incoming = incomingById.get(draft.id)
+      incomingById.delete(draft.id)
+      if (child.destroyed) { next.push(child); continue }      // my destroy still staged
+      if (incoming) {
+        if (child.session.rehydrate({ record: incoming })) conflict = true
+        next.push(child)
+      } else {
+        // gone from the server: clean rows drop; dirty rows are a conflict
+        const dirty = Object.keys(child.session.changedData()).length > 0
+        if (dirty) { conflict = true; next.push(child) }
+        // clean → omit (deleted elsewhere)
+      }
+    }
+    // Rows that appeared elsewhere
+    for (const row of incomingById.values()) {
+      next.push({
+        key: `id:${row.id}`,
+        session: this.makeChildSession({ ...row }, false),
+        isNew: false,
+        destroyed: false,
+      })
+    }
+    this.children = next
+    this.parent.notifyExternal(this.name)
+    return conflict
+  }
+
+  /**
    * Server truth arrived outside the submit path (refetch/rehydrate) and the
    * caller verified no local edits are pending — rebuild the rows to match.
    * Sessions for rows that still exist are REUSED (touched state, React
@@ -596,6 +673,51 @@ export class NestedOneManager {
     this.child.session.settleNested(row)
     this.child.session.resetBaseline()
     this.parent.notifyExternal(this.name)
+  }
+
+  /** Replay a PARKED singular payload — staging only, mirror of the array manager's. */
+  restorePayload(item: any): void {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return
+    const { id, _destroy, _key, ...fields } = item
+    if (id != null) {
+      if (!this.child || this.child.isNew || (this.child.session.draft as any).id !== id) return
+      if (_destroy === true) { if (this.allowDestroy) this.child.destroyed = true }
+      else for (const [k, v] of Object.entries(fields)) this.child.session.setValue(k, v)
+    } else if (!_destroy && !this.child) {
+      this.child = this.makeChild({ ...fields }, true)
+    }
+    this.parent.notifyExternal(this.name)
+  }
+
+  /**
+   * REHYDRATE — the singular merge (DESIGN-cache-coherence §B, arity one).
+   * Same table as the array manager: recurse into a matching live child,
+   * insert an appeared-elsewhere child, drop a clean deleted-elsewhere
+   * child, flag a dirty one. Returns true on conflict.
+   */
+  rehydrate(row: any): boolean {
+    if (Array.isArray(row)) return false
+    const incoming = row && typeof row === 'object' ? row : null
+    if (!this.child) {
+      if (incoming) {
+        this.child = this.makeChild({ ...incoming }, incoming.id == null)
+        this.parent.notifyExternal(this.name)
+      }
+      return false
+    }
+    if (this.child.isNew || this.child.destroyed) return false   // mine to settle
+    const draft: any = this.child.session.draft
+    if (incoming && incoming.id === draft.id) {
+      const conflict = this.child.session.rehydrate({ record: incoming })
+      this.parent.notifyExternal(this.name)
+      return conflict
+    }
+    // gone (or replaced) elsewhere
+    const dirty = Object.keys(this.child.session.changedData()).length > 0
+    if (dirty) return true
+    this.child = incoming ? this.makeChild({ ...incoming }, incoming.id == null) : null
+    this.parent.notifyExternal(this.name)
+    return false
   }
 
   /**

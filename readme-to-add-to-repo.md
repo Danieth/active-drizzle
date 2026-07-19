@@ -332,3 +332,59 @@ A batch of DX fixes so a fresh project typechecks out of the box:
   that can't exist statically (`CommentableClient`).
 - `ClientModel` takes `Partial<TAttrs>` (drafts are sparse by nature) and
   declares `id?` (a new-form draft genuinely has none).
+
+---
+
+## Live forms — the cache-coherence stack (built)
+
+Mutate a record from ANY surface; every other surface — including live,
+half-edited forms — gets fresh without losing a keystroke:
+
+- **The edge table** (`_coherence.gen.ts`): codegen composes the include
+  graph with the write-effect graph (counterCache/touch/dependent/nested,
+  transitively), so a proposal mutation that touches its loan invalidates
+  the doors that embed LOANS too. Every generated mutation fans out
+  through one `applyEntityChange` call — WebSocket-ready by construction
+  (signals feed the same entry point).
+- **rehydrate()**: refetches three-way-merge into live forms — clean
+  fields adopt, dirty fields survive, true conflicts withhold the version
+  token so the next save 409s into the conflict UX. Nested children merge
+  by id.
+- **`<handle.Conflict>{resolve => ...}`** — renders only during a 409;
+  wire "Take theirs"/"Keep mine" to `resolve('reload'|'overwrite')`.
+- **Draft parking**: navigate away mid-edit and back — unsaved diffs park
+  (LRU/TTL, cleared on save) and restore through the same merge; a field
+  the server moved meanwhile conflicts honestly instead of silently.
+- **poll + pendingIf**: `useDealEditForm(id, { poll: { every: 3000,
+  until: d => d.reportStatus === 'ready' } })` +
+  `<deal.reportUrl view pendingIf={d => d.reportStatus !== 'ready'}
+  pendingLabel="Generating…"/>` for backend-job fields.
+
+## The index surface (built)
+
+```tsx
+<Deals.Index>                       {/* the head is a component — no hooks */}
+  <Deals.Search />                  {/* from index.searchable */}
+  <Deals.Filters />                 {/* tier-1: enum→facet chips, boolean→toggle */}
+  <Deals.Items>{(deal, row) => <deal.name view />}</Deals.Items>
+  <Deals.Pagination />
+</Deals.Index>
+<Deals.One id={5}>{form => <form.Form>…</form.Form>}</Deals.One>
+```
+
+Declared server-side, allowlisted, codec-normalized, narrowing-only.
+Tier-2 NAMED filters keep product semantics on the server:
+
+```ts
+index: {
+  filterable: ['stage', 'priority', 'isFeatured'],
+  filters: { bigDeals: { label: 'Big deals', kind: 'toggle',
+    apply: (rel) => rel.where({ amount: { gte: 20_000 } }) } },
+}
+```
+
+(Range `where` hashes — `{ gte, lte, gt, lt, ne }` — now work everywhere,
+with bounds running through the Attr codecs.) Drive named filters from any
+widget via `Deals.use().session.setFilter('bigDeals', true)` — change what
+"big" means in the controller, no client redeploy. Individual placement:
+`<Deals.Filters.stage/>`. The raw hooks stay exported underneath.

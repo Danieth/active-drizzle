@@ -181,7 +181,7 @@ export function buildRouter<TContext = Record<string, any>>(
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'index',
         async (ctrl) => {
           if (typeof ctrl.index === 'function') return ctrl.index()
-          return defaultIndex(ctrl.relation, model, config, input as any)
+          return defaultIndex(ctrl.relation, model, config, input as any, context, ctrl)
         },
         undefined,
         config.scopeBy,
