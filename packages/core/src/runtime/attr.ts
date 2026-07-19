@@ -1,4 +1,5 @@
-import type { AttrConfig } from './application-record.js'
+import type { AttrConfig, EncryptOptions } from './application-record.js'
+import { encryptValue, decryptValue } from './encryption.js'
 import {
   decimalToScaledBigInt,
   numberToDecimalString,
@@ -355,7 +356,7 @@ function typedArrayAttr(scalar: AttrConfig, config: Partial<Omit<AttrConfig, '_i
  *   static metadata = Attr.json<{ tags: string[] }>()
  *   static price    = Attr.new({ get: v => v / 100, set: v => Math.round(v * 100) })
  */
-export const Attr = {
+const _AttrImpl = {
   /**
    * Maps an integer/smallint column ↔ descriptive string labels.
    * Powers is<Label>() predicates and to<Label>() bang setters on instances.
@@ -1000,3 +1001,73 @@ export const Attr = {
     }
   },
 } as const
+
+// ── Chainable .encrypt() ─────────────────────────────────────────────────────
+//
+// ONE change point instead of twenty: every Attr factory's return value flows
+// through makeEncryptable(), which attaches a non-enumerable `encrypt()` (so it
+// never leaks into Object.keys / JSON.stringify / codegen output).
+//
+// Encryption is a CODEC, not a type — it wraps whatever get/set already exists,
+// so `Attr.money('cents').encrypt()` still does dollars↔cents and merely stores
+// ciphertext. The coded value is JSON-encoded before encrypting so numbers,
+// booleans and objects survive the round-trip exactly rather than degrading to
+// strings.
+
+function attachEncrypt<T>(config: T): T {
+  const c = config as any
+  if (!c || typeof c !== 'object' || c._isAttr !== true) return config
+  if (Object.prototype.hasOwnProperty.call(c, 'encrypt')) return config
+
+  Object.defineProperty(c, 'encrypt', {
+    enumerable: false,
+    configurable: true,
+    value(opts: EncryptOptions = {}): AttrConfig {
+      const inner    = this as AttrConfig
+      const mode     = opts.deterministic ? 'deterministic' : 'randomized'
+      const innerGet = inner.get ?? ((v: any) => v)
+      const innerSet = inner.set ?? ((v: any) => v)
+
+      return attachEncrypt({
+        ...inner,
+        _encrypted: {
+          mode,
+          ...(opts.blindIndex ? { blindIndex: opts.blindIndex } : {}),
+          ...(opts.bits ? { bits: opts.bits } : {}),
+        },
+        set: (val: any) => {
+          const coded = innerSet(val)
+          return coded === null || coded === undefined
+            ? null                                   // NULL stays NULL — IS NULL keeps working
+            : encryptValue(JSON.stringify(coded), mode)
+        },
+        get: (raw: any) => {
+          const plain = decryptValue(raw)
+          if (plain === null || plain === undefined) return null
+          let decoded: any
+          try { decoded = JSON.parse(plain) }
+          catch { decoded = plain }                  // legacy plaintext (dual-read backfill)
+          return innerGet(decoded)
+        },
+      } as AttrConfig) as AttrConfig
+    },
+  })
+  return config
+}
+
+/** Recursively wraps factories (incl. callable namespaces like Attr.range/Attr.array). */
+function makeEncryptable(node: any): any {
+  if (typeof node === 'function') {
+    const wrapped = (...args: any[]) => attachEncrypt(node(...args))
+    for (const k of Object.keys(node)) (wrapped as any)[k] = makeEncryptable(node[k])
+    return wrapped
+  }
+  if (node && typeof node === 'object') {
+    const out: any = {}
+    for (const k of Object.keys(node)) out[k] = makeEncryptable(node[k])
+    return out
+  }
+  return node
+}
+
+export const Attr = makeEncryptable(_AttrImpl) as typeof _AttrImpl

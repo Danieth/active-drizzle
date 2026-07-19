@@ -43,14 +43,53 @@ export function clearErrorHandlers(): void {
  * Fans an error out to every registered handler. Never throws — a broken
  * error tracker must not take down the request that was already failing.
  */
+/**
+ * Postgres puts the *offending value* in its error text:
+ *   detail: `Key (email)=(ada@example.com) already exists.`
+ * That's user data — and once `.encrypt()` ships it can be a plaintext PII
+ * search term — heading straight for an error tracker. Redact the value while
+ * keeping the column name, so `translateDbError` can still say which field
+ * failed and you can still see which constraint broke.
+ */
+const VALUE_IN_PARENS = /=\([^)]*\)/g
+
+/** Redacts `=(value)` occurrences, leaving `Key (column)` intact. */
+export function redactErrorValues(text: string): string {
+  return text.replace(VALUE_IN_PARENS, '=(REDACTED)')
+}
+
+/**
+ * Returns a prototype-preserving clone with value-bearing fields redacted, so
+ * handlers still receive a real `Error` (stack + `instanceof` intact) carrying
+ * every useful signal — `code`/SQLSTATE, `constraint`, `table`, `column` — but
+ * never the offending value itself.
+ */
+export function scrubDbError(error: unknown): unknown {
+  if (!error || typeof error !== 'object') return error
+  const e = error as Record<string, any>
+  const dirty = ['detail', 'where', 'message', 'hint'].some(k => typeof e[k] === 'string' && VALUE_IN_PARENS.test(e[k]))
+  VALUE_IN_PARENS.lastIndex = 0                     // regex is /g — reset before reuse
+  if (!dirty) return error
+
+  const clone: Record<string, any> = Object.create(Object.getPrototypeOf(e))
+  for (const key of Object.getOwnPropertyNames(e)) clone[key] = e[key]
+  for (const key of ['detail', 'where', 'message', 'hint']) {
+    if (typeof clone[key] === 'string') clone[key] = redactErrorValues(clone[key])
+  }
+  return clone
+}
+
 export function reportError(error: unknown, context: ErrorContext = {}): void {
+  // Single choke point: every error — save path AND query path — is scrubbed
+  // once, here, rather than at each call site.
+  const safe = scrubDbError(error)
   if (_handlers.size === 0) {
-    console.error('[active-drizzle] unhandled error:', error, context)
+    console.error('[active-drizzle] unhandled error:', safe, context)
     return
   }
   for (const handler of _handlers) {
     try {
-      handler(error, context)
+      handler(safe, context)
     } catch (handlerErr) {
       console.error('[active-drizzle] error handler threw:', handlerErr)
     }

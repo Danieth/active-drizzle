@@ -63,7 +63,14 @@ export {
   type ActionRenderApi,
   type ChangeEntry,
   type ChangesRenderApi,
+  buildFieldBind,
+  useFieldProps,
+  type BuildFieldBindOptions,
 } from './form-handle.js'
+export {
+  createTestSession, buildTestProps, fieldStateFixtures,
+  type CreateTestSessionOptions, type FieldStateName,
+} from './testing.js'
 export { NestedArrayManager, NestedOneManager, type NestedChild, type NestedTransport } from './nested.js'
 export { useForm, useEditForm, useNewForm, type UseFormOptions } from './use-form.js'
 export { useAbilities, type Abilities } from './use-abilities.js'

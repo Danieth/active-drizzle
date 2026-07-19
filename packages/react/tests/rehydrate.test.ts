@@ -203,8 +203,8 @@ describe('incoming map — the `elsewhere` source (value + at, adopt, token rele
     const s = makeSession({ id: 1, name: 'a', amount: '10' })
     s.setValue('name', 'MINE')
     s.rehydrate({ record: { id: 1, name: 'THEIRS', amount: '10', updatedAt: '2026-07-19T10:00:00Z' }, version: V2 })
-    expect(s.getIncoming()).toEqual({ name: { value: 'THEIRS', at: '2026-07-19T10:00:00Z' } })
-    expect(s.getIncomingFor('name')).toEqual({ value: 'THEIRS', at: '2026-07-19T10:00:00Z' })
+    expect(s.getIncoming()).toEqual({ name: { value: 'THEIRS', at: '2026-07-19T10:00:00Z', by: null } })
+    expect(s.getIncomingFor('name')).toEqual({ value: 'THEIRS', at: '2026-07-19T10:00:00Z', by: null })
     expect(s.getIncomingFor('amount')).toBeUndefined()   // clean adopt — not a divergence
   })
 

@@ -13,6 +13,10 @@ export interface RecordEnvelope {
   record: Record<string, any>
   abilities: Record<string, 'edit' | 'view'>
   can: Record<string, boolean>
+  /** WHY, for every FALSE verdict in `can` that can explain itself —
+   *  state machines derive it from their declaration; @mutation guards
+   *  supply it via `hint`. Disabled buttons explain themselves for free. */
+  why?: Record<string, string>
   /** Non-fatal write problems, e.g. stripped non-permitted fields. */
   issues?: Array<{ field: string; code: string }>
   /** Optimistic-lock token (update.optimisticLock) — echo as `_version` on PATCH. */
@@ -135,6 +139,29 @@ function collectStateEvents(model: any): string[] {
   return events
 }
 
+/** WHY an Attr.state event is unavailable for THIS record — derived from
+ *  the machine's own declaration: wrong state → the legal from-states;
+ *  guard declined → the transition's declared message. */
+function stateEventReason(model: any, record: any, event: string): string | null {
+  for (const [prop, cfg] of staticEntries(model)) {
+    if (!cfg || typeof cfg !== 'object' || cfg._type !== 'state' || !cfg.transitions) continue
+    const tr = cfg.transitions[event]
+    if (!tr) continue
+    const current = record?.[prop]
+    // from may be '*', an array, or a single state — normalize before use
+    const fromList = tr.from === '*' ? null : Array.isArray(tr.from) ? tr.from : [tr.from]
+    const fromOk = fromList === null || fromList.includes(current)
+    if (!fromOk) {
+      return `requires ${prop} '${fromList!.join("' or '")}' (currently '${current ?? '—'}')`
+    }
+    if (typeof tr.if === 'function') {
+      try { if (!tr.if(record)) return (tr.message as string) ?? 'conditions not met' } catch { return (tr.message as string) ?? 'conditions not met' }
+    }
+    return null
+  }
+  return null
+}
+
 /**
  * Builds the Forms envelope for a record:
  *   { record, abilities, can }
@@ -174,8 +201,13 @@ export function buildRecordEnvelope(
   }
 
   const can: Record<string, boolean> = {}
+  const why: Record<string, string> = {}
   for (const event of collectStateEvents(model)) {
     can[event] = typeof record.can === 'function' ? Boolean(record.can(event)) : false
+    if (!can[event]) {
+      const reason = stateEventReason(model, record, event)
+      if (reason) why[event] = reason
+    }
   }
   // @mutation verdicts ride the same map: guarded mutations project their
   // `if` per record; unguarded ones are always available. The verdict is a
@@ -184,6 +216,11 @@ export function buildRecordEnvelope(
   for (const mut of getMutations(ctrl?.constructor ?? {})) {
     if (mut.bulk) continue
     can[mut.method] = mut.if ? Boolean(mut.if(record, ctx, ctrl)) : true
+    if (!can[mut.method]) {
+      delete why[mut.method]
+      const hint = typeof mut.hint === 'function' ? mut.hint(record, ctx) : mut.hint
+      if (hint) why[mut.method] = hint
+    }
   }
 
   // The primary key always serializes — an envelope without `id` is a record
@@ -197,6 +234,7 @@ export function buildRecordEnvelope(
     record: serialized,
     abilities,
     can,
+    ...(Object.keys(why).length ? { why } : {}),
   }
   // Optimistic lock: the version token rides every envelope so the client
   // can echo it back on PATCH
@@ -249,8 +287,10 @@ export interface IndexParams {
   page?: number
   /** perPage: 0 is legal for chart/metric-only calls — skips data + count. */
   perPage?: number
-  /** Categorical chart request: x ∈ index.chartable, y = 'count' | 'sum:F' | 'avg:F' (F ∈ index.measures). */
-  chart?: { x: string; y?: string }
+  /** Chart request: x ∈ index.chartable, y = 'count' | 'sum:F' | 'avg:F'
+   *  (F ∈ index.measures). `bucket` time-buckets a date/timestamp x
+   *  (hour/day/week/month/quarter/year) — the time-series lane. */
+  chart?: { x: string; y?: string; bucket?: string }
   /** Scalar metric request: 'count' | 'sum:F' | 'avg:F' (F ∈ index.measures). */
   metric?: string
   /**
@@ -474,11 +514,28 @@ export async function defaultIndex(
 
   let chart: Array<{ x: string; y: number }> | undefined
   if (params.chart) {
-    const { x, y = 'count' } = params.chart
+    const { x, y = 'count', bucket } = params.chart
     if (!(idx.chartable ?? []).includes(x)) throw new BadRequest(`Cannot chart by '${x}' (not in chartable)`)
-    const grouped = await runAggregate(applyNarrowing(scopedRel).group(x), y)
+    const BUCKETS = ['hour', 'day', 'week', 'month', 'quarter', 'year']
+    if (bucket !== undefined && !BUCKETS.includes(bucket)) {
+      throw new BadRequest(`chart.bucket must be one of ${BUCKETS.join('/')}`)
+    }
+    let base = applyNarrowing(scopedRel)
+    let grouped: any
+    if (bucket) {
+      if (typeof base.groupByTime !== 'function') throw new BadRequest(`bucketing requires a Relation with .groupByTime()`)
+      try {
+        grouped = await runAggregate(base.groupByTime(x, bucket), y)
+      } catch (e: any) {
+        throw new BadRequest(`Cannot time-bucket '${x}' — bucketing needs a date/timestamp column (${e?.message ?? e})`)
+      }
+    } else {
+      grouped = await runAggregate(base.group(x), y)
+    }
     const yField = y === 'count' ? null : y.split(':')[1]!
     chart = Object.entries(grouped ?? {}).map(([k, v]) => ({ x: k, y: measureValue(yField, v) }))
+    // time series read left→right; categorical keeps engine order
+    if (bucket) chart.sort((a, b) => String(a.x).localeCompare(String(b.x)))
   }
 
   let metric: any

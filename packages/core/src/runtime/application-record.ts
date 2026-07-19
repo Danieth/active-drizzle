@@ -69,8 +69,37 @@ export interface AttrPresentationalMeta {
  * _isAttr: true distinguishes Attr configs from association markers,
  * class prototypes, and other static properties during validate() loops.
  */
+/** Options for the chainable `.encrypt()` modifier available on every Attr. */
+export interface EncryptOptions {
+  /**
+   * Derive the IV from the plaintext so equal values encrypt identically and
+   * `where({ field })` matches. Leaks equality — never use on low-cardinality
+   * columns (status, tier, gender). Default: false (randomized, unqueryable).
+   */
+  deterministic?: boolean
+  /** Name of an indexed sidecar column to hold a keyed hash for lookups. */
+  blindIndex?: string
+  /** Blind-index width in bits (multiple of 8). Fewer bits = more privacy, more false positives. */
+  bits?: number
+}
+
+/** Marker left on an encrypted Attr so query guards, codegen, and controllers can see it. */
+export interface EncryptedMeta {
+  mode: 'randomized' | 'deterministic'
+  blindIndex?: string
+  bits?: number
+}
+
 export interface AttrConfig extends AttrPresentationalMeta {
   readonly _isAttr?: true
+  /** Present when `.encrypt()` was applied — drives query guards + allowlist rejection. */
+  readonly _encrypted?: EncryptedMeta
+  /**
+   * Wraps this Attr's codec in AES-256-GCM encryption. Composes with any Attr
+   * type — `Attr.money('cents').encrypt()` still does dollars↔cents, it just
+   * stores ciphertext. See docs: encryption removes most of the query surface.
+   */
+  encrypt?: (opts?: EncryptOptions) => AttrConfig
   get?: (raw: any) => any
   set?: (val: any) => any
   default?: any | (() => any)

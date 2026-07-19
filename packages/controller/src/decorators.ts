@@ -128,6 +128,7 @@ export function mutation(config?: Partial<Omit<MutationEntry, 'method'>> | null)
       ...(config?.required !== undefined ? { required: config.required } : {}),
       ...(config?.if !== undefined ? { if: config.if } : {}),
       ...(config?.label !== undefined ? { label: config.label } : {}),
+      ...(config?.hint !== undefined ? { hint: config.hint } : {}),
     }
     ctor[MUTATION_META] = [...(ctor[MUTATION_META] ?? []), entry]
   }

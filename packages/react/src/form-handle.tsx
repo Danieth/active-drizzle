@@ -15,7 +15,7 @@ import React, { createContext, useContext, useEffect, useState, useSyncExternalS
 import { FormSession, type SessionStatus } from './form-session.js'
 import { parseControllerError } from './errors.js'
 import { NestedArrayManager, NestedOneManager, type NestedChild } from './nested.js'
-import { resolvePresenter, checkRequiredMeta, type PresenterBind } from './presenters.js'
+import { resolvePresenter, checkRequiredMeta, type PresenterBind, type PresenterProps } from './presenters.js'
 
 /**
  * Context decides what COMMIT does — the presenter never knows:
@@ -58,6 +58,9 @@ export type FieldComponent = FC<FieldProps> & {
   readonly errors: string[]
   readonly meta: Record<string, any>
   readonly value: any
+  readonly dirty: boolean
+  readonly elsewhere: import('./form-session.js').IncomingChange | undefined
+  readonly ability: 'edit' | 'view'
 }
 
 /** A child form handle: full field access plus its identity + Remove. */
@@ -177,6 +180,116 @@ function resolveCopy(meta: Record<string, any>, draft: any): Record<string, any>
 }
 
 /**
+ * The full presenter-props escape hatch: everything a generated Field
+ * assembles for its presenter, as a HOOK — so a portal, a joint field, an
+ * adapter, or any novel composition renders against the real contract.
+ * Commit routing follows the surrounding <Form> context exactly like a
+ * generated Field (hooks read context from where they RUN, so a portal
+ * keeps its owner form's semantics).
+ */
+export function useFieldProps(
+  form: { $session: FormSession<any> } | FormSession<any>,
+  field: string,
+  opts: { mode?: 'edit' | 'view'; commit?: 'change' | 'blur'; overrides?: Record<string, any> } = {},
+): PresenterProps {
+  const session: FormSession<any> =
+    (form as any)?.$session ?? (form as FormSession<any>)
+  useSyncExternalStore(
+    (cb) => session.subscribe(field, cb),
+    () => session.fieldVersion(field),
+    () => session.fieldVersion(field),
+  )
+  const formCtx = useContext(FormModeContext)
+  const commitViaContext = (f: string): void => {
+    if (formCtx?.mode === 'autoflush') {
+      session.touch(f)
+      session.requestAutoFlush(formCtx.debounceMs)
+    } else {
+      void session.commitField(f, formCtx ? 'stage' : 'autosave')
+    }
+  }
+  const fieldMeta: Record<string, any> =
+    ((session.draft as any)?.constructor?.fieldMeta as Record<string, any>) ?? {}
+  const meta = resolveCopy(fieldMeta[field] ?? {}, session.draft)
+  const bind = buildFieldBind(session, {
+    field,
+    ...(opts.commit !== undefined ? { commit: opts.commit } : {}),
+    onCommit: commitViaContext,
+  })
+  const incoming = session.getIncomingFor(field)
+  return {
+    value: session.getValue(field),
+    bind,
+    meta,
+    overrides: opts.overrides ?? {},
+    mode: opts.mode ?? (session.canEdit(field) ? 'edit' : 'view'),
+    draft: session.draft,
+    errors: session.visibleErrors(field),
+    state: session.fieldState(field) !== 'ready' ? session.fieldState(field) : session.getStatus(),
+    dirty: session.fieldDirty(field),
+    ...(incoming !== undefined ? { elsewhere: incoming } : {}),
+  }
+}
+
+export interface BuildFieldBindOptions {
+  field: string
+  /** Column actually written (attachment fields write `<name>AssetId(s)`). */
+  writeField?: string
+  /** The presenter's natural commit moment (default 'blur'). */
+  commit?: 'change' | 'blur'
+  /** What COMMIT does. Default: stage only (the session accumulates the
+   *  diff). Generated Fields pass their <Form>-context commit here; a
+   *  custom composition may pass its own. */
+  onCommit?: (field: string) => void
+  /** Attachment value mapping (asset object(s) → id(s) on write). */
+  attachment?: 'one' | 'many'
+  /** Extra disable signal (e.g. pendingIf's waiting). */
+  disabled?: boolean
+}
+
+/**
+ * The PUBLIC bind builder — the exact contract generated Fields wire into
+ * presenters, exported so novel compositions (portals, joint fields,
+ * adapters, tests, storybooks) build against the REAL thing instead of a
+ * hand-rolled imitation: IME guards, data-ad-cancel blur-skip, commit
+ * staging, disable rules — all included.
+ */
+export function buildFieldBind(session: FormSession<any>, opts: BuildFieldBindOptions): PresenterBind {
+  const { field } = opts
+  const writeField = opts.writeField ?? field
+  const commitMoment = opts.commit ?? 'blur'
+  const onCommit = opts.onCommit ?? (() => { /* stage-only: the diff waits for submit/flush */ })
+  return {
+    name: field,
+    onChange: (value: any) => {
+      const written = !opts.attachment ? value
+        : opts.attachment === 'many'
+          ? (Array.isArray(value) ? value.map((v: any) => v?.id ?? v) : value)
+          : value?.id ?? value
+      session.setValue(writeField, written)
+      if (commitMoment === 'change' && !session.isComposing(field)) onCommit(writeField)
+    },
+    onCommit: () => onCommit(writeField),
+    onBlur: (e?: { relatedTarget?: any }) => {
+      // C10: blur fires before a Cancel button's click — a blur INTO an
+      // element marked data-ad-cancel must not autosave first
+      const cancelIntent = Boolean(
+        e?.relatedTarget?.closest?.('[data-ad-cancel]') ?? e?.relatedTarget?.dataset?.adCancel,
+      )
+      if (cancelIntent) session.touch(writeField)
+      else onCommit(writeField)
+    },
+    onCompositionStart: () => session.beginComposition(field),
+    onCompositionEnd: () => {
+      // C11: IME composition commits once, at composition end
+      session.endComposition(field)
+      if (commitMoment === 'change') onCommit(writeField)
+    },
+    disabled: Boolean(opts.disabled) || session.getStatus() === 'saving' || session.fieldState(field) === 'saving',
+  }
+}
+
+/**
  * A @mutation action wired onto the handle — `<deal.Archive/>` renders from
  * this. Paramless actions are plain verdict-aware buttons; actions with
  * declared params render an implicit mini-form (scaffolding inputs) unless
@@ -196,6 +309,8 @@ export interface ActionRenderApi {
   run: (data?: Record<string, any>) => Promise<boolean>
   /** Server verdict (envelope can map); ungoverned sessions default to allow. */
   allowed: boolean
+  /** WHY not, in the server's own words — null when allowed/unexplained. */
+  why: string | null
   pending: boolean
   errors: Record<string, string[]> | null
   label: string
@@ -515,37 +630,16 @@ export function createFormHandle<T extends Record<string, any>>(
       const writeField = !isAttachment ? dataField
         : meta.kind === 'attachmentOne' ? `${field}AssetId` : `${field}AssetIds`
 
-      const commitMoment = resolved.def.commit ?? 'blur'
-      const bind: PresenterBind = {
-        name: field,
-        onChange: (value: any) => {
-          // Presenters may pass an asset object/array or raw id(s)
-          const written = !isAttachment ? value
-            : Array.isArray(value) ? value.map((v: any) => v?.id ?? v)
-            : value?.id ?? value
-          session.setValue(writeField, written)
-          // Discrete inputs (toggle/select) commit on change — flushed/
-          // autosaved per context, staged + errors-visible otherwise
-          if (commitMoment === 'change' && !session.isComposing(dataField)) commitViaContext(writeField)
-        },
-        onCommit: () => commitViaContext(writeField),
-        onBlur: (e?: { relatedTarget?: any }) => {
-          // C10: blur fires before a Cancel button's click — a blur INTO an
-          // element marked data-ad-cancel must not autosave first
-          const cancelIntent = Boolean(
-            e?.relatedTarget?.closest?.('[data-ad-cancel]') ?? e?.relatedTarget?.dataset?.adCancel,
-          )
-          if (cancelIntent) session.touch(writeField)
-          else commitViaContext(writeField)
-        },
-        onCompositionStart: () => session.beginComposition(dataField),
-        onCompositionEnd: () => {
-          // C11: IME composition commits once, at composition end
-          session.endComposition(dataField)
-          if (commitMoment === 'change') commitViaContext(writeField)
-        },
-        disabled: waiting || session.getStatus() === 'saving' || session.fieldState(dataField) === 'saving',
-      }
+      // One bind implementation for everyone — the same builder is exported
+      // (buildFieldBind) so custom compositions share this exact contract
+      const bind: PresenterBind = buildFieldBind(session, {
+        field: dataField,
+        writeField,
+        commit: resolved.def.commit ?? 'blur',
+        onCommit: commitViaContext,
+        ...(isAttachment ? { attachment: meta.kind === 'attachmentMany' ? 'many' as const : 'one' as const } : {}),
+        disabled: waiting,
+      })
 
       const overrides: Record<string, any> = { ...(props.props ?? {}) }
       if (props.label !== undefined) overrides.label = props.label
@@ -577,6 +671,11 @@ export function createFormHandle<T extends Record<string, any>>(
       errors: { get: () => session.visibleErrors(dataField) },
       meta: { get: () => resolveCopy(fieldMeta[field] ?? {}, session.draft) },
       value: { get: () => session.getValue(dataField) },
+      // Read parity with what the presenter receives — a footer counting
+      // unsaved fields or a conflict summary reads the handle, not $session
+      dirty: { get: () => session.fieldDirty(dataField) },
+      elsewhere: { get: () => session.getIncomingFor(dataField) },
+      ability: { get: () => (session.canEdit(dataField) ? 'edit' : 'view') as 'edit' | 'view' },
     })
     return Field as FieldComponent
   }
@@ -708,7 +807,7 @@ export function createFormHandle<T extends Record<string, any>>(
 
   // <deal.Can edit="amount"> / <deal.Can action="markWon" not fallback={…}> —
   // hide/swap UI from the envelope's own verdicts; zero hardcoded roles
-  const CanComponent: FC<{ edit?: string; action?: string; not?: boolean; fallback?: ReactNode; children?: ReactNode }> = ({ edit, action, not, fallback, children }) => {
+  const CanComponent: FC<{ edit?: string; action?: string; not?: boolean; fallback?: ReactNode; children?: ReactNode | ((s: { allowed: boolean; why: string | null }) => ReactNode) }> = ({ edit, action, not, fallback, children }) => {
     useSyncExternalStore(
       (cb) => session.subscribe('*', cb),
       () => session.fieldVersion('*'),
@@ -718,6 +817,8 @@ export function createFormHandle<T extends Record<string, any>>(
     if (edit !== undefined) allowed = session.canEdit(edit)
     else if (action !== undefined) allowed = session.verdict(action)
     if (not) allowed = !allowed
+    const why = action !== undefined ? session.whyNot(action) : null
+    if (typeof children === 'function') return <>{children({ allowed, why })}</>
     return <>{allowed ? children : fallback ?? null}</>
   }
   CanComponent.displayName = 'AdCan'
@@ -794,6 +895,7 @@ export function createFormHandle<T extends Record<string, any>>(
       const [errors, setErrors] = useState<Record<string, string[]> | null>(null)
       const [values, setValues] = useState<Record<string, any>>({})
       const allowed = session.verdict(name)
+      const why = session.whyNot(name)
 
       const run = async (data?: Record<string, any>): Promise<boolean> => {
         if (pending) return false
@@ -814,7 +916,7 @@ export function createFormHandle<T extends Record<string, any>>(
       }
 
       if (typeof children === 'function') {
-        return <>{(children as (api: ActionRenderApi) => ReactNode)({ run, allowed, pending, errors, label, params })}</>
+        return <>{(children as (api: ActionRenderApi) => ReactNode)({ run, allowed, pending, errors, label, params, why })}</>
       }
 
       // No declared params (or all pre-supplied) → plain verdict-aware button
@@ -823,6 +925,7 @@ export function createFormHandle<T extends Record<string, any>>(
           <span data-ad-action={name}>
             <button type="button" {...(className !== undefined ? { className } : {})}
               disabled={!allowed || pending}
+              {...(!allowed && why ? { title: why } : {})}
               onClick={() => void run(fields)}>
               {children ?? label}
             </button>

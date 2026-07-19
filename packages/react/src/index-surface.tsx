@@ -317,8 +317,8 @@ export interface IndexSurface {
   Empty: FC<{ children?: (api: { reason: 'no-records' | 'no-matches'; clearFilters: () => void }) => ReactNode; className?: string }>
   /** The state machine as columns — data only; you paint the board. */
   Board: FC<{ groupBy?: string; children?: (b: BoardApi) => ReactNode; className?: string }>
-  /** Allowlisted categorical aggregation — points, no chart lib. */
-  Chart: FC<{ x: string; y?: string; filtered?: boolean; children?: (points: Array<{ x: string; y: number }>, q: any) => ReactNode; className?: string }>
+  /** Allowlisted aggregation — points, no chart lib. `bucket` time-buckets a date x. */
+  Chart: FC<{ x: string; y?: string; bucket?: 'hour' | 'day' | 'week' | 'month' | 'quarter' | 'year'; filtered?: boolean; children?: (points: Array<{ x: string; y: number }>, q: any) => ReactNode; className?: string }>
   /** Allowlisted scalar aggregation — one number. */
   Metric: FC<{ agg: string; filtered?: boolean; children?: (value: any, q: any) => ReactNode; className?: string }>
   /** Data grid contract — columns/rows/sort; scaffold table by default. */
@@ -784,8 +784,8 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
     const base = filtered && ctx ? ctx.session.params() : {}
     return { ...base, page: 0, perPage: 0, ...extra }
   }
-  const Chart: IndexSurface['Chart'] = ({ x, y = 'count', filtered = true, children, className }) => {
-    const params = useAggParams(filtered, { chart: { x, y } })
+  const Chart: IndexSurface['Chart'] = ({ x, y = 'count', bucket, filtered = true, children, className }) => {
+    const params = useAggParams(filtered, { chart: { x, y, ...(bucket ? { bucket } : {}) } })
     const q = cfg.useIndexQuery(params)
     const points: Array<{ x: string; y: number }> = (q.data as any)?.chart ?? []
     if (children) return <>{children(points, q)}</>

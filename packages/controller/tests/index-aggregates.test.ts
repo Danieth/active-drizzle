@@ -26,7 +26,7 @@ class MiniRel {
   offsetN = 0
   constructor(rows: any[]) { this.rows = rows }
   clone(): MiniRel {
-    const c = new MiniRel(this.rows)
+    const c = new (this.constructor as any)(this.rows)
     c.preds = [...this.preds]; c.groupField = this.groupField
     c.limitN = this.limitN; c.offsetN = this.offsetN
     return c
@@ -222,5 +222,75 @@ describe('teaching guards — errors that name the fix', () => {
     const res = await defaultIndex(new MiniRel(ROWS), { ...model, ownedBy: undefined }, cfg,
       { page: 0, perPage: 2 } as any)
     expect(res.data).toHaveLength(2)
+  })
+})
+
+describe('why-map + time bucketing (wishlist 3 & 6)', () => {
+  it('chart.bucket allowlists units and sorts the series', async () => {
+    const rows = [
+      { id: 1, stage: 'draft', priority: 'low', amount: 100, createdAt: '2026-02-10' },
+      { id: 2, stage: 'draft', priority: 'low', amount: 200, createdAt: '2026-01-05' },
+      { id: 3, stage: 'draft', priority: 'low', amount: 50,  createdAt: '2026-01-20' },
+    ]
+    const cfg = { ...CONFIG, index: { ...CONFIG.index, chartable: ['createdAt'] } }
+    // MiniRel gains a naive month-bucketer for the math
+    class BucketRel extends MiniRel {
+      groupByTime(f: string, unit: string): BucketRel {
+        const c = this.clone() as BucketRel
+        ;(c as any).groupField = `__bucket_${f}`
+        for (const r of c.rows) (r as any)[`__bucket_${f}`] = String(r[f]).slice(0, 7)   // YYYY-MM
+        return c
+      }
+    }
+    const res = await defaultIndex(new BucketRel(rows) as any, model, cfg,
+      { perPage: 0, chart: { x: 'createdAt', y: 'sum:amount', bucket: 'month' } } as any)
+    expect(res.chart).toEqual([
+      { x: '2026-01', y: '2.50' },     // 200+50 cents → codec'd
+      { x: '2026-02', y: '1.00' },
+    ])                                  // sorted ascending — time reads left→right
+    await expect(defaultIndex(new BucketRel(rows) as any, model, cfg,
+      { chart: { x: 'createdAt', bucket: 'fortnight' } } as any)).rejects.toBeInstanceOf(BadRequest)
+  })
+})
+
+describe('why — false verdicts explain themselves', async () => {
+  const { buildRecordEnvelope } = await import('../src/crud-handlers.js')
+  const { mutation } = await import('../src/decorators.js')
+
+  it('state machines derive reasons from their own declaration', () => {
+    const stateAttr = {
+      _type: 'state',
+      transitions: {
+        submit: { from: ['draft'], to: 'submitted', if: (d: any) => d.amount != null, message: 'needs an amount' },
+        win: { from: ['submitted'], to: 'won' },
+      },
+    }
+    const mdl: any = { name: 'Deal', stage: stateAttr }
+    const cfgE: any = { get: { expose: ['stage'], abilities: true }, update: { permit: [] } }
+    class C {}
+    // wrong state: win from draft
+    const rec1 = { id: 1, stage: 'draft', amount: null, can: (e: string) => e === 'submit' ? false : false }
+    const env1 = buildRecordEnvelope(rec1, mdl, cfgE, {}, new C())
+    expect(env1.why?.['win']).toContain("requires stage 'submitted'")
+    expect(env1.why?.['win']).toContain("currently 'draft'")
+    // right state, guard declines → declared message
+    expect(env1.why?.['submit']).toBe('needs an amount')
+  })
+
+  it('mutation hints ride the why map (static + per-record fn)', () => {
+    class HintCtrl {
+      @mutation({ if: () => false, hint: 'already at highest priority' })
+      async bumpPriority() {}
+      @mutation({ if: () => false, hint: (r: any) => `locked by ${r.owner}` })
+      async steal() {}
+      @mutation({ if: () => false })
+      async bare() {}
+    }
+    const env = buildRecordEnvelope({ id: 1, owner: 'ada' }, { name: 'X' } as any,
+      { get: { expose: ['id'], abilities: true }, update: { permit: [] } } as any, {}, new HintCtrl())
+    expect(env.can['bumpPriority']).toBe(false)
+    expect(env.why?.['bumpPriority']).toBe('already at highest priority')
+    expect(env.why?.['steal']).toBe('locked by ada')
+    expect(env.why?.['bare']).toBeUndefined()          // no hint → no entry, wire stays lean
   })
 })

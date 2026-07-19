@@ -23,6 +23,8 @@ export interface ServerEnvelope {
   record?: Record<string, any>
   abilities?: Record<string, Ability>
   can?: Record<string, boolean>
+  /** WHY for false verdicts — disabled buttons explain themselves. */
+  why?: Record<string, string>
   issues?: Array<{ field: string; code: string }>
   /** Optimistic-lock token — echoed back as `_version` on every submit. */
   version?: string
@@ -66,6 +68,10 @@ export interface SubmitPayload {
 export interface IncomingChange {
   value: any
   at: string | number | null
+  /** WHO, when the projection carries it — the `updatedByName` /
+   *  `updatedBy` convention: expose either field and every elsewhere
+   *  affordance can say "Mel changed this" for free. Null otherwise. */
+  by: string | null
 }
 
 export interface FormEvent {
@@ -116,6 +122,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
 
   private abilities: Record<string, Ability> | null
   private canMap: Record<string, boolean>
+  private whyMap: Record<string, string> = {}
   /** Whether a `can` map ever arrived — governed sessions consult it for
    *  action verdicts; ungoverned ones (row handles built from plain rows)
    *  default to allow and let the server gate. */
@@ -177,6 +184,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     this.mode = opts.mode
     this.abilities = opts.abilities ?? null
     this.canMap = opts.can ?? {}
+    this.whyMap = (opts as any).why ?? {}
     this.canGoverned = opts.can != null
     this.version = opts.version ?? null
     this.validateFn = opts.validate
@@ -329,6 +337,31 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   verdict(action: string): boolean {
     if (!this.canGoverned) return true
     return this.canMap[action] === true
+  }
+
+  /**
+   * WHY an action's verdict is false — the server's own words ("requires
+   * stage 'submitted'", a mutation's declared hint). Null when allowed or
+   * unexplained. Disabled buttons/steppers surface this for free.
+   */
+  whyNot(action: string): string | null {
+    if (this.verdict(action)) return null
+    return this.whyMap[action] ?? null
+  }
+
+  /** @internal TESTING ONLY — arrange a per-field narration state so
+   *  presenter catalogs/stories can show every state against the REAL
+   *  session + bind contract instead of a hand-rolled imitation. */
+  _primeFieldState(field: string, state: 'saving' | 'saved' | 'error' | 'pending' | null): void {
+    if (state === null) this.fieldStates.delete(field)
+    else this.fieldStates.set(field, state)
+    this.notify(field)
+  }
+
+  /** @internal TESTING ONLY — arrange the session status. */
+  _primeStatus(status: SessionStatus): void {
+    this.status = status
+    this.notifyAll()
   }
 
   /** @internal Emits an 'action' form event (generated action buttons). */
@@ -651,6 +684,11 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
 
     this.autoFlushInFlight = true
     const flushed = this.snapshotDraft()
+    // Per-field save narration: exactly the fields riding THIS flush pulse
+    // 'saving' → 'saved' — a dense grid can flash the cell that landed
+    // instead of strobing every field on the session-wide status
+    const flushedFields = Object.keys(this.changedData())
+    for (const f of flushedFields) this.fieldStates.set(f, 'saving')
     this.status = 'saving'
     this.notifyAll()
 
@@ -670,20 +708,29 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
       this.serverErrors = {}
       this.applyFlushSuccess(result.envelope, flushed)
       this.lastSavedAt = Date.now()
+      // fields NOT re-edited mid-flight show 'saved'; re-edited ones drop
+      // back to dirty narration (they ride the follow-up flush)
+      for (const f of flushedFields) {
+        if (valueEquals(this.snapshotDraft()[f], flushed[f])) this.fieldStates.set(f, 'saved')
+        else this.fieldStates.delete(f)
+      }
       this.status = 'saved'
       emitFormEvent({ type: 'saved', session: this })
       this.notifyAll()
     } else if (result.status === 0) {
       // Offline: the draft keeps every edit; the diff is queued as a unit
+      for (const f of flushedFields) this.fieldStates.set(f, 'pending')
       this.pendingFlush = true
       this.status = 'ready'
       this.notifyAll()
     } else if (result.status === 401 || result.status === 403) {
+      for (const f of flushedFields) this.fieldStates.delete(f)
       this.status = 'unauthenticated'   // draft untouched (C15)
       this.notifyAll()
     } else if (result.status === 409) {
       // The whole point of the lock under autosave: two tabs both flushing
       // must not silently clobber each other — surface it, don't retry
+      for (const f of flushedFields) this.fieldStates.delete(f)
       this.enterConflict(result.envelope)
       this.notifyAll()
     } else {
@@ -691,6 +738,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
       if (Object.keys(result.errors ?? {}).length === 0) {
         this.serverErrors = { base: ['Something went wrong — your changes are not saved yet.'] }
       }
+      for (const f of flushedFields) this.fieldStates.delete(f)
       this.status = 'error'
       this.notifyAll()
     }
@@ -731,7 +779,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
         this.abilities = envelope!.abilities ?? null
         for (const [name, manager] of this.nested) manager.setLocked(!this.canEditNested(name))
       }
-      if (envelope!.can !== undefined) { this.canMap = envelope!.can ?? {}; this.canGoverned = envelope!.can != null }
+      if (envelope!.can !== undefined) { this.canMap = envelope!.can ?? {}; this.whyMap = envelope!.why ?? {}; this.canGoverned = envelope!.can != null }
       this.serverIssues = envelope!.issues ?? []
       const stripped = this.serverIssues.filter(i => i.code === 'forbidden').map(i => i.field)
       if (stripped.length > 0) {
@@ -939,6 +987,8 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     // projection ships it, else the version token (epoch millis under
     // optimisticLock: true). Zero new wire bytes.
     const at: string | number | null = (rec as any)?.updatedAt ?? envelope.version ?? null
+    // the actor rides the same convention — no new wire, just projection fields
+    const by: string | null = (rec as any)?.updatedByName ?? (rec as any)?.updatedBy ?? null
     if (rec) {
       const now = this.snapshotDraft()
       for (const [k, their] of Object.entries(rec)) {
@@ -969,7 +1019,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
           // can offer it ("changed 30s ago → take it") instead of it being
           // invisible until the save-time 409
           conflict = true
-          this.incomingMap[k] = { value: their, at }
+          this.incomingMap[k] = { value: their, at, by }
         }
       }
       for (const [name, manager] of this.nested) {
@@ -998,7 +1048,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
       this.abilities = envelope.abilities ?? null
       for (const [name, manager] of this.nested) manager.setLocked(!this.canEditNested(name))
     }
-    if (envelope.can !== undefined) { this.canMap = envelope.can ?? {}; this.canGoverned = envelope.can != null }
+    if (envelope.can !== undefined) { this.canMap = envelope.can ?? {}; this.whyMap = envelope.why ?? {}; this.canGoverned = envelope.can != null }
     // Version adoption ONLY when conflict-free — withholding it is what
     // guarantees the conflict surfaces (T3): the stale token 409s.
     // The withheld token is REMEMBERED: adopting the last incoming field
@@ -1045,7 +1095,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
         manager.setLocked(!this.canEditNested(name))
       }
     }
-    if (envelope.can !== undefined) { this.canMap = envelope.can ?? {}; this.canGoverned = envelope.can != null }
+    if (envelope.can !== undefined) { this.canMap = envelope.can ?? {}; this.whyMap = envelope.why ?? {}; this.canGoverned = envelope.can != null }
     if (envelope.version !== undefined) this.version = envelope.version ?? null
     this.serverIssues = envelope.issues ?? []
     // A save that silently dropped fields is a permit/UI mismatch — never

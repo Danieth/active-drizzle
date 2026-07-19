@@ -1468,7 +1468,7 @@ function emitFormHooks(
     L.push(`  Filters: FC<{ className?: string }> & { [K in ${filterUnion}]: FC<{ presenter?: string | FC<FilterPresenterProps>; className?: string; props?: Record<string, any> }> }`)
     L.push(`  Filter: FC<{ name: ${filterUnion}; children: (p: FilterPresenterProps) => ReactNode }>`)
     L.push(`  Sidebar: FC<{ groups?: Array<${filterUnion}>; presenters?: Partial<Record<${filterUnion}, string | FC<FilterPresenterProps>>>; children?: (api: SidebarApi) => ReactNode; className?: string }>`)
-    L.push(`  Chart: FC<{ x: ${chartableU}; y?: ${measuresU}; filtered?: boolean; children?: (points: Array<{ x: string; y: number }>, q: any) => ReactNode; className?: string }>`)
+    L.push(`  Chart: FC<{ x: ${chartableU}; y?: ${measuresU}; bucket?: 'hour' | 'day' | 'week' | 'month' | 'quarter' | 'year'; filtered?: boolean; children?: (points: Array<{ x: string; y: number }>, q: any) => ReactNode; className?: string }>`)
     L.push(`  Metric: FC<{ agg: ${measuresU}; filtered?: boolean; children?: (value: any, q: any) => ReactNode; className?: string }>`)
     L.push(`  Board: FC<{ groupBy?: ${filterUnion}; children?: (b: BoardApi) => ReactNode; className?: string }>`)
     L.push(`}`)

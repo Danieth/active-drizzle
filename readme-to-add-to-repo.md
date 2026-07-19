@@ -796,3 +796,47 @@ bypass setters) — which is exactly the canonical tsconfig. Enforce +
 backstop is the honest mechanism. Bonus from the same report: the opaque
 `findMany of undefined` crash on a schema-export/table-name mismatch is
 now a teaching error naming the export to fix.
+
+
+## The presenter platform (design-engineer wishlist round — 6 of 8 built)
+
+**The escape hatch (#1):** `buildFieldBind(session, opts)` — the EXACT
+bind generated Fields wire (IME guards, data-ad-cancel blur-skip, commit
+staging, disable rules) is now public, and `useFieldProps(form, field)`
+assembles full live PresenterProps as a hook (portals keep their owner
+form's commit semantics). Novel compositions build against the real
+contract, never an imitation.
+
+**The honest storybook kit (#2):** `createTestSession`, `buildTestProps`,
+`fieldStateFixtures` — every presenter state (ready/dirty/saving/saved/
+error/pending/waiting/conflict/elsewhere/view) as a REAL session arranged
+into that state.
+
+**Why on verdicts (#3):** false `can` entries ship a `why` map — state
+machines DERIVE it from their own declaration ("requires stage
+'submitted' (currently 'draft')", the declared transition `message`),
+@mutation guards supply it via `hint:` (string or per-record fn).
+Client: `session.whyNot(action)`, `<deal.Can action>` function-children
+get `{allowed, why}`, action buttons get `title` + render-prop `why`.
+Doctrine held: reasons are DECLARED or DERIVED — never inferred from
+permit lambdas (field-level ability reasons deferred until a declaration
+shape earns its config surface).
+
+**Per-field flush narration (#4):** a debounced autosave flush pulses
+'saving' → 'saved' on exactly the fields it carried; mid-flight re-edits
+drop back to dirty; failures clear the marks.
+
+**`elsewhere.by` (#5):** convention — expose `updatedByName` (or
+`updatedBy`) in your projection and every elsewhere affordance says
+"Mel changed this · 2m ago". Zero new wire.
+
+**Time-bucketed charts (#6):** `<Deals.Chart x="createdAt" bucket="week"
+y="sum:amount">` — `Relation.groupByTime` (date_trunc, unit allowlisted),
+server-validated, series sorted ascending, bucket union in the generated
+Chart type.
+
+**Read parity (#8):** field members expose `.dirty` / `.elsewhere` /
+`.ability` beside `.errors/.meta/.value`.
+
+**Deferred (#7 ambient copy/i18n):** no blocked consumer; a resolver stub
+would ossify before the real i18n design exists.

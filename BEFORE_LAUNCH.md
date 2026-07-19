@@ -112,7 +112,23 @@ Encrypting a column removes most of the query surface, and **the failures are si
 - **Controller allowlists**: `filterable` may allow **equality only** on deterministic/blind fields; `sortable` and `searchable` must reject every encrypted field outright.
 - **Free win while you're there:** for *deterministic* fields, `group()` has the `Attr.get` codec — decrypt the group keys before returning, so callers get `{ 'alice@x.com': 3 }` instead of `{ 'v1:k1:…': 3 }`. (Impossible for blind indexes — an HMAC is one-way.)
 
-**MVP for launch:** `.encrypt()` with randomized + deterministic modes and an env-var `KeyProvider`, validator enforcement of the text-column rule, the §4E guards, and SSE on by default for attachments. Blind index and client-side file envelope encryption can be fast-follows.
+### 4F. Sensitive values must never reach the error tracker
+
+Query-path errors are now enriched and fanned out to `onError()` (`Relation._exec()` — model, table, operation, **compiled SQL**). The SQL is safe: it's the `$1`-placeholder form, so **bound params are deliberately excluded**, and that's pinned by `tests/integration/query-error-reporting.test.ts` ("NEVER reports bound params").
+
+That default must hold once `.encrypt()` ships, because params get *more* sensitive, not less:
+
+- A `where({ ssn })` on a **deterministic** field sends the **plaintext search term** through `Attr.set`. Logging params would put raw SSNs in Rollbar.
+- A **blind index** lookup carries the HMAC — an equality oracle. Less bad, still not for an error tracker.
+- Even without encryption, params are ordinary user data (emails, names, tokens).
+
+**To do before launch:**
+- [ ] Keep params out of `reportError` context by default — treat it as a security invariant, not a preference (the test above is the guard).
+- [ ] If a `debug: { logParams: true }` escape hatch is ever added for local dev, it must **hard-refuse** when any param feeds an `_encrypted` attr, and must be impossible to enable in production.
+- [ ] Audit the other places an error can carry a value: `translateDbError` reads pg `detail` (e.g. `Key (email)=(a@b.co) already exists.`) — that string **contains the plaintext value** and currently flows into user-facing messages. Decide whether `detail` is scrubbed before it reaches the tracker *and* the client.
+- [ ] Same rule for the codegen/validator diagnostics and any query logging added later (see NICE_TO_HAVE §2 instrumentation).
+
+**MVP for launch:** `.encrypt()` with randomized + deterministic modes and an env-var `KeyProvider`, validator enforcement of the text-column rule, the §4E guards, the §4F params invariant, and SSE on by default for attachments. Blind index and client-side file envelope encryption can be fast-follows.
 
 ---
 

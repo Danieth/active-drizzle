@@ -2,6 +2,7 @@ import { eq, and, or, inArray, notInArray, arrayContains, isNull, ilike, desc, a
 import { union, unionAll, intersect, except } from 'drizzle-orm/pg-core'
 import { getExecutor, getSchema, MODEL_REGISTRY, transaction, RecordNotFound } from './boot.js'
 import { modelClassName } from './class-name.js'
+import { reportError } from './error-reporting.js'
 import type { ApplicationRecord } from './application-record.js'
 
 /**
@@ -110,6 +111,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     const table = this.getTable()
     const pattern = '%' + t.replace(/[\\%_]/g, (m) => '\\' + m) + '%'
     const conds = fields.map((f) => {
+      this._guardEncrypted(f, 'text-search')
       const col = table[_resolveColKey(this._ctor, f)]
       if (!col) throw new Error(`Column "${f}" not found on table "${this._tableName}"`)
       return ilike(col, pattern)
@@ -163,6 +165,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     const table = this.getTable()
     let vec: SQL | null = null
     for (const [f, w] of entries) {
+      this._guardEncrypted(f, 'text-search')
       const col = table[_resolveColKey(this._ctor, f)]
       if (!col) throw new Error(`Column "${f}" not found on table "${this._tableName}"`)
       const weight = ['A', 'B', 'C', 'D'].includes(w) ? w : 'D'
@@ -211,6 +214,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    */
   public order(field: string | SQL, direction: 'asc' | 'desc' = 'asc'): this {
     if (typeof field === 'string') {
+      this._guardEncrypted(field, 'ORDER BY')
       const table = this.getTable()
       const col = table[field]
       if (!col) throw new Error(`Column "${field}" not found on table "${this._tableName}"`)
@@ -288,8 +292,39 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
 
   // ── Advanced query modifiers ──────────────────────────────────────────────
 
+  /** Encryption marker for a field, if any. */
+  protected _encMeta(field: string): { mode: 'randomized' | 'deterministic'; blindIndex?: string } | undefined {
+    const attr = (this._ctor as any)[field]
+    return attr?._isAttr ? attr._encrypted : undefined
+  }
+
+  /**
+   * FAIL LOUDLY. Encryption removes most of the query surface, and the failures
+   * are silently WRONG rather than loud: a randomized column GROUP BYs into one
+   * group per row, COUNT(DISTINCT) returns the row count, and a UNIQUE index on
+   * it never fires. Nothing else will ever tell you — so we throw here.
+   */
+  protected _guardEncrypted(field: string, op: string, allowDeterministic = false): void {
+    const meta = this._encMeta(field)
+    if (!meta) return
+    if (allowDeterministic && meta.mode === 'deterministic') return
+    const model = modelClassName(this._ctor)
+    const why = meta.mode === 'randomized'
+      ? `'${field}' is randomized-encrypted, so its stored bytes differ on every write`
+      : `'${field}' is encrypted, so ciphertext ordering/matching is meaningless`
+    throw new Error(
+      `active-drizzle: cannot ${op} encrypted field '${model}.${field}' — ${why}. ` +
+      `Encrypted columns support equality only (and only in deterministic or blind-index mode). ` +
+      `Fix: ${op === 'ORDER BY' || op === 'keyset-paginate on' ? 'sort/paginate on a plaintext column (e.g. id, createdAt)' :
+             op === 'aggregate' ? 'aggregate a plaintext column' :
+             op === 'text-search' ? 'search a plaintext projection (e.g. a domain or last-four column)' :
+             'use .encrypt({ deterministic: true }) if this field must be looked up'}.`,
+    )
+  }
+
   /** Resolves a camelCase field (honoring `Attr.for` column maps) to its drizzle column. */
-  protected _col(field: string): any {
+  protected _col(field: string, op = 'query', allowDeterministic = false): any {
+    this._guardEncrypted(field, op, allowDeterministic)
     const table = this.getTable()
     const col = table[_resolveColKey(this._ctor, field)]
     if (!col) throw new Error(`Column "${field}" not found on table "${this._tableName}"`)
@@ -306,7 +341,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     // accumulate GROUP BYs from separate chains (facet loops do exactly this)
     const next = this._clone() as this
     for (const f of fields) {
-      if (typeof f === 'string') next._group.push({ col: next._col(f), field: f })
+      if (typeof f === 'string') next._group.push({ col: next._col(f, 'GROUP BY', true), field: f })
       else next._group.push({ col: f, field: null })
     }
     return next
@@ -326,6 +361,19 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     return next
   }
 
+  /**
+   * Time-bucketed GROUP BY — `.groupByTime('createdAt', 'week').count()`
+   * → { '2026-07-13T00:00:00.000Z': 12, … }. Unit is ALLOWLISTED (it is
+   * interpolated into SQL); the column must be date/timestamp.
+   */
+  public groupByTime(field: string, unit: 'hour' | 'day' | 'week' | 'month' | 'quarter' | 'year'): this {
+    const UNITS = ['hour', 'day', 'week', 'month', 'quarter', 'year']
+    if (!UNITS.includes(unit)) throw new Error(`groupByTime: unit must be one of ${UNITS.join('/')}`)
+    const next = this._clone() as this
+    next._group.push({ col: sql.raw(`date_trunc('${unit}', "${(this._col(field) as any).name}")`), field: null })
+    return next
+  }
+
   /** HAVING — filter groups. `.group('userId').having(sql`count(*) > 5`)`. */
   public having(condition: SQL): this {
     const next = this._clone() as this
@@ -341,7 +389,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    */
   public distinct(on?: string | string[]): this {
     if (on === undefined) { this._distinct = true; return this }
-    this._distinctOn = (Array.isArray(on) ? on : [on]).map(f => this._col(f))
+    this._distinctOn = (Array.isArray(on) ? on : [on]).map(f => this._col(f, 'SELECT DISTINCT', true))
     return this
   }
 
@@ -355,7 +403,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    */
   public seek(fields: string[], opts: { after?: Record<string, any>; dir?: 'asc' | 'desc' } = {}): this {
     const dir  = opts.dir ?? 'asc'
-    const cols = fields.map(f => this._col(f))
+    const cols = fields.map(f => this._col(f, 'keyset-paginate on'))
     for (const c of cols) this._order.push((dir === 'desc' ? desc(c) : asc(c)) as SQL)
     if (opts.after) {
       const vals = fields.map(f => {
@@ -379,7 +427,8 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    * based on the type discriminator column.
    */
   public async load(): Promise<TModel[]> {
-    const rows = await this._withDefaultScopes()._buildQuery()
+    const q = this._withDefaultScopes()._buildQuery()
+    const rows = await this._exec<any[]>(q, 'select')
 
     // STI subclass resolution: build the typeValue → subclass map ONCE for the
     // whole result set instead of scanning MODEL_REGISTRY per row (was O(rows ×
@@ -567,7 +616,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     if (!grouped) {
       let q: any = getExecutor(this._tableName).select({ n: aggExpr }).from(table)
       if (where) q = q.where(where)
-      const [row] = await q
+      const [row] = await this._exec<any[]>(q, 'aggregate')
       return toScalar((row as any)?.n)
     }
 
@@ -578,7 +627,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     q = q.groupBy(...rel._group.map(g => g.col))
     if (rel._having) q = q.having(rel._having)
 
-    const rows: any[] = await q
+    const rows: any[] = await this._exec<any[]>(q, 'aggregate')
     const out: Record<string, any> = {}
     for (const r of rows) {
       const key = rel._group.map((g, i) => {
@@ -598,22 +647,22 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
 
   /** SUM of a column (Attr.for aware) — scalar, or a `{ groupKey → sum }` map when grouped. */
   public async sum(field: string): Promise<number> {
-    return this._agg(sql`coalesce(sum(${this._col(field)}), 0)::numeric`, 0, v => Number(v ?? 0))
+    return this._agg(sql`coalesce(sum(${this._col(field, 'aggregate')}), 0)::numeric`, 0, v => Number(v ?? 0))
   }
 
   /** AVERAGE of a column (null if no rows) — or a `{ groupKey → avg }` map when grouped. */
   public async average(field: string): Promise<number | null> {
-    return this._agg(sql`avg(${this._col(field)})::numeric`, null, v => (v == null ? null : Number(v)))
+    return this._agg(sql`avg(${this._col(field, 'aggregate')})::numeric`, null, v => (v == null ? null : Number(v)))
   }
 
   /** Minimum value of a column — or a `{ groupKey → min }` map when grouped. */
   public async minimum(field: string): Promise<any> {
-    return this._agg(sql`min(${this._col(field)})`, null, v => v ?? null)
+    return this._agg(sql`min(${this._col(field, 'aggregate')})`, null, v => v ?? null)
   }
 
   /** Maximum value of a column — or a `{ groupKey → max }` map when grouped. */
   public async maximum(field: string): Promise<any> {
-    return this._agg(sql`max(${this._col(field)})`, null, v => v ?? null)
+    return this._agg(sql`max(${this._col(field, 'aggregate')})`, null, v => v ?? null)
   }
 
   /**
@@ -637,10 +686,10 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     const where = rel._buildFinalWhere()
     const a: AggBuilder = {
       count:   ()          => ({ expr: sql`count(*)::int`,                             to: v => Number(v ?? 0) }),
-      sum:     (f: string) => ({ expr: sql`coalesce(sum(${rel._col(f)}), 0)::numeric`, to: v => Number(v ?? 0) }),
-      average: (f: string) => ({ expr: sql`avg(${rel._col(f)})::numeric`,              to: v => (v == null ? null : Number(v)) }),
-      minimum: (f: string) => ({ expr: sql`min(${rel._col(f)})`,                       to: v => v ?? null }),
-      maximum: (f: string) => ({ expr: sql`max(${rel._col(f)})`,                       to: v => v ?? null }),
+      sum:     (f: string) => ({ expr: sql`coalesce(sum(${rel._col(f, 'aggregate')}), 0)::numeric`, to: v => Number(v ?? 0) }),
+      average: (f: string) => ({ expr: sql`avg(${rel._col(f, 'aggregate')})::numeric`,              to: v => (v == null ? null : Number(v)) }),
+      minimum: (f: string) => ({ expr: sql`min(${rel._col(f, 'aggregate')})`,                       to: v => v ?? null }),
+      maximum: (f: string) => ({ expr: sql`max(${rel._col(f, 'aggregate')})`,                       to: v => v ?? null }),
     }
     const spec = build(a)
     const keys = Object.keys(spec)
@@ -656,7 +705,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
       q = q.groupBy(...rel._group.map(g => g.col))
       if (rel._having) q = q.having(rel._having)
     }
-    const rows: any[] = await q
+    const rows: any[] = await this._exec<any[]>(q, 'aggregate')
 
     const shape = (row: any) => {
       const o: Record<string, any> = {}
@@ -696,7 +745,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
       .groupBy(col)
     if (whereExpr) q = q.where(whereExpr)
 
-    const rows: any[] = await q
+    const rows: any[] = await this._exec<any[]>(q, 'aggregate')
     const Ctor = rel._ctor
     const attrGet = (Ctor[field] as any)?._isAttr ? (Ctor[field] as any).get : undefined
 
@@ -722,7 +771,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     const whereExpr = rel._buildFinalWhere()
     let q: any = getExecutor(this._tableName).select({ one: sql`1` }).from(table).limit(1)
     if (whereExpr) q = q.where(whereExpr)
-    const rows = await q
+    const rows = await this._exec<any[]>(q, 'select')
     return rows.length > 0
   }
 
@@ -915,7 +964,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
         `(a camelCase export over a snake_case table is the usual culprit).`,
       )
     }
-    const rows: any[] = await queryApi.findMany(config)
+    const rows: any[] = await this._exec<any[]>(queryApi.findMany(config), 'pluck')
 
     return rows.map((row: any) => {
       // Single-field shortcut → plain value
@@ -975,7 +1024,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     if (rel._offset > 0)       q = q.offset(rel._offset)
     if (rel._order.length > 0) q = q.orderBy(...rel._order)
 
-    const rows: any[] = await q
+    const rows: any[] = await this._exec<any[]>(q, 'pluck')
 
     return rows.map((row: any) => {
       if (fields.length === 1) {
@@ -1008,7 +1057,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     let q: any = db.update(table).set(mapped)
     const whereExpr = rel._buildFinalWhere()
     if (whereExpr) q = q.where(whereExpr)
-    const result = await q
+    const result = await this._exec<any>(q, 'update')
     return (result as any)?.rowCount ?? (result as any)?.length ?? 0
   }
 
@@ -1028,7 +1077,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     let q: any = db.delete(table)
     const whereExpr = rel._buildFinalWhere()
     if (whereExpr) q = q.where(whereExpr)
-    const result = await q
+    const result = await this._exec<any>(q, 'delete')
     return (result as any)?.rowCount ?? 0
   }
 
@@ -1143,7 +1192,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     if (rel._order.length > 0) q = q.orderBy(...rel._order)
     if (rel._limit) q = q.limit(rel._limit)
     if (rel._offset > 0) q = q.offset(rel._offset)
-    return await q
+    return await this._exec<any>(q, 'select')
   }
 
   // ── Set operations (UNION / INTERSECT / EXCEPT) → model instances ─────────
@@ -1163,7 +1212,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     let combined: any = op(leg(this), leg(other))
     if (this._order.length > 0) combined = combined.orderBy(...this._order)
     if (this._limit) combined = combined.limit(this._limit)
-    const rows: any[] = await combined
+    const rows: any[] = await this._exec<any[]>(combined, 'select')
     return rows.map((r: any) => new (this._ctor as any)(r, false))
   }
 
@@ -1177,6 +1226,37 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   }
 
   // ── Internals ────────────────────────────────────────────────────────────
+
+  /**
+   * Executes a built query with error enrichment.
+   *
+   * Read failures used to escape as a bare driver error — no model, no table,
+   * no SQL, and a stack pointing into `pg-pool`/`node-postgres` internals — and
+   * they never reached `onError()` at all, so half of every app's DB errors
+   * were invisible to Rollbar/Sentry. This mirrors what the save path already
+   * does in `ApplicationRecord._handleDbError`: fan the RAW error out to the
+   * registered handlers with context, then rethrow it untouched so callers
+   * (and `translateDbError`) still see exactly what the driver produced.
+   *
+   * SECURITY: only the compiled SQL *string* is reported — never the bound
+   * params. Params carry user data, and for `.encrypt()`ed attrs they'd carry
+   * plaintext search terms straight into an error tracker. See BEFORE_LAUNCH §4F.
+   */
+  private async _exec<T>(q: any, operation: string): Promise<T> {
+    try {
+      return await q
+    } catch (err) {
+      let compiledSql: string | undefined
+      try { compiledSql = q?.toSQL?.()?.sql } catch { /* not every builder compiles */ }
+      reportError(err, {
+        model: modelClassName(this._ctor),
+        table: this._tableName,
+        operation,
+        ...(compiledSql ? { sql: compiledSql } : {}),
+      })
+      throw err
+    }
+  }
 
   /**
    * Builds the final WHERE expression, injecting the STI type discriminator
@@ -1270,8 +1350,17 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
       if (!col) throw new Error(`Column "${key}" (mapped to "${colKey}") not found on table "${this._tableName}". Check spelling (use camelCase).`)
 
       if (rawVal === null || rawVal === undefined) {
-        this._where.push(isNull(col) as SQL)
+        this._where.push(isNull(col) as SQL)   // IS NULL works on every mode — NULL is never encrypted
         continue
+      }
+
+      // Encrypted fields support EQUALITY ONLY, and only in deterministic mode
+      // (where Attr.set encrypts the search term to the same bytes the column
+      // holds). Randomized fields can never match; ranges can never work.
+      const encMeta = this._encMeta(key)
+      if (encMeta) {
+        if (_isOperatorObject(rawVal)) this._guardEncrypted(key, 'range-filter')
+        else if (encMeta.mode !== 'deterministic') this._guardEncrypted(key, 'filter')
       }
 
       // Relation sub-query value

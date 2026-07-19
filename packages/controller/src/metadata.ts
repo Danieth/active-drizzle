@@ -295,6 +295,10 @@ export interface MutationEntry {
   if?: (record: any, ctx: any, ctrl: any) => boolean
   /** Human label for the generated button / mini-form. */
   label?: string
+  /** WHY the guard declined — rides the envelope `why` map so the greyed
+   *  button explains itself ("already at highest priority"). String or
+   *  per-record function. */
+  hint?: string | ((record: any, ctx: any) => string)
 }
 
 export interface ActionEntry {

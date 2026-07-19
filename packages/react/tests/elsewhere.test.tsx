@@ -43,7 +43,7 @@ describe('elsewhere rides PresenterProps', () => {
   it('a diverged field gets { value, at }; a settled field gets nothing', () => {
     const { handle } = makeConflicted()
     render(<handle.name edit />)
-    expect(lastProps!.elsewhere).toEqual({ value: 'THEIRS', at: '2026-07-19T12:00:00Z' })
+    expect(lastProps!.elsewhere).toEqual({ value: 'THEIRS', at: '2026-07-19T12:00:00Z', by: null })
     expect(lastProps!.value).toBe('MINE')          // never eat a keystroke
     render(<handle.amount edit />)
     expect(lastProps!.elsewhere).toBeUndefined()

@@ -1,8 +1,10 @@
 # Field encryption — chainable `.encrypt()`
-### Design doc · 2026-07-19 · status: PROPOSED (nothing implemented yet)
+### Design doc · 2026-07-19 · status: CORE BUILT — propagation layers TODO
 ### Goal: "encrypt any field" without losing the ability to find rows by it.
 
-> **Current state: there is ZERO encryption in the codebase.** Scanned 2026-07-19 — no `encrypt`/`decrypt`/`cipher`/`pgcrypto`/KMS code, no crypto dependencies, no `Attr.encrypted`, and the S3 storage layer does **not** set `ServerSideEncryption` on upload. This doc is the plan, not a description of something that exists.
+> **Built (69 tests):** the cipher (`runtime/encryption.ts` — AES-256-GCM, versioned format, `KeyProvider` seam, deterministic mode, blind-index helper), the chainable `.encrypt()` on every Attr, the fail-loudly query guards in `Relation`, and pg-value redaction in `reportError`.
+>
+> **Not built:** blind-index query rewrite, codegen/controller/React propagation (§3.7), S3 `ServerSideEncryption` (§5), KMS `KeyProvider`.
 
 ---
 
@@ -180,6 +182,71 @@ A blind index is `hmac_sha256(indexKey, normalize(plaintext))` stored in a sidec
 - **Rotation.** Envelope encryption means rotating the master key only rewraps DEKs. Rotating a *data* key means re-encrypting rows; rotating the *index* key means rebuilding every sidecar.
 - **Performance.** Every read decrypts — a `pluck` of 10k rows × 3 encrypted fields is 30k decrypt calls. Randomized columns can't use an index at all, so any accidental filter on one degrades to a full scan (another reason to reject it at build time).
 - **Losing the key loses the data.** Key backup/escrow is a product decision, not a library one — but the docs must say it out loud.
+
+---
+
+## 3.7 Propagation — the rules must reach the frontend
+
+Encryption is decided in the model but *enforced* in five places. If the rule stops at the ORM, the UI happily renders a sort header that returns garbage.
+
+```
+Attr.encrypt()  →  _encrypted marker
+      │
+      ├─ Relation guards ...................... ✅ BUILT (throws on order/range/search/aggregate)
+      ├─ codegen: carry _encrypted into meta ... ⬜ TODO
+      ├─ controller allowlists (filter/sort/search) ⬜ TODO
+      ├─ envelope: per-field capability ........ ⬜ TODO
+      └─ React: filter/sort/table UI ........... ⬜ TODO
+```
+
+### The distinction that drives the UI: server-side vs client-side
+
+**The wire carries plaintext.** The server decrypts on read (`Attr.get`) and serializes through `expose`, so an API response contains real values — encryption here is *at rest*, not end-to-end. That means:
+
+- **Client-side operations on an already-fetched page work fine.** Sorting or filtering the 25 rows in the browser operates on plaintext. Nothing to block.
+- **Server-side operations across the whole table do not.** Sorting a paginated list, filtering before pagination, or a `?q=` search all happen in SQL — impossible.
+
+So the UI rule isn't "encrypted fields are inert," it's **"encrypted fields can't participate in *server-driven* list operations."** That's exactly the set the controller allowlists govern.
+
+### What each layer must do
+
+| Layer | Rule |
+|---|---|
+| **codegen** | Emit `_encrypted: { mode, blindIndex? }` into the model meta and the generated client types, so downstream layers can see it without importing the model. |
+| **controller `filterable`** | Reject randomized fields outright. Allow deterministic/blind for **equality only** — reject `gte`/`lte`/`contains` operators at config-validation time, not request time. |
+| **controller `sortable` / `searchable`** | Reject every encrypted field at build time. |
+| **envelope** | Add a per-field capability alongside the existing `abilities` map, e.g. `{ email: { encrypted: 'deterministic', ops: ['eq'] } }`. The client already consumes the envelope, so this is the natural carrier. |
+| **React** | Filter builder offers only the permitted operators (an equality input, never a range or "contains"); table headers for encrypted fields are not sortable; the global search box doesn't claim to cover them. |
+
+The build-time half matters most: **a wrong allowlist is a silently-empty result set**, and the validator already reads both models and controller config, so it can catch every case before the app runs.
+
+---
+
+## 3.8 Derived copies — where encryption actually leaks (incl. Elasticsearch)
+
+> **Encryption is only as strong as the leakiest copy of the data.**
+
+This is the part people miss. The database column is ciphertext, but plaintext still flows to every *derived* store, and each one is a full bypass:
+
+| Derived copy | Exposure |
+|---|---|
+| **Elasticsearch / OpenSearch index** | 🔴 holds plaintext, fully searchable, usually weaker auth than the DB |
+| Redis / query cache | 🔴 plaintext values |
+| Materialized views, analytics warehouse, CDC/replication streams | 🔴 plaintext |
+| CSV / PDF exports, audit logs, `console.log` | 🔴 plaintext |
+| Error trackers | ✅ handled — see the redaction work |
+
+### The Elasticsearch decision
+
+If you index an encrypted field into ES, **you have not protected it — you have moved the exposure** from a hardened database to a search cluster. Three honest options:
+
+1. **Don't index encrypted fields (recommended default).** The indexer skips any field carrying `_encrypted`. Search covers plaintext fields only. Simple, and it holds automatically as new fields get encrypted.
+2. **Index blind-index tokens only.** Exact-match lookup without plaintext — but you lose analyzers, stemming, fuzziness, and relevance ranking, i.e. the entire reason to run ES.
+3. **Treat ES as a second trusted store** — its own at-rest encryption, network isolation, and access control — and accept the duplicated exposure as a documented, deliberate risk.
+
+**This should be enforced, not remembered.** Option 1 becomes real only if the indexer reads `_encrypted` and skips those fields by construction; a convention in a README will be violated the first time someone adds a field. Same enforcement argument applies to exports and cache-key builders.
+
+The general rule worth putting in the user docs: **the moment you `.encrypt()` a field, audit every place that value gets copied.** The ORM can guard SQL; it cannot guard your indexer.
 
 ---
 
