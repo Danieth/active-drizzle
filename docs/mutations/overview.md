@@ -106,23 +106,34 @@ user.isDestroyed  // true
 
 Runs `@beforeDestroy` and `@afterDestroy` hooks. If the model has `dependent: 'destroy'` associations, those records are destroyed first.
 
-### `Relation.destroyAll()` — bulk DELETE (no hooks)
+### `Relation.destroyAll()` — bulk destroy (hooks run)
 
-Issues a **single raw `DELETE`** for every matching row and returns the number of rows removed. It does **not** load records, so `@beforeDestroy` / `@afterDestroy` hooks do **not** run and `dependent: 'destroy'` associations are **not** cascaded.
-
-```ts
-const removed = await User.where({ active: false }).destroyAll()
-// DELETE FROM users WHERE active = false  → number of rows deleted
-```
-
-::: warning Hooks do not run
-`destroyAll()` is the fast path. If you need per-record callbacks or dependent-destroy cascading, load the records and destroy them individually:
+Loads each matching record and calls `destroy()` on it, so `@beforeDestroy` / `@afterDestroy` hooks fire and `dependent: 'destroy'` associations cascade. Returns the number of records destroyed. Rails `destroy_all`.
 
 ```ts
-for (const user of await User.where({ active: false }).load()) {
-  await user.destroy()   // hooks + dependent: 'destroy' cascade
-}
+const destroyed = await User.where({ active: false }).destroyAll()
+// one DELETE per record — hooks + cascade honored
 ```
+
+Wrap it in a transaction if you need all-or-nothing:
+
+```ts
+await User.transaction(async () => {
+  await User.where({ active: false }).destroyAll()
+})
+```
+
+### `Relation.deleteAll()` — raw DELETE (no hooks)
+
+Issues a **single** `DELETE` for every matching row and returns the row count. Nothing is loaded, so hooks do **not** run and `dependent: 'destroy'` is **not** cascaded (database `ON DELETE` constraints still apply). Rails `delete_all`.
+
+```ts
+const removed = await User.where({ active: false }).deleteAll()
+// DELETE FROM users WHERE active = false — one statement, fast
+```
+
+::: tip Which one?
+`destroyAll()` when the model has destroy-time behavior to honor (callbacks, dependent children). `deleteAll()` when it doesn't and you want one fast statement.
 :::
 
 ---

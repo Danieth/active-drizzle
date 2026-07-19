@@ -479,7 +479,8 @@ async archive(ids: number[]) {
 | `.findEach(batchSize, fn)` | `Promise<void>` | Batch iteration |
 | `.withLock(fn)` | `Promise<T>` | Lock row in transaction |
 | `.toSubquery(col?)` | SQL value | Use as IN subquery |
-| `.destroyAll()` | `Promise<number>` | Raw bulk DELETE, **no hooks**, returns row count |
+| `.destroyAll()` | `Promise<number>` | Loads + destroys each — **hooks run**, `dependent: 'destroy'` cascades |
+| `.deleteAll()` | `Promise<number>` | Single raw DELETE — **no hooks**, no cascade |
 | `.updateAll(attrs)` | `Promise<number>` | Raw UPDATE, no hooks, returns row count |
 
 ### Advanced query methods

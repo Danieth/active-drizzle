@@ -15,8 +15,89 @@ import { join, resolve } from 'node:path'
 
 const [, , command, name, ...rest] = process.argv
 
+// ── trails doctor — the misconfigurations that degrade SILENTLY ─────────────
+// Each check exists because the failure mode shows no error anywhere: a
+// missing tsconfig include quietly kills every type augmentation; a stale
+// .gen quietly serves yesterday's types; a missing barrel import quietly
+// unregisters a model.
+if (command === 'doctor') {
+  const { readFileSync: rf, existsSync: ex, readdirSync: rd, statSync: st } = await import('node:fs')
+  const cwd = process.cwd()
+  let failed = 0
+  const ok = (msg) => console.log(`  ✓ ${msg}`)
+  const bad = (msg, fix) => { failed++; console.log(`  ✗ ${msg}\n      fix: ${fix}`) }
+  const warn = (msg) => console.log(`  ⚠ ${msg}`)
+
+  console.log('trails doctor\n')
+
+  // config file
+  if (['trails.config.ts', 'trails.config.mts', 'trails.config.js', 'trails.config.mjs'].some(f => ex(join(cwd, f)))) {
+    ok('trails.config found')
+  } else {
+    warn('no trails.config — everything defaults (fine, but the one master file is recommended)')
+  }
+
+  // tsconfig — THE silent type-killer
+  try {
+    const raw = rf(join(cwd, 'tsconfig.json'), 'utf8').replace(/\/\/[^"\n]*$/gm, '')
+    const ts = JSON.parse(raw)
+    const paths = ts.compilerOptions?.paths ?? {}
+    if (paths['@gen/*']) ok(`tsconfig paths: @gen/* → ${paths['@gen/*']}`)
+    else bad('tsconfig has no @gen/* paths entry — @gen imports type-error in the editor',
+      `"baseUrl": ".", "paths": { "@gen/*": ["./.gen/*"] }`)
+    const inc = ts.include ?? []
+    if (inc.some((i) => String(i).includes('.gen'))) ok('tsconfig include covers .gen')
+    else bad('tsconfig include does NOT cover .gen — type augmentations are SILENTLY dead (dot-dirs never ride wildcard includes)',
+      `add ".gen/**/*" to tsconfig "include"`)
+  } catch { bad('tsconfig.json unreadable', 'create/fix tsconfig.json') }
+
+  // .gen freshness
+  if (!ex(join(cwd, '.gen'))) {
+    bad('.gen/ missing — nothing generated yet', 'npm run regen (or start `npm run dev` once)')
+  } else {
+    const newest = (dir, pat) => ex(dir)
+      ? Math.max(0, ...rd(dir).filter(f => pat.test(f)).map(f => st(join(dir, f)).mtimeMs)) : 0
+    const srcNewest = Math.max(
+      newest(join(cwd, 'server/db'), /schema\.ts$/),
+      newest(join(cwd, 'server/models'), /\.model\.ts$/),
+      newest(join(cwd, 'server/controllers'), /\.ctrl\.ts$/),
+    )
+    const genNewest = Math.max(
+      newest(join(cwd, '.gen/models'), /\.ts$/),
+      newest(join(cwd, '.gen/controllers'), /\.ts$/),
+    )
+    if (genNewest === 0) bad('.gen/ is empty', 'npm run regen')
+    else if (srcNewest > genNewest + 2000) bad('.gen/ is STALE (sources newer than generated output)', 'npm run regen')
+    else ok('.gen/ present and fresh')
+  }
+
+  // gitignore
+  try {
+    const gi = rf(join(cwd, '.gitignore'), 'utf8')
+    if (/^\.gen\/?$/m.test(gi)) ok('.gitignore covers .gen/')
+    else bad('.gen/ is not gitignored — generated files will pollute diffs', 'add ".gen/" to .gitignore')
+  } catch { warn('no .gitignore') }
+
+  // user-owned wiring
+  if (ex(join(cwd, 'server/controllers/_client.ts'))) ok('_client.ts present (user-owned wiring)')
+  else warn('_client.ts missing — the first codegen run creates the stub')
+
+  // database mode
+  if (process.env.DATABASE_URL) ok('DATABASE_URL set — real Postgres (schema sync: npm run db:push)')
+  else warn('DATABASE_URL unset — dev falls back to IN-MEMORY PGlite (data resets on restart)')
+
+  // framework packages
+  const missing = ['active-drizzle', '@active-drizzle/controller', '@active-drizzle/react']
+    .filter(m => !ex(join(cwd, 'node_modules', m)))
+  if (missing.length === 0) ok('framework packages installed')
+  else bad(`missing packages: ${missing.join(', ')}`, 'npm install')
+
+  console.log(failed ? `\n${failed} problem${failed > 1 ? 's' : ''} found` : '\nall clear')
+  process.exit(failed ? 1 : 0)
+}
+
 if (command !== 'new' || !name) {
-  console.log('Usage: trails new <app-name> [--link <path-to-active-drizzle-monorepo>]')
+  console.log('Usage: trails new <app-name> [--link <monorepo>] | trails doctor')
   process.exit(command === 'new' ? 1 : 0)
 }
 
@@ -54,6 +135,7 @@ const files = {
       'dev:server': 'tsx watch server/main.ts',
       'dev:client': 'vite',
       'db:push': 'drizzle-kit push',
+      'test': 'vitest run',
       'regen': 'tsx scripts/regen.mts',
       'typecheck': 'tsc --noEmit',
     },
@@ -82,6 +164,7 @@ const files = {
       'tsx': '^4.19.0',
       'typescript': '^5.7.0',
       'vite': '^6.0.0',
+      'vitest': '^3.0.0',
     },
   }, null, 2) + '\n',
 
@@ -118,7 +201,7 @@ export default defineConfig({
       allowImportingTsExtensions: true, noEmit: true, types: ['vite/client', 'node'],
       baseUrl: '.', paths: { '@gen/*': ['./.gen/*'] },
     },
-    include: ['server', 'src', '.gen/**/*', 'vite.config.ts', 'trails.config.ts'],
+    include: ['server', 'src', 'tests', '.gen/**/*', 'vite.config.ts', 'trails.config.ts'],
   }, null, 2) + '\n',
 
   'vite.config.ts': `import { defineConfig } from 'vite'
@@ -424,6 +507,40 @@ npm run dev
 Generated files live in \`.gen/\` (gitignored, rebuilt by the vite plugin —
 never edit them) and are imported through the \`@gen\` alias:
 \`import { Posts } from '@gen/controllers'\` anywhere, no ../.. paths.
+`,
+
+  'tests/contract.test.ts': `/**
+ * The security suite that writes itself: every allowlist in the
+ * controller config (filterable, sortable, permit, chartable, expose,
+ * mutation params) IS a contract — these probes are DERIVED from that
+ * same config and forge every field. An empty failures array is a
+ * passing contract; it can never fall behind the config because it IS
+ * the config. Runs fully in-process (PGlite, no server).
+ */
+import { describe, it, expect } from 'vitest'
+import { call } from '@orpc/server'
+import { boot, bindDatabase } from 'active-drizzle'
+import { buildRouter, buildContractProbes, runContractProbes } from '@active-drizzle/controller'
+
+import * as schema from '../server/db/schema.ts'
+import { db } from '../server/db/index.ts'
+import { Post } from '../server/models/index.ts'
+import { PostController } from '../server/controllers/Post.ctrl.ts'
+
+boot(db as any, { posts: schema.posts })
+void Post
+
+const { router } = buildRouter(PostController)
+
+describe('contract probes — the forge-every-field suite', () => {
+  it('every hostile input derived from the config is rejected or stripped', async () => {
+    const probes = buildContractProbes(PostController)
+    expect(probes.length).toBeGreaterThan(0)
+    const failures = await runContractProbes(probes, (proc, input) =>
+      call((router as any)[proc], input, { context: {} }))
+    expect(failures).toEqual([])
+  })
+})
 `,
 
   'scripts/regen.mts': `/**

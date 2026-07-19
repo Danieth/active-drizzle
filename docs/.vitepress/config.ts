@@ -6,6 +6,7 @@ const modelSidebar = [
     collapsed: false,
     items: [
       { text: 'Overview', link: '/models/overview' },
+      { text: 'Schema & Migrations', link: '/models/schema-and-migrations' },
       { text: 'Model Methods (Reference)', link: '/models/methods' },
       { text: 'Attributes & Enums', link: '/models/attributes' },
       { text: 'Arrays, Ranges & Timezones', link: '/models/typed-attrs' },
@@ -104,6 +105,12 @@ export default defineConfig({
           text: 'File Storage',
           items: [
             { text: 'Storage Setup', link: '/guide/storage' },
+          ],
+        },
+        {
+          text: 'Examples',
+          items: [
+            { text: 'Trigger.dev Task & Retry', link: '/examples/trigger-task-and-retry' },
           ],
         },
       ],

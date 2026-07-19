@@ -749,3 +749,21 @@ routes per TABLE (`getExecutor(table)`), transactions take `{ database }`
 and NEVER capture queries against other databases (different connections
 — pretending otherwise would silently break atomicity; pinned by tests).
 Cross-database associations/includes are unsupported by design.
+
+
+## Born bulletproof: template contract tests + `trails doctor` (built)
+
+Every `trails new` app now ships `tests/contract.test.ts` — the
+forge-every-field security suite derived from the controller's own config,
+running fully in-process (oRPC `call`, PGlite, no server). `npm test`
+exists on day one and can never fall behind the config, because it IS the
+config.
+
+`trails doctor` checks the misconfigurations that degrade SILENTLY —
+each check exists because the failure shows no error anywhere: tsconfig
+missing the `@gen/*` paths or the `.gen/**/*` include (type augmentations
+silently dead), stale `.gen/` (yesterday's types served fresh),
+un-gitignored `.gen/`, missing `_client.ts`, missing framework packages —
+✓/✗ with the exact fix per line, exit 1 on problems (CI-able). Plus: the
+"table not found" runtime error now teaches the boot map / bindDatabase /
+barrel-import checklist instead of just asking "did you call boot()?".

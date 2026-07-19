@@ -62,7 +62,14 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
 
   protected getTable(): any {
     const table = getSchema()[this._tableName]
-    if (!table) throw new Error(`Table "${this._tableName}" not found in schema. Did you call boot()?`)
+    if (!table) {
+      throw new Error(
+        `active-drizzle: model '${modelClassName(this._ctor) ?? this._tableName}' declares table '${this._tableName}', ` +
+        `but no such table was bound. Fix: add it to the boot map — boot(db, { ${this._tableName}: schema.${this._tableName}, … }) — ` +
+        `or bind it to another database: bindDatabase('name', db2, { ${this._tableName}: … }). ` +
+        `(Also check the model is imported through your models/index.ts barrel — ESM elides unused imports.)`,
+      )
+    }
     return table
   }
 
@@ -977,9 +984,15 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   }
 
   /**
-   * Bulk DELETE for all records matching the current where clauses.
+   * Raw bulk DELETE — one statement, **no hooks, no cascade**. Returns the
+   * number of rows removed. Rails `delete_all`.
+   *
+   * Nothing is loaded into memory, so `@beforeDestroy`/`@afterDestroy` never
+   * fire and `dependent: 'destroy'` associations are NOT cascaded (database
+   * `ON DELETE` constraints still apply). Use it when you want speed and the
+   * model has no destroy-time behavior to honor.
    */
-  public async destroyAll(): Promise<number> {
+  public async deleteAll(): Promise<number> {
     const rel = this._withDefaultScopes()
     const db = getExecutor(this._tableName)
     const table = rel.getTable()
@@ -988,6 +1001,25 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     if (whereExpr) q = q.where(whereExpr)
     const result = await q
     return (result as any)?.rowCount ?? 0
+  }
+
+  /**
+   * Loads each matching record and calls `destroy()` on it, so
+   * `@beforeDestroy`/`@afterDestroy` hooks run and `dependent: 'destroy'`
+   * associations cascade. Returns the number of records destroyed.
+   * Rails `destroy_all`.
+   *
+   * This is the correct-but-slower path (one DELETE per record). For a fast
+   * bulk delete that skips all model behavior, use {@link deleteAll}.
+   * Wrap in `Model.transaction()` if you need all-or-nothing semantics.
+   */
+  public async destroyAll(): Promise<number> {
+    const records = await this.load()
+    let destroyed = 0
+    for (const record of records) {
+      if (await (record as any).destroy()) destroyed++
+    }
+    return destroyed
   }
 
   /**

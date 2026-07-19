@@ -263,11 +263,20 @@ describe('Relation.toSubquery()', () => {
 
 // ── destroyAll ─────────────────────────────────────────────────────────────
 
+describe('Relation.deleteAll()', () => {
+  it('calls db.delete(table) with where clause — one raw statement, no hooks', async () => {
+    const rel = new Relation(Post).where({ status: 'draft' })
+    await rel.deleteAll()
+    expect(mockDb.deleteMock).toHaveBeenCalled()
+  })
+})
+
 describe('Relation.destroyAll()', () => {
-  it('calls db.delete(table) with where clause', async () => {
+  it('loads records and destroys each (does NOT issue a bulk DELETE)', async () => {
     const rel = new Relation(Post).where({ status: 'draft' })
     await rel.destroyAll()
-    expect(mockDb.deleteMock).toHaveBeenCalled()
+    // destroyAll goes through load() + record.destroy(), so no bulk delete
+    expect(mockDb.deleteMock).not.toHaveBeenCalled()
   })
 })
 

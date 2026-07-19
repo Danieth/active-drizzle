@@ -236,11 +236,11 @@ await User.where({ active: false }).updateAll({ role: 0 })
 await user.destroy()
 user.isDestroyed  // true
 
-// Bulk raw DELETE — fast, but NO hooks and no dependent-destroy cascade
-const removed = await User.where({ active: false }).destroyAll()   // → row count
+// Bulk destroy — hooks run + dependent: 'destroy' cascades (one DELETE per record)
+const destroyed = await User.where({ active: false }).destroyAll()
 
-// Need hooks / cascading? Load and destroy each record instead:
-for (const u of await User.where({ active: false }).load()) await u.destroy()
+// Raw bulk DELETE — one statement, fast, NO hooks and no cascade
+const removed = await User.where({ active: false }).deleteAll()
 ```
 
 See [Create, Update, Destroy](/mutations/overview) for the complete reference.
