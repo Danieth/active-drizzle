@@ -30,11 +30,43 @@ The spine is already good — `translateDbError` + `onError`/`reportError` (serv
 
 ---
 
-## 3. Ecosystem reach
+## 3. Query & data-layer DX
+
+The query builder is already deep (`sum`/`average`/`minimum`/`maximum`/`tally`, `exists`/`any`/`many`, `findOrCreateBy`, `inBatches`, `SELECT … FOR UPDATE` locking, composite keys). Two genuine gaps:
+
+- **`.toSQL()` / `.explain()` — see the query before it runs.** Confirmed missing (only `toSubquery` exists, for composition). Drizzle already compiles the SQL, so surfacing `.toSQL()` (returns the string) and `.explain()` (EXPLAIN ANALYZE) on `Relation` is ~an afternoon and pays off every single debugging session. **Highest value-per-effort item in this file.**
+- **Upsert / bulk `ON CONFLICT`.** Missing today (`findOrCreateBy` is the race-prone, row-at-a-time stand-in). Drizzle gives us `.onConflictDoUpdate` / `.onConflictDoNothing`.
+  - **Difficulty: the SQL is easy; the *semantics* are the work.** Bulk upsert has to decide — and document — what it does about the ActiveRecord layer: do validations run? do `beforeSave`/`afterSave` hooks fire per row? does dirty-tracking / `updated_at` update? Rails' `upsert_all`/`insert_all` deliberately **bypass** validations + callbacks (they're raw), which surprises people. Pick a stance (likely: bypass hooks/validations like `updateAll`, document loudly, and offer a slower per-row path that runs them). That decision — not the Drizzle call — is the hard part. Also: Attr `set` transforms must apply to *both* the insert values and the conflict-update set, and the conflict target has to resolve composite/unique keys. **Net: 1 day for the happy path, the real cost is nailing + documenting the semantics.**
+
+---
+
+## 4. Ecosystem reach
 
 - **More framework adapters.** We have `hono`; Express / Next route-handlers / Remix / Fastify would widen the funnel a lot (the controller layer is already framework-agnostic; adapters are thin).
 - **`generate:scaffold`** end-to-end (model + Drizzle table stub + controller + factory + a React form) — the "wow, one command" demo. (Lives in the DESIGN doc's `ad generate:*`.)
 - **Edge/serverless proof.** Actually run the suite on Workers/Neon-http/PGlite and publish the matrix (also a BEFORE_LAUNCH trust item).
+
+---
+
+## 5. Adoption & docs
+
+- **Client bundle size with N models — measure first, it's probably fine.** The react package ships generated runtime per model, so the worry is 50–100 models bloating the client. Honest guess: **it's fine**, because generated per-model code is thin and tree-shakes. **But if a measurement ever shows growth**, the fix Daniel floated is the right one: a **shared generated base type/class that every model's generated type inherits from**. `_globals.gen.d.ts` already establishes this pattern (ambient aliases) — push the common structure into one base so each per-model file emits only its *delta*. That keeps the bundle DRY and effectively "pre-tree-shaken." Rule: measure → only build the base if the number demands it.
+- **SSR / hydration story — currently UNKNOWN, needs investigation.** How do client model instances behave under Next/Remix SSR + hydration? Open questions: are proxy-wrapped records serializable across the RSC/hydration boundary? Do they survive `JSON.stringify` → rehydrate as live models or as plain objects? Does `boot()` run on the server, the client, or both? We genuinely don't know yet — this is a **find-out-and-document** item, not a feature. People *will* ask on day one, so it needs a real answer before it becomes a support fire.
+- **Sharpen the comparison + a "migrating from Prisma" guide.** There's an attempt in the main docs, but it reads as a **blur**. A crisp side-by-side (active-drizzle vs Prisma vs raw Drizzle vs TypeORM — on schema ownership, type-safety, associations, migrations, testing) plus a concrete Prisma→active-drizzle walkthrough is the single best conversion tool. Rewrite the blur into an opinionated table.
+
+---
+
+## Nice to have — but EXPENSIVE
+
+Real, but each is a meaningful chunk of work, not a weekend spike:
+
+- **Read replicas *and* full multi-database (`connected_to`).** Not just read/write splitting — per-model or per-request connection routing, sharding, DB-per-tenant. High value at scale, but it reaches into `boot()`, the executor seam, transaction handling, and every query path. Design deliberately; defer until someone actually needs it.
+
+---
+
+## Deliberately left to apps (design stance, not a gap)
+
+- **Full audit / change-history (who-changed-what-when, old→new).** The `trackable` concern is intentionally **general-purpose** (timestamps/blame) — it is *not* meant to grow into a specialized audit solution, because real audit requirements (retention, tamper-evidence, field-level diffs, regulatory export format) are app-specific. Ship the `afterCommit` + dirty-tracking seams that let an app build exactly the audit it needs; don't ship an opinionated audit table and pretend it fits everyone.
 
 ---
 

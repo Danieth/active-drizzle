@@ -432,9 +432,10 @@ export class NestedArrayManager {
    *   local new rows / destroy-marked rows → keep as-is (mine to settle)
    * Returns true when any child (or structure) conflicted.
    */
-  rehydrate(rows: any): boolean {
-    if (!Array.isArray(rows)) return false
+  rehydrate(rows: any): { conflict: boolean; changed: boolean } {
+    if (!Array.isArray(rows)) return { conflict: false, changed: false }
     let conflict = false
+    let changed = false
     const incomingById = new Map<any, any>()
     for (const r of rows) if (r?.id != null) incomingById.set(r.id, r)
 
@@ -446,17 +447,20 @@ export class NestedArrayManager {
       incomingById.delete(draft.id)
       if (child.destroyed) { next.push(child); continue }      // my destroy still staged
       if (incoming) {
+        const before = child.session.getRecentChanges().length
         if (child.session.rehydrate({ record: incoming })) conflict = true
+        if (child.session.getRecentChanges().length > before) changed = true
         next.push(child)
       } else {
         // gone from the server: clean rows drop; dirty rows are a conflict
         const dirty = Object.keys(child.session.changedData()).length > 0
         if (dirty) { conflict = true; next.push(child) }
-        // clean → omit (deleted elsewhere)
+        else changed = true                                    // deleted elsewhere
       }
     }
     // Rows that appeared elsewhere
     for (const row of incomingById.values()) {
+      changed = true
       next.push({
         key: `id:${row.id}`,
         session: this.makeChildSession({ ...row }, false),
@@ -466,7 +470,7 @@ export class NestedArrayManager {
     }
     this.children = next
     this.parent.notifyExternal(this.name)
-    return conflict
+    return { conflict, changed }
   }
 
   /**
@@ -695,29 +699,32 @@ export class NestedOneManager {
    * insert an appeared-elsewhere child, drop a clean deleted-elsewhere
    * child, flag a dirty one. Returns true on conflict.
    */
-  rehydrate(row: any): boolean {
-    if (Array.isArray(row)) return false
+  rehydrate(row: any): { conflict: boolean; changed: boolean } {
+    if (Array.isArray(row)) return { conflict: false, changed: false }
     const incoming = row && typeof row === 'object' ? row : null
     if (!this.child) {
       if (incoming) {
         this.child = this.makeChild({ ...incoming }, incoming.id == null)
         this.parent.notifyExternal(this.name)
+        return { conflict: false, changed: true }              // appeared elsewhere
       }
-      return false
+      return { conflict: false, changed: false }
     }
-    if (this.child.isNew || this.child.destroyed) return false   // mine to settle
+    if (this.child.isNew || this.child.destroyed) return { conflict: false, changed: false }
     const draft: any = this.child.session.draft
     if (incoming && incoming.id === draft.id) {
+      const before = this.child.session.getRecentChanges().length
       const conflict = this.child.session.rehydrate({ record: incoming })
+      const changed = this.child.session.getRecentChanges().length > before
       this.parent.notifyExternal(this.name)
-      return conflict
+      return { conflict, changed }
     }
     // gone (or replaced) elsewhere
     const dirty = Object.keys(this.child.session.changedData()).length > 0
-    if (dirty) return true
+    if (dirty) return { conflict: true, changed: false }
     this.child = incoming ? this.makeChild({ ...incoming }, incoming.id == null) : null
     this.parent.notifyExternal(this.name)
-    return false
+    return { conflict: false, changed: true }
   }
 
   /**

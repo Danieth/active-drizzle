@@ -134,6 +134,10 @@ export interface FormHandleApi<T extends Record<string, any> = Record<string, an
    *  receives resolve('reload' | 'overwrite'). Style it however; the
    *  machinery (withheld token, fresh envelope) is already armed. */
   Conflict: FC<{ children: (resolve: (mode: 'reload' | 'overwrite') => Promise<boolean>) => ReactNode; className?: string }>
+  /** "Changes have happened" — renders only when rehydrate() adopted
+   *  changes from elsewhere. Render-prop gets the affected field names +
+   *  dismiss; without children a minimal default notice renders. */
+  Changes: FC<{ children?: (info: { fields: string[]; dismiss: () => void }) => ReactNode; className?: string }>
 }
 
 /** Field props narrowed by the field's kind — presenter names are gated. */
@@ -639,6 +643,27 @@ export function createFormHandle<T extends Record<string, any>>(
   }
   ConflictComponent.displayName = 'AdConflict'
 
+  const ChangesComponent: FC<{ children?: (info: { fields: string[]; dismiss: () => void }) => ReactNode; className?: string }> = ({ children, className }) => {
+    useSyncExternalStore(
+      (cb) => session.subscribe('*', cb),
+      () => session.fieldVersion('*'),
+      () => session.fieldVersion('*'),
+    )
+    const fields = session.getRecentChanges()
+    if (!fields.length) return null
+    const dismiss = () => session.dismissRecentChanges()
+    if (children) {
+      return <div role="status" data-ad-changes {...(className !== undefined ? { className } : {})}>{children({ fields, dismiss })}</div>
+    }
+    return (
+      <div role="status" data-ad-changes {...(className !== undefined ? { className } : {})}>
+        Updated elsewhere: {fields.join(', ')}{' '}
+        <button type="button" onClick={dismiss}>✕</button>
+      </div>
+    )
+  }
+  ChangesComponent.displayName = 'AdChanges'
+
   const BaseErrorsComponent: FC<{ className?: string }> = ({ className }) => {
     useSyncExternalStore(
       (cb) => session.subscribe('*', cb),
@@ -679,6 +704,7 @@ export function createFormHandle<T extends Record<string, any>>(
         case 'SaveStatus': return SaveStatusComponent
         case 'BaseErrors': return BaseErrorsComponent
         case 'Conflict': return ConflictComponent
+        case 'Changes': return ChangesComponent
         // React/JS runtime probes that must not become field components.
         // Without this, `${handle}` would resolve toString to a Field and
         // invoke a React component as a plain function.

@@ -158,3 +158,42 @@ describe('nested merge — singular manager', () => {
     expect(m.current()).toBeNull()
   })
 })
+
+describe('"changes have happened" — the affordance + event bus', async () => {
+  const { onFormEvents } = await import('../src/form-session.js')
+
+  it('rehydrate records adopted fields; dismiss clears; no record when nothing changed', () => {
+    const s = makeSession({ id: 1, name: 'a', amount: '10' })
+    s.rehydrate({ record: { id: 1, name: 'b', amount: '10' }, version: V2 })
+    expect(s.getRecentChanges()).toEqual(['name'])          // amount didn't change → not listed
+    s.rehydrate({ record: { id: 1, name: 'b', amount: '10' }, version: '3000' })
+    expect(s.getRecentChanges()).toEqual(['name'])          // no-op refetch adds nothing
+    s.dismissRecentChanges()
+    expect(s.getRecentChanges()).toEqual([])
+  })
+
+  it('nested structural changes list the association name', () => {
+    const s = makeSession({ id: 1, name: 'deal' })
+    const m = new NestedArrayManager(s, 'notes', [{ id: 7, body: 'a' }])
+    s.registerNested('notes', m)
+    s.rehydrate({ record: { id: 1, name: 'deal', notes: [{ id: 7, body: 'a' }, { id: 9, body: 'new elsewhere' }] }, version: V2 })
+    expect(s.getRecentChanges()).toEqual(['notes'])
+  })
+
+  it('the event bus reports rehydrated/conflict/saved with fields', async () => {
+    const events: any[] = []
+    const off = onFormEvents(e => events.push({ type: e.type, fields: e.fields }))
+    try {
+      const submit = vi.fn()
+        .mockResolvedValueOnce({ ok: false, status: 409 } as any)
+        .mockResolvedValue({ ok: true })
+      const s = new FormSession({ draft: { id: 1, name: 'a' }, mode: 'edit', abilities: null, version: V1, submit })
+      s.rehydrate({ record: { id: 1, name: 'elsewhere' }, version: V2 })   // → rehydrated
+      s.setValue('name', 'mine')
+      await s.submit()                                                     // 409 → conflict
+      await s.resolveConflict('overwrite')                                 // resubmit ok → saved
+      expect(events.map(e => e.type)).toEqual(['rehydrated', 'conflict', 'saved'])
+      expect(events[0].fields).toEqual(['name'])
+    } finally { off() }
+  })
+})

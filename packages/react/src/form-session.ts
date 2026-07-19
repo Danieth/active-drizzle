@@ -45,6 +45,41 @@ export interface SubmitPayload {
   _version?: string
 }
 
+// ── Semantic form events — the toast/telemetry seam ─────────────────────────
+//
+// The session emits WHAT HAPPENED in product terms; the app decides how to
+// present it — one registration at startup, any toast/telemetry lib:
+//
+//   onFormEvents((e) => {
+//     if (e.type === 'rehydrated')     toast.info(`Updated elsewhere: ${e.fields?.join(', ')}`)
+//     if (e.type === 'conflict')       toast.warn('This record changed elsewhere')
+//     if (e.type === 'saved')          toast.success('Saved')
+//     if (e.type === 'draft-restored') toast.info('Restored your unsaved edits')
+//   })
+//
+// Mirrors onClientError: module-level, unsubscribable, throw-proof.
+
+export interface FormEvent {
+  type: 'rehydrated' | 'conflict' | 'saved' | 'draft-restored'
+  /** rehydrated/draft-restored: the affected field/association names. */
+  fields?: string[]
+  session: FormSession<any>
+}
+
+const _formEventHandlers = new Set<(e: FormEvent) => void>()
+
+/** Register a global form-event handler (toasts, telemetry). Returns unsubscribe. */
+export function onFormEvents(handler: (e: FormEvent) => void): () => void {
+  _formEventHandlers.add(handler)
+  return () => { _formEventHandlers.delete(handler) }
+}
+
+function emitFormEvent(e: FormEvent): void {
+  for (const h of _formEventHandlers) {
+    try { h(e) } catch (err) { console.error('[active-drizzle] form event handler threw:', err) }
+  }
+}
+
 export interface FormSessionOptions<T extends Record<string, any>> {
   draft: T
   mode: 'edit' | 'new'
@@ -84,6 +119,9 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
 
   /** Optimistic-lock token — rides every submit as `_version`. */
   private version: string | null = null
+  /** Fields adopted from elsewhere by rehydrate() since last dismissal —
+   *  the "changes have happened" affordance (<handle.Changes/>). */
+  private recentChanges: string[] = []
   /** The server's CURRENT envelope from a 409 — fuel for resolveConflict(). */
   private conflictEnvelope: ServerEnvelope | null = null
 
@@ -399,6 +437,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
       this.baseline = this.snapshotDraft()
       this.lastSavedAt = Date.now()
       this.status = 'saved'
+      emitFormEvent({ type: 'saved', session: this })
       this.notifyAll()
       return true
     }
@@ -591,6 +630,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
       this.applyFlushSuccess(result.envelope, flushed)
       this.lastSavedAt = Date.now()
       this.status = 'saved'
+      emitFormEvent({ type: 'saved', session: this })
       this.notifyAll()
     } else if (result.status === 0) {
       // Offline: the draft keeps every edit; the diff is queued as a unit
@@ -712,6 +752,19 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
       this.setValue(k, mine)                              // never lose the edit
     }
     if (conflict && parked.version != null) this.version = parked.version   // stale on purpose
+    emitFormEvent({ type: 'draft-restored', fields: Object.keys(parked.data), session: this })
+    this.notifyAll()
+  }
+
+  // ── "Changes have happened" (the <handle.Changes/> affordance) ───────────
+
+  /** Field/association names adopted from elsewhere since last dismissal. */
+  getRecentChanges(): string[] { return this.recentChanges }
+
+  /** Acknowledge the changes-from-elsewhere notice. */
+  dismissRecentChanges(): void {
+    if (!this.recentChanges.length) return
+    this.recentChanges = []
     this.notifyAll()
   }
 
@@ -731,6 +784,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
    */
   private enterConflict(envelope?: ServerEnvelope): void {
     this.conflictEnvelope = envelope ?? null
+    emitFormEvent({ type: 'conflict', session: this })
     this.serverErrors = {
       ...this.serverErrors,
       base: ['This record was changed elsewhere — reload it or overwrite.'],
@@ -799,6 +853,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     }
 
     let conflict = false
+    const adopted: string[] = []
     const rec = envelope.record
     if (rec) {
       const now = this.snapshotDraft()
@@ -808,6 +863,9 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
         const mine = now[k]
         if (valueEquals(mine, base)) {
           // clean → adopt (accessor-proof, same as applyEnvelope)
+          // Bookkeeping columns (pk/timestamps) change on every save — they
+          // are not user-meaningful "changes from elsewhere"
+          if (!valueEquals(mine, their) && !BOOKKEEPING_FIELDS.has(k)) adopted.push(k)
           try {
             ;(this.draft as any)[k] = their
           } catch {
@@ -827,11 +885,22 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
         if (!(name in rec)) continue
         const m = manager as any
         if (typeof m.rehydrate === 'function') {
-          if (m.rehydrate((rec as any)[name])) conflict = true
+          const r = m.rehydrate((rec as any)[name])
+          const rConflict = typeof r === 'object' && r !== null ? Boolean(r.conflict) : Boolean(r)
+          const rChanged = typeof r === 'object' && r !== null ? Boolean(r.changed) : false
+          if (rConflict) conflict = true
+          if (rChanged) adopted.push(name)
         } else if (manager.attributesPayload() === null) {
           manager.syncFromServer((rec as any)[name])
         }
       }
+    }
+    // "Changes have happened" — record what arrived from elsewhere so the
+    // UI can PRESENT it (<handle.Changes/>) instead of values shifting
+    // silently; accumulates until dismissed
+    if (adopted.length) {
+      for (const f of adopted) if (!this.recentChanges.includes(f)) this.recentChanges.push(f)
+      emitFormEvent({ type: 'rehydrated', fields: adopted, session: this })
     }
 
     if (envelope.abilities !== undefined) {
@@ -957,6 +1026,9 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     return out
   }
 }
+
+/** Never reported by <Changes/> — they move on every save by design. */
+const BOOKKEEPING_FIELDS = new Set(['id', 'updatedAt', 'createdAt', 'updated_at', 'created_at', 'lockVersion', 'lock_version'])
 
 function valueEquals(a: any, b: any): boolean {
   if (Object.is(a, b)) return true
