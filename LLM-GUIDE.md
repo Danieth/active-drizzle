@@ -165,6 +165,12 @@ const EDITABLE = ['name', 'amount', 'notesAttributes', 'briefAttributes'] as con
     searchable: ['name', 'contactEmail'],   // ?q= ilike fallback
     search: { fields: { name: 'A', contactEmail: 'B' } },  // weighted FTS (websearch + ts_rank, hybrid substring)
     filterable: ['stage', 'priority', 'isHot'],            // tier-1 column filters (codec-normalized, allowlisted)
+    facets: true,                       // disjunctive counts ride every response → FilterPresenterProps.counts
+    chartable: ['stage'], measures: ['amount'],  // chart {x,y:'count'|'sum:F'|'avg:F'} + metric params (perPage:0 = agg-only)
+    // search.adapter (the ES lane): external engine returns IDS ONLY in rank
+    // order; hydration stays behind this door. search.doc = the ONE searchDoc
+    // transform (buildSearchDoc) your shipper + reindex both call.
+    // Fallback chain: adapter → search.fields (PG FTS) → searchable (ilike).
     filters: {                                             // tier-2 NAMED filters — semantics server-side
       bigDeals: { label: 'Big deals', kind: 'toggle',
         apply: (rel, _on, ctx) => rel.where({ amount: { gte: 20_000 } }) },
@@ -308,6 +314,24 @@ ix.session.setFilter('priority', { nin: ['low'] })          // NOT IN
 ix.session.setFilter('tags', { all: ['hot', 'q3'] })        // array contains ALL
 ix.session.setFilter('$or', [{ stage: 'submitted' }, { priority: 'high' }])  // (a OR b) AND rest
 // max 10 branches, no nesting, tier-1 fields only; richer logic = a NAMED filter's apply()
+
+// derived surfaces (all data-to-presenter; scaffold defaults marked data-ad-scaffold):
+<Deals.Board />                                   // Attr.state AS kanban: states=columns, move(row,to)
+<Deals.Board groupBy="priority" />                //   resolves the TRANSITION (_event) or PATCHes the value
+<Deals.Board>{({ columns, move, canMove }) => …}</Deals.Board>   // bring your own DnD
+<Deals.Chart x="stage" y="sum:amount">{(points) => …}</Deals.Chart>  // [{x,y}], filter-aware in <Index>
+<Deals.Metric agg="count">{(v) => …}</Deals.Metric>
+<Deals.Table columns={['name','stage']}>{({ columns, rows, setSort, mutateRow }) => …}</Deals.Table>
+<Deals.Empty />                                   // knows WHY: no-records vs no-matches (+clearFilters)
+<Deals.Error>{({ kind, message }) => …}</Deals.Error>
+<Deals.FormSkeleton /> <Deals.ListSkeleton rows={5} />
+// permission gates from the envelope's own verdicts:
+<deal.Can edit="amount">…</deal.Can>  <deal.Can action="markWon" not fallback={…}>…</deal.Can>
+// const { canEdit, can } = useAbilities(deal)
+// live: connectEventSource(qc, coherenceEdges, '/live') — server pushes {resource, op}
+//   signals (NEVER payloads); the coherence fan-out refetches; forms three-way merge.
+// contract probes: buildContractProbes(Ctrl) + runContractProbes(probes, call) — the
+//   forge-every-field security suite derived from the same metadata that enforces it.
 
 // custom widgets / tier-2 named filters via the session:
 const ix = Deals.use()   // { session, state, meta, rows, pagination, isLoading }

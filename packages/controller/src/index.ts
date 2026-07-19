@@ -34,6 +34,7 @@ export {
 
 // Config types
 export type {
+  SearchAdapter,
   CrudConfig,
   SingletonConfig,
   IndexConfig,
@@ -48,6 +49,7 @@ export type {
 
 // Router
 export { buildRouter, mergeRouters, type BuildResult, type RouteRecord } from './router.js'
+export { buildContractProbes, runContractProbes, type ContractProbe, type ContractProbeFailure } from './contract-probes.js'
 
 // Handlers (useful for custom overrides)
 export {
@@ -60,6 +62,7 @@ export {
   convertFilterValue,
   buildRecordEnvelope,
   enforceMutationRules,
+  buildSearchDoc,
   type RecordEnvelope,
   type IndexResult,
   type IndexParams,

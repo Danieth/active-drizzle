@@ -36,6 +36,12 @@ export interface ScopeEntry {
   paramName: string            // e.g. 'teamId'  (used in oRPC input schema)
 }
 
+/** External search engine contract — see IndexConfig.search.adapter. */
+export interface SearchAdapter {
+  /** Matching ids in rank order (cap at opts.limit). Ids ONLY. */
+  search(term: string, ctx: any, opts: { limit: number }): Promise<Array<number | string>>
+}
+
 export interface IndexConfig {
   scopes?: string[]
   defaultScopes?: string[]
@@ -107,7 +113,26 @@ export interface IndexConfig {
    * 'relevance' }` is accepted while searching. `searchable` remains the
    * simple-ilike fallback when `search` is absent.
    */
-  search?: { fields: Record<string, 'A' | 'B' | 'C' | 'D'> }
+  search?: {
+    fields?: Record<string, 'A' | 'B' | 'C' | 'D'>
+    /**
+     * External search engine plug (the "ES lane"), IDS-ONLY by doctrine:
+     * the adapter returns matching ids in rank order and NOTHING else —
+     * hydration always goes back through the door-scoped relation, so a
+     * compromised or stale engine can only ever surface records this door
+     * already allows, with this door's projection. Feeding the engine
+     * (searchDoc transform + outbox/afterCommit shipping) is APP code —
+     * the framework keeps the hook points stable and ships none of it.
+     * Falls back to `fields` (PG FTS) / `searchable` (ilike) when absent.
+     */
+    adapter?: SearchAdapter
+    /**
+     * One-way searchDoc transform — what YOUR shipper should index for a
+     * record. Declared here so the app's outbox/afterCommit code and any
+     * reindex script derive the SAME document (buildSearchDoc helper).
+     */
+    doc?: (record: any) => Record<string, unknown>
+  }
   include?: IncludeSpec[]
   perPage?: number
   maxPerPage?: number

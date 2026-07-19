@@ -563,3 +563,68 @@ inline field (`elsewhere`) → floater (`<Changes>`) → save-time dialog
 (`<Conflict>` + `resolveConflict`). Session API when you go headless:
 `getIncoming() / getIncomingFor(f) / adoptIncoming(f) / adoptAllIncoming()
 / dismissIncoming()`.
+
+## The derived-frontend batch (overnight round — all built, all verified)
+
+**Facet counts** — `index: { facets: true }` and every index response
+carries `facets: { stage: { draft: 12, … } }`, computed DISJUNCTIVELY
+(each field's own filter excluded, so options never zero out) with label
+keys. They flow into `FilterPresenterProps.counts` — chips show live
+numbers with zero client code.
+
+**Chart / Metric** — `chartable: ['stage']` + `measures: ['amount']`
+allowlist two aggregation params: `chart: { x, y: 'count'|'sum:F'|'avg:F' }`
+and `metric: 'sum:F'`. `<Deals.Chart x="stage" y="sum:amount">{points =>`
+paints YOUR bars from `[{x, y}]` — no chart lib shipped, filter-aware
+inside `<Deals.Index>`, standalone outside, `perPage: 0` for
+aggregation-only calls.
+
+**`<Deals.Board>`** — the `Attr.state` machine AS a kanban, data-only:
+states are columns (facet counts attached), `move(row, to)` resolves the
+declared TRANSITION and PATCHes `_event` (guards stay server-enforced),
+`canMove` exposes the transition graph for drag affordances. Scaffold
+rendering shows only legal moves. `groupBy` any facet field to get a
+plain grouped board (moves PATCH the value).
+
+**`<Deals.Table>`** — the grid CONTRACT: columns from field meta
+(name/kind/label + sortable flags), rows, `setSort`, and the
+coherence-wired `mutateRow` for inline edits. Scaffold table by default;
+virtualization is deliberately yours.
+
+**`<Deals.Empty>` / `<Deals.Error>`** — empty pages know WHY
+(server-computed `emptyReason`: no-records vs no-matches → the right CTA,
+one extra COUNT only when empty); errors arrive parsed
+(forbidden/not-found/unauthenticated/…).
+
+**`<deal.Can>` + `useAbilities`** — `<deal.Can edit="amount">`,
+`<deal.Can action="markWon" not fallback={…}>`: declarative gates over
+the SAME mask the server enforces. Never hardcode `if (admin)` again.
+
+**Skeletons** — `<Deals.FormSkeleton/>` / `<Deals.ListSkeleton/>` shaped
+by the declared fields.
+
+**Live signals (the WS plug, plugged)** — `connectEventSource(qc,
+coherenceEdges, '/live')` and every server push fans the same coherence
+edges a local mutation does. SIGNAL-ONLY doctrine: `{ resource, op }`
+frames, never payloads — refetches carry the truth through the normal
+doors and open forms absorb them via the three-way merge. Verified: a
+shell-side mutation moved a board card, re-drew the chart, and updated
+counts in an untouched browser.
+
+**The ES lane (ids-only, doctrine intact)** — `search: { adapter, doc }`:
+an external engine answers `?q=` with IDS in rank order and nothing else;
+hydration returns through the door-scoped relation (a compromised engine
+cannot leak a field or a record the door wouldn't serve), order kept via
+`Relation.orderByIds`. `doc` is the ONE searchDoc transform — your
+afterCommit/outbox shipper and reindex script both call it
+(`buildSearchDoc`), so they can never drift. Falls back adapter → PG FTS
+→ ilike. Demo ships a toy in-memory engine; swap in ES and nothing else
+changes.
+
+**Contract probes — the security suite writes itself** —
+`buildContractProbes(DealController)` derives the forge-every-field suite
+from the SAME metadata that enforces it (undeclared filters, $or
+forging/nesting/cap, forged sort/chart/metric, non-permitted
+mass-assignment, missing required mutation params);
+`runContractProbes(probes, call)` runs them through any transport.
+9 probes generated for the demo controller, 0 failures, live.

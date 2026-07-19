@@ -366,7 +366,13 @@ export async function defaultIndex(
     // stays free of drizzle imports (mixed copies don't compose).
     if (q) {
       const fts = (idx as any).search
-      if (fts?.fields && typeof r.ftsSearch === 'function') {
+      if (fts?.adapter && adapterIds !== null) {
+        // External engine (ids-only doctrine): the adapter contributed IDS
+        // in rank order; hydration stays inside THIS door-scoped relation —
+        // a lying engine can only surface records the door already allows.
+        r = r.where({ id: adapterIds.length ? adapterIds : [-1] })
+        if (typeof r.orderByIds === 'function') r = r.orderByIds(adapterIds)
+      } else if (fts?.fields && typeof r.ftsSearch === 'function') {
         // Weighted websearch + rank — the badass path
         r = r.ftsSearch(q, fts.fields)
         searchedFts = true
@@ -378,6 +384,14 @@ export async function defaultIndex(
       }
     }
     return r
+  }
+
+  // External adapter search resolves ONCE (async), before the narrowing
+  // pipeline fans out — every re-run (facets, chart) reuses the same ids
+  let adapterIds: Array<number | string> | null = null
+  if (q && (idx as any).search?.adapter) {
+    const ids = await (idx as any).search.adapter.search(q, ctx, { limit: 200 })
+    adapterIds = Array.isArray(ids) ? ids.filter(i => typeof i === 'number' || typeof i === 'string') : []
   }
 
   const scopedRel = rel   // door + scopes, BEFORE narrowing — facets/empty re-derive from here
@@ -927,6 +941,22 @@ export function convertFilterValue(model: any, field: string, value: any): any {
     if (typeof value === 'string') return attr.values[value] ?? value
   }
   return value
+}
+
+/**
+ * The ONE-WAY searchDoc transform: what an external engine should index
+ * for this record under this controller's config. Your outbox/afterCommit
+ * shipper and your reindex script both call THIS, so they can never drift.
+ * Defaults to the expose projection — the read ceiling is also the index
+ * ceiling (an engine must not hold fields the door would never serve).
+ */
+export function buildSearchDoc(record: any, config: CrudConfig): Record<string, unknown> {
+  const docFn = (config.index as any)?.search?.doc
+  if (typeof docFn === 'function') return docFn(record)
+  const expose: string[] = config.get?.expose ?? []
+  const out: Record<string, unknown> = { id: record?.id }
+  for (const f of expose) out[f] = record?.[f]
+  return out
 }
 
 // ── Singleton helpers ─────────────────────────────────────────────────────────

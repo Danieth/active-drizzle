@@ -291,6 +291,20 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     return next
   }
 
+  /**
+   * Order rows by an EXTERNAL id ranking — the hydration half of the
+   * ids-only search-adapter contract: an engine (ES, whatever) returns ids
+   * in rank order, the door-scoped relation loads them, and this keeps the
+   * engine's order without trusting anything but the ids.
+   */
+  public orderByIds(ids: Array<number | string>): this {
+    if (ids.length === 0) return this
+    const next = this._clone() as this
+    const idCol = next._col('id')
+    next._order.push(sql`array_position(ARRAY[${sql.join(ids.map(i => sql`${i}`), sql`, `)}]::bigint[], ${idCol})`)
+    return next
+  }
+
   /** HAVING — filter groups. `.group('userId').having(sql`count(*) > 5`)`. */
   public having(condition: SQL): this {
     const next = this._clone() as this
