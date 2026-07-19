@@ -1,4 +1,4 @@
-import { eq, and, inArray, isNull, desc, asc, sql, type SQL } from 'drizzle-orm'
+import { eq, and, or, inArray, isNull, ilike, desc, asc, sql, type SQL } from 'drizzle-orm'
 import { getExecutor, getSchema, MODEL_REGISTRY, transaction, RecordNotFound } from './boot.js'
 import type { ApplicationRecord } from './application-record.js'
 
@@ -62,6 +62,30 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     } else {
       this._where.push(condition as SQL)
     }
+    return this
+  }
+
+  /**
+   * Case-insensitive substring match ORed across columns:
+   *
+   *   User.search('ada', ['name', 'email'])
+   *   → WHERE (name ILIKE '%ada%' OR email ILIKE '%ada%')
+   *
+   * The term is escaped (%, _, \ are literals), so user input can be passed
+   * straight through. A blank term or empty field list is a no-op. Attr.for
+   * column mappings resolve; fields must be text-typed columns.
+   */
+  public search(term: string | null | undefined, fields: string[]): this {
+    const t = (term ?? '').trim()
+    if (!t || !fields.length) return this
+    const table = this.getTable()
+    const pattern = '%' + t.replace(/[\\%_]/g, (m) => '\\' + m) + '%'
+    const conds = fields.map((f) => {
+      const col = table[_resolveColKey(this._ctor, f)]
+      if (!col) throw new Error(`Column "${f}" not found on table "${this._tableName}"`)
+      return ilike(col, pattern)
+    })
+    this._where.push(conds.length === 1 ? conds[0]! : or(...conds)!)
     return this
   }
 

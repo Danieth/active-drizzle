@@ -17,6 +17,8 @@ import type { ModelCacheKeys, ModelIndexResult, PaginationMeta } from './client-
 export interface SearchState {
   scopes?: string[]
   filters?: Record<string, any>
+  /** Substring search across the controller's `searchable` columns. */
+  q?: string
   sort?: { field: string; dir: 'asc' | 'desc' }
   page?: number
   perPage?: number
@@ -34,6 +36,8 @@ export interface UseSearchReturn<T extends SearchState = SearchState> {
   setSort: (field: string, dir?: 'asc' | 'desc') => void
   setPage: (page: number) => void
   setParamScope: (name: string, value: any) => void
+  /** Set the substring-search term (resets to page 0). */
+  setQ: (q: string) => void
 }
 
 // ── CRUD hook factory ─────────────────────────────────────────────────────────
@@ -329,6 +333,10 @@ export function createSearchHook<TState extends SearchState>(
       setState(s => ({ ...s, [name]: value, page: 0 }))
     }, [])
 
-    return { state, set, reset, setScope, setFilter, setSort, setPage, setParamScope }
+    const setQ = useCallback((q: string) => {
+      setState(s => ({ ...s, q, page: 0 }))
+    }, [])
+
+    return { state, set, reset, setScope, setFilter, setSort, setPage, setParamScope, setQ }
   }
 }

@@ -145,6 +145,7 @@ class BaseController extends ActiveController<AppContext> {}
     sortable: ['id', 'name', 'budget'],
     defaultSort: { field: 'id', dir: 'asc' },
     filterable: ['status', 'teamId'],
+    searchable: ['name'],
     perPage: 10,
     maxPerPage: 50,
   },
@@ -365,6 +366,39 @@ describe('Index — scopes, paramScopes, filters, sort, pagination', () => {
   it('rejects unknown filter field with 400', async () => {
     await expectStatus(
       call(CampaignController, 'index', { teamId, filters: { unknownField: 'x' } }, { teamId }),
+      'BAD_REQUEST',
+    )
+  })
+
+  it('q substring-searches case-insensitively across searchable columns', async () => {
+    const res = await call(CampaignController, 'index',
+      { teamId, q: 'ALPH' }, { teamId })
+    expect(res.data.length).toBe(1)
+    expect(res.data[0].name).toBe('Alpha')
+  })
+
+  it('q composes with filters (both narrow)', async () => {
+    const res = await call(CampaignController, 'index',
+      { teamId, q: 'a', filters: { status: 'active' } }, { teamId })
+    // 'a' matches Alpha/Beta/Gamma/Delta; active narrows to Beta + Gamma
+    expect(res.data.map((c: any) => c.name).sort()).toEqual(['Beta', 'Gamma'])
+  })
+
+  it('q escapes LIKE wildcards (a literal % matches nothing, not everything)', async () => {
+    const res = await call(CampaignController, 'index',
+      { teamId, q: '%' }, { teamId })
+    expect(res.data.length).toBe(0)
+  })
+
+  it('blank q is a no-op', async () => {
+    const res = await call(CampaignController, 'index',
+      { teamId, q: '   ' }, { teamId })
+    expect(res.pagination.totalCount).toBe(4)
+  })
+
+  it('rejects q on an index without searchable config (400)', async () => {
+    await expectStatus(
+      call(RootCampaignController, 'index', { q: 'alpha' }, {}),
       'BAD_REQUEST',
     )
   })

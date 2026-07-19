@@ -43,6 +43,16 @@ export interface IndexConfig {
   sortable?: string[]
   defaultSort?: { field: string; dir: 'asc' | 'desc' }
   filterable?: string[]
+  /**
+   * Columns the `q` param substring-searches (case-insensitive, ORed):
+   *
+   *   index: { searchable: ['name', 'email'] }
+   *   → ?q=ada  ⇒  WHERE name ILIKE '%ada%' OR email ILIKE '%ada%'
+   *
+   * Like `filterable`, this is an allowlist: a `q` sent to an index without
+   * `searchable` is a BadRequest, never a silent no-op.
+   */
+  searchable?: string[]
   include?: IncludeSpec[]
   perPage?: number
   maxPerPage?: number

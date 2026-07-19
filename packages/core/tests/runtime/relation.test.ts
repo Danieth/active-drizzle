@@ -167,6 +167,44 @@ describe('Relation.where() — hash conditions', () => {
   })
 })
 
+// ── search() ───────────────────────────────────────────────────────────────
+
+describe('Relation.search()', () => {
+  it('single field → one ilike expression', () => {
+    const rel = new Relation(Post)
+    rel.search('hel', ['title'])
+    expect(rel['_where']).toHaveLength(1)
+    expect(JSON.stringify(rel['_where'][0])).toContain('%hel%')
+  })
+
+  it('multiple fields → one ORed expression, not stacked ANDs', () => {
+    const rel = new Relation(Post)
+    rel.search('x', ['title', 'status'])
+    expect(rel['_where']).toHaveLength(1)
+    expect(JSON.stringify(rel['_where'][0]).toLowerCase()).toContain('or')
+  })
+
+  it('escapes LIKE wildcards in the term', () => {
+    const rel = new Relation(Post)
+    rel.search('50%_done', ['title'])
+    const s = JSON.stringify(rel['_where'][0])
+    expect(s).toContain('%50\\\\%\\\\_done%')
+  })
+
+  it('blank term or empty fields is a no-op', () => {
+    const rel = new Relation(Post)
+    rel.search('   ', ['title'])
+    rel.search('x', [])
+    rel.search(null, ['title'])
+    expect(rel['_where']).toHaveLength(0)
+  })
+
+  it('throws on unknown column', () => {
+    const rel = new Relation(Post)
+    expect(() => rel.search('x', ['nope'])).toThrow(/nope/i)
+  })
+})
+
 // ── order() ────────────────────────────────────────────────────────────────
 
 describe('Relation.order()', () => {

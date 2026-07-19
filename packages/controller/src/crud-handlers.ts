@@ -135,6 +135,7 @@ export interface IndexParams {
   scopes?: string[]
   [paramScope: string]: any        // paramScope values
   filters?: Record<string, any>
+  q?: string
   ids?: number[]
   sort?: { field: string; dir?: 'asc' | 'desc' }
   page?: number
@@ -186,6 +187,16 @@ export async function defaultIndex(
   // Reject unknown filter keys
   for (const key of Object.keys(rawFilters)) {
     if (!filterableFields.includes(key)) throw new BadRequest(`Cannot filter by '${key}'`)
+  }
+
+  // 4.5 Substring search (q ORed across the searchable allowlist).
+  // The SQL is built by Relation.search — core's drizzle instance — so the
+  // controller stays free of drizzle imports (mixed copies don't compose).
+  const q = typeof params.q === 'string' ? params.q.trim() : ''
+  if (q) {
+    if (!idx.searchable?.length) throw new BadRequest(`This index does not support search (no 'searchable' config)`)
+    if (typeof rel.search !== 'function') throw new BadRequest(`Search requires a Relation with .search()`)
+    rel = rel.search(q, idx.searchable)
   }
 
   // 5. ids param (for combobox hydration — still respects scope)

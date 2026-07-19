@@ -165,6 +165,7 @@ export function buildRouter<TContext = Record<string, any>>(
         ...scopeSchema,
         scopes:  z.array(z.string()).optional(),
         filters: z.record(z.string(), z.any()).optional(),
+        q:       z.string().optional(),
         ids:     z.array(z.number()).optional(),
         sort:    z.object({ field: z.string(), dir: z.enum(['asc', 'desc']) }).optional(),
         page:    z.number().int().min(0).optional(),
