@@ -40,3 +40,4 @@ Thumbs.db
 .idea/
 *.local
 .claude/worktrees/
+.claude/launch.json
