@@ -197,3 +197,63 @@ describe('"changes have happened" — the affordance + event bus', async () => {
     } finally { off() }
   })
 })
+
+describe('incoming map — the `elsewhere` source (value + at, adopt, token release)', () => {
+  it('a TRUE CONFLICT records {value: theirs, at: updatedAt} in the incoming map', () => {
+    const s = makeSession({ id: 1, name: 'a', amount: '10' })
+    s.setValue('name', 'MINE')
+    s.rehydrate({ record: { id: 1, name: 'THEIRS', amount: '10', updatedAt: '2026-07-19T10:00:00Z' }, version: V2 })
+    expect(s.getIncoming()).toEqual({ name: { value: 'THEIRS', at: '2026-07-19T10:00:00Z' } })
+    expect(s.getIncomingFor('name')).toEqual({ value: 'THEIRS', at: '2026-07-19T10:00:00Z' })
+    expect(s.getIncomingFor('amount')).toBeUndefined()   // clean adopt — not a divergence
+  })
+
+  it('without updatedAt the stamp falls back to the version token', () => {
+    const s = makeSession({ id: 1, name: 'a' })
+    s.setValue('name', 'MINE')
+    s.rehydrate({ record: { id: 1, name: 'THEIRS' }, version: V2 })
+    expect(s.getIncomingFor('name')!.at).toBe(V2)
+  })
+
+  it('adoptIncoming = fine-grained take-theirs: field settles AND the withheld token releases', () => {
+    const s = makeSession({ id: 1, name: 'a' })
+    s.setValue('name', 'MINE')
+    s.rehydrate({ record: { id: 1, name: 'THEIRS' }, version: V2 })
+    expect(s.getVersion()).toBe(V1)                      // withheld
+    s.adoptIncoming('name')
+    expect((s.draft as any).name).toBe('THEIRS')
+    expect(s.isDirty()).toBe(false)                      // baseline moved with it
+    expect(s.getIncoming()).toEqual({})
+    expect(s.getVersion()).toBe(V2)                      // last conflict adopted → fully settled
+  })
+
+  it('partial adopt keeps the token withheld until the LAST conflict is taken', () => {
+    const s = makeSession({ id: 1, name: 'a', amount: '10' })
+    s.setValue('name', 'MINE'); s.setValue('amount', '99')
+    s.rehydrate({ record: { id: 1, name: 'T1', amount: '55' }, version: V2 })
+    expect(Object.keys(s.getIncoming()).sort()).toEqual(['amount', 'name'])
+    s.adoptIncoming('name')
+    expect(s.getVersion()).toBe(V1)                      // amount still stands
+    s.adoptAllIncoming()
+    expect(s.getVersion()).toBe(V2)
+  })
+
+  it('entries clear when the divergence disappears (converged / server rolled back)', () => {
+    const s = makeSession({ id: 1, name: 'a' })
+    s.setValue('name', 'MINE')
+    s.rehydrate({ record: { id: 1, name: 'THEIRS' }, version: V2 })
+    expect(s.getIncomingFor('name')).toBeDefined()
+    s.rehydrate({ record: { id: 1, name: 'MINE' }, version: '3000' })   // server converged on mine
+    expect(s.getIncomingFor('name')).toBeUndefined()
+    expect(s.getVersion()).toBe('3000')
+  })
+
+  it('dismissIncoming is presentation-only: notice clears, the stale token still 409s', () => {
+    const s = makeSession({ id: 1, name: 'a' })
+    s.setValue('name', 'MINE')
+    s.rehydrate({ record: { id: 1, name: 'THEIRS' }, version: V2 })
+    s.dismissIncoming()
+    expect(s.getIncoming()).toEqual({})
+    expect(s.getVersion()).toBe(V1)                      // safety intact
+  })
+})

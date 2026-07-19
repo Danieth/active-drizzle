@@ -519,3 +519,47 @@ under the deals family root — so the numbers recompute for free whenever
 ANY deal mutation lands (browser-verified: one row's "🏆 won" click moved
 pipeline → closed value in the header above it). Without a render-prop it
 renders scaffolding JSON (`data-ad-scaffold`), same doctrine as filters.
+
+## `elsewhere` — the incoming value rides the presenter (built)
+
+When the three-way merge finds the server holding a DIFFERENT value for a
+field you've edited (the true-conflict case: mine survives, token
+withheld), that divergence is now DATA, not just a future 409. One map,
+recorded only by the merge, feeds two surfaces:
+
+```tsx
+// (1) every field presenter — one optional prop:
+function MyText({ value, bind, elsewhere }: PresenterProps) {
+  return <>
+    <input value={value} onChange={e => bind.onChange(e.target.value)} />
+    {elsewhere && (
+      <button onClick={() => bind.onChange(elsewhere.value)}>
+        changed {relative(elsewhere.at)} → take "{String(elsewhere.value)}"
+      </button>
+    )}
+  </>
+}
+
+// (2) the fat floater — <deal.Changes> render-prop:
+<deal.Changes>{({ changes, adoptAll, dismiss, fields }) => (
+  <aside className="floater">
+    {changes.map(c => (
+      <p key={c.field}>{c.label} → {String(c.value)} <button onClick={c.adopt}>take</button></p>
+    ))}
+    {changes.length > 1 && <button onClick={adoptAll}>take all</button>}
+    <button onClick={dismiss}>✕</button>
+  </aside>
+)}</deal.Changes>
+```
+
+`elsewhere = { value, at }` — `at` is the envelope's `updatedAt ?? version`
+stamped at merge time, so "when it changed" costs zero wire bytes.
+Per-field `adopt()` is the fine-grained take-theirs: draft AND baseline
+move (the field is clean again), and taking the LAST standing change
+releases the withheld version token — adopt-all fully settles, no 409
+pending. `dismiss()` is presentation-only: the notice clears but the stale
+token still guards the next submit. One conflict system, three altitudes:
+inline field (`elsewhere`) → floater (`<Changes>`) → save-time dialog
+(`<Conflict>` + `resolveConflict`). Session API when you go headless:
+`getIncoming() / getIncomingFor(f) / adoptIncoming(f) / adoptAllIncoming()
+/ dismissIncoming()`.

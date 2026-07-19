@@ -227,7 +227,10 @@ const { status, form: deal } = useDealEditForm(id, {          // poll until a ba
   <deal.brief.Build>+ add brief</deal.brief.Build>
 
   <deal.SaveStatus />                      {/* saving/saved/unsaved/offline/conflict pill */}
-  <deal.Changes />                         {/* "updated elsewhere: name, notes ✕" — or render-prop {({fields, dismiss}) => ...} */}
+  <deal.Changes />                         {/* adopted-notice + TRUE-CONFLICT floater: "Deal Name → theirs [take theirs] [take all] ✕" */}
+  {/* render-prop: {({ fields, changes, adoptAll, dismiss }) => ...} — changes: [{field,label,value,at,adopt()}]
+      per-field adopt() = take-theirs (baseline moves, field clean); last adopt releases the withheld
+      version token (fully settled); dismiss() is presentation-only (stale token still 409s) */}
   <deal.BaseErrors />
   <deal.Conflict>{resolve => (<>           {/* renders only during a 409 */}
     <button onClick={() => resolve('reload')}>Take theirs</button>
@@ -296,6 +299,8 @@ setDefaultFilterPresenters({ facet: 'segmented' })
 <Deals.Filters.stage presenter="segmented" />   // per-site override, kind-gated
 <Deals.Filter name="stage">{({ meta, value, set, clear }) => <MyWidget/>}</Deals.Filter>  // raw state
 // FilterPresenterProps = { name, meta, value, set, clear, session, counts? }
+// PresenterProps also carries elsewhere?: { value, at } — the server's value for THIS field
+// while you hold a different one (true conflict). Adopt inline via bind.onChange(elsewhere.value).
 // unregistered kinds render SCAFFOLDING (data-ad-scaffold, console notice) — replace in real apps
 
 // combinators (all allowlisted + codec-transformed; depth-1 by design):

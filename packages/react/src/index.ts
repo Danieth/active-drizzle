@@ -61,10 +61,12 @@ export {
   type FormActionMeta,
   type ActionProps,
   type ActionRenderApi,
+  type ChangeEntry,
+  type ChangesRenderApi,
 } from './form-handle.js'
 export { NestedArrayManager, NestedOneManager, type NestedChild, type NestedTransport } from './nested.js'
 export { useForm, useEditForm, useNewForm, type UseFormOptions } from './use-form.js'
-export { onFormEvents, type FormEvent } from './form-session.js'
+export { onFormEvents, type FormEvent, type IncomingChange } from './form-session.js'
 export { useGeneratedForm, type UseGeneratedFormOptions } from './generated-form.js'
 export { DraftStore, defaultDraftStore, type ParkedDraft } from './draft-store.js'
 export { applyEntityChange, type CoherenceEdges, type EntityChange, type QueryClientLike } from './coherence.js'

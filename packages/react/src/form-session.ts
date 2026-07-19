@@ -59,6 +59,15 @@ export interface SubmitPayload {
 //
 // Mirrors onClientError: module-level, unsubscribable, throw-proof.
 
+/** A field the server moved while you hold a DIFFERENT local value —
+ *  `value` is theirs, `at` is the envelope's updatedAt ?? version stamped
+ *  at merge time (no extra wire bytes). Feeds the per-field `elsewhere`
+ *  presenter prop and the <handle.Changes> floater — same map, two bulbs. */
+export interface IncomingChange {
+  value: any
+  at: string | number | null
+}
+
 export interface FormEvent {
   type: 'rehydrated' | 'conflict' | 'saved' | 'draft-restored' | 'action'
   /** rehydrated/draft-restored: the affected field/association names. */
@@ -129,6 +138,14 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   /** Fields adopted from elsewhere by rehydrate() since last dismissal —
    *  the "changes have happened" affordance (<handle.Changes/>). */
   private recentChanges: string[] = []
+  /** TRUE-CONFLICT fields: server holds a different value than my dirty
+   *  draft. Single source for the `elsewhere` presenter prop AND the
+   *  Changes floater — recorded/cleared ONLY by the three-way merge and
+   *  adoptIncoming, so the two surfaces can never disagree. */
+  private incomingMap: Record<string, IncomingChange> = {}
+  /** The version token withheld while conflicts stand — adopted the moment
+   *  the last incoming field is taken (adopt-all fully settles). */
+  private withheldVersion: string | null = null
   /** The server's CURRENT envelope from a 409 — fuel for resolveConflict(). */
   private conflictEnvelope: ServerEnvelope | null = null
 
@@ -786,6 +803,45 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   getRecentChanges(): string[] { return this.recentChanges }
 
   /** Acknowledge the changes-from-elsewhere notice. */
+  /** The incoming map: fields the server moved under your dirty draft. */
+  getIncoming(): Record<string, IncomingChange> {
+    return { ...this.incomingMap }
+  }
+
+  getIncomingFor(field: string): IncomingChange | undefined {
+    return this.incomingMap[field]
+  }
+
+  /**
+   * Fine-grained take-theirs: adopt ONE incoming field. The draft and
+   * baseline move to the server's value (the field is clean again) and,
+   * when this was the LAST standing conflict, the withheld version token
+   * is released — the session is fully settled, no 409 pending.
+   */
+  adoptIncoming(field: string): void {
+    const inc = this.incomingMap[field]
+    if (!inc) return
+    delete this.incomingMap[field]
+    this.setValue(field, inc.value)
+    this.baseline[field] = this.snapshotDraft()[field]
+    if (Object.keys(this.incomingMap).length === 0 && this.withheldVersion != null) {
+      this.version = this.withheldVersion
+      this.withheldVersion = null
+    }
+    this.notifyAll()
+  }
+
+  adoptAllIncoming(): void {
+    for (const f of Object.keys(this.incomingMap)) this.adoptIncoming(f)
+  }
+
+  /** Notice-level dismissal of the incoming set — presentation only; the
+   *  withheld version token still 409s the next submit (safety intact). */
+  dismissIncoming(): void {
+    this.incomingMap = {}
+    this.notifyAll()
+  }
+
   dismissRecentChanges(): void {
     if (!this.recentChanges.length) return
     this.recentChanges = []
@@ -879,6 +935,10 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     let conflict = false
     const adopted: string[] = []
     const rec = envelope.record
+    // "when it changed": the envelope's own clock — updatedAt when the
+    // projection ships it, else the version token (epoch millis under
+    // optimisticLock: true). Zero new wire bytes.
+    const at: string | number | null = (rec as any)?.updatedAt ?? envelope.version ?? null
     if (rec) {
       const now = this.snapshotDraft()
       for (const [k, their] of Object.entries(rec)) {
@@ -896,13 +956,20 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
             Object.defineProperty(this.draft, k, { value: their, writable: true, enumerable: true, configurable: true })
           }
           this.baseline[k] = their
+          delete this.incomingMap[k]
         } else if (valueEquals(their, base)) {
           // server didn't move → my edit stands, baseline stands
+          delete this.incomingMap[k]
         } else if (valueEquals(their, mine)) {
           // both converged on the same value → settle silently
           this.baseline[k] = their
+          delete this.incomingMap[k]
         } else {
+          // TRUE CONFLICT: mine survives; THEIRS is recorded so presenters
+          // can offer it ("changed 30s ago → take it") instead of it being
+          // invisible until the save-time 409
           conflict = true
+          this.incomingMap[k] = { value: their, at }
         }
       }
       for (const [name, manager] of this.nested) {
@@ -933,8 +1000,13 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     }
     if (envelope.can !== undefined) { this.canMap = envelope.can ?? {}; this.canGoverned = envelope.can != null }
     // Version adoption ONLY when conflict-free — withholding it is what
-    // guarantees the conflict surfaces (T3): the stale token 409s
-    if (envelope.version !== undefined && !conflict) this.version = envelope.version ?? null
+    // guarantees the conflict surfaces (T3): the stale token 409s.
+    // The withheld token is REMEMBERED: adopting the last incoming field
+    // (per-field take-theirs) releases it, so adopt-all fully settles.
+    if (envelope.version !== undefined) {
+      if (!conflict) { this.version = envelope.version ?? null; this.withheldVersion = null }
+      else this.withheldVersion = envelope.version ?? null
+    }
 
     this.notifyAll()
     return conflict

@@ -55,6 +55,14 @@ export interface PresenterProps<V = any> {
   state: 'ready' | 'saving' | 'saved' | 'error' | 'unauthenticated' | 'conflict' | 'pending' | 'waiting'
   /** True while this field's draft value differs from the server baseline — render an "unsaved" marker. */
   dirty: boolean
+  /**
+   * The server moved THIS field while you hold a different local value:
+   * `value` is theirs, `at` is when (envelope updatedAt ?? version).
+   * Present only during a live divergence — render an inline affordance
+   * ("changed 30s ago → take it") and adopt via bind.onChange(elsewhere.value)
+   * or session-level adoptIncoming. Absent = nothing moved under you.
+   */
+  elsewhere?: { value: any; at: string | number | null }
 }
 
 export interface PresenterDef {

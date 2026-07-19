@@ -198,6 +198,27 @@ export interface ActionRenderApi {
   params: string[]
 }
 
+/** One TRUE-CONFLICT entry in <handle.Changes>: the server's value for a
+ *  field you hold differently, when it changed, and a one-call adopt. */
+export interface ChangeEntry {
+  field: string
+  label: string
+  value: any
+  at: string | number | null
+  adopt: () => void
+}
+
+export interface ChangesRenderApi {
+  /** Fields ADOPTED from elsewhere (clean fields that tracked the server). */
+  fields: string[]
+  /** Fields the server moved under your dirty draft — with adopt(). */
+  changes: ChangeEntry[]
+  /** Take theirs for every standing change (releases the withheld token). */
+  adoptAll: () => void
+  /** Presentation-only: clears both notices; a real conflict still 409s. */
+  dismiss: () => void
+}
+
 export interface ActionProps {
   /** Pre-supplied param values — renders a plain button even when params exist. */
   fields?: Record<string, any>
@@ -528,6 +549,7 @@ export function createFormHandle<T extends Record<string, any>>(
       if (props.className !== undefined) overrides.className = props.className
 
       const Component = resolved.def.component
+      const incoming = session.getIncomingFor(dataField)
       return (
         <Component
           value={session.getValue(dataField)}
@@ -541,6 +563,7 @@ export function createFormHandle<T extends Record<string, any>>(
             : session.fieldState(dataField) !== 'ready' ? session.fieldState(dataField)
             : session.getStatus()}
           dirty={session.fieldDirty(dataField)}
+          {...(incoming !== undefined ? { elsewhere: incoming } : {})}
         />
       )
     }
@@ -679,21 +702,39 @@ export function createFormHandle<T extends Record<string, any>>(
   }
   ConflictComponent.displayName = 'AdConflict'
 
-  const ChangesComponent: FC<{ children?: (info: { fields: string[]; dismiss: () => void }) => ReactNode; className?: string }> = ({ children, className }) => {
+  const ChangesComponent: FC<{ children?: (info: ChangesRenderApi) => ReactNode; className?: string }> = ({ children, className }) => {
     useSyncExternalStore(
       (cb) => session.subscribe('*', cb),
       () => session.fieldVersion('*'),
       () => session.fieldVersion('*'),
     )
     const fields = session.getRecentChanges()
-    if (!fields.length) return null
-    const dismiss = () => session.dismissRecentChanges()
+    // The floater's fat half: TRUE-CONFLICT fields with the server's value,
+    // when it changed, and a per-field adopt — same map the `elsewhere`
+    // presenter prop reads, so the two surfaces can never disagree
+    const changes: ChangeEntry[] = Object.entries(session.getIncoming()).map(([field, inc]) => ({
+      field,
+      label: (fieldMeta[field]?.label as string | undefined) ?? field,
+      value: inc.value,
+      at: inc.at,
+      adopt: () => session.adoptIncoming(field),
+    }))
+    const adoptAll = () => session.adoptAllIncoming()
+    const dismiss = () => { session.dismissRecentChanges(); session.dismissIncoming() }
+    if (!fields.length && !changes.length) return null
     if (children) {
-      return <div role="status" data-ad-changes {...(className !== undefined ? { className } : {})}>{children({ fields, dismiss })}</div>
+      return <div role="status" data-ad-changes {...(className !== undefined ? { className } : {})}>{children({ fields, dismiss, changes, adoptAll })}</div>
     }
     return (
       <div role="status" data-ad-changes {...(className !== undefined ? { className } : {})}>
-        Updated elsewhere: {fields.join(', ')}{' '}
+        {fields.length > 0 && <>Updated elsewhere: {fields.join(', ')}{' '}</>}
+        {changes.map((c) => (
+          <span key={c.field} data-ad-change={c.field}>
+            {c.label} → {String(c.value)}{' '}
+            <button type="button" onClick={c.adopt}>take theirs</button>{' '}
+          </span>
+        ))}
+        {changes.length > 1 && <button type="button" onClick={adoptAll}>take all</button>}{' '}
         <button type="button" onClick={dismiss}>✕</button>
       </div>
     )
