@@ -70,7 +70,7 @@ export { useAbilities, type Abilities } from './use-abilities.js'
 export { onFormEvents, type FormEvent, type IncomingChange } from './form-session.js'
 export { useGeneratedForm, type UseGeneratedFormOptions } from './generated-form.js'
 export { DraftStore, defaultDraftStore, type ParkedDraft } from './draft-store.js'
-export { applyEntityChange, type CoherenceEdges, type EntityChange, type QueryClientLike } from './coherence.js'
+export { applyEntityChange, connectLiveSignals, connectEventSource, type LiveSignal, type CoherenceEdges, type EntityChange, type QueryClientLike } from './coherence.js'
 export {
   createIndexSurface,
   IndexSession,

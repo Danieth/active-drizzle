@@ -49,3 +49,62 @@ export function applyEntityChange(
     qc.invalidateQueries({ queryKey: [family] })
   }
 }
+
+// ── Live signals — the transport PLUG (DESIGN-cache-coherence §WS) ──────────
+//
+// The framework never owns the wire. Whatever pushes — WebSocket, SSE, a
+// BroadcastChannel from another tab — the contract is SIGNAL-ONLY:
+// { resource, op }. No payloads are trusted or applied; a signal only
+// triggers the same coherence fan-out a local mutation does, the refetch
+// carries the truth, and open forms absorb it through the three-way merge
+// (dirty fields survive, true conflicts surface `elsewhere` + withhold the
+// version token). Safety is transport-independent by construction.
+
+export interface LiveSignal {
+  resource: string
+  op?: 'create' | 'update' | 'destroy'
+}
+
+/**
+ * Wire any push source into the coherence engine. `subscribe` registers a
+ * signal callback and returns an unsubscribe — the shape of every event
+ * emitter ever. Returns the disconnect function.
+ *
+ *   const off = connectLiveSignals(qc, coherenceEdges, (on) => {
+ *     socket.on('entity', on); return () => socket.off('entity', on)
+ *   })
+ */
+export function connectLiveSignals(
+  qc: QueryClientLike,
+  edges: CoherenceEdges,
+  subscribe: (onSignal: (s: LiveSignal) => void) => () => void,
+): () => void {
+  return subscribe((s) => {
+    if (!s || typeof s.resource !== 'string' || !s.resource) return
+    const op = s.op === 'create' || s.op === 'destroy' ? s.op : 'update'
+    applyEntityChange(qc, edges, { resource: s.resource, op })
+  })
+}
+
+/**
+ * The zero-config flavor: an SSE endpoint that emits JSON LiveSignals.
+ * Reconnects are EventSource's own; malformed frames are ignored.
+ *
+ *   useEffect(() => connectEventSource(qc, coherenceEdges, '/live'), [])
+ */
+export function connectEventSource(
+  qc: QueryClientLike,
+  edges: CoherenceEdges,
+  url: string,
+): () => void {
+  if (typeof EventSource === 'undefined') return () => {}
+  const es = new EventSource(url)
+  const off = connectLiveSignals(qc, edges, (on) => {
+    const handler = (e: MessageEvent) => {
+      try { on(JSON.parse(e.data)) } catch { /* malformed frame — ignore */ }
+    }
+    es.addEventListener('message', handler)
+    return () => es.removeEventListener('message', handler)
+  })
+  return () => { off(); es.close() }
+}
