@@ -1,0 +1,9 @@
+{
+  "name": "trails",
+  "version": "0.1.0",
+  "description": "trails new — scaffold a working ActiveDrizzle (trails) app in one command",
+  "type": "module",
+  "bin": { "trails": "./bin/trails.mjs" },
+  "files": ["bin"],
+  "license": "MIT"
+}

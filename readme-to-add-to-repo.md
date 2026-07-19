@@ -670,3 +670,46 @@ over any group's body automatically. `SidebarApi` is fully exported for
 headless use. Requires `index: { facets: true }` (or a field list) on the
 controller — no facets config → options render count-less, everything
 else still works.
+
+## `trails.config.ts` — the ONE configuration file (built)
+
+JavaScript, not JSON, Rails' environment concept without Rails' file
+sprawl: base config + inline `environments` overrides, deep-merged by
+NODE_ENV at boot. Secrets are REFERENCED from `process.env`, never stored
+— the file commits, the values deploy.
+
+```ts
+import { defineConfig } from 'active-drizzle'
+export default defineConfig({
+  server:   { port: 8787 },
+  channels: { bus: process.env.REDIS_URL ? 'redis' : 'memory',
+              redisUrl: process.env.REDIS_URL },     // set REDIS_URL → multi-process just works
+  environments: {
+    production: { channels: { revalidate: 'always' } },
+    test:       { server: { port: 0 } },
+  },
+})
+```
+
+Merge semantics (pinned by tests): objects merge deep, arrays and scalars
+replace wholesale — an env that sets a list MEANS that list. Missing file
+= everything defaults; `loadConfig()` at boot, `defineConfig` for types.
+App-defined sections ride along and merge the same way. Why one file over
+Rails' `config/environments/*`: Rails split files because Ruby config is
+imperative patching; a typed JS object needs no split, and one file means
+the whole config surface is one grep.
+
+## `trails new` — a working app in one command (built)
+
+```sh
+npx trails new myapp        # (--link <monorepo> during pre-release)
+cd myapp && npm install && npm run dev
+```
+
+Sixteen files: PGlite (zero-setup Postgres), one schema table, one model
+(validations, scope, touch hook), one controller (expose/permit/search/
+facets/optimisticLock), `trails.config.ts`, the vite codegen plugin wired,
+a client using the GENERATED surface (`<Posts.Index>`, `<Posts.Sidebar>`,
+autosave form with Conflict/Changes), plus `npm run regen` for clean-room
+codegen without vite. Verified end-to-end: generate → install → regen →
+tsc clean → boot → index/search/facets/envelope all answering.
