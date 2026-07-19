@@ -18,12 +18,15 @@ import { resolvePresenter, checkRequiredMeta, type PresenterBind } from './prese
 
 /**
  * Context decides what COMMIT does — the presenter never knows:
- *   inside <Form>          → 'stage'    (batch; Submit sends the diff)
- *   inside <Form autosave> → 'autosave' (single-field PATCH per commit)
- *   no Form at all         → 'autosave' by definition (the handle owns the
- *                            transport; without one, commits just stage)
+ *   inside <Form>          → 'stage'     (batch; Submit sends the diff)
+ *   inside <Form autosave> → 'autoflush' (whole-diff, validity-gated,
+ *                            debounced flush — the object saves itself the
+ *                            moment it's coherent and quiet)
+ *   no Form at all         → 'autosave'  (single-field PATCH per commit — a
+ *                            lone field commits itself; without a transport,
+ *                            commits just stage)
  */
-const FormModeContext = createContext<'stage' | 'autosave' | null>(null)
+const FormModeContext = createContext<{ mode: 'stage' | 'autoflush'; debounceMs: number } | null>(null)
 
 /** The enclosing Form's submit pipeline — Submit buttons route through it so onSuccess fires. */
 const FormSubmitContext = createContext<((opts?: { event?: string }) => Promise<boolean>) | null>(null)
@@ -91,8 +94,10 @@ export interface FormHandleApi<T extends Record<string, any> = Record<string, an
   $status: SessionStatus
   $submit: (opts?: { event?: string }) => Promise<boolean>
   $can: (event: string) => boolean
-  Form: FC<{ children?: ReactNode; onSuccess?: () => void; autosave?: boolean }>
+  Form: FC<{ children?: ReactNode; onSuccess?: () => void; autosave?: boolean | { debounceMs?: number } }>
   Submit: FC<{ children?: ReactNode; event?: string }>
+  /** Floating save affordance: saving… / saved ✓ / unsaved / offline / error. */
+  SaveStatus: FC<{ className?: string; labels?: Partial<Record<'saving' | 'saved' | 'unsaved' | 'offline' | 'error' | 'idle', string>> }>
   BaseErrors: FC
 }
 
@@ -266,8 +271,17 @@ export function createFormHandle<T extends Record<string, any>>(
         () => session.fieldVersion(channel),
         () => session.fieldVersion(channel),
       )
-      const contextMode = useContext(FormModeContext)
-      const commitMode: 'stage' | 'autosave' = contextMode ?? 'autosave'
+      const formCtx = useContext(FormModeContext)
+      // Route a commit by context: autoflush stages + schedules the whole-
+      // diff flush; stage just stages; no Form → per-field autosave PATCH
+      const commitViaContext = (f: string): void => {
+        if (formCtx?.mode === 'autoflush') {
+          session.touch(f)
+          session.requestAutoFlush(formCtx.debounceMs)
+        } else {
+          void session.commitField(f, formCtx ? 'stage' : 'autosave')
+        }
+      }
 
       const rawMeta = fieldMeta[field] ?? {}
       const meta = resolveCopy(rawMeta, session.draft)
@@ -306,11 +320,11 @@ export function createFormHandle<T extends Record<string, any>>(
             : Array.isArray(value) ? value.map((v: any) => v?.id ?? v)
             : value?.id ?? value
           session.setValue(writeField, written)
-          // Discrete inputs (toggle/select) commit on change — instant
-          // autosave in autosave contexts, staged + errors-visible otherwise
-          if (commitMoment === 'change') void session.commitField(writeField, commitMode)
+          // Discrete inputs (toggle/select) commit on change — flushed/
+          // autosaved per context, staged + errors-visible otherwise
+          if (commitMoment === 'change' && !session.isComposing(dataField)) commitViaContext(writeField)
         },
-        onCommit: () => void session.commitField(writeField, commitMode),
+        onCommit: () => commitViaContext(writeField),
         onBlur: (e?: { relatedTarget?: any }) => {
           // C10: blur fires before a Cancel button's click — a blur INTO an
           // element marked data-ad-cancel must not autosave first
@@ -318,13 +332,13 @@ export function createFormHandle<T extends Record<string, any>>(
             e?.relatedTarget?.closest?.('[data-ad-cancel]') ?? e?.relatedTarget?.dataset?.adCancel,
           )
           if (cancelIntent) session.touch(writeField)
-          else void session.commitField(writeField, commitMode)
+          else commitViaContext(writeField)
         },
         onCompositionStart: () => session.beginComposition(dataField),
         onCompositionEnd: () => {
           // C11: IME composition commits once, at composition end
           session.endComposition(dataField)
-          if (commitMoment === 'change') void session.commitField(writeField, commitMode)
+          if (commitMoment === 'change') commitViaContext(writeField)
         },
         disabled: session.getStatus() === 'saving' || session.fieldState(dataField) === 'saving',
       }
@@ -345,6 +359,7 @@ export function createFormHandle<T extends Record<string, any>>(
           draft={session.draft}
           errors={session.visibleErrors(dataField)}
           state={session.fieldState(dataField) !== 'ready' ? session.fieldState(dataField) : session.getStatus()}
+          dirty={session.fieldDirty(dataField)}
         />
       )
     }
@@ -358,15 +373,21 @@ export function createFormHandle<T extends Record<string, any>>(
     return Field as FieldComponent
   }
 
-  const FormComponent: FC<{ children?: ReactNode; onSuccess?: () => void; autosave?: boolean; className?: string }> = ({ children, onSuccess, autosave, className }) => {
-    // Offline autosave: when connectivity returns, retry any queued deltas.
+  const FormComponent: FC<{ children?: ReactNode; onSuccess?: () => void; autosave?: boolean | { debounceMs?: number }; className?: string }> = ({ children, onSuccess, autosave, className }) => {
+    const auto = Boolean(autosave)
+    const debounceMs = typeof autosave === 'object' && autosave?.debounceMs !== undefined ? autosave.debounceMs : 400
+    // Offline autosave: when connectivity returns, retry queued work.
     // The whole "orchestrator" — one listener, kept deliberately tiny.
+    // Unmount also cancels any armed flush — no stale timers firing.
     useEffect(() => {
-      if (!autosave || typeof window === 'undefined') return
+      if (!auto || typeof window === 'undefined') return
       const onOnline = () => void session.flushPending()
       window.addEventListener('online', onOnline)
-      return () => window.removeEventListener('online', onOnline)
-    }, [autosave])
+      return () => {
+        window.removeEventListener('online', onOnline)
+        session.cancelAutoFlush()
+      }
+    }, [auto])
 
     const submitThroughForm = async (opts?: { event?: string }) => {
       const ok = await session.submit(opts ?? {})
@@ -374,7 +395,7 @@ export function createFormHandle<T extends Record<string, any>>(
       return ok
     }
     return (
-      <FormModeContext.Provider value={autosave ? 'autosave' : 'stage'}>
+      <FormModeContext.Provider value={auto ? { mode: 'autoflush', debounceMs } : { mode: 'stage', debounceMs: 0 }}>
         <FormSubmitContext.Provider value={submitThroughForm}>
           <form
             {...(className !== undefined ? { className } : {})}
@@ -421,6 +442,45 @@ export function createFormHandle<T extends Record<string, any>>(
   }
   SubmitComponent.displayName = 'AdSubmit'
 
+  /**
+   * The floating save affordance — autosave forms have no Save button, so
+   * THIS is how persistence stays legible: "Saving…" → "Saved ✓", with
+   * distinct states for unsaved, offline-queued, and rejected work. Headless
+   * beyond a default label set: style via className + [data-state], or
+   * override labels per state.
+   */
+  const SaveStatusComponent: FC<{ className?: string; labels?: Partial<Record<'saving' | 'saved' | 'unsaved' | 'offline' | 'error' | 'idle', string>> }> = ({ className, labels }) => {
+    useSyncExternalStore(
+      (cb) => session.subscribe('*', cb),
+      () => session.fieldVersion('*'),
+      () => session.fieldVersion('*'),
+    )
+    const st = session.getStatus()
+    const state: 'saving' | 'saved' | 'unsaved' | 'offline' | 'error' | 'idle' =
+      st === 'saving' ? 'saving'
+      : session.hasPending() ? 'offline'
+      : st === 'error' || st === 'unauthenticated' ? 'error'
+      : session.isDirty() ? 'unsaved'
+      : session.getLastSavedAt() !== null ? 'saved'
+      : 'idle'
+    const DEFAULTS: Record<typeof state, string> = {
+      saving: 'Saving…',
+      saved: 'Saved ✓',
+      unsaved: 'Unsaved changes',
+      offline: 'Offline — changes queued',
+      error: "Couldn't save",
+      idle: '',
+    }
+    const text = labels?.[state] ?? DEFAULTS[state]
+    if (!text) return null
+    return (
+      <span role="status" data-state={state} {...(className !== undefined ? { className } : {})}>
+        {text}
+      </span>
+    )
+  }
+  SaveStatusComponent.displayName = 'AdSaveStatus'
+
   const BaseErrorsComponent: FC<{ className?: string }> = ({ className }) => {
     useSyncExternalStore(
       (cb) => session.subscribe('*', cb),
@@ -456,6 +516,7 @@ export function createFormHandle<T extends Record<string, any>>(
         case '$can': return (event: string) => session.can(event)
         case 'Form': return FormComponent
         case 'Submit': return SubmitComponent
+        case 'SaveStatus': return SaveStatusComponent
         case 'BaseErrors': return BaseErrorsComponent
         // React/JS runtime probes that must not become field components.
         // Without this, `${handle}` would resolve toString to a Field and

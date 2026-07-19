@@ -436,3 +436,13 @@ describe('belongsTo ref sugar emission', () => {
     expect(out).not.toContain(`watcherIds`)
   })
 })
+
+describe('autocreate transport (new-form create-then-update)', () => {
+  it('the new-form submit creates once, then PATCHes the remembered id', () => {
+    const out = generate()
+    expect(out).toContain(`const createdId = useRef<number | string | null>(null)`)
+    expect(out).toContain(`createdId.current == null`)
+    expect(out).toContain(`client.loans.update({ id: createdId.current,`)
+    expect(out).toContain(`import { useRef } from 'react'`)
+  })
+})

@@ -53,6 +53,8 @@ export interface PresenterProps<V = any> {
   draft: any
   errors: string[]
   state: 'ready' | 'saving' | 'saved' | 'error' | 'unauthenticated' | 'pending'
+  /** True while this field's draft value differs from the server baseline — render an "unsaved" marker. */
+  dirty: boolean
 }
 
 export interface PresenterDef {

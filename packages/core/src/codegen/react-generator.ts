@@ -118,6 +118,8 @@ function generateControllerFile(
   if (rqImports.length) {
     L.push(`import { ${[...new Set(rqImports)].join(', ')} } from '@tanstack/react-query'`)
   }
+  // New-form hooks track the created id across renders (autocreate transport)
+  if (envelopeEnabled) L.push(`import { useRef } from 'react'`)
 
 
   // Which property validators ship to THIS client — projection-scoped AND
@@ -1106,10 +1108,18 @@ function emitFormHooks(
   L.push(`}`)
   L.push('')
 
-  L.push(`/** New-record form: defaults draft; submit POSTs to create. */`)
+  L.push(`/**`)
+  L.push(` * New-record form. The transport is create-THEN-update: the first`)
+  L.push(` * successful save materializes the row and remembers its id; every save`)
+  L.push(` * after that is a PATCH. Under <Form autosave> this IS autocreate — the`)
+  L.push(` * record comes into existence the moment the draft is first valid, then`)
+  L.push(` * keeps saving itself. (A staged form benefits too: a second Save`)
+  L.push(` * updates instead of duplicating.)`)
+  L.push(` */`)
   L.push(`export function use${modelName}NewForm(${hasScopes ? `scopes: ${scopeType}` : ''}): { status: 'ready'; form: ${modelName}FormHandle } {`)
   L.push(`  const qc = useQueryClient()`)
   L.push(`  const _scopes = ${scopesArg}`)
+  L.push(`  const createdId = useRef<number | string | null>(null)`)
   L.push(`  const { form } = useGeneratedForm<${modelName}Client>({`)
   L.push(`    formKey: 'new',`)
   L.push(`    mode: 'new',`)
@@ -1117,9 +1127,15 @@ function emitFormHooks(
   L.push(`    makeDraft: (r) => new ${modelName}Client(r),`)
   L.push(`    fieldMeta: (${modelName}Client as any).fieldMeta ?? {},`)
   if (transportsLine) L.push(transportsLine)
-  L.push(`    submit: async ({ data }) => {`)
+  L.push(`    submit: async ({ data, _event }) => {`)
   L.push(`      try {`)
-  L.push(`        const res: any = await client.${clientKey}.create({ ${scopeSpread}data })`)
+  L.push(`        const res: any = createdId.current == null`)
+  L.push(`          ? await client.${clientKey}.create({ ${scopeSpread}data })`)
+  L.push(`          : await client.${clientKey}.update({ ${scopeSpread}id: createdId.current, data: _event ? { ...data, _event } : data })`)
+  L.push(`        if (createdId.current == null) {`)
+  L.push(`          const rid = res && typeof res === 'object' ? ('record' in res ? res.record?.id : res.id) : null`)
+  L.push(`          if (rid != null) createdId.current = rid`)
+  L.push(`        }`)
   L.push(`        qc.invalidateQueries({ queryKey: ${keysName}.root(_scopes as any) })`)
   L.push(`        return { ok: true, ...(res && typeof res === 'object' && 'record' in res ? { envelope: res } : {}) }`)
   L.push(`      } catch (e) { return _${lcFirst(modelName)}SubmitResult(e) }`)

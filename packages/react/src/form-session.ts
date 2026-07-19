@@ -375,6 +375,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
       // recursively, so grandchildren re-key too (settleNested)
       this.settleNested(result.envelope?.record)
       this.baseline = this.snapshotDraft()
+      this.lastSavedAt = Date.now()
       this.status = 'saved'
       this.notifyAll()
       return true
@@ -463,17 +464,163 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   }
 
   /**
-   * Retry every queued offline write (newest value per field). Called when
-   * connectivity returns. Clean, fail-closed: a field that fails again just
-   * stays queued for the next flush.
+   * Retry every queued offline write. Called when connectivity returns.
+   * Clean, fail-closed: work that fails again just stays queued.
    */
   async flushPending(): Promise<void> {
-    if (this.pendingWrites.size === 0) return
-    const fields = [...this.pendingWrites.keys()]
-    for (const field of fields) await this.commitField(field, 'autosave')
+    if (this.pendingWrites.size > 0) {
+      const fields = [...this.pendingWrites.keys()]
+      for (const field of fields) await this.commitField(field, 'autosave')
+    }
+    if (this.pendingFlush) await this.autoFlush()
   }
 
-  hasPending(): boolean { return this.pendingWrites.size > 0 }
+  hasPending(): boolean { return this.pendingWrites.size > 0 || this.pendingFlush }
+
+  // ── Whole-diff autosave (the <Form autosave> engine) ─────────────────────
+  //
+  // Why object-level and not field-level: the client holds the ENTIRE
+  // projected draft plus every validator that fits the projection, so it can
+  // know the whole object is coherent BEFORE sending. Commits stage locally;
+  // the accumulated diff flushes when the draft is valid and the debounce
+  // window closes. Invalid intermediate states (isFeatured toggled, amount
+  // not typed yet) simply stay local — no jarring mid-edit 422s, and
+  // multi-field invariants save atomically in one PATCH.
+
+  private autoFlushTimer: ReturnType<typeof setTimeout> | null = null
+  private autoFlushInFlight = false
+  private autoFlushQueued = false
+  private pendingFlush = false
+  private lastSavedAt: number | null = null
+
+  /** Timestamp of the last successful save (submit or flush) — SaveStatus fuel. */
+  getLastSavedAt(): number | null { return this.lastSavedAt }
+
+  /** Field-level unsaved signal: the draft differs from the server baseline. */
+  fieldDirty(field: string): boolean {
+    return !valueEquals(this.baseline[field], this.snapshotDraft()[field])
+  }
+
+  /** Debounced flush — <Form autosave> field commits land here. */
+  requestAutoFlush(delayMs = 400): void {
+    if (this.autoFlushTimer) clearTimeout(this.autoFlushTimer)
+    this.autoFlushTimer = setTimeout(() => {
+      this.autoFlushTimer = null
+      void this.autoFlush()
+    }, delayMs)
+  }
+
+  /** Unmount hygiene — a dropped form must not fire a stale flush. */
+  cancelAutoFlush(): void {
+    if (this.autoFlushTimer) { clearTimeout(this.autoFlushTimer); this.autoFlushTimer = null }
+  }
+
+  /**
+   * Flush the accumulated diff IF the whole draft is currently valid.
+   * Single-flight; edits made mid-flight stay dirty (never clobbered by the
+   * response) and roll into an immediate follow-up flush. Offline queues the
+   * whole diff for flushPending(). A 422 binds field errors but does NOT
+   * splash untouched fields (C1 stands: no markSubmitAttempted here).
+   */
+  async autoFlush(): Promise<boolean> {
+    if (this.autoFlushInFlight) { this.autoFlushQueued = true; return false }
+    if (!this.submitFn) return false
+    if (!this.isDirty()) return true
+    if (Object.keys(this.gateErrors()).length > 0) return false   // stays local
+
+    this.autoFlushInFlight = true
+    const flushed = this.snapshotDraft()
+    this.status = 'saving'
+    this.notifyAll()
+
+    let result: SubmitResult
+    try {
+      result = await this.submitFn({ data: this.changedData() })
+    } catch {
+      result = { ok: false, status: 0 }
+    }
+    this.autoFlushInFlight = false
+
+    if (result.ok) {
+      this.pendingFlush = false
+      this.serverErrors = {}
+      this.applyFlushSuccess(result.envelope, flushed)
+      this.lastSavedAt = Date.now()
+      this.status = 'saved'
+      this.notifyAll()
+    } else if (result.status === 0) {
+      // Offline: the draft keeps every edit; the diff is queued as a unit
+      this.pendingFlush = true
+      this.status = 'ready'
+      this.notifyAll()
+    } else if (result.status === 401 || result.status === 403) {
+      this.status = 'unauthenticated'   // draft untouched (C15)
+      this.notifyAll()
+    } else {
+      this.serverErrors = this.refieldErrors(result.errors ?? {})
+      if (Object.keys(result.errors ?? {}).length === 0) {
+        this.serverErrors = { base: ['Something went wrong — your changes are not saved yet.'] }
+      }
+      this.status = 'error'
+      this.notifyAll()
+    }
+
+    // Mid-flight edits (or coalesced requests) ride the next flush
+    if (this.autoFlushQueued) {
+      this.autoFlushQueued = false
+      if (this.isDirty()) this.requestAutoFlush(0)
+    } else if (result.ok && this.isDirty()) {
+      this.requestAutoFlush(0)
+    }
+    return result.ok
+  }
+
+  /**
+   * Success application that never clobbers keystrokes made DURING the
+   * flight: server values fold into the draft only for fields unchanged
+   * since the flush snapshot; the baseline takes the server truth either
+   * way, so mid-flight edits stay dirty and ride the next flush.
+   */
+  private applyFlushSuccess(envelope: ServerEnvelope | undefined, flushed: Record<string, any>): void {
+    const rec = envelope?.record
+    if (rec) {
+      const now = this.snapshotDraft()
+      for (const [k, v] of Object.entries(rec)) {
+        if (this.nested.has(k)) continue
+        if (valueEquals(now[k], flushed[k])) {
+          try {
+            ;(this.draft as any)[k] = v
+          } catch {
+            Object.defineProperty(this.draft, k, { value: v, writable: true, enumerable: true, configurable: true })
+          }
+        }
+        this.baseline[k] = v
+      }
+      if (envelope!.abilities !== undefined) {
+        this.abilities = envelope!.abilities ?? null
+        for (const [name, manager] of this.nested) manager.setLocked(!this.canEditNested(name))
+      }
+      if (envelope!.can !== undefined) this.canMap = envelope!.can ?? {}
+      this.serverIssues = envelope!.issues ?? []
+      const stripped = this.serverIssues.filter(i => i.code === 'forbidden').map(i => i.field)
+      if (stripped.length > 0) {
+        console.warn(
+          `[active-drizzle] the server stripped non-permitted fields from this autosave: `
+          + `${stripped.join(', ')} — permit them in the controller or stop rendering them editable.`,
+        )
+        this.serverErrors = {
+          ...this.serverErrors,
+          base: [...(this.serverErrors['base'] ?? []), `Some changes were not permitted and were not saved: ${stripped.join(', ')}`],
+        }
+      }
+      this.settleNested(rec)
+    } else {
+      for (const k of Object.keys(flushed)) {
+        if (!this.nested.has(k)) this.baseline[k] = flushed[k]
+      }
+      this.settleNested(undefined)
+    }
+  }
 
   /** Fold a server envelope in: new record values, mask, can, version. */
   applyEnvelope(envelope: ServerEnvelope): void {

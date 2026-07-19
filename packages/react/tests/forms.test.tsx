@@ -819,3 +819,151 @@ describe('refMany fields (habtm sugar)', () => {
     expect(screen.queryByRole('button')).toBeNull()
   })
 })
+
+// ── Whole-diff autosave: <Form autosave> flushes the OBJECT, not fields ──────
+
+describe('whole-diff autosave (validity-gated flush)', () => {
+  function autoHandle(opts: { validate?: (d: any) => Record<string, string[]>; submit: any }) {
+    const session = new FormSession<LoanDraft>({
+      draft: makeDraft(),
+      mode: 'edit',
+      abilities: { amount: 'edit', purpose: 'edit', isPublished: 'edit' },
+      can: {},
+      ...(opts.validate ? { validate: opts.validate } : {}),
+      submit: opts.submit,
+    })
+    return { handle: createFormHandle(session, { fieldMeta: FIELD_META }), session }
+  }
+
+  it('two edits inside the debounce window flush as ONE PATCH with both fields', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const { handle: loan } = autoHandle({ submit: submitSpy })
+    render(
+      <loan.Form autosave={{ debounceMs: 30 }}>
+        <loan.amount edit /><loan.purpose edit />
+      </loan.Form>,
+    )
+    const [amount, purpose] = screen.getAllByRole('textbox')
+    fireEvent.change(amount!, { target: { value: '9' } })
+    fireEvent.blur(amount!)
+    fireEvent.change(purpose!, { target: { value: 'FLEET' } })
+    fireEvent.blur(purpose!)
+    await waitFor(() => expect(submitSpy).toHaveBeenCalledTimes(1))
+    expect(submitSpy.mock.calls[0]![0].data).toEqual({ amount: '9', purpose: 'FLEET' })
+  })
+
+  it('an invalid draft stays LOCAL; the flush fires when the draft heals — with the full diff', async () => {
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const { handle: loan } = autoHandle({
+      submit: submitSpy,
+      validate: (d) => (d.amount === '' ? { amount: ['required'] } : {}),
+    })
+    render(
+      <loan.Form autosave={{ debounceMs: 10 }}>
+        <loan.amount edit /><loan.purpose edit />
+      </loan.Form>,
+    )
+    const [amount, purpose] = screen.getAllByRole('textbox')
+    // Break validity, then edit ANOTHER field — nothing may flush
+    fireEvent.change(amount!, { target: { value: '' } })
+    fireEvent.blur(amount!)
+    fireEvent.change(purpose!, { target: { value: 'FLEET' } })
+    fireEvent.blur(purpose!)
+    await new Promise(r => setTimeout(r, 60))
+    expect(submitSpy).not.toHaveBeenCalled()
+    // Heal — the flush carries BOTH fields atomically
+    fireEvent.change(amount!, { target: { value: '5' } })
+    fireEvent.blur(amount!)
+    await waitFor(() => expect(submitSpy).toHaveBeenCalledTimes(1))
+    expect(submitSpy.mock.calls[0]![0].data).toEqual({ amount: '5', purpose: 'FLEET' })
+  })
+
+  it('keystrokes during a flight are never clobbered and ride the next flush', async () => {
+    let release: (v: SubmitResult) => void
+    const submitSpy = vi.fn(() => new Promise<SubmitResult>(r => { release = r }))
+    const { handle: loan, session } = autoHandle({ submit: submitSpy as any })
+    render(<loan.Form autosave={{ debounceMs: 0 }}><loan.amount edit /></loan.Form>)
+    const amount = screen.getByRole('textbox')
+    fireEvent.change(amount, { target: { value: '1' } })
+    fireEvent.blur(amount)
+    await waitFor(() => expect(submitSpy).toHaveBeenCalledTimes(1))
+    // Mid-flight edit
+    fireEvent.change(amount, { target: { value: '12' } })
+    // Server echoes the FLUSHED value — must not clobber '12'
+    await act(async () => { release!({ ok: true, envelope: { record: { ...makeDraft(), amount: '1' } } }) })
+    expect(session.getValue('amount')).toBe('12')
+    // The newer edit flushes next
+    fireEvent.blur(amount)
+    await waitFor(() => expect(submitSpy).toHaveBeenCalledTimes(2))
+    expect((submitSpy.mock.calls[1]![0] as any).data).toEqual({ amount: '12' })
+  })
+
+  it('a network failure queues the WHOLE diff; flushPending retries it', async () => {
+    let fail = true
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => {
+      if (fail) throw new Error('offline')
+      return { ok: true }
+    })
+    const { handle: loan, session } = autoHandle({ submit: submitSpy })
+    render(<loan.Form autosave={{ debounceMs: 0 }}><loan.amount edit /></loan.Form>)
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '7' } })
+    fireEvent.blur(screen.getByRole('textbox'))
+    await waitFor(() => expect(session.hasPending()).toBe(true))
+    expect(session.getValue('amount')).toBe('7')   // the edit survives
+    fail = false
+    await act(async () => { await session.flushPending() })
+    expect(session.hasPending()).toBe(false)
+    expect(submitSpy.mock.calls.at(-1)![0].data).toEqual({ amount: '7' })
+  })
+})
+
+// ── SaveStatus + per-field dirty ─────────────────────────────────────────────
+
+describe('SaveStatus and the dirty signal', () => {
+  function statusHandle(submit: any) {
+    const session = new FormSession<LoanDraft>({
+      draft: makeDraft(),
+      mode: 'edit',
+      abilities: { amount: 'edit' },
+      can: {},
+      submit,
+    })
+    return { handle: createFormHandle(session, { fieldMeta: FIELD_META }), session }
+  }
+
+  it('walks unsaved → saving → saved across a flush', async () => {
+    let release: (v: SubmitResult) => void
+    const submitSpy = vi.fn(() => new Promise<SubmitResult>(r => { release = r }))
+    const { handle: loan } = statusHandle(submitSpy)
+    render(
+      <loan.Form autosave={{ debounceMs: 20 }}>
+        <loan.amount edit /><loan.SaveStatus />
+      </loan.Form>,
+    )
+    expect(screen.queryByRole('status')).toBeNull()   // pristine → renders nothing
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '3' } })
+    expect(screen.getByRole('status').getAttribute('data-state')).toBe('unsaved')
+    fireEvent.blur(screen.getByRole('textbox'))
+    await waitFor(() => expect(screen.getByRole('status').getAttribute('data-state')).toBe('saving'))
+    await act(async () => { release!({ ok: true }) })
+    expect(screen.getByRole('status').getAttribute('data-state')).toBe('saved')
+    expect(screen.getByRole('status').textContent).toBe('Saved ✓')
+  })
+
+  it('presenters receive dirty=true until the value is saved', async () => {
+    const seen: boolean[] = []
+    function DirtyProbe({ value, bind, dirty }: PresenterProps) {
+      seen.push(dirty)
+      return <input value={value ?? ''} onChange={(e) => bind.onChange(e.target.value)} onBlur={bind.onBlur} />
+    }
+    registerPresenter('dirtyProbe', { kind: '*', commit: 'blur', component: DirtyProbe })
+    const submitSpy = vi.fn(async (): Promise<SubmitResult> => ({ ok: true }))
+    const { handle: loan } = statusHandle(submitSpy)
+    render(<loan.Form autosave={{ debounceMs: 0 }}><loan.amount edit="dirtyProbe" /></loan.Form>)
+    expect(seen.at(-1)).toBe(false)
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '8' } })
+    expect(seen.at(-1)).toBe(true)
+    fireEvent.blur(screen.getByRole('textbox'))
+    await waitFor(() => expect(seen.at(-1)).toBe(false))   // saved → clean again
+  })
+})
