@@ -58,6 +58,24 @@ export type ActiveDrizzlePluginOptions = {
   reactHooks?: boolean
   /** tsconfig.json path (defaults to ./tsconfig.json) */
   tsconfig?: string
+  /**
+   * Generated-output home. Default '.gen': every generated file lands in
+   * `<genDir>/models` + `<genDir>/controllers` instead of beside its
+   * source, and the plugin injects a vite alias `@gen` → `<genDir>` so
+   * apps write `import { Deals } from '@gen/controllers'`. Add the
+   * matching tsconfig paths entry for editor resolution:
+   *   "baseUrl": ".", "paths": { "@gen/*": [".gen/*"] }
+   * Set `false` for the legacy co-located layout.
+   */
+  genDir?: string | false
+}
+
+/** Relative import specifier from one dir to another (posix, ./-prefixed). */
+function relImport(fromDir: string, toDir: string): string {
+  let rel = relative(fromDir, toDir).split('\\').join('/')
+  if (rel === '') rel = '.'
+  if (!rel.startsWith('.')) rel = './' + rel
+  return rel
 }
 
 export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
@@ -276,7 +294,12 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
 
     const files: GeneratedFile[] = []
     const firstModelDir = dirname(modelPaths[0]!)
-    const outDir = resolve(root, options.outputDir ?? firstModelDir)
+    // .gen mode (default): generated files live under <genDir>/models,
+    // OUT of the source tree; imports back to sources use a computed prefix
+    const genRoot = options.genDir === false ? null : resolve(root, options.genDir ?? '.gen')
+    const outDir = genRoot ? join(genRoot, 'models') : resolve(root, options.outputDir ?? firstModelDir)
+    const srcPrefix = genRoot ? relImport(outDir, firstModelDir) : '.'
+    mkdirSync(outDir, { recursive: true })
 
     for (const model of models) {
       const base = model.filePath.split('/').pop()!.replace('.model.ts', '.model.gen')
@@ -285,14 +308,20 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
       // file's build output and silently dropped from the program, which
       // killed every `declare module` augmentation under `tsc --noEmit`.
       const typesBase = base.replace(/\.model\.gen$/, '.model.types.gen')
-      files.push({ path: `${typesBase}.d.ts`, content: generateModelTypes(model, projectMeta) })
-      files.push({ path: `${base}.ts`,   content: generateClientRuntime(model, projectMeta) })
+      files.push({ path: `${typesBase}.d.ts`, content: generateModelTypes(model, projectMeta, srcPrefix) })
+      files.push({ path: `${base}.ts`,   content: generateClientRuntime(model, projectMeta, srcPrefix) })
     }
 
     if (globalsNeedRegen) {
-      files.push({ path: '_registry.gen.ts',       content: generateRegistry(projectMeta) })
+      files.push({ path: '_registry.gen.ts',       content: generateRegistry(projectMeta, outDir) })
       files.push({ path: '.active-drizzle/schema.md', content: generateDocs(projectMeta) })
       files.push({ path: '_globals.gen.d.ts',      content: generateGlobals(projectMeta, outDir) })
+      if (genRoot) {
+        // models barrel → import { DealClient } from '@gen/models'
+        const barrel = ['// AUTO-GENERATED — DO NOT EDIT', '',
+          ...models.map(m => `export * from './${m.filePath.split('/').pop()!.replace('.model.ts', '.model.gen')}'`), '']
+        files.push({ path: 'index.ts', content: barrel.join('\n') })
+      }
     }
 
     // ── Write — skip unchanged files ─────────────────────────────────────────
@@ -309,6 +338,8 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
         mkdirSync(docsDir, { recursive: true })
         targetPath = resolve(root, file.path)
       } else if (file.path === '_registry.gen.ts' || file.path === '_globals.gen.d.ts') {
+        targetPath = join(outDir, file.path)
+      } else if (genRoot) {
         targetPath = join(outDir, file.path)
       } else {
         const modelFile = modelPaths.find(mp =>
@@ -382,10 +413,17 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     const p = getOrCreateProject()
     const ctrlMeta = extractControllers(p, ctrlPaths)
 
-    // Output dir: same as model outputDir, or first ctrl file's dir
-    const outDir = options.outputDir
-      ? resolve(root, options.outputDir)
-      : dirname(ctrlPaths[0]!)
+    // Output dir: <genDir>/controllers (default), or legacy co-located
+    const genRoot = options.genDir === false ? null : resolve(root, options.genDir ?? '.gen')
+    const ctrlSrcDir = dirname(ctrlPaths[0]!)
+    const outDir = genRoot ? join(genRoot, 'controllers')
+      : options.outputDir ? resolve(root, options.outputDir)
+      : ctrlSrcDir
+    // _client.ts is USER-OWNED wiring — it stays in the source controllers
+    // dir (never inside a sweepable/gitignored generated tree); generated
+    // files import it through this prefix
+    const clientDir = genRoot ? ctrlSrcDir : outDir
+    const clientImportPrefix = genRoot ? relImport(outDir, ctrlSrcDir) : '.'
 
     mkdirSync(outDir, { recursive: true })
 
@@ -424,7 +462,7 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
       }
       const projectMeta = { schema: schemaMeta!, models: extractedModels }
 
-      const hookFiles = generateReactHooks(ctrlMeta, projectMeta, outDir)
+      const hookFiles = generateReactHooks(ctrlMeta, projectMeta, outDir, { clientDir, clientImportPrefix })
       for (const f of hookFiles) {
         // _client.ts is user-owned — only write if it doesn't exist yet
         if (f.skipIfExists) {
@@ -448,6 +486,13 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
   return {
     name: 'active-drizzle',
     enforce: 'pre' as const,
+
+    config(userConfig: { root?: string }) {
+      if (options.genDir === false) return undefined
+      // `import { Deals } from '@gen/controllers'` — everywhere, no ../..
+      const r = userConfig.root ? resolve(userConfig.root) : process.cwd()
+      return { resolve: { alias: { '@gen': resolve(r, options.genDir ?? '.gen') } } }
+    },
 
     configResolved(config: { root: string }) {
       root = config.root

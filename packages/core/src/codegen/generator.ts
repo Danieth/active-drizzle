@@ -78,7 +78,7 @@ export function generate(project: ProjectMeta): GeneratedFile[] {
  *   export interface ModelCreate { ... }
  *   export type ModelUpdate = ...
  */
-export function generateModelTypes(model: ModelMeta, project: ProjectMeta): string {
+export function generateModelTypes(model: ModelMeta, project: ProjectMeta, srcPrefix = '.'): string {
   const lines: string[] = [];
   const recordName = `${model.className}Record`;
   const table = project.schema.tables[model.tableName];
@@ -92,7 +92,7 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta): stri
   lines.push('');
 
   // ── Instance augmentation ─────────────────────────────────────────────
-  lines.push(`declare module './${model.className}.model' {`);
+  lines.push(`declare module '${srcPrefix}/${model.className}.model' {`);
   lines.push(`  interface ${model.className} {`);
   lines.push(`    readonly _associations: ${model.className}Associations;`);
 
@@ -348,7 +348,7 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta): stri
  * `new Asset.Client(payload)` works after importing this file (or the registry).
  * Also re-declares the type shape via `declare module` for TypeScript merging.
  */
-export function generateClientRuntime(model: ModelMeta, project: ProjectMeta): string {
+export function generateClientRuntime(model: ModelMeta, project: ProjectMeta, srcPrefix = '.'): string {
   const lines: string[] = [];
   const table = project.schema.tables[model.tableName];
 
@@ -374,12 +374,12 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta): s
   );
 
   lines.push(`// AUTO-GENERATED — do not edit manually`);
-  lines.push(`import { ${model.className} as _${model.className} } from './${model.className}.model.js'`);
+  lines.push(`import { ${model.className} as _${model.className} } from '${srcPrefix}/${model.className}.model.js'`);
   if (needsValidates) {
     lines.push(`import { Validates } from 'active-drizzle'`);
   }
   for (const [cls, basename] of assocImports) {
-    lines.push(`import { ${cls} as _${cls} } from './${basename}.js'`);
+    lines.push(`import { ${cls} as _${cls} } from '${srcPrefix}/${basename}.js'`);
   }
   lines.push('');
   lines.push(`class ${model.className}Client {`);
@@ -795,17 +795,16 @@ function modelProjectionFields(model: ModelMeta, project: ProjectMeta): Set<stri
   return fields;
 }
 
-export function generateRegistry(project: ProjectMeta): string {
+export function generateRegistry(project: ProjectMeta, registryDir?: string): string {
   const lines: string[] = [];
   lines.push(`// AUTO-GENERATED — do not edit manually`);
 
   for (const model of project.models) {
-    // model.filePath is absolute.
-    // _registry.gen.ts is generated in `src/generated/_registry.gen.ts`
-    // We compute the relative path from the expected `src/generated` dir
-    // to the actual model file.
-    const registryDir = path.join(process.cwd(), 'src/generated');
-    let rel = path.relative(registryDir, model.filePath);
+    // model.filePath is absolute; imports are relative to where the
+    // registry is actually written (the caller passes its output dir)
+    const base = registryDir
+      ?? (project.models[0] ? path.dirname(project.models[0].filePath) : process.cwd());
+    let rel = path.relative(base, model.filePath);
     if (!rel.startsWith('.')) rel = './' + rel;
     // strip .ts, append .js
     rel = rel.replace(/\.ts$/, '.js');

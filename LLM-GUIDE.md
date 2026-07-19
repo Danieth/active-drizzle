@@ -18,11 +18,15 @@ You write THREE files per resource; everything else is generated:
    — declares the API surface AND the permission model AND the generated
    client/form/index surfaces.
 
-Codegen (vite plugin `active-drizzle/vite`) turns these into:
-`X.model.gen.ts` (browser Client class), `X.model.types.gen.d.ts` (type
-augmentations), `x.gen.ts` per controller (typed client + hooks + form
-handles + index surface), `_coherence.gen.ts` (cache invalidation edges),
-`_routes.gen.ts`. NEVER edit `*.gen.*` files.
+Codegen (vite plugin `active-drizzle/vite`) writes EVERYTHING into
+`.gen/` (gitignored; never edit): `.gen/models/` (Client classes + type
+augmentations + _registry) and `.gen/controllers/` (typed client + hooks +
+form handles + index surface per controller, `_coherence.gen.ts`,
+`_routes.gen.ts`, barrels). Import through the injected alias — from
+ANYWHERE: `import { Deals, useDealEditForm, coherenceEdges } from
+'@gen/controllers'`, `import { DealClient } from '@gen/models'`.
+tsconfig: `"baseUrl": ".", "paths": {"@gen/*": ["./.gen/*"]}`, include
+`".gen/**/*"`. Legacy co-located layout: plugin option `genDir: false`.
 
 Server boot:
 ```ts

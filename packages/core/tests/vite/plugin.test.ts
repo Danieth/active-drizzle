@@ -73,7 +73,7 @@ export class Business extends ApplicationRecord {
 
 describe('activeDrizzle() Vite plugin', () => {
   it('returns a plugin object with correct name and hooks', () => {
-    const plugin = activeDrizzle({ schema: 'db/schema.ts', models: 'src/models/**/*.model.ts' })
+    const plugin = activeDrizzle({ genDir: false, schema: 'db/schema.ts', models: 'src/models/**/*.model.ts' })
     expect((plugin as any).name).toBe('active-drizzle')
     expect(typeof (plugin as any).buildStart).toBe('function')
     expect(typeof (plugin as any).configureServer).toBe('function')
@@ -101,6 +101,7 @@ describe('activeDrizzle — full codegen run on disk', () => {
     }))
 
     const plugin = activeDrizzle({
+      genDir: false,
       schema: 'db/schema.ts',
       models: 'src/models/*.model.ts',
       outputDir: 'src/models',
@@ -120,6 +121,7 @@ describe('activeDrizzle — full codegen run on disk', () => {
     writeFile(dir, 'tsconfig.json', JSON.stringify({ compilerOptions: { strict: true, experimentalDecorators: true } }))
 
     const plugin = activeDrizzle({
+      genDir: false,
       schema: 'db/schema.ts',
       models: 'src/models/*.model.ts',
       outputDir: 'src/models',
@@ -137,6 +139,7 @@ describe('activeDrizzle — full codegen run on disk', () => {
     writeFile(dir, 'tsconfig.json', JSON.stringify({ compilerOptions: { strict: true, experimentalDecorators: true } }))
 
     const plugin = activeDrizzle({
+      genDir: false,
       schema: 'db/schema.ts',
       models: 'src/models/*.model.ts',
     })
@@ -158,6 +161,7 @@ describe('activeDrizzle — full codegen run on disk', () => {
     writeFile(dir, 'tsconfig.json', JSON.stringify({ compilerOptions: { strict: true, experimentalDecorators: true } }))
 
     const plugin = activeDrizzle({
+      genDir: false,
       schema: 'db/schema.ts',
       models: 'src/models/*.model.ts',
     })
@@ -174,6 +178,7 @@ describe('activeDrizzle — full codegen run on disk', () => {
 
   it('gracefully handles missing schema file', async () => {
     const plugin = activeDrizzle({
+      genDir: false,
       schema: 'nonexistent/schema.ts',
       models: 'src/models/*.model.ts',
     })
@@ -187,11 +192,48 @@ describe('activeDrizzle — full codegen run on disk', () => {
     writeFile(dir, 'db/schema.ts', SIMPLE_SCHEMA)
 
     const plugin = activeDrizzle({
+      genDir: false,
       schema: 'db/schema.ts',
       models: 'src/models/*.model.ts',  // no files exist
     })
 
     ;(plugin as any).configResolved({ root: dir })
     await expect((plugin as any).buildStart()).resolves.toBeUndefined()
+  })
+})
+
+describe('genDir (the default): .gen layout + @gen alias', async () => {
+  const { mkdtempSync, writeFileSync: wf, mkdirSync: mkd, existsSync: ex, readFileSync: rf } = await import('node:fs')
+  const { join: j } = await import('node:path')
+  const { tmpdir } = await import('node:os')
+
+  it('writes models to .gen/models with source-prefixed imports, injects the alias', async () => {
+    const root = mkdtempSync(j(tmpdir(), 'ad-gendir-'))
+    mkd(j(root, 'db'), { recursive: true }); mkd(j(root, 'src/models'), { recursive: true })
+    wf(j(root, 'db/schema.ts'), `import { pgTable, serial, text } from 'drizzle-orm/pg-core'
+export const ducks = pgTable('ducks', { id: serial('id').primaryKey(), name: text('name') })
+`)
+    wf(j(root, 'src/models/Duck.model.ts'), `import { ApplicationRecord, model, Attr } from 'active-drizzle'
+@model('ducks')
+export class Duck extends ApplicationRecord {
+  static name = Attr.string({ label: 'Name' })
+}
+`)
+    const plugin: any = (await import('../../src/vite/index.js')).default({
+      schema: 'db/schema.ts', models: 'src/models/*.model.ts',
+    })
+    // alias injection happens in the config hook
+    const injected = plugin.config({ root })
+    expect(injected.resolve.alias['@gen']).toBe(j(root, '.gen'))
+    plugin.configResolved({ root })
+    await plugin.buildStart()
+
+    expect(ex(j(root, '.gen/models/Duck.model.gen.ts'))).toBe(true)
+    expect(ex(j(root, '.gen/models/index.ts'))).toBe(true)
+    expect(ex(j(root, 'src/models/Duck.model.gen.ts'))).toBe(false)   // source tree stays clean
+    const gen = rf(j(root, '.gen/models/Duck.model.gen.ts'), 'utf8')
+    expect(gen).toContain(`from '../../src/models/Duck.model.js'`)    // prefixed back to source
+    const dts = rf(j(root, '.gen/models/Duck.model.types.gen.d.ts'), 'utf8')
+    expect(dts).toContain(`declare module '../../src/models/Duck.model'`)
   })
 })

@@ -47,6 +47,14 @@ export function generateReactHooks(
   ctrlProject: CtrlProjectMeta,
   projectMeta: ProjectMeta | null,
   outputDir: string,
+  opts: {
+    /** Where the user-owned _client.ts stub lives (defaults to outputDir).
+     *  In .gen mode this stays in the SOURCE controllers dir — user files
+     *  never live inside a sweepable/ignored generated tree. */
+    clientDir?: string
+    /** Import prefix from generated files back to _client.ts ('.' when co-located). */
+    clientImportPrefix?: string
+  } = {},
 ): GeneratedReactFile[] {
   const files: GeneratedReactFile[] = []
 
@@ -64,7 +72,7 @@ export function generateReactHooks(
       ? (projectMeta?.models.find(m => m.className === ctrl.modelClass) ?? null)
       : null
 
-    const content = generateControllerFile(ctrl, model, projectMeta, outputDir, controllerKeys, controllerModelClasses)
+    const content = generateControllerFile(ctrl, model, projectMeta, outputDir, controllerKeys, controllerModelClasses, opts.clientImportPrefix ?? '.')
     const fileName = `${toFileName(ctrl.className)}.gen.ts`
 
     files.push({ filePath: join(outputDir, fileName), content })
@@ -101,7 +109,7 @@ export function generateReactHooks(
 
   // Client stub — only written once
   files.push({
-    filePath: join(outputDir, '_client.ts'),
+    filePath: join(opts.clientDir ?? outputDir, '_client.ts'),
     content: generateClientStub(),
     skipIfExists: true,
   })
@@ -234,6 +242,7 @@ function generateControllerFile(
   outputDir: string,
   controllerKeys: Set<string> = new Set(),
   controllerModelClasses: Set<string> = new Set(),
+  clientImportPrefix = '.',
 ): string {
   const L: string[] = []
   // Instant nested resources discovered while rendering meta — the hook wires
@@ -340,7 +349,7 @@ function generateControllerFile(
     L.push(`import type { UseUploadOptions, UseMultiUploadOptions, CtrlAttachmentMeta as AttachmentMeta } from '@active-drizzle/react'`)
   }
 
-  L.push(`import { client } from './_client'`)
+  L.push(`import { client } from '${clientImportPrefix}/_client'`)
 
   // Cross-model association imports (for includes). A child Attrs type can
   // only be IMPORTED when the child has its own controller (that's what
@@ -1020,6 +1029,9 @@ function generateBarrel(ctrlProject: CtrlProjectMeta, _outputDir: string): strin
   for (const ctrl of ctrlProject.controllers) {
     L.push(`export * from './${toFileName(ctrl.className)}.gen'`)
   }
+  // the coherence edge table rides the barrel too:
+  // import { coherenceEdges } from '@gen/controllers'
+  L.push(`export { coherenceEdges } from './_coherence.gen'`)
   return L.join('\n') + '\n'
 }
 

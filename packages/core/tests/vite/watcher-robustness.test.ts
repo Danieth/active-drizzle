@@ -57,7 +57,7 @@ describe('watcher robustness', () => {
     w(dir, 'db/schema.ts', SCHEMA)
     w(dir, 'src/models/Asset.model.ts', model('BASELINE'))
     w(dir, 'tsconfig.json', '{"compilerOptions":{"strict":true,"experimentalDecorators":true}}')
-    const plugin: any = activeDrizzle({ schema: 'db/schema.ts', models: 'src/models/*.model.ts', outputDir: 'src/models' })
+    const plugin: any = activeDrizzle({ genDir: false, schema: 'db/schema.ts', models: 'src/models/*.model.ts', outputDir: 'src/models' })
     plugin.configResolved({ root: dir })
     return plugin
   }
@@ -130,7 +130,7 @@ describe('watcher robustness', () => {
       return readdirSync(md).filter(f => f.includes('.gen.')).map(f => readFileSync(join(md, f), 'utf8')).join('\n')
     }
 
-    const plugin: any = activeDrizzle({ schema: 'db/schema.ts', models: 'src/models/*.model.ts', outputDir: 'src/models' })
+    const plugin: any = activeDrizzle({ genDir: false, schema: 'db/schema.ts', models: 'src/models/*.model.ts', outputDir: 'src/models' })
     plugin.configResolved({ root: linkRoot })   // configured via the symlink
     await plugin.buildStart()
     let change!: (f: string) => any

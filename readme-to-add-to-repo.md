@@ -713,3 +713,22 @@ a client using the GENERATED surface (`<Posts.Index>`, `<Posts.Sidebar>`,
 autosave form with Conflict/Changes), plus `npm run regen` for clean-room
 codegen without vite. Verified end-to-end: generate → install → regen →
 tsc clean → boot → index/search/facets/envelope all answering.
+
+
+## `.gen/` + the `@gen` alias — generated files out of the source tree (built)
+
+All codegen output now lands in `.gen/models` + `.gen/controllers`
+(default; `genDir: false` restores co-location). The plugin injects a vite
+alias so every app import is `import { Deals } from '@gen/controllers'` —
+no relative paths, and with the tsconfig `paths` entry cmd-click jumps
+straight into the generated file. `_client.ts` (user-owned wiring) stays
+in the source controllers dir — user files never live in a
+sweepable/gitignored tree. Barrels: `@gen/controllers` re-exports every
+controller surface + `coherenceEdges`; `@gen/models` the Client classes.
+One `.gitignore` line (`.gen/`) replaces four glob patterns. tsc note:
+include `".gen/**/*"` explicitly — hidden directories don't ride wildcard
+includes.
+
+Also: GETTING-STARTED.md now exists — the one-command path
+(`trails new` → three files you write → `@gen` imports → config → the
+dev loop).

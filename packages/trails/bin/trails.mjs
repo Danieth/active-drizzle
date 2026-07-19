@@ -108,8 +108,9 @@ export default defineConfig({
       jsx: 'react-jsx', strict: true, skipLibCheck: true,
       experimentalDecorators: true, useDefineForClassFields: true,
       allowImportingTsExtensions: true, noEmit: true, types: ['vite/client', 'node'],
+      baseUrl: '.', paths: { '@gen/*': ['./.gen/*'] },
     },
-    include: ['server', 'src', 'vite.config.ts', 'trails.config.ts'],
+    include: ['server', 'src', '.gen/**/*', 'vite.config.ts', 'trails.config.ts'],
   }, null, 2) + '\n',
 
   'vite.config.ts': `import { defineConfig } from 'vite'
@@ -279,7 +280,7 @@ createRoot(document.getElementById('root')!).render(<App />)
  */
 import React, { useState } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { Posts, usePostEditForm } from '../server/controllers/post.gen'
+import { Posts, usePostEditForm } from '@gen/controllers'
 
 const qc = new QueryClient()
 
@@ -351,8 +352,9 @@ npm run dev        # server :8787 + client :5173
 - **src/App.tsx** — generated surface + form; register presenters to
   replace the labeled scaffolding
 
-Generated files (\`server/controllers/*.gen.ts\`) are rebuilt by the vite
-plugin — never edit them.
+Generated files live in \`.gen/\` (gitignored, rebuilt by the vite plugin —
+never edit them) and are imported through the \`@gen\` alias:
+\`import { Posts } from '@gen/controllers'\` anywhere, no ../.. paths.
 `,
 
   'scripts/regen.mts': `/**
@@ -374,6 +376,8 @@ function sweep(dir: string) {
 }
 sweep(join(ROOT, 'server/models'))
 sweep(join(ROOT, 'server/controllers'))
+sweep(join(ROOT, '.gen/models'))
+sweep(join(ROOT, '.gen/controllers'))
 
 const plugin: any = activeDrizzle({
   schema: 'server/db/schema.ts',
@@ -388,10 +392,7 @@ console.log('✓ regen complete')
 
   '.gitignore': `node_modules
 dist
-*.gen.ts
-*.gen.d.ts
-*.model.gen.ts
-*.model.types.gen.d.ts
+.gen/
 `,
 }
 
