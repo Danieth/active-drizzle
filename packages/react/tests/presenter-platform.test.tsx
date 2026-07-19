@@ -7,10 +7,8 @@
 import React from 'react'
 import { describe, it, expect, vi } from 'vitest'
 import { render, act } from '@testing-library/react'
-import {
-  FormSession, createFormHandle, buildFieldBind, useFieldProps,
-  createTestSession, buildTestProps, fieldStateFixtures,
-} from '../src/index.js'
+import { FormSession, createFormHandle, buildFieldBind, useFieldProps } from '../src/index.js'
+import { createTestSession, buildTestProps, fieldStateFixtures } from '../src/testing.js'
 
 const META = { amount: { kind: 'money', label: 'Amount' }, name: { kind: 'string', label: 'Name' } }
 

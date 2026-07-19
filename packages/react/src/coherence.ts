@@ -52,6 +52,12 @@ export function applyEntityChange(
 
 // ── Live signals — the transport PLUG (DESIGN-cache-coherence §WS) ──────────
 //
+// CONVERGENCE NOTE (YAGNI): when the channels lane lands
+// (DESIGN-ws-channels), THIS lane is absorbed — channels' reconnect-
+// invalidate IS the degraded mode, and two live lanes is one too many.
+// connectLiveSignals/connectEventSource are therefore transitional API:
+// fine to use today, expected to fold into connectChannels.
+//
 // The framework never owns the wire. Whatever pushes — WebSocket, SSE, a
 // BroadcastChannel from another tab — the contract is SIGNAL-ONLY:
 // { resource, op }. No payloads are trusted or applied; a signal only

@@ -67,10 +67,9 @@ export {
   useFieldProps,
   type BuildFieldBindOptions,
 } from './form-handle.js'
-export {
-  createTestSession, buildTestProps, fieldStateFixtures,
-  type CreateTestSessionOptions, type FieldStateName,
-} from './testing.js'
+// The testing kit lives OFF the runtime surface on purpose (YAGNI for
+// app bundles): import { createTestSession, fieldStateFixtures } from
+// '@active-drizzle/react/testing'
 export { NestedArrayManager, NestedOneManager, type NestedChild, type NestedTransport } from './nested.js'
 export { useForm, useEditForm, useNewForm, type UseFormOptions } from './use-form.js'
 export { useAbilities, type Abilities } from './use-abilities.js'

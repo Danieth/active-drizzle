@@ -6,6 +6,22 @@ only identifiers. No prose padding; rules are absolute unless marked.
 
 ## 0. Mental model
 
+**SURFACE TIERS (read this first — it's the YAGNI contract):**
+- **CORE** (the spine; stable, learn this): models + controllers +
+  codegen, the forms machinery (sessions/presenters/autosave/409/merge/
+  coherence), Index/Search/Filters/Items/Pagination, config, the CLI.
+  This is the Rails-analog surface. Build on it freely.
+- **SCAFFOLDING TIER** (conveniences you OUTGROW): Sidebar, Board, Table,
+  Chart, Metric, Skeletons, Empty/Error defaults, all `data-ad-scaffold`
+  rendering. Contract: their DATA shapes (render-prop APIs) are stable;
+  their default pixels are demo furniture; pre-1.0 they may move to a
+  separate package. Prefer the render-prop over the scaffold in real apps.
+- **SEAMS** (small, stable plugs): presenter/filter registries,
+  buildFieldBind/useFieldProps, SearchAdapter, BroadcastBus, contract
+  probes, `@active-drizzle/react/testing` (subpath — NOT on the runtime
+  surface). New capability enters as recipe → seam → surface, in that
+  order; most things should STOP at recipe or seam.
+
 You write THREE files per resource; everything else is generated:
 
 1. **Schema** (drizzle): `export const deals = pgTable('deals', {...})` —
