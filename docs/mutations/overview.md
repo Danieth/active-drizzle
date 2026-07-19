@@ -106,20 +106,24 @@ user.isDestroyed  // true
 
 Runs `@beforeDestroy` and `@afterDestroy` hooks. If the model has `dependent: 'destroy'` associations, those records are destroyed first.
 
-### `Relation.destroyAll()` — bulk destroy
+### `Relation.destroyAll()` — bulk DELETE (no hooks)
 
-Loads each record and calls `destroy()` on it (hooks run):
-
-```ts
-await User.where({ active: false }).destroyAll()
-```
-
-### `Relation.deleteAll()` — raw DELETE (no hooks)
+Issues a **single raw `DELETE`** for every matching row and returns the number of rows removed. It does **not** load records, so `@beforeDestroy` / `@afterDestroy` hooks do **not** run and `dependent: 'destroy'` associations are **not** cascaded.
 
 ```ts
-await User.where({ active: false }).deleteAll()
-// DELETE FROM users WHERE active = false — no hooks, faster
+const removed = await User.where({ active: false }).destroyAll()
+// DELETE FROM users WHERE active = false  → number of rows deleted
 ```
+
+::: warning Hooks do not run
+`destroyAll()` is the fast path. If you need per-record callbacks or dependent-destroy cascading, load the records and destroy them individually:
+
+```ts
+for (const user of await User.where({ active: false }).load()) {
+  await user.destroy()   // hooks + dependent: 'destroy' cascade
+}
+```
+:::
 
 ---
 

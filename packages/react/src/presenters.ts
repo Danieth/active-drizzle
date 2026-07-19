@@ -208,7 +208,9 @@ function lookup(name: string, field: string, kind: string | null): PresenterDef 
       || (fallback !== undefined && accepted.includes(fallback))
     if (!matches) {
       throw new Error(
-        `Presenter "${name}" accepts kind ${accepted.map(k => `'${k}'`).join('|')} but field "${field}" is '${kind}'`,
+        `Presenter "${name}" serves kind ${accepted.map(k => `'${k}'`).join('|')} but field "${field}" is '${kind}'. ` +
+        `Use a '${kind}' presenter here, or register one that serves it: registerPresenter('${name}', { kind: '${kind}', … }). ` +
+        `To catch this at COMPILE time, augment AdPresenterKinds with your presenter names → kinds (LLM-GUIDE: presenters).`,
       )
     }
   }

@@ -23,6 +23,7 @@ const modelSidebar = [
       { text: 'Basics', link: '/querying/basics' },
       { text: 'Scopes', link: '/querying/scopes' },
       { text: 'Aggregates & Counting', link: '/querying/aggregates' },
+      { text: 'Advanced Queries', link: '/querying/advanced' },
       { text: 'Pluck & Pick', link: '/querying/pluck' },
     ],
   },

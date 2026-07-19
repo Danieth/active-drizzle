@@ -4,7 +4,7 @@
  * Controllers that define their own methods override these automatically.
  */
 import { BadRequest, Conflict, NotFound, ValidationError, toValidationError } from './errors.js'
-import { getMutations } from './metadata.js'
+import { getMutations, getScopes } from './metadata.js'
 import type { CrudConfig, IndexConfig, MutationEntry } from './metadata.js'
 
 // ── Forms envelope (expose / abilities / can) ─────────────────────────────────
@@ -344,6 +344,23 @@ export async function defaultIndex(
     if (key === '$or') continue
     if (!filterableFields.includes(key) && !(key in namedFilters)) {
       throw new BadRequest(`Cannot filter by '${key}'`)
+    }
+  }
+
+  // TEACHING GUARD: a filter sent at the TOP LEVEL ({ stage: 'draft' })
+  // instead of nested ({ filters: { stage: 'draft' } }) used to be silently
+  // ignored — the classic first-mistake. Name it and show the fix.
+  const KNOWN_TOP_LEVEL = new Set(['scopes', 'filters', 'q', 'ids', 'sort', 'page', 'perPage',
+    'chart', 'metric', 'facets', 'options', ...(idx.paramScopes ?? []),
+    // @scope URL params ride the top level BY DESIGN (/teams/:teamId/…)
+    ...getScopes(ctrl?.constructor ?? {}).map((s: any) => s.paramName)])
+  for (const key of Object.keys(params)) {
+    if (KNOWN_TOP_LEVEL.has(key)) continue
+    if (filterableFields.includes(key) || key in namedFilters) {
+      throw new BadRequest(
+        `'${key}' is a filter — nest it: { filters: { ${key}: ... } }. ` +
+        `Top-level '${key}' is ignored by the wire shape.`,
+      )
     }
   }
 
@@ -718,11 +735,16 @@ export async function defaultUpdate(
   await _autoAttach(record, model, rawInput, updatePermit)
 
   if (envelope) {
-    // Report stripped fields so the generated UI can't hide a permit bug
+    // Report stripped fields so the generated UI can't hide a permit bug.
+    // TEACHING: a stripped key that is an ASSOCIATION name whose
+    // '<name>Attributes' IS permitted gets a did-you-mean — writing
+    // `reactions:` instead of `reactionsAttributes:` was a silent strip.
     const editable = new Set(Object.keys(permitted))
     const issues = Object.keys(fields)
       .filter(k => !editable.has(k) && k in fields)
-      .map(field => ({ field, code: 'forbidden' }))
+      .map(field => editable.has(`${field}Attributes`)
+        ? { field, code: `forbidden — did you mean '${field}Attributes'?` }
+        : { field, code: 'forbidden' })
     // PATCH response = GET envelope — abilities recomputed on the SAVED
     // record, so a permit that narrowed after a transition re-masks the
     // same JSX read-only (post-transition self-locking). The GET includes

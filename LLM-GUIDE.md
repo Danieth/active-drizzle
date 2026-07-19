@@ -67,6 +67,19 @@ models/index.ts barrel + `X.ctrl.ts` → save → `import { Xs, useXEditForm }
 from '@gen/controllers'`. RECIPE — security check in any test:
 `expect(await runContractProbes(buildContractProbes(XController), call)).toEqual([])`.
 
+ERRORS THAT TEACH (rely on them): generated surfaces carry LITERAL-UNION
+types — a wrong filter/chart/metric/board name is a COMPILE error listing
+the valid options; `<Deals.Filters.typo/>` is a compile error. Arm the
+presenter↔kind compile gate with one d.ts (see `src/presenter-kinds.d.ts`
+in the demo): augment `AdPresenterKinds` with your presenter names → kinds
+and `<deal.amount edit="tagsInput"/>` (money × array) becomes a compile
+error listing the legal presenters. Runtime guards name the fix: a
+top-level filter param → 400 "'stage' is a filter — nest it: { filters:
+{ stage: … } }"; a stripped `reactions:` write → issue "did you mean
+'reactionsAttributes'?"; association options behind `as any` now parse
+THROUGH the cast (genuinely dynamic options throw at codegen, never a
+silent no-op).
+
 Files you edit: `server/db/schema.ts`, `server/models/*.model.ts`,
 `server/controllers/*.ctrl.ts`, `trails.config.ts`, your React code.
 Files you NEVER edit: everything in `.gen/` (rebuilt on save; gitignored).

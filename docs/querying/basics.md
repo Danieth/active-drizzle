@@ -459,7 +459,7 @@ async archive(ids: number[]) {
 | `.limit(n)` | `Relation` | Cap result count |
 | `.offset(n)` | `Relation` | Skip N records |
 | `.includes(...assocs)` | `Relation` | Eager-load associations |
-| `.select(...cols)` | `Relation` | Select specific columns |
+| `.select((t, Fn) => ({…}))` | `Promise<row[]>` | Projection / window functions → typed rows |
 | `.none()` | `Relation` | Empty relation (no DB hit) |
 | `.load()` | `Promise<T[]>` | Execute → array |
 | `.all()` | `Promise<T[]>` | Execute → array (alias) |
@@ -479,9 +479,29 @@ async archive(ids: number[]) {
 | `.findEach(batchSize, fn)` | `Promise<void>` | Batch iteration |
 | `.withLock(fn)` | `Promise<T>` | Lock row in transaction |
 | `.toSubquery(col?)` | SQL value | Use as IN subquery |
-| `.destroyAll()` | `Promise<void>` | Delete with hooks |
-| `.deleteAll()` | `Promise<void>` | Raw DELETE, no hooks |
-| `.updateAll(attrs)` | `Promise<void>` | Raw UPDATE, no hooks |
+| `.destroyAll()` | `Promise<number>` | Raw bulk DELETE, **no hooks**, returns row count |
+| `.updateAll(attrs)` | `Promise<number>` | Raw UPDATE, no hooks, returns row count |
+
+### Advanced query methods
+
+See [Advanced Queries](/querying/advanced) for full examples.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.group(...fields)` | `Relation` | GROUP BY — turns aggregates into `{ key → value }` maps |
+| `.having(sqlCond)` | `Relation` | HAVING — filter groups |
+| `.distinct(on?)` | `Relation` | `SELECT DISTINCT`, or `DISTINCT ON (col)` with an arg |
+| `.seek(fields, opts?)` | `Relation` | Keyset/cursor pagination (row-value comparison) |
+| `.aggregate(a => ({…}))` | `Promise<object>` | Several metrics in **one** round-trip |
+| `.select((t, Fn) => ({…}))` | `Promise<row[]>` | Projection + window functions (`Fn.rank()` etc.) |
+| `.union(other)` | `Promise<T[]>` | UNION → model instances |
+| `.unionAll(other)` / `.intersect(other)` / `.except(other)` | `Promise<T[]>` | Other set operations |
+| `.toSQL()` | `{ sql, params }` | Compile without executing (debugging) |
+| `.whereAny(branches)` | `Relation` | OR across condition hashes |
+| `.search(term, fields)` | `Relation` | Case-insensitive `ILIKE` across columns |
+| `.ftsSearch(term, fields)` | `Relation` | Weighted Postgres full-text search |
+| `.orderByRelevance()` | `Relation` | Order by full-text `ts_rank` |
+| `.orderByIds(ids)` | `Relation` | Preserve an explicit id ordering |
 
 ---
 

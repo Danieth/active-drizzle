@@ -293,7 +293,8 @@ function generateControllerFile(
     L.push(`import { ${[...new Set(rqImports)].join(', ')} } from '@tanstack/react-query'`)
   }
   // New-form hooks track the created id across renders (autocreate transport)
-  if (envelopeEnabled) L.push(`import { useRef } from 'react'`)
+  if (envelopeEnabled) L.push(`import { useRef } from 'react'
+import type { FC, ReactNode } from 'react'`)
 
 
   // Which property validators ship to THIS client — projection-scoped AND
@@ -333,6 +334,7 @@ function generateControllerFile(
       // factory + a per-row view session
       if (ctrl.scopes.length === 0) {
         adImports.push('createIndexSurface', 'FormSession', 'createFormHandle')
+        adTypeImports.push('IndexSurface', 'FilterPresenterProps', 'SidebarApi', 'BoardApi')
       }
       // Nested form members type through their handle interfaces
       for (const t of new Set(nestedHandleMembers.map(m => m.handleType))) adTypeImports.push(t)
@@ -1450,7 +1452,26 @@ function emitFormHooks(
       }
     }
     const surfaceName = pluralize(modelName)
+    // ── Literal-union surface typing: wrong names EXPLODE at compile time ──
+    const filterNames = [
+      ...((idx as any).filterable ?? []),
+      ...Object.keys((idx as any).filters ?? {}),
+    ] as string[]
+    const filterUnion = filterNames.length ? filterNames.map(f => `'${f}'`).join(' | ') : 'never'
+    const chartableU = ((idx as any).chartable ?? []).map((f: string) => `'${f}'`).join(' | ') || 'never'
+    const measuresU = ['count', ...(((idx as any).measures ?? []) as string[]).flatMap(m => [`sum:${m}`, `avg:${m}`])]
+      .map(m => `'${m}'`).join(' | ')
+    const surfaceTypeName = `${surfaceName}Surface`
     L.push(`/** Compound index surface — the beheaded list page: <${surfaceName}.Index><${surfaceName}.Search/><${surfaceName}.Filters/><${surfaceName}.Items>{(${lcFirst(modelName)}) => ...}</${surfaceName}.Items><${surfaceName}.Pagination/></${surfaceName}.Index>, plus <${surfaceName}.One id={...}>{form => ...} as the context-headed edit form. */`)
+    L.push(`/** Declared-name teeth: filter/chart/metric/board names are LITERAL types — a typo or an undeclared name is a compile error listing the valid options. */`)
+    L.push(`export interface ${surfaceTypeName} extends Omit<IndexSurface, 'Filters' | 'Filter' | 'Sidebar' | 'Chart' | 'Metric' | 'Board'> {`)
+    L.push(`  Filters: FC<{ className?: string }> & { [K in ${filterUnion}]: FC<{ presenter?: string | FC<FilterPresenterProps>; className?: string; props?: Record<string, any> }> }`)
+    L.push(`  Filter: FC<{ name: ${filterUnion}; children: (p: FilterPresenterProps) => ReactNode }>`)
+    L.push(`  Sidebar: FC<{ groups?: Array<${filterUnion}>; presenters?: Partial<Record<${filterUnion}, string | FC<FilterPresenterProps>>>; children?: (api: SidebarApi) => ReactNode; className?: string }>`)
+    L.push(`  Chart: FC<{ x: ${chartableU}; y?: ${measuresU}; filtered?: boolean; children?: (points: Array<{ x: string; y: number }>, q: any) => ReactNode; className?: string }>`)
+    L.push(`  Metric: FC<{ agg: ${measuresU}; filtered?: boolean; children?: (value: any, q: any) => ReactNode; className?: string }>`)
+    L.push(`  Board: FC<{ groupBy?: ${filterUnion}; children?: (b: BoardApi) => ReactNode; className?: string }>`)
+    L.push(`}`)
     L.push(`export const ${surfaceName} = createIndexSurface({`)
     L.push(`  meta: {`)
     if ((idx as any).sortable?.length) L.push(`    sortable: [${((idx as any).sortable as string[]).map(s => `'${s}'`).join(', ')}],`)
@@ -1511,7 +1532,7 @@ function emitFormHooks(
       }
       L.push(`  },`)
     }
-    L.push(`})`)
+    L.push(`}) as unknown as ${surfaceTypeName}`)
     L.push('')
   }
 }

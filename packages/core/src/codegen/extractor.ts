@@ -349,18 +349,51 @@ function extractAssociations(classDecl: ClassDeclaration): AssociationMeta[] {
     let explicitTable: string | null = null;
     let options: Record<string, unknown> = {};
 
+    // TEACHING GUARD: options wrapped in a cast (`{...} as any`) arrive as
+    // an AsExpression, not an object literal — previously a SILENT no-op
+    // that broke codegen invisibly. Unwrap the cast when possible; refuse
+    // loudly when the options genuinely aren't statically analyzable.
+    const unwrap = (n: any): any => {
+      let cur = n
+      while (cur && (Node.isAsExpression(cur) || Node.isParenthesizedExpression(cur) || Node.isSatisfiesExpression?.(cur))) {
+        cur = cur.getExpression()
+      }
+      return cur
+    }
+    const optionsNode = (n: any): Record<string, unknown> | 'not-literal' | null => {
+      if (!n) return null
+      const inner = unwrap(n)
+      if (Node.isObjectLiteralExpression(inner)) return parseObjectLiteral(inner as ObjectLiteralExpression)
+      return 'not-literal'
+    }
+
     if (args[0] && Node.isStringLiteral(args[0])) {
       explicitTable = args[0].getLiteralValue();
-      if (args[1] && Node.isObjectLiteralExpression(args[1])) {
-        options = parseObjectLiteral(args[1]);
+      const o = optionsNode(args[1])
+      if (o === 'not-literal') {
+        throw new Error(
+          `[active-drizzle] association '${prop.getName()}': options must be a PLAIN object literal — ` +
+          `found ${args[1]!.getKindName()}. Remove the cast/expression (e.g. drop 'as any'); ` +
+          `codegen reads these options statically and a cast makes them invisible.`,
+        )
       }
-    } else if (args[0] && Node.isObjectLiteralExpression(args[0])) {
-      // No explicit table — first arg is the options object
-      options = parseObjectLiteral(args[0]);
-    } else if (args[1] && Node.isObjectLiteralExpression(args[1])) {
-      // Explicit-but-empty table slot — `belongsTo(undefined, { polymorphic: true })`
-      // (the documented polymorphic form): options ride in the second arg.
-      options = parseObjectLiteral(args[1]);
+      if (o) options = o
+    } else {
+      const first = optionsNode(args[0])
+      const second = optionsNode(args[1])
+      if (first && first !== 'not-literal') {
+        // No explicit table — first arg is the options object
+        options = first
+      } else if (second && second !== 'not-literal') {
+        // Explicit-but-empty table slot — `belongsTo(undefined, { polymorphic: true })`
+        options = second
+      } else if (first === 'not-literal' || second === 'not-literal') {
+        throw new Error(
+          `[active-drizzle] association '${prop.getName()}': options must be a PLAIN object literal — ` +
+          `found ${(first === 'not-literal' ? args[0] : args[1])!.getKindName()}. Remove the cast ` +
+          `('as any' etc.); codegen reads these options statically and a cast makes them invisible.`,
+        )
+      }
     }
 
     result.push({

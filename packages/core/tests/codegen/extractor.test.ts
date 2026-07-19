@@ -700,3 +700,44 @@ export class Asset extends ApplicationRecord {
     expect(meta).toBeDefined()
   })
 })
+
+describe('teaching guard: cast/dynamic association options', () => {
+  it("'{...} as any' now parses THROUGH the cast — the silent-breakage failure mode is gone", () => {
+    const project = createTestProject({
+      schema: schemas.assetsAndBusinesses,
+      models: {
+        'Cast.model.ts': modelBuilder('Cast', 'assets')
+          .attr('notes', `hasMany('businesses', { dependent: 'destroy' } as any)`)
+          .build(),
+      },
+    })
+    const meta = project.extractModel('Cast.model.ts')
+    expect(meta.associations.find(a => a.propertyName === 'notes')?.options['dependent']).toBe('destroy')
+  })
+
+  it('parenthesized literals parse too (unwrap, not refuse)', () => {
+    const project = createTestProject({
+      schema: schemas.assetsAndBusinesses,
+      models: {
+        'Ok.model.ts': modelBuilder('Ok', 'assets')
+          .attr('notes', `hasMany('businesses', ({ dependent: 'destroy' }))`)
+          .build(),
+      },
+    })
+    expect(project.extractModel('Ok.model.ts').associations
+      .find(a => a.propertyName === 'notes')?.options['dependent']).toBe('destroy')
+  })
+
+  it('GENUINELY dynamic options (an identifier) throw a teaching error, never a silent no-op', () => {
+    const project = createTestProject({
+      schema: schemas.assetsAndBusinesses,
+      models: {
+        'Dyn.model.ts': modelBuilder('Dyn', 'assets')
+          .attr('notes', `hasMany('businesses', SHARED_OPTS)`)
+          .build(),
+      },
+    })
+    expect(() => project.extractModel('Dyn.model.ts'))
+      .toThrow(/PLAIN object literal[\s\S]*statically/)
+  })
+})

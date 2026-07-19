@@ -207,3 +207,20 @@ describe('emptyReason — an empty page knows why', () => {
     expect(res.emptyReason).toBeUndefined()
   })
 })
+
+describe('teaching guards — errors that name the fix', () => {
+  it("a TOP-LEVEL filter key gets 'nest it under filters:' — never a silent ignore", async () => {
+    await expect(run({ stage: 'draft' })).rejects.toThrow(/nest it: \{ filters: \{ stage/)
+    // named filters teach the same way; declared param names stay legal
+    const cfg = { ...CONFIG, index: { ...CONFIG.index, filters: { bigDeals: { apply: (r: any) => r } } } }
+    await expect(defaultIndex(new MiniRel(ROWS), model, cfg, { bigDeals: true } as any))
+      .rejects.toThrow(/nest it: \{ filters: \{ bigDeals/)
+  })
+
+  it('paramScopes and known wire params never trip the guard', async () => {
+    const cfg = { ...CONFIG, index: { ...CONFIG.index, paramScopes: ['ownedBy'] } }
+    const res = await defaultIndex(new MiniRel(ROWS), { ...model, ownedBy: undefined }, cfg,
+      { page: 0, perPage: 2 } as any)
+    expect(res.data).toHaveLength(2)
+  })
+})
