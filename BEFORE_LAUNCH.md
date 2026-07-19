@@ -32,7 +32,25 @@ Today DB/validation errors surface as English strings (`"has already been taken"
 
 ---
 
-## 🟡 4. Trust-signal minimums for a public release
+## 🟠 4. Encryption at rest — field + file  (finance domain → do it before release)
+
+For a financial app, encrypting PII/secrets is often a compliance line, not a feature. And the *format* is a launch decision: adding encryption to columns/files that already hold plaintext later means a data-backfill + key ceremony — painful and risky post-launch. Scope it now, ship at least the MVP before release.
+
+**A. Field-level encryption — `Attr.encrypted(...)`.** Three modes, because "encrypted but still searchable" is the real requirement:
+- **Non-deterministic (default, most secure):** random IV per value → same plaintext yields different ciphertext → **not** queryable. For fields you never search (tokens, secrets).
+- **Deterministic (`{ deterministic: true }`):** same plaintext → same ciphertext → supports **equality** queries (`where({ ssn })` matches on ciphertext). Leaks equality; use for fields you must look up exactly.
+- **Blind index (the advanced "we can still search" answer):** keep the real value non-deterministically encrypted, and emit a **separate keyed-HMAC column** that *is* queryable (CipherSweet-style). Gives exact-match (and, with tricks, prefix) search without deterministic leakage. This is the one worth showing off.
+- **Key management is the hard part, not the cipher:** per-attribute keys via **envelope encryption** (a data key encrypted by a KMS master key), plus a **rotation** story. Get the on-disk format right up front (versioned so keys can rotate).
+
+**B. File encryption on the S3/attachments layer — automatic.**
+- **Easy default (ship this): SSE-KMS.** One header on `PutObject` → server-side encryption with an auditable KMS key. Make it the storage layer's default so every upload is encrypted at rest with zero app code. Cheap, big compliance win.
+- **Stretch: client-side envelope encryption.** Encrypt bytes *before* upload with a data key (itself KMS-wrapped); store the wrapped key alongside. True end-to-end — S3 never sees plaintext — but it breaks range reads / direct presigned downloads (needs a decrypt proxy), so it's an opt-in advanced mode, not the default.
+
+**MVP for launch:** deterministic + blind-index `Attr.encrypted` with KMS envelope keys, and **SSE-KMS on by default** for attachments. Client-side file envelope encryption can be a fast-follow.
+
+---
+
+## 🟡 5. Trust-signal minimums for a public release
 
 - **`CHANGELOG.md` + a stated semver/deprecation policy.** "We won't break you" is what makes someone build on a `0.x`. (Currently absent.)
 - **`LICENSE` + `CONTRIBUTING.md`** present and correct (MIT is declared in `package.json` — ensure a `LICENSE` file exists).
