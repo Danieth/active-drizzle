@@ -464,3 +464,58 @@ group ANDs onto the door-scoped relation — narrowing only. Anything more
 complex than one flat OR belongs in a NAMED filter's server-side
 `apply()` — that escape hatch already takes arbitrary logic and changes
 without a client redeploy. Runtime primitive: `Relation.whereAny([...])`.
+
+## @mutation buttons — the action IS a presenter (built)
+
+A controller mutation now declares its whole interaction contract, and the
+form handle grows a PascalCase member for it:
+
+```ts
+@mutation({ if: (deal) => deal.isSubmitted(), label: 'Mark won' })
+async markWon(deal: Deal) { await deal.advance('win'); return this.envelope(deal) }
+
+@mutation({ params: ['reason'], required: ['reason'],
+            if: (deal) => deal.isSubmitted(), label: 'Send back' })
+async sendBack(deal: Deal, data: { reason: string }) { ... }
+```
+
+```tsx
+<deal.MarkWon/>                             // paramless → verdict-aware button
+<deal.SendBack/>                            // params → implicit mini-form (scaffolding)
+<deal.SendBack fields={{ reason: 'dup' }}>Reject as dup</deal.SendBack>  // pre-supplied → plain button
+<deal.SendBack>{({ run, allowed, pending, errors }) => …}</deal.SendBack> // render-prop
+```
+
+The rules, in order:
+- **`if` is a guard, not a hint.** Its verdict rides the envelope `can` map
+  (the button greys itself per record) AND dispatch re-evaluates it — a
+  forged POST on a draft deal gets `422 "markWon is not available"`.
+- **`params` is a permit ceiling for the payload.** Undeclared keys are
+  stripped before the method runs; `required` params 422 with per-field
+  issues that land on the mini-form inputs.
+- **Return `this.envelope(record)`** (new ActiveController helper) and the
+  button folds fresh fields + verdicts straight into the live session — the
+  buttons re-grey the instant the stage flips, no refetch.
+- **Coherence included.** Every action fires the edge fan-out: the index,
+  the aggregation header, and any open form refetch. Row handles get the
+  same members (`<deal.MarkWon/>` inside `<Deals.Items>`), ungoverned rows
+  default to allow and let the server gate.
+- Events: the global bus emits `{ type: 'action', action, ok }` — one toast
+  registration covers every button in the app.
+
+## Aggregation @actions — first-class surface members (built)
+
+A GET action is index-like: it renders from the same surface, headlessly:
+
+```ts
+@action('GET') async stats() { …aggregate math… }
+```
+```tsx
+<Deals.Stats>{(s) => <span>{s.open} open · {money(s.pipeline)} pipeline</span>}</Deals.Stats>
+```
+
+No hook in sight, works outside `<Deals.Index>`, and its cache key lives
+under the deals family root — so the numbers recompute for free whenever
+ANY deal mutation lands (browser-verified: one row's "🏆 won" click moved
+pipeline → closed value in the header above it). Without a render-prop it
+renders scaffolding JSON (`data-ad-scaffold`), same doctrine as filters.

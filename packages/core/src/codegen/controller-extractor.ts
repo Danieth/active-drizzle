@@ -110,14 +110,29 @@ function extractController(cls: ClassDeclaration, filePath: string): CtrlMeta | 
     const methodName = method.getName()
     const args = mutDec.getArguments()
     let bulk = false
+    let params: string[] = []
+    let required: string[] = []
+    let label: string | null = null
+    let guarded = false
     if (args.length > 0) {
       const obj = parseObjectLiteral(args[0]!)
       bulk = obj?.bulk === true || obj?.bulk === 'true'
+      if (Array.isArray(obj?.params)) params = obj.params
+      if (Array.isArray(obj?.required)) required = obj.required
+      const text = args[0]!.getText()
+      const lm = text.match(/label\s*:\s*['"`]([^'"`]+)['"`]/)
+      if (lm) label = lm[1]!
+      // presence check only — the guard function itself stays server-side
+      guarded = /\bif\s*:/.test(text)
     }
     mutations.push({
       method: methodName,
       bulk,
       kebabPath: toKebab(methodName),
+      params,
+      required,
+      label,
+      guarded,
     })
   }
 

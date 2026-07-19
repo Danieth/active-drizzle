@@ -6,6 +6,7 @@ const modelSidebar = [
     collapsed: false,
     items: [
       { text: 'Overview', link: '/models/overview' },
+      { text: 'Model Methods (Reference)', link: '/models/methods' },
       { text: 'Attributes & Enums', link: '/models/attributes' },
       { text: 'Arrays, Ranges & Timezones', link: '/models/typed-attrs' },
       { text: 'State Machines', link: '/models/state-machines' },
@@ -46,6 +47,21 @@ const modelSidebar = [
   },
 ]
 
+const helpersSidebar = [
+  {
+    text: '@active-drizzle/helpers',
+    collapsed: false,
+    items: [
+      { text: 'Overview', link: '/guide/helpers' },
+      { text: 'Array Helpers', link: '/helpers/arrays' },
+      { text: 'String Helpers', link: '/helpers/strings' },
+      { text: 'Number Helpers', link: '/helpers/numbers' },
+      { text: 'Date & Time Helpers', link: '/helpers/dates' },
+      { text: 'Object Helpers', link: '/helpers/objects' },
+    ],
+  },
+]
+
 export default defineConfig({
   title: 'ActiveDrizzle',
   description: 'Rails-style ActiveRecord for Drizzle ORM — with full TypeScript codegen',
@@ -64,6 +80,7 @@ export default defineConfig({
       { text: 'Models', link: '/models/overview' },
       { text: 'Controllers', link: '/controllers/overview' },
       { text: 'React Query', link: '/react/overview' },
+      { text: 'Helpers', link: '/helpers/arrays' },
       { text: 'Codegen & CLI', link: '/codegen/vite-plugin' },
     ],
 
@@ -96,11 +113,14 @@ export default defineConfig({
       '/mutations/': modelSidebar,
       '/hooks/': modelSidebar,
 
+      '/helpers/': helpersSidebar,
+
       '/controllers/': [
         {
           text: 'Controllers',
           items: [
             { text: 'Overview', link: '/controllers/overview' },
+            { text: 'API Reference', link: '/controllers/reference' },
             { text: 'Routing & URL Structure', link: '/controllers/routing' },
             { text: 'CRUD Actions', link: '/controllers/crud-actions' },
             { text: 'Abilities & Forms Envelope', link: '/controllers/abilities' },

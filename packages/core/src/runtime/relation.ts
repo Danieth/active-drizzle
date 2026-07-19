@@ -561,6 +561,67 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   }
 
   /**
+   * Runs several aggregates over the SAME relation in **one round-trip** — the
+   * multi-metric dashboard query. Beats firing N async aggregates concurrently
+   * (which is N round-trips): this is a single `SELECT count(*), sum(…), avg(…)`.
+   *
+   *   const { orders, revenue, avg } = await Order.where({ paid: true }).aggregate(a => ({
+   *     orders:  a.count(),
+   *     revenue: a.sum('total'),
+   *     avg:     a.average('total'),
+   *   }))
+   *
+   * Composes with `.group(...)` → `{ groupKey → { …metrics } }` in one query.
+   */
+  public async aggregate<S extends Record<string, AggTerm>>(
+    build: (a: AggBuilder) => S,
+  ): Promise<Record<keyof S, any> | Record<string, Record<keyof S, any>>> {
+    const rel   = this._withDefaultScopes()
+    const table = rel.getTable()
+    const where = rel._buildFinalWhere()
+    const a: AggBuilder = {
+      count:   ()          => ({ expr: sql`count(*)::int`,                             to: v => Number(v ?? 0) }),
+      sum:     (f: string) => ({ expr: sql`coalesce(sum(${rel._col(f)}), 0)::numeric`, to: v => Number(v ?? 0) }),
+      average: (f: string) => ({ expr: sql`avg(${rel._col(f)})::numeric`,              to: v => (v == null ? null : Number(v)) }),
+      minimum: (f: string) => ({ expr: sql`min(${rel._col(f)})`,                       to: v => v ?? null }),
+      maximum: (f: string) => ({ expr: sql`max(${rel._col(f)})`,                       to: v => v ?? null }),
+    }
+    const spec = build(a)
+    const keys = Object.keys(spec)
+
+    const sel: Record<string, any> = {}
+    for (const k of keys) sel[k] = spec[k]!.expr
+    const grouped = rel._group.length > 0
+    if (grouped) rel._group.forEach((g, i) => { sel['_g' + i] = g.col })
+
+    let q: any = getExecutor().select(sel).from(table)
+    if (where) q = q.where(where)
+    if (grouped) {
+      q = q.groupBy(...rel._group.map(g => g.col))
+      if (rel._having) q = q.having(rel._having)
+    }
+    const rows: any[] = await q
+
+    const shape = (row: any) => {
+      const o: Record<string, any> = {}
+      for (const k of keys) o[k] = spec[k]!.to(row?.[k])
+      return o
+    }
+    if (!grouped) return shape(rows[0]) as any
+
+    const out: Record<string, any> = {}
+    for (const r of rows) {
+      const key = rel._group.map((g, i) => {
+        const raw  = r['_g' + i]
+        const attr = g.field ? (rel._ctor as any)[g.field] : undefined
+        return attr?._isAttr && attr.get ? String(attr.get(raw)) : String(raw ?? 'null')
+      }).join(',')
+      out[key] = shape(r)
+    }
+    return out
+  }
+
+  /**
    * Returns an object mapping each distinct value of `field` to its count.
    * Like Rails' tally: `Order.all().tally('status')` → `{ pending: 3, confirmed: 7 }`.
    * Applies Attr.get transform so enum integers appear as labels.
@@ -1187,6 +1248,20 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
 
     return (db.query as any)[this._tableName].findMany(config)
   }
+}
+
+// ── Coalesced aggregates (for `.aggregate(a => …)`) ──────────────────────────
+
+/** One aggregate expression + its scalar post-processor. */
+export type AggTerm = { expr: SQL; to: (v: any) => any }
+
+/** The builder handed to `.aggregate()` — same metrics as the standalone terminals. */
+export type AggBuilder = {
+  count(): AggTerm
+  sum(field: string): AggTerm
+  average(field: string): AggTerm
+  minimum(field: string): AggTerm
+  maximum(field: string): AggTerm
 }
 
 // ── Window functions (for `.select((t, Fn) => …)`) ───────────────────────────

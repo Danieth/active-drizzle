@@ -175,6 +175,13 @@ export interface IndexSurfaceConfig {
   makeRowHandle: (row: Record<string, any>) => any
   /** Injected by codegen for Surface.One: the generated edit-form hook. */
   useEditForm?: (id: number, opts?: any) => { status: string; form: any }
+  /**
+   * Aggregation/computed GET @actions as first-class surface members —
+   * `<Deals.Stats>{(data) => …}</Deals.Stats>`. Keyed PascalCase; each value
+   * is the generated useQuery hook. Their cache keys live under the family
+   * root, so every mutation's coherence fan-out refetches them for free.
+   */
+  queries?: Record<string, () => { data: any; isLoading: boolean; isError: boolean }>
 }
 
 interface IndexCtx {
@@ -200,6 +207,8 @@ export interface IndexSurface {
   One: FC<{ id: number; poll?: { every: number; until?: (r: any) => boolean }; children: (form: any) => ReactNode; loading?: ReactNode }>
   /** Context accessor for custom widgets: session + live query + meta. */
   use: () => { session: IndexSession; state: IndexState; meta: IndexMeta; rows: any[]; pagination: any; isLoading: boolean }
+  /** Query components from cfg.queries (aggregation @actions), keyed PascalCase. */
+  [query: string]: any
 }
 
 export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
@@ -435,5 +444,25 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
     }
   }
 
-  return { Index, Search, Filters, Filter, Items, Pagination, One, use }
+  // ── Aggregation query components — <Surface.Stats>{(data, q) => …} ──────
+  // Standalone by design: they do NOT require <Surface.Index> context (an
+  // aggregate header can render above the list, or on a page of its own).
+  const queryComponents: Record<string, FC<any>> = {}
+  for (const [qname, useQueryHook] of Object.entries(cfg.queries ?? {})) {
+    const QueryComponent: FC<{
+      children?: (data: any, q: { data: any; isLoading: boolean; isError: boolean }) => ReactNode
+      loading?: ReactNode
+      className?: string
+    }> = ({ children, loading, className }) => {
+      const q = useQueryHook()
+      if (q.isLoading) return <>{loading ?? null}</>
+      if (children) return <>{children(q.data, q)}</>
+      // Scaffolding default — replace with the render-prop in real apps
+      return <pre data-ad-scaffold="" data-ad-query={qname} {...(className !== undefined ? { className } : {})}>{JSON.stringify(q.data, null, 2)}</pre>
+    }
+    ;(QueryComponent as any).displayName = `AdQuery(${qname})`
+    queryComponents[qname] = QueryComponent
+  }
+
+  return { Index, Search, Filters, Filter, Items, Pagination, One, use, ...queryComponents }
 }

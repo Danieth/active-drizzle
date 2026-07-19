@@ -19,7 +19,7 @@
  */
 import { useEffect, useRef, useState } from 'react'
 import { FormSession, type ServerEnvelope, type SubmitPayload, type SubmitResult } from './form-session.js'
-import { createFormHandle, type FormHandle } from './form-handle.js'
+import { createFormHandle, type FormHandle, type FormActionMeta } from './form-handle.js'
 import { defaultDraftStore } from './draft-store.js'
 
 export interface UseGeneratedFormOptions<T extends Record<string, any>> {
@@ -35,6 +35,8 @@ export interface UseGeneratedFormOptions<T extends Record<string, any>> {
   validate?: (draft: T) => Record<string, string[]>
   /** Instant nested transports keyed by child resource (for instant nested writes). */
   nestedTransports?: Record<string, import('./nested.js').NestedTransport>
+  /** @mutation actions — PascalCase handle members become buttons/mini-forms. */
+  actions?: Record<string, FormActionMeta>
   /**
    * Draft parking key ("resource:id"). When set, unsaved edits PARK on
    * unmount and RESTORE (three-way, conflict-aware) on the next mount of
@@ -80,6 +82,7 @@ export function useGeneratedForm<T extends Record<string, any>>(
     const handle = createFormHandle(session, {
       ...(opts.fieldMeta ? { fieldMeta: opts.fieldMeta } : {}),
       ...(opts.nestedTransports ? { nestedTransports: opts.nestedTransports } : {}),
+      ...(opts.actions ? { actions: opts.actions } : {}),
     })
     // Parked draft from a previous visit? Replay it (three-way vs the
     // fresh baseline; a moved field keeps the stale token → 409 later)

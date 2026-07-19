@@ -4,7 +4,8 @@
  * Controllers that define their own methods override these automatically.
  */
 import { BadRequest, Conflict, NotFound, ValidationError, toValidationError } from './errors.js'
-import type { CrudConfig, IndexConfig } from './metadata.js'
+import { getMutations } from './metadata.js'
+import type { CrudConfig, IndexConfig, MutationEntry } from './metadata.js'
 
 // ── Forms envelope (expose / abilities / can) ─────────────────────────────────
 
@@ -16,6 +17,42 @@ export interface RecordEnvelope {
   issues?: Array<{ field: string; code: string }>
   /** Optimistic-lock token (update.optimisticLock) — echo as `_version` on PATCH. */
   version?: string
+}
+
+/**
+ * Server-side gate for a @mutation call — the guard and param rules are
+ * ENFORCED here, not just projected into the envelope verdict:
+ *   1. `if` guard false → 422 base error (the button was grey for a reason)
+ *   2. `params` declared → data is allowlist-stripped (permit-style ceiling)
+ *   3. `required` params missing/blank → 422 with per-field issues
+ * Returns the sanitized payload to pass to the method.
+ */
+export function enforceMutationRules(
+  mut: MutationEntry,
+  record: any,
+  data: Record<string, any> | undefined,
+  ctx: any,
+  ctrl: any,
+): Record<string, any> | undefined {
+  if (mut.if && !mut.if(record, ctx, ctrl)) {
+    throw new ValidationError({ base: [`${mut.method} is not available for this record`] })
+  }
+  let payload = data
+  if (mut.params) {
+    payload = {}
+    for (const k of mut.params) {
+      if (data && k in data) payload[k] = data[k]
+    }
+  }
+  if (mut.required?.length) {
+    const errors: Record<string, string[]> = {}
+    for (const k of mut.required) {
+      const v = payload?.[k]
+      if (v == null || (typeof v === 'string' && v.trim() === '')) errors[k] = ['is required']
+    }
+    if (Object.keys(errors).length > 0) throw new ValidationError(errors)
+  }
+  return payload
 }
 
 /** The optimistic-lock field name, or null when locking is off. */
@@ -139,6 +176,14 @@ export function buildRecordEnvelope(
   const can: Record<string, boolean> = {}
   for (const event of collectStateEvents(model)) {
     can[event] = typeof record.can === 'function' ? Boolean(record.can(event)) : false
+  }
+  // @mutation verdicts ride the same map: guarded mutations project their
+  // `if` per record; unguarded ones are always available. The verdict is a
+  // PROJECTION — dispatch re-evaluates the guard server-side regardless.
+  // (Don't name a mutation after a state event — the mutation verdict wins.)
+  for (const mut of getMutations(ctrl?.constructor ?? {})) {
+    if (mut.bulk) continue
+    can[mut.method] = mut.if ? Boolean(mut.if(record, ctx, ctrl)) : true
   }
 
   // The primary key always serializes — an envelope without `id` is a record

@@ -211,6 +211,12 @@ ago((2).weeks())                          // 2.weeks.ago
 
 ## Full helper reference
 
+For the complete per-method reference — full signatures, descriptions, and runnable examples for every function — see the dedicated pages:
+
+- [Array Helpers](/helpers/arrays) · [String Helpers](/helpers/strings) · [Number Helpers](/helpers/numbers) · [Date & Time Helpers](/helpers/dates) · [Object Helpers](/helpers/objects)
+
+The quick index below lists what's available:
+
 **Array** — `first(n?)`, `last(n?)`, `second`–`fifth`, `isBlank`, `isPresent`, `presence`, `compact`, `uniq(by?)`, `without`, `including`, `pluck`/`pluckKey`, `groupBy`, `indexBy`, `countBy`, `tally`, `partition`, `sum(fn?)`, `minBy`, `maxBy`, `sortBy`, `eachSlice`, `eachCons`, `inGroupsOf`, `inGroups`, `sample(n?)`, `shuffle`, `toSentence`, `zip`, `rotate`, `eachWithObject`, `takeWhile`, `dropWhile`, `chunkWhile`, `sliceWhen`, `from`, `to`, `sole`, `deepDup`.
 
 **String** — `pluralize(count?)`, `singularize`, `camelize`, `underscore`, `dasherize`, `humanize`, `titleize`, `classify`, `tableize`, `parameterize`, `foreignKey`, `capitalize`, `deletePrefix`, `deleteSuffix`, `isBlank`, `isPresent`, `presence`, `truncate`, `truncateWords`, `squish`, `stripHeredoc`, `indent`, `toBoolean`, `remove`, `first(n?)`, `last(n?)`, `from`, `to`, `swapcase`, `center`.

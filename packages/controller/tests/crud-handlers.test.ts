@@ -336,3 +336,80 @@ describe('defaultIndex $or', () => {
       .rejects.toBeInstanceOf(BR)
   })
 })
+
+// ── @mutation rules: guard + params allowlist + required (enforced, not advisory) ──
+
+import { enforceMutationRules, buildRecordEnvelope as buildEnv2 } from '../src/crud-handlers.js'
+import { ValidationError } from '../src/errors.js'
+import { mutation } from '../src/decorators.js'
+
+describe('enforceMutationRules', () => {
+  const record = { id: 1, stage: 'submitted' }
+
+  it('guard false → 422 base error (the grey button is enforced server-side)', () => {
+    const mut: any = { method: 'sendBack', bulk: false, if: (r: any) => r.stage === 'draft' }
+    expect(() => enforceMutationRules(mut, record, { reason: 'x' }, {}, {}))
+      .toThrowError(ValidationError)
+    try { enforceMutationRules(mut, record, undefined, {}, {}) } catch (e: any) {
+      expect(e.errors.base[0]).toContain('sendBack is not available')
+    }
+  })
+
+  it('guard true → payload flows; params allowlist strips undeclared keys', () => {
+    const mut: any = { method: 'sendBack', bulk: false, if: (r: any) => r.stage === 'submitted', params: ['reason'] }
+    const out = enforceMutationRules(mut, record, { reason: 'needs numbers', isHot: true, ownerId: 99 }, {}, {})
+    expect(out).toEqual({ reason: 'needs numbers' })   // forged fields never reach the method
+  })
+
+  it('required params missing/blank → 422 with per-field issues', () => {
+    const mut: any = { method: 'sendBack', bulk: false, params: ['reason'], required: ['reason'] }
+    for (const data of [undefined, {}, { reason: '' }, { reason: '   ' }, { reason: null }]) {
+      try {
+        enforceMutationRules(mut, record, data as any, {}, {})
+        expect.unreachable('should have thrown')
+      } catch (e: any) {
+        expect(e).toBeInstanceOf(ValidationError)
+        expect(e.errors.reason).toEqual(['is required'])
+      }
+    }
+    expect(enforceMutationRules(mut, record, { reason: 'ok' }, {}, {})).toEqual({ reason: 'ok' })
+  })
+
+  it('no params declared → data passes through untouched (back-compat)', () => {
+    const mut: any = { method: 'poke', bulk: false }
+    expect(enforceMutationRules(mut, record, { anything: 1 }, {}, {})).toEqual({ anything: 1 })
+  })
+
+  it('guard receives (record, ctx, ctrl)', () => {
+    const seen: any[] = []
+    const mut: any = { method: 'x', bulk: false, if: (...args: any[]) => { seen.push(args); return true } }
+    const ctx = { user: { id: 7 } }, ctrl = { relation: 'rel' }
+    enforceMutationRules(mut, record, undefined, ctx, ctrl)
+    expect(seen[0]).toEqual([record, ctx, ctrl])
+  })
+})
+
+describe('buildRecordEnvelope — @mutation verdicts ride the can map', () => {
+  class GuardedCtrl {
+    @mutation({ if: (r: any) => r.stage === 'submitted', label: 'Mark won' })
+    async win() {}
+    @mutation()
+    async poke() {}
+    @mutation({ bulk: true })
+    async archiveAll() {}
+  }
+
+  const config: any = { get: { expose: ['stage'], abilities: true }, update: { permit: [] } }
+  const model: any = { name: 'Deal', fieldMeta: {} }
+
+  it('guarded mutation projects its per-record verdict; unguarded is always true; bulk is excluded', () => {
+    const ctrl = new GuardedCtrl()
+    const env = buildEnv2({ id: 1, stage: 'submitted' }, model, config, {}, ctrl)
+    expect(env.can['win']).toBe(true)
+    expect(env.can['poke']).toBe(true)
+    expect(env.can).not.toHaveProperty('archiveAll')
+
+    const env2 = buildEnv2({ id: 2, stage: 'draft' }, model, config, {}, ctrl)
+    expect(env2.can['win']).toBe(false)
+  })
+})

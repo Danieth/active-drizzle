@@ -58,6 +58,9 @@ export {
   type ArrayFieldHandle,
   type OneFieldHandle,
   type NestedFormHandle,
+  type FormActionMeta,
+  type ActionProps,
+  type ActionRenderApi,
 } from './form-handle.js'
 export { NestedArrayManager, NestedOneManager, type NestedChild, type NestedTransport } from './nested.js'
 export { useForm, useEditForm, useNewForm, type UseFormOptions } from './use-form.js'

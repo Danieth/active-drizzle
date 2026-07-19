@@ -44,6 +44,14 @@ export interface CtrlMutationMeta {
   method: string
   bulk: boolean
   kebabPath: string     // URL path segment
+  /** Declared payload param names — the button becomes an implicit mini-form. */
+  params?: string[]
+  /** Params the server 422s on when missing/blank. */
+  required?: string[]
+  /** Human label for the generated button. */
+  label?: string | null
+  /** Whether an `if:` guard is declared (its verdict rides the envelope can map). */
+  guarded?: boolean
 }
 
 export interface CtrlActionMeta {

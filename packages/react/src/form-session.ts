@@ -60,9 +60,12 @@ export interface SubmitPayload {
 // Mirrors onClientError: module-level, unsubscribable, throw-proof.
 
 export interface FormEvent {
-  type: 'rehydrated' | 'conflict' | 'saved' | 'draft-restored'
+  type: 'rehydrated' | 'conflict' | 'saved' | 'draft-restored' | 'action'
   /** rehydrated/draft-restored: the affected field/association names. */
   fields?: string[]
+  /** action: the @mutation name and whether it succeeded. */
+  action?: string
+  ok?: boolean
   session: FormSession<any>
 }
 
@@ -104,6 +107,10 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
 
   private abilities: Record<string, Ability> | null
   private canMap: Record<string, boolean>
+  /** Whether a `can` map ever arrived — governed sessions consult it for
+   *  action verdicts; ungoverned ones (row handles built from plain rows)
+   *  default to allow and let the server gate. */
+  private canGoverned = false
 
   private touched = new Set<string>()
   private submitAttempted = false
@@ -153,6 +160,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     this.mode = opts.mode
     this.abilities = opts.abilities ?? null
     this.canMap = opts.can ?? {}
+    this.canGoverned = opts.can != null
     this.version = opts.version ?? null
     this.validateFn = opts.validate
       ?? ((d: T) => (typeof (d as any).validate === 'function' ? (d as any).validate() : {}))
@@ -293,6 +301,22 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   /** Server verdict for an Attr.state event; client may only narrow, never widen. */
   can(event: string): boolean {
     return this.canMap[event] === true
+  }
+
+  /**
+   * Availability verdict for a @mutation action button. On a GOVERNED
+   * session (an envelope's can map arrived) this is the server's word; on
+   * an ungoverned one (row handle over a plain row) it defaults to allow —
+   * the server re-evaluates the guard at dispatch either way.
+   */
+  verdict(action: string): boolean {
+    if (!this.canGoverned) return true
+    return this.canMap[action] === true
+  }
+
+  /** @internal Emits an 'action' form event (generated action buttons). */
+  notifyAction(action: string, ok: boolean): void {
+    emitFormEvent({ type: 'action', action, ok, session: this })
   }
 
   /**
@@ -690,7 +714,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
         this.abilities = envelope!.abilities ?? null
         for (const [name, manager] of this.nested) manager.setLocked(!this.canEditNested(name))
       }
-      if (envelope!.can !== undefined) this.canMap = envelope!.can ?? {}
+      if (envelope!.can !== undefined) { this.canMap = envelope!.can ?? {}; this.canGoverned = envelope!.can != null }
       this.serverIssues = envelope!.issues ?? []
       const stripped = this.serverIssues.filter(i => i.code === 'forbidden').map(i => i.field)
       if (stripped.length > 0) {
@@ -907,7 +931,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
       this.abilities = envelope.abilities ?? null
       for (const [name, manager] of this.nested) manager.setLocked(!this.canEditNested(name))
     }
-    if (envelope.can !== undefined) this.canMap = envelope.can ?? {}
+    if (envelope.can !== undefined) { this.canMap = envelope.can ?? {}; this.canGoverned = envelope.can != null }
     // Version adoption ONLY when conflict-free — withholding it is what
     // guarantees the conflict surfaces (T3): the stale token 409s
     if (envelope.version !== undefined && !conflict) this.version = envelope.version ?? null
@@ -949,7 +973,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
         manager.setLocked(!this.canEditNested(name))
       }
     }
-    if (envelope.can !== undefined) this.canMap = envelope.can ?? {}
+    if (envelope.can !== undefined) { this.canMap = envelope.can ?? {}; this.canGoverned = envelope.can != null }
     if (envelope.version !== undefined) this.version = envelope.version ?? null
     this.serverIssues = envelope.issues ?? []
     // A save that silently dropped fields is a permit/UI mismatch — never

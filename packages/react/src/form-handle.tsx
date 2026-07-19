@@ -11,8 +11,9 @@
  * for programmatic reads. Each field subscribes to ITS OWN slice of the
  * FormSession via useSyncExternalStore — a keystroke re-renders one field.
  */
-import React, { createContext, useContext, useEffect, useSyncExternalStore, Fragment, type FC, type ReactNode } from 'react'
+import React, { createContext, useContext, useEffect, useState, useSyncExternalStore, Fragment, type FC, type ReactNode } from 'react'
 import { FormSession, type SessionStatus } from './form-session.js'
+import { parseControllerError } from './errors.js'
 import { NestedArrayManager, NestedOneManager, type NestedChild } from './nested.js'
 import { resolvePresenter, checkRequiredMeta, type PresenterBind } from './presenters.js'
 
@@ -171,6 +172,39 @@ function resolveCopy(meta: Record<string, any>, draft: any): Record<string, any>
   return overrides ? { ...meta, ...overrides } : meta
 }
 
+/**
+ * A @mutation action wired onto the handle — `<deal.Archive/>` renders from
+ * this. Paramless actions are plain verdict-aware buttons; actions with
+ * declared params render an implicit mini-form (scaffolding inputs) unless
+ * the call site pre-supplies `fields` or takes the render-prop.
+ */
+export interface FormActionMeta {
+  label?: string
+  params?: string[]
+  required?: string[]
+  /** POST transport for this action — wired by codegen. */
+  transport: (data?: Record<string, any>) => Promise<any>
+  /** Post-success hook — codegen routes coherence invalidation here. */
+  onSuccess?: (result: any) => void
+}
+
+export interface ActionRenderApi {
+  run: (data?: Record<string, any>) => Promise<boolean>
+  /** Server verdict (envelope can map); ungoverned sessions default to allow. */
+  allowed: boolean
+  pending: boolean
+  errors: Record<string, string[]> | null
+  label: string
+  params: string[]
+}
+
+export interface ActionProps {
+  /** Pre-supplied param values — renders a plain button even when params exist. */
+  fields?: Record<string, any>
+  className?: string
+  children?: ReactNode | ((api: ActionRenderApi) => ReactNode)
+}
+
 export function createFormHandle<T extends Record<string, any>>(
   session: FormSession<T>,
   options: {
@@ -179,6 +213,8 @@ export function createFormHandle<T extends Record<string, any>>(
     extras?: Record<string, any>
     /** Instant nested transports keyed by child resource (from the generated hook). */
     nestedTransports?: Record<string, import('./nested.js').NestedTransport>
+    /** @mutation actions — PascalCase members become verdict-aware buttons/mini-forms. */
+    actions?: Record<string, FormActionMeta>
   } = {},
 ): FormHandle<T> {
   const fieldMeta: Record<string, Record<string, any>> =
@@ -680,6 +716,82 @@ export function createFormHandle<T extends Record<string, any>>(
   }
   BaseErrorsComponent.displayName = 'AdBaseErrors'
 
+  // ── @mutation action components — the button IS a presenter ─────────────
+  // Verdict-aware (envelope can map → greyed, server re-enforces at dispatch),
+  // coherence-wired (onSuccess), and envelope-folding (a returned envelope
+  // rehydrates the live session: fields, abilities, and verdicts re-mask).
+  const makeActionComponent = (name: string, meta: FormActionMeta): FC<ActionProps> => {
+    const label = meta.label ?? name.replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase())
+    const params = meta.params ?? []
+    const Action: FC<ActionProps> = ({ fields, className, children }) => {
+      useSyncExternalStore(
+        (cb) => session.subscribe('*', cb),
+        () => session.fieldVersion('*'),
+        () => session.fieldVersion('*'),
+      )
+      const [pending, setPending] = useState(false)
+      const [errors, setErrors] = useState<Record<string, string[]> | null>(null)
+      const [values, setValues] = useState<Record<string, any>>({})
+      const allowed = session.verdict(name)
+
+      const run = async (data?: Record<string, any>): Promise<boolean> => {
+        if (pending) return false
+        setPending(true); setErrors(null)
+        try {
+          const res = await meta.transport(data)
+          if (res && typeof res === 'object' && 'record' in res) session.rehydrate(res)
+          meta.onSuccess?.(res)
+          session.notifyAction(name, true)
+          setValues({})
+          return true
+        } catch (e) {
+          const parsed = parseControllerError(e)
+          setErrors(parsed?.fields ?? { base: [parsed?.message ?? 'Action failed'] })
+          session.notifyAction(name, false)
+          return false
+        } finally { setPending(false) }
+      }
+
+      if (typeof children === 'function') {
+        return <>{(children as (api: ActionRenderApi) => ReactNode)({ run, allowed, pending, errors, label, params })}</>
+      }
+
+      // No declared params (or all pre-supplied) → plain verdict-aware button
+      if (params.length === 0 || fields) {
+        return (
+          <span data-ad-action={name}>
+            <button type="button" {...(className !== undefined ? { className } : {})}
+              disabled={!allowed || pending}
+              onClick={() => void run(fields)}>
+              {children ?? label}
+            </button>
+            {errors && <span role="alert" data-ad-action-error="">{Object.values(errors).flat().join(' · ')}</span>}
+          </span>
+        )
+      }
+
+      // Declared params, nothing supplied → implicit mini-form. The inputs
+      // are SCAFFOLDING (like unregistered filter presenters) — real apps
+      // pre-supply `fields` or take the render-prop
+      const baseMsgs = errors?.['base'] ?? []
+      return (
+        <span data-ad-action={name} data-ad-scaffold="" {...(className !== undefined ? { className } : {})}>
+          {params.map((p) => (
+            <label key={p}> {p}
+              <input value={values[p] ?? ''} disabled={!allowed || pending}
+                onChange={(e) => setValues((v) => ({ ...v, [p]: e.target.value }))} />
+              {errors?.[p] && <span role="alert">{errors[p]!.join(', ')}</span>}
+            </label>
+          ))}
+          <button type="button" disabled={!allowed || pending} onClick={() => void run(values)}>{label}</button>
+          {baseMsgs.length > 0 && <span role="alert" data-ad-action-error="">{baseMsgs.join(' · ')}</span>}
+        </span>
+      )
+    }
+    Action.displayName = `AdAction(${name})`
+    return Action
+  }
+
   const target = {} as FormHandle<T>
 
   return new Proxy(target, {
@@ -714,6 +826,16 @@ export function createFormHandle<T extends Record<string, any>>(
           return undefined
       }
       if (options.extras && prop in options.extras) return options.extras[prop]
+      // PascalCase @mutation members: <deal.Archive/> ← actions['archive']
+      if (options.actions && /^[A-Z]/.test(prop)) {
+        const actionName = prop[0]!.toLowerCase() + prop.slice(1)
+        const actionMeta = options.actions[actionName]
+        if (actionMeta) {
+          let a = cache.get(prop)
+          if (!a) { a = makeActionComponent(actionName, actionMeta); cache.set(prop, a) }
+          return a
+        }
+      }
       if (prop.startsWith('$') || prop.startsWith('_')) return undefined
       let field = cache.get(prop)
       if (!field) {

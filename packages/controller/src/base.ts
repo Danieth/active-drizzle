@@ -6,7 +6,8 @@
  * and add @mutation / @action methods.
  */
 import { BadRequest } from './errors.js'
-import { collectBeforeHooks, collectAfterHooks, collectRescueHandlers } from './metadata.js'
+import { collectBeforeHooks, collectAfterHooks, collectRescueHandlers, getCrudMeta } from './metadata.js'
+import { buildRecordEnvelope, type RecordEnvelope } from './crud-handlers.js'
 
 /** Sentinel returned by _handleError when no rescue handler matched. */
 const UNHANDLED = Symbol('ad:unhandled')
@@ -46,6 +47,18 @@ export class ActiveController<
    * }
    */
   protected record: any = null
+
+  /**
+   * The record as a forms envelope ({ record, abilities, can, version })
+   * under THIS controller's @crud config. Return it from @mutation methods
+   * so the generated action button folds fresh verdicts/fields straight
+   * into the live form session — no refetch round-trip.
+   */
+  protected envelope(record: any): RecordEnvelope {
+    const meta = getCrudMeta(this.constructor)
+    if (!meta) throw new Error('[active-drizzle] envelope() requires a @crud controller')
+    return buildRecordEnvelope(record, meta.model, meta.config, this.context, this)
+  }
 
   /**
    * Mutable per-request state, populated by @before hooks.

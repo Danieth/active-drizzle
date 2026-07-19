@@ -15,7 +15,7 @@ import {
 import { inferControllerPath } from './decorators.js'
 import {
   defaultIndex, defaultGet, defaultCreate, defaultUpdate, defaultDestroy,
-  singletonFindOrCreate,
+  singletonFindOrCreate, enforceMutationRules,
 } from './crud-handlers.js'
 import { BadRequest, Conflict, HttpError, NotFound, ValidationError, toValidationError, serializeError } from './errors.js'
 
@@ -300,7 +300,8 @@ export function buildRouter<TContext = Record<string, any>>(
           const record = await rel.where({ id: (input as any).id }).first()
           if (!record) throw new NotFound(model.name)
           return dispatch(ControllerClass, context as TContext, input as any, rel, mut.method,
-            (ctrl) => ctrl[mut.method](record, (input as any).data),
+            (ctrl) => ctrl[mut.method](record,
+              enforceMutationRules(mut, record, (input as any).data, context, ctrl)),
             record,
             config.scopeBy,
           )
@@ -377,7 +378,8 @@ export function buildRouter<TContext = Record<string, any>>(
             const findBy = config.findBy(context, ctrl)
             const record = await singletonModel.findBy(findBy)
             if (!record) throw new NotFound(model.name)
-            return ctrl[mut.method](record, (input as any).data)
+            return ctrl[mut.method](record,
+              enforceMutationRules(mut, record, (input as any).data, context, ctrl))
           })
       })
       routes.push({ method: 'POST', path: `${basePath}/${kebab}`, procedure: mut.method, action: mut.method })

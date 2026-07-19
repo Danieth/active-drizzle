@@ -232,6 +232,24 @@ export interface MutationEntry {
   records?: boolean
   optimistic?: Record<string, any>
   returns?: 'self' | 'new'
+  /**
+   * Declared payload fields — a permit-style ALLOWLIST for `data`. When
+   * present, anything not listed is stripped before the method runs, and
+   * the generated button becomes an implicit mini-form for these fields.
+   * Without it, `data` passes through untouched (pre-existing behavior).
+   */
+  params?: string[]
+  /** Params that must be present and non-blank — 422 with field issues otherwise. */
+  required?: string[]
+  /**
+   * Per-record guard: whether this mutation is available for the record
+   * RIGHT NOW. Rides the envelope `can` map (the generated button greys
+   * itself) AND gates dispatch server-side (422 when false) — the verdict
+   * is a projection of the rule, never the rule itself. Must be synchronous.
+   */
+  if?: (record: any, ctx: any, ctrl: any) => boolean
+  /** Human label for the generated button / mini-form. */
+  label?: string
 }
 
 export interface ActionEntry {

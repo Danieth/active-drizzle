@@ -319,6 +319,7 @@ function generateControllerFile(
     if (envelopeEnabled) {
       adImports.push('useGeneratedForm', 'parseControllerError')
       adTypeImports.push('FormHandleApi', 'TypedFieldComponent', 'SubmitResult')
+      if (ctrl.mutations.some(m => !m.bulk)) adTypeImports.push('ActionProps')
       // Index surface (unscoped controllers): compound components need the
       // factory + a per-row view session
       if (ctrl.scopes.length === 0) {
@@ -895,6 +896,9 @@ function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string, tableName: stri
     const hookName = mut.bulk ? toBulkMutateName(mut.method) : toMutateName(mut.method)
     if (mut.bulk) {
       L.push(`    ${hookName}: () => ${qcOpen}useMutation({ mutationFn: (ids: (number | string)[]) => client.${clientKey}.${mut.method}({ ${scopeSpread}ids })${cohere('update')} })${qcClose},`)
+    } else if (mut.params?.length) {
+      const dataType = `{ ${mut.params.map(pp => `${pp}?: any`).join('; ')} }`
+      L.push(`    ${hookName}: () => ${qcOpen}useMutation({ mutationFn: ({ id, data }: { id: number | string; data?: ${dataType} }) => client.${clientKey}.${mut.method}({ ${scopeSpread}id, data })${cohere('update')} })${qcClose},`)
     } else {
       L.push(`    ${hookName}: () => ${qcOpen}useMutation({ mutationFn: (id: number | string) => client.${clientKey}.${mut.method}({ ${scopeSpread}id })${cohere('update')} })${qcClose},`)
     }
@@ -977,6 +981,9 @@ function emitWith(L: string[], ctrl: CtrlMeta, clientKey: string): void {
     const fnName = mut.bulk ? toBulkMutateName(mut.method) : toMutateName(mut.method)
     if (mut.bulk) {
       L.push(`    ${fnName}: (ids: (number | string)[]) => client.${clientKey}.${mut.method}({ ${scopeSpread}ids }),`)
+    } else if (mut.params?.length) {
+      const dataType = `{ ${mut.params.map(pp => `${pp}?: any`).join('; ')} }`
+      L.push(`    ${fnName}: (id: number | string, data?: ${dataType}) => client.${clientKey}.${mut.method}({ ${scopeSpread}id, data }),`)
     } else {
       L.push(`    ${fnName}: (id: number | string) => client.${clientKey}.${mut.method}({ ${scopeSpread}id }),`)
     }
@@ -1216,6 +1223,27 @@ function emitFormHooks(
 ): void {
   const clientKey = toClientKey(ctrl)
   const keysName = `${lcFirst(modelName)}Keys`
+  // Non-bulk @mutations become PascalCase action members on the handle
+  // (<deal.Archive/>). Reserved component names can't be shadowed.
+  const RESERVED_HANDLE_MEMBERS = new Set(['Form', 'Submit', 'SaveStatus', 'BaseErrors', 'Conflict', 'Changes'])
+  const actionMuts = ctrl.mutations.filter(m => !m.bulk && !RESERVED_HANDLE_MEMBERS.has(capitalize(m.method)))
+  const emitActionsOption = (indent: string, idExpr: string, scopePrefix = '', guardCreatedId = false): string[] => {
+    const out: string[] = []
+    out.push(`${indent}actions: {`)
+    for (const mut of actionMuts) {
+      const parts: string[] = []
+      if (mut.label) parts.push(`label: ${JSON.stringify(mut.label)}`)
+      if (mut.params?.length) parts.push(`params: [${mut.params.map(pp => `'${pp}'`).join(', ')}]`)
+      if (mut.required?.length) parts.push(`required: [${mut.required.map(pp => `'${pp}'`).join(', ')}]`)
+      parts.push(guardCreatedId
+        ? `transport: (data?: any) => { if (${idExpr} == null) return Promise.reject(new Error('[active-drizzle] save the record before running ${mut.method}')); return client.${clientKey}.${mut.method}({ ${scopePrefix}id: ${idExpr}, data }) }`
+        : `transport: (data?: any) => client.${clientKey}.${mut.method}({ ${scopePrefix}id: ${idExpr}, data })`)
+      parts.push(`onSuccess: () => _adCohere('${model.tableName}', 'update')`)
+      out.push(`${indent}  ${mut.method}: { ${parts.join(', ')} },`)
+    }
+    out.push(`${indent}},`)
+    return out
+  }
   const colTypes = new Map(
     (projectMeta.schema.tables[model.tableName]?.columns ?? []).map(c => [c.name, c.type as string]),
   )
@@ -1255,6 +1283,10 @@ function emitFormHooks(
     if (fields.includes(m.name)) continue
     L.push(`  ${m.name}: ${m.handleType}`)
   }
+  // @mutation action members — <deal.Archive/> is a verdict-aware button
+  for (const mut of actionMuts) {
+    L.push(`  ${capitalize(mut.method)}: (props: ActionProps) => any`)
+  }
   L.push(`}`)
   L.push('')
 
@@ -1279,14 +1311,17 @@ function emitFormHooks(
   // maps to the child controller's create/update/destroy; the nested manager
   // fires these optimistically when the parent row is already persisted.
   const transportsName = `_${lcFirst(modelName)}NestedTransports`
-  if (instantResources.size > 0) {
+  const needsAdQc = instantResources.size > 0 || actionMuts.length > 0
+  if (needsAdQc) {
     // Module-scope query-client ref — the form hooks stamp it on render so
-    // instant nested writes (which run outside hook context) still fan
-    // coherence invalidation to every dependent surface
+    // instant nested writes AND @mutation action buttons (which run outside
+    // hook context) still fan coherence invalidation to every surface
     L.push(`let _adQc: ReturnType<typeof useQueryClient> | null = null`)
     L.push(`const _adCohere = (resource: string, op: 'create' | 'update' | 'destroy') => {`)
     L.push(`  if (_adQc) applyEntityChange(_adQc, coherenceEdges, { resource, op })`)
     L.push(`}`)
+  }
+  if (instantResources.size > 0) {
     L.push(`const ${transportsName} = {`)
     for (const resource of instantResources) {
       L.push(`  ${resource}: {`)
@@ -1305,7 +1340,7 @@ function emitFormHooks(
   L.push(`/** Envelope-wired edit form. Session is keyed by id: navigating between records rebuilds; refetches THREE-WAY MERGE into the live draft (clean fields adopt, dirty fields survive, true conflicts route to the 409 story). \`poll\` refetches every N ms until \`until(record)\` is satisfied — pair with a field's pendingIf for backend-job fields. */`)
   L.push(`export function use${modelName}EditForm(id: number${scopesParam}, opts?: { poll?: { every: number; until?: (record: any) => boolean } }): { status: 'loading' | 'error' | 'ready'; form: ${modelName}FormHandle | null } {`)
   L.push(`  const qc = useQueryClient()`)
-  if (instantResources.size > 0) L.push(`  _adQc = qc`)
+  if (needsAdQc) L.push(`  _adQc = qc`)
   L.push(`  const _scopes = ${scopesArg}`)
   L.push(`  const query = useQuery({`)
   L.push(`    queryKey: ${keysName}.detail(id, _scopes as any),`)
@@ -1324,6 +1359,7 @@ function emitFormHooks(
   L.push(`    makeDraft: (r) => new ${modelName}Client(r),`)
   L.push(`    fieldMeta: (${modelName}Client as any).fieldMeta ?? {},`)
   if (transportsLine) L.push(transportsLine)
+  if (actionMuts.length > 0) for (const line of emitActionsOption('    ', 'id', scopeSpread)) L.push(line)
   L.push(`    submit: async ({ data, _event, _version }) => {`)
   L.push(`      try {`)
   L.push(`        // _event / _version are protocol keys, not fields — the controller peels them off`)
@@ -1350,7 +1386,7 @@ function emitFormHooks(
   L.push(` */`)
   L.push(`export function use${modelName}NewForm(${hasScopes ? `scopes: ${scopeType}` : ''}): { status: 'ready'; form: ${modelName}FormHandle } {`)
   L.push(`  const qc = useQueryClient()`)
-  if (instantResources.size > 0) L.push(`  _adQc = qc`)
+  if (needsAdQc) L.push(`  _adQc = qc`)
   L.push(`  const _scopes = ${scopesArg}`)
   L.push(`  const createdId = useRef<number | string | null>(null)`)
   L.push(`  const { form } = useGeneratedForm<${modelName}Client>({`)
@@ -1361,6 +1397,7 @@ function emitFormHooks(
   L.push(`    makeDraft: (r) => new ${modelName}Client(r),`)
   L.push(`    fieldMeta: (${modelName}Client as any).fieldMeta ?? {},`)
   if (transportsLine) L.push(transportsLine)
+  if (actionMuts.length > 0) for (const line of emitActionsOption('    ', 'createdId.current', scopeSpread, true)) L.push(line)
   L.push(`    submit: async ({ data, _event, _version }) => {`)
   L.push(`      try {`)
   L.push(`        const res: any = createdId.current == null`)
@@ -1409,15 +1446,43 @@ function emitFormHooks(
     L.push(`    searchable: ${Boolean((idx as any).searchable?.length)},`)
     if (filterMetaParts.length) L.push(`    filters: { ${filterMetaParts.join(', ')} },`)
     L.push(`  },`)
-    L.push(`  useIndexQuery: (params) => useQuery({`)
+    if (actionMuts.length > 0) {
+      // The surface's own query hook stamps the query-client ref so row
+      // action buttons (running outside hook context) can fan coherence
+      L.push(`  useIndexQuery: (params) => { _adQc = useQueryClient(); return useQuery({`)
+    } else {
+      L.push(`  useIndexQuery: (params) => useQuery({`)
+    }
     L.push(`    queryKey: ${keysName}.list({} as Record<string, never>, params as any),`)
     L.push(`    queryFn: () => client.${clientKey}.index(params as any),`)
-    L.push(`  }),`)
-    L.push(`  makeRowHandle: (row) => createFormHandle(`)
-    L.push(`    new FormSession({ draft: new ${modelName}Client(row), mode: 'edit', abilities: null }),`)
-    L.push(`    { fieldMeta: (${modelName}Client as any).fieldMeta ?? {} },`)
-    L.push(`  ),`)
+    L.push(`  })${actionMuts.length > 0 ? ' }' : ''},`)
+    if (actionMuts.length > 0) {
+      L.push(`  makeRowHandle: (row) => createFormHandle(`)
+      L.push(`    new FormSession({ draft: new ${modelName}Client(row), mode: 'edit', abilities: null }),`)
+      L.push(`    {`)
+      L.push(`      fieldMeta: (${modelName}Client as any).fieldMeta ?? {},`)
+      for (const line of emitActionsOption('      ', '(row as any).id')) L.push(line)
+      L.push(`    },`)
+      L.push(`  ),`)
+    } else {
+      L.push(`  makeRowHandle: (row) => createFormHandle(`)
+      L.push(`    new FormSession({ draft: new ${modelName}Client(row), mode: 'edit', abilities: null }),`)
+      L.push(`    { fieldMeta: (${modelName}Client as any).fieldMeta ?? {} },`)
+      L.push(`  ),`)
+    }
     L.push(`  useEditForm: use${modelName}EditForm,`)
+    // Aggregation GET @actions become first-class surface members —
+    // <Deals.Stats>{(data) => …}. Keys live under the family root, so the
+    // coherence fan-out keeps computed numbers fresh for free.
+    const surfaceQueries = ctrl.actions.filter(a => a.httpMethod === 'GET' && !a.load)
+    if (surfaceQueries.length > 0) {
+      L.push(`  queries: {`)
+      for (const act of surfaceQueries) {
+        const actionKey = toActionClientKey(act, clientKey)
+        L.push(`    ${capitalize(act.method)}: () => useQuery({ queryKey: [...${keysName}.root({} as Record<string, never>), '${act.method}'], queryFn: () => client.${actionKey}({}) }),`)
+      }
+      L.push(`  },`)
+    }
     L.push(`})`)
     L.push('')
   }

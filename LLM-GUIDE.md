@@ -132,7 +132,26 @@ write UPDATES an existing child (singular invariant). habtm writes:
 ## 3. Controller DSL
 
 ```ts
-import { controller, crud, mutation, query, before } from '@active-drizzle/controller'
+import { controller, crud, mutation, action, before } from '@active-drizzle/controller'
+
+// @mutation: POST /deals/:id/<kebab>. Options (ALL optional):
+//   if:       (record, ctx, ctrl) => boolean — per-record guard. Verdict ships
+//             in the envelope can map (button greys) AND is re-enforced at
+//             dispatch (422). Sync only.
+//   params:   ['reason']  — payload ALLOWLIST; undeclared data keys stripped
+//   required: ['reason']  — missing/blank → 422 {reason: ['is required']}
+//   label:    'Send back' — button/mini-form label
+// Return this.envelope(record) → the client button folds fresh fields+verdicts
+// into the live form session (no refetch).
+@mutation({ if: (d: any) => d.isSubmitted(), label: 'Mark won' })
+async markWon(deal: any) { await deal.advance('win'); return this.envelope(deal) }
+@mutation({ params: ['reason'], required: ['reason'], if: (d: any) => d.isSubmitted() })
+async sendBack(deal: any, data: { reason: string }) { ...; return this.envelope(deal) }
+
+// @action('GET') with no load → aggregation route, becomes <Deals.Stats/> on
+// the index surface + indexStats() hook. Cache key under the family root →
+// coherence refetches it after every mutation.
+@action('GET') async stats() { const rows = await this.relation.load(); return { total: rows.length } }
 
 const EDITABLE = ['name', 'amount', 'notesAttributes', 'briefAttributes'] as const
 
@@ -216,6 +235,14 @@ const { status, form: deal } = useDealEditForm(id, {          // poll until a ba
   </>)}</deal.Conflict>
   <deal.Submit>Save</deal.Submit>
   <deal.Submit event="submit">Submit deal</deal.Submit>       {/* state transition; auto-disabled via server can-map */}
+
+  {/* @mutation members — PascalCase of the method name: */}
+  <deal.MarkWon />                          {/* paramless → button; disabled unless envelope can.markWon */}
+  <deal.SendBack />                         {/* params → implicit mini-form (scaffolding inputs, data-ad-scaffold) */}
+  <deal.SendBack fields={{ reason: 'dup' }}>Reject as dup</deal.SendBack>  {/* pre-supplied → plain button */}
+  <deal.SendBack>{({ run, allowed, pending, errors, label, params }) => ...}</deal.SendBack>  {/* render-prop */}
+  {/* success: envelope return folds into the session (verdicts re-grey live) + coherence fan-out;
+      422 field errors land on the mini-form inputs; bus emits {type:'action', action, ok} */}
 </deal.Form>
 ```
 
@@ -243,6 +270,12 @@ onFormEvents(e => {   // types: 'rehydrated' | 'conflict' | 'saved' | 'draft-res
 ```
 
 ## 5. Frontend — index surface (generated, zero hooks)
+
+GET @actions without :id are surface members (PascalCase): `<Deals.Stats>{(data, q) => ...}</Deals.Stats>`
+— standalone (no <Deals.Index> needed), scaffolding JSON without a render-prop, auto-refetched by
+every mutation's coherence fan-out (family-root cache key). Row handles inside <Deals.Items> carry
+the same @mutation members (`<deal.MarkWon/>`); index rows are UNGOVERNED (no envelope) so buttons
+default enabled and the server's guard 422s illegitimate presses.
 
 ```tsx
 <Deals.Index>                              {/* the head is a component */}

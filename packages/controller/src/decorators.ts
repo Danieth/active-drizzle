@@ -106,8 +106,15 @@ export function attachable(config?: AttachableConfig) {
  * async archive(ids: number[]) {
  *   await this.relation.where({ id: ids }).updateAll({ status: 'archived' })
  * }
+ *
+ * @example
+ * // Guarded button with a declared payload — the client gets a verdict-aware
+ * // <deal.SendBack/> mini-form; the server enforces guard + params regardless
+ * @mutation({ params: ['reason'], required: ['reason'],
+ *             if: (deal) => deal.isSubmitted(), label: 'Send back' })
+ * async sendBack(deal: Deal, data: { reason: string }) { ... }
  */
-export function mutation(config?: Omit<MutationEntry, 'method'> | null) {
+export function mutation(config?: Partial<Omit<MutationEntry, 'method'>> | null) {
   // supports both @mutation and @mutation({bulk: true})
   return function (_target: any, key: string, _descriptor: PropertyDescriptor) {
     const ctor = _target.constructor
@@ -117,6 +124,10 @@ export function mutation(config?: Omit<MutationEntry, 'method'> | null) {
       ...(config?.records !== undefined ? { records: config.records } : {}),
       ...(config?.optimistic !== undefined ? { optimistic: config.optimistic } : {}),
       ...(config?.returns !== undefined ? { returns: config.returns } : {}),
+      ...(config?.params !== undefined ? { params: config.params } : {}),
+      ...(config?.required !== undefined ? { required: config.required } : {}),
+      ...(config?.if !== undefined ? { if: config.if } : {}),
+      ...(config?.label !== undefined ? { label: config.label } : {}),
     }
     ctor[MUTATION_META] = [...(ctor[MUTATION_META] ?? []), entry]
   }

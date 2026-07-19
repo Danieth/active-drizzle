@@ -8,6 +8,11 @@ Non-blocking ideas — the "makes people love it, not just use it" pile. Launch 
 
 **Thesis:** Drizzle already gives us the full power of Postgres underneath — "maxing out" isn't adding SQL *capability*, it's **surfacing it as type-safe, chainable `Relation` methods** so users never hit the "raw SQL cliff" for common analytical/hierarchical work, and results still **hydrate into typed models / typed row shapes** (the thing raw Drizzle makes you give up). Keep `.where(sql\`…\`)` as the escape hatch for the long tail.
 
+> ### ✅ SHIPPED (2026-07-19) — verified on real Postgres (`tests/integration/advanced-queries.test.ts`)
+> `.group()` + `.having()` + grouped aggregates (Rails `group(:x).sum(:y)` → map, enum-labeled keys) · `.distinct()` / `.distinct('col')` (DISTINCT / DISTINCT ON) · `.select((t, Fn) => …)` with **window functions** (`Fn.rank/rowNumber/denseRank/sum/avg/lag/lead/ntile/…`.`over({partitionBy, orderBy})`) · `.seek()` keyset pagination · `.union/.unionAll/.intersect/.except` · `.toSQL()`.
+>
+> **Still TODO (the harder-to-surface-compactly ones):** CTEs / `WITH RECURSIVE`, `LATERAL` joins, association `.joins()`, JSONB/array operator helpers, full-text (in flight — `DESIGN-search-pg-first.md`).
+
 ### Tier 1 — grouped & analytical aggregation (what every dashboard needs)
 - **`.group(...)` + `.having(...)`** — grouped aggregation (the two you asked for, hence top billing). `Order.group('status').sum('total')` → `{ pending: 1200, paid: 5000 }`; `.having(...)` filters the groups.
 - **Filtered aggregates** — `COUNT(*) FILTER (WHERE paid)` — count paid vs pending in one pass instead of `CASE` gymnastics.
