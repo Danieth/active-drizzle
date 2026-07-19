@@ -177,13 +177,33 @@ scribers) socket writes — Node does this comfortably. No second service,
 no IPC, the afterCommit hook publishes to an in-memory bus that IS the
 socket registry.
 
-**After 5k / multi-process:** the ONLY thing that changes is the bus:
-`BroadcastBus { publish(channel, frame); subscribe(channel, fn) }` —
-in-memory today, Redis pub/sub adapter when the app outgrows one process
-(publisher = afterCommit in any API process; subscriber = whichever
-process holds the socket). This is exactly ActionCable's adapter seam, and
-it is where an anycable-like mover would attach *if ever* — never as a
-framework dependency.
+**Multi-process (the "server 1 subscriber, server 2 commit" problem):**
+the ONLY thing that changes is the bus:
+`BroadcastBus { publish(channel, frame); subscribe(channel, fn) }`.
+With `REDIS_URL` set, every process publishes commits to Redis pub/sub
+AND subscribes, forwarding frames to its OWN sockets — server 2's commit
+reaches server 1's subscriber through Redis, with sockets living on every
+API process. This is ActionCable's production topology exactly (Rails
+never had a dedicated socket worker; Puma workers hold sockets, Redis
+connects them). One env var, no new processes: **the default multi-
+process answer.**
+
+**Dedicated channel processes (optional tier 3):** there is NO separate
+worker program — subscription auth is a door dry-run, which needs the
+controllers, models, and DB, so the socket-holder must have the app
+loaded. Therefore the "ws worker" is the SAME app in a channels role:
+`run server --role=channels` boots everything but serves no HTTP — it
+holds sockets, authorizes subscribes against the DB, and reads the bus,
+while API processes go publish-only. Reach for this for COMFORT, not
+correctness (API deploys stop dropping sockets; socket tier scales
+independently) — rolling-deploy socket loss is already a non-event via
+reconnect-invalidate. The app-less alternative (socket tier RPCing back
+to the API per auth decision) is the anycable/gRPC architecture and is
+explicitly rejected as a dependency and as a design.
+
+The three tiers share one seam, unchanged: memory bus = single process;
+Redis bus = sockets-everywhere OR channels-role — the only difference
+between those two is which processes call createChannelServer.
 
 **Not chosen, and why:** a separate socket service on day one (operational
 cost before 5k users exist); anycable (a dependency owning our auth path);
@@ -219,8 +239,9 @@ same bus, zero coupling to the resource machinery.
    controller serialization.
 4. **Client**: `connectChannels`, form `live: true`, `<Index live>`,
    reconnect-invalidate. The demo's SSE lane is then deleted (superseded).
-5. **Redis bus adapter** — only when someone actually approaches the
-   ceiling. Not before.
+5. **Redis bus adapter + `--role=channels` boot flag** — the multi-process
+   story (§8). The adapter ships when someone runs >1 process; the role
+   flag is ~20 lines once the adapter exists.
 
 **Explicitly not in v1:** operational deltas / CRDTs, server-side index
 membership arithmetic (§6), presence (rides §9 later), catch-up replay,
