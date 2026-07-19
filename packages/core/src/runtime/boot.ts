@@ -19,6 +19,40 @@ export const afterCommitQueue = new AsyncLocalStorage<Array<() => Promise<void>>
 let _activeDb: GlobalDb | null = null
 let _schema: Record<string, any> = {}
 
+// ── Multi-database binding ───────────────────────────────────────────────────
+// DOCTRINE: we DEFER to drizzle for connections (no shim — drizzle already
+// owns drivers/pooling). What the framework owns is BINDING: which tables
+// live on which drizzle instance. boot() binds the default; bindDatabase()
+// binds more. Table-level routing keeps @model('events') unchanged — the
+// database is a property of the binding, not the model declaration.
+const _databases = new Map<string, GlobalDb>()
+const _tableDb = new Map<string, string>()
+
+/** Which database the CURRENT transaction belongs to — a tx on 'default'
+ *  must never capture queries against 'analytics' (they are different
+ *  connections; pretending otherwise would silently break atomicity). */
+export const transactionDbName = new AsyncLocalStorage<string>()
+
+/**
+ * Bind additional tables to ANOTHER drizzle instance:
+ *
+ *   boot(db, { posts: schema.posts })                                  // default
+ *   bindDatabase('analytics', analyticsDb, { events: aSchema.events }) // extra
+ *
+ * Models declare tables as always — routing happens here. LIMITS (by
+ * design): associations/includes across databases are not supported
+ * (different connections cannot join); load separately.
+ */
+export function bindDatabase(name: string, db: GlobalDb, schema: Record<string, any>): void {
+  if (name === 'default') throw new Error(`active-drizzle: 'default' is bound by boot()`)
+  assertNoReservedColumnNames(schema)
+  _databases.set(name, db)
+  for (const tableName of Object.keys(schema)) {
+    _schema[tableName] = schema[tableName]
+    _tableDb.set(tableName, name)
+  }
+}
+
 export const MODEL_REGISTRY: Record<string, any> = {}
 
 /**
@@ -59,9 +93,18 @@ export function boot(db: GlobalDb, schema: Record<string, any>) {
   }).catch(() => { /* attachments module may not be loaded */ })
 }
 
-export function getExecutor(): GlobalDb {
-  if (!_activeDb) throw new Error('active-drizzle: call boot(db, schema) before querying.')
-  return (transactionContext.getStore() ?? _activeDb) as GlobalDb
+export function getExecutor(table?: string): GlobalDb {
+  const dbName = table ? (_tableDb.get(table) ?? 'default') : 'default'
+  // An active transaction only captures queries AGAINST ITS OWN database
+  const tx = transactionContext.getStore()
+  if (tx && (transactionDbName.getStore() ?? 'default') === dbName) return tx as GlobalDb
+  const db = dbName === 'default' ? _activeDb : _databases.get(dbName)
+  if (!db) {
+    throw new Error(dbName === 'default'
+      ? 'active-drizzle: call boot(db, schema) before querying.'
+      : `active-drizzle: database '${dbName}' is not bound — call bindDatabase('${dbName}', db, schema).`)
+  }
+  return db as GlobalDb
 }
 
 export function getSchema(): Record<string, any> {
@@ -125,9 +168,14 @@ export class AbortChain extends Error {
  */
 const txDepth = new AsyncLocalStorage<number>()
 
-export async function transaction<T>(callback: () => Promise<T>): Promise<T> {
-  if (!_activeDb) throw new Error('active-drizzle: call boot(db, schema) before using transaction().')
-  const db = _activeDb as any
+export async function transaction<T>(
+  callback: () => Promise<T>,
+  opts: { database?: string } = {},
+): Promise<T> {
+  const dbName = opts.database ?? 'default'
+  const bound = dbName === 'default' ? _activeDb : _databases.get(dbName)
+  if (!bound) throw new Error(`active-drizzle: database '${dbName}' is not bound — boot()/bindDatabase() first.`)
+  const db = bound as any
   if (typeof db.transaction !== 'function') {
     throw new Error('active-drizzle: DB driver does not support transactions.')
   }
@@ -144,7 +192,8 @@ export async function transaction<T>(callback: () => Promise<T>): Promise<T> {
   const queue: Array<() => Promise<void>> = []
   const result = await db.transaction((tx: any) =>
     txDepth.run(depth + 1, () =>
-      afterCommitQueue.run(queue, () => transactionContext.run(tx as GlobalDb, callback))
+      afterCommitQueue.run(queue, () =>
+        transactionDbName.run(dbName, () => transactionContext.run(tx as GlobalDb, callback)))
     )
   )
   // Fire afterCommit hooks only at the outermost transaction boundary

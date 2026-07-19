@@ -53,6 +53,7 @@ const files = {
       'dev': 'concurrently -n server,client -c blue,green "npm:dev:server" "npm:dev:client"',
       'dev:server': 'tsx watch server/main.ts',
       'dev:client': 'vite',
+      'db:push': 'drizzle-kit push',
       'regen': 'tsx scripts/regen.mts',
       'typecheck': 'tsc --noEmit',
     },
@@ -64,6 +65,7 @@ const files = {
       '@orpc/server': '^1.13.6',
       '@tanstack/react-query': '^5.90.0',
       'drizzle-orm': '^0.44.0',
+      'pg': '^8.13.0',
       'hono': '^4.6.0',
       'react': '^19.0.0',
       'react-dom': '^19.0.0',
@@ -72,6 +74,8 @@ const files = {
     devDependencies: {
       '@types/react': '^19.0.0',
       '@types/node': '^22.0.0',
+      '@types/pg': '^8.11.0',
+      'drizzle-kit': '^0.31.0',
       '@types/react-dom': '^19.0.0',
       '@vitejs/plugin-react': '^4.3.0',
       'concurrently': '^9.0.0',
@@ -90,6 +94,10 @@ import { defineConfig } from 'active-drizzle'
 
 export default defineConfig({
   server: { port: 8787 },
+  // Real Postgres when DATABASE_URL is set (run \`npm run db:push\` once to
+  // sync the schema). Without it, dev falls back to IN-MEMORY PGlite —
+  // zero setup, data resets on restart, loudly announced at boot.
+  database: { url: process.env.DATABASE_URL },
   channels: {
     // memory = single process. Set REDIS_URL and multi-process just works.
     bus: process.env.REDIS_URL ? 'redis' : 'memory',
@@ -133,6 +141,69 @@ export default defineConfig({
     proxy: { '/rpc': 'http://localhost:8787' },
   },
 })
+`,
+
+  'drizzle.config.ts': `import { defineConfig } from 'drizzle-kit'
+
+// Schema sync for REAL Postgres: \`npm run db:push\` (drizzle-kit owns
+// migrations/push — the framework defers to drizzle for everything
+// connection- and schema-lifecycle-shaped).
+export default defineConfig({
+  dialect: 'postgresql',
+  schema: './server/db/schema.ts',
+  dbCredentials: { url: process.env.DATABASE_URL ?? '' },
+})
+`,
+
+  'server/db/index.ts': `/**
+ * The database — DEFER-to-drizzle doctrine: connections are drizzle's job,
+ * the framework only BINDS models to instances (boot / bindDatabase).
+ *
+ *   DATABASE_URL set   → real Postgres (node-postgres). \`npm run db:push\`
+ *                        once to sync the schema.
+ *   DATABASE_URL unset → IN-MEMORY PGlite for zero-setup dev. Data resets
+ *                        on every restart; the schema is bootstrapped
+ *                        below.
+ *
+ * More databases? Bind extra tables to other instances:
+ *   import { bindDatabase } from 'active-drizzle'
+ *   bindDatabase('analytics', analyticsDb, { events: aSchema.events })
+ * (Cross-database associations/includes are not supported — different
+ * connections cannot join.)
+ */
+import { loadConfig } from 'active-drizzle'
+import * as schema from './schema.ts'
+
+const config = await loadConfig()
+const url = config.database?.url
+
+async function connect() {
+  if (url) {
+    const { default: pg } = await import('pg')
+    const { drizzle } = await import('drizzle-orm/node-postgres')
+    return drizzle(new pg.Pool({ connectionString: url }), { schema })
+  }
+  console.warn(
+    '[db] No DATABASE_URL — using IN-MEMORY PGlite (data resets on restart).\\n' +
+    '[db] For real Postgres: set DATABASE_URL, then \`npm run db:push\`.',
+  )
+  const { PGlite } = await import('@electric-sql/pglite')
+  const { drizzle } = await import('drizzle-orm/pglite')
+  const lite = new PGlite()
+  // Dev bootstrap only — real Postgres schema sync is drizzle-kit's job
+  await lite.exec(\`
+    CREATE TABLE posts (
+      id SERIAL PRIMARY KEY,
+      title TEXT NOT NULL,
+      body TEXT,
+      published BOOLEAN NOT NULL DEFAULT false,
+      updated_at TIMESTAMP NOT NULL DEFAULT now()
+    );
+  \`)
+  return drizzle(lite, { schema })
+}
+
+export const db = await connect()
 `,
 
   'index.html': `<!doctype html>
@@ -212,11 +283,9 @@ export class PostController extends ApplicationController {}
 `,
 
   'server/main.ts': `/**
- * PGlite (in-process Postgres, zero setup) + Hono + oRPC.
- * boot → buildRouter → RPCHandler at /rpc. Port from trails.config.ts.
+ * Boot: db (real PG or dev PGlite — see server/db/index.ts) → models →
+ * router → RPCHandler at /rpc. Port from trails.config.ts.
  */
-import { PGlite } from '@electric-sql/pglite'
-import { drizzle } from 'drizzle-orm/pglite'
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
 import { RPCHandler } from '@orpc/server/fetch'
@@ -224,29 +293,20 @@ import { boot, loadConfig } from 'active-drizzle'
 import { buildRouter } from '@active-drizzle/controller'
 
 import * as schema from './db/schema.ts'
+import { db } from './db/index.ts'
 import { Post } from './models/index.ts'
 import { PostController } from './controllers/Post.ctrl.ts'
 
-const pg = new PGlite()
-const db = drizzle(pg, { schema })
-
-await pg.exec(\`
-  CREATE TABLE posts (
-    id SERIAL PRIMARY KEY,
-    title TEXT NOT NULL,
-    body TEXT,
-    published BOOLEAN NOT NULL DEFAULT false,
-    updated_at TIMESTAMP NOT NULL DEFAULT now()
-  );
-\`)
-
 // 'as any': the app's drizzle-orm instance vs the framework's — nominal
-// protected-member clash across duplicate module identities (the demo
-// carries the same cast; runtime is a single shared connection either way)
+// protected-member clash across duplicate module identities (runtime is a
+// single shared connection either way)
 boot(db as any, { posts: schema.posts })
 
-await Post.create({ title: 'Hello trails', body: 'Generated by trails new.', published: true })
-await Post.create({ title: 'A draft to edit', body: 'Open it and type — it autosaves.' })
+// Seed once — idempotent across restarts on a REAL database
+if ((await Post.all().count()) === 0) {
+  await Post.create({ title: 'Hello trails', body: 'Generated by trails new.', published: true })
+  await Post.create({ title: 'A draft to edit', body: 'Open it and type — it autosaves.' })
+}
 
 const { router } = buildRouter(PostController)
 const rpc = new RPCHandler({ posts: router })
@@ -263,7 +323,7 @@ app.use('/rpc/*', async (c) => {
 const config = await loadConfig()
 const port = config.server?.port ?? 8787
 serve({ fetch: app.fetch, port })
-console.log(\`\${'${name}'} API on http://localhost:\${port}  [channels bus: \${config.channels?.bus ?? 'memory'}]\`)
+console.log(\`\${'${name}'} API on http://localhost:\${port}\`)
 `,
 
   'src/main.tsx': `import React from 'react'
@@ -342,6 +402,15 @@ Postgres), one model, one controller — and everything else derived.
 \`\`\`sh
 npm install
 npm run dev        # server :8787 + client :5173
+\`\`\`
+
+**Database:** with no \`DATABASE_URL\` you get IN-MEMORY PGlite (zero
+setup, resets on restart — announced loudly at boot). For real Postgres:
+
+\`\`\`sh
+export DATABASE_URL=postgres://localhost/myapp
+npm run db:push    # drizzle-kit syncs the schema
+npm run dev
 \`\`\`
 
 - **server/db/schema.ts** — the drizzle table (export name = canonical name)

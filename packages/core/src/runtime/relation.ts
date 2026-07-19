@@ -538,7 +538,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     const where = rel._buildFinalWhere()
 
     if (!grouped) {
-      let q: any = getExecutor().select({ n: aggExpr }).from(table)
+      let q: any = getExecutor(this._tableName).select({ n: aggExpr }).from(table)
       if (where) q = q.where(where)
       const [row] = await q
       return toScalar((row as any)?.n)
@@ -546,7 +546,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
 
     const sel: Record<string, any> = { n: aggExpr }
     rel._group.forEach((g, i) => { sel['_g' + i] = g.col })
-    let q: any = getExecutor().select(sel).from(table)
+    let q: any = getExecutor(this._tableName).select(sel).from(table)
     if (where) q = q.where(where)
     q = q.groupBy(...rel._group.map(g => g.col))
     if (rel._having) q = q.having(rel._having)
@@ -623,7 +623,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     const grouped = rel._group.length > 0
     if (grouped) rel._group.forEach((g, i) => { sel['_g' + i] = g.col })
 
-    let q: any = getExecutor().select(sel).from(table)
+    let q: any = getExecutor(this._tableName).select(sel).from(table)
     if (where) q = q.where(where)
     if (grouped) {
       q = q.groupBy(...rel._group.map(g => g.col))
@@ -663,7 +663,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     const col    = table[colKey]
     if (!col) throw new Error(`Column "${colKey}" not found on "${rel._tableName}"`)
     const whereExpr = rel._buildFinalWhere()
-    let q: any = getExecutor()
+    let q: any = getExecutor(this._tableName)
       .select({ val: col, n: sql<number>`count(*)::int` })
       .from(table)
       .groupBy(col)
@@ -693,7 +693,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     rel = rel._withDefaultScopes()
     const table = rel.getTable()
     const whereExpr = rel._buildFinalWhere()
-    let q: any = getExecutor().select({ one: sql`1` }).from(table).limit(1)
+    let q: any = getExecutor(this._tableName).select({ one: sql`1` }).from(table).limit(1)
     if (whereExpr) q = q.where(whereExpr)
     const rows = await q
     return rows.length > 0
@@ -879,7 +879,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     if (rel._offset > 0)       config.offset  = rel._offset
     if (rel._order.length > 0) config.orderBy = rel._order
 
-    const rows: any[] = await (getExecutor().query as any)[rel._tableName].findMany(config)
+    const rows: any[] = await (getExecutor(this._tableName).query as any)[rel._tableName].findMany(config)
 
     return rows.map((row: any) => {
       // Single-field shortcut → plain value
@@ -917,7 +917,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   private async _pluckFlat(fields: string[], Ctor: any): Promise<any[]> {
     if ((this as any)._isNone) return []
     const rel = this._withDefaultScopes()
-    const db    = getExecutor()
+    const db    = getExecutor(this._tableName)
     const table = rel.getTable()
 
     const selection: Record<string, any> = {}
@@ -962,7 +962,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    */
   public async updateAll(updates: Record<string, any>): Promise<number> {
     const rel = this._withDefaultScopes()
-    const db = getExecutor()
+    const db = getExecutor(this._tableName)
     const table = rel.getTable()
     const Ctor = rel._ctor
     const mapped: Record<string, any> = {}
@@ -981,7 +981,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    */
   public async destroyAll(): Promise<number> {
     const rel = this._withDefaultScopes()
-    const db = getExecutor()
+    const db = getExecutor(this._tableName)
     const table = rel.getTable()
     let q: any = db.delete(table)
     const whereExpr = rel._buildFinalWhere()
@@ -1030,7 +1030,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     const table = rel.getTable()
     const col = table[selectColumn]
     if (!col) throw new Error(`Column "${selectColumn}" not found on table "${rel._tableName}"`)
-    let q: any = getExecutor().select({ _val: col }).from(table)
+    let q: any = getExecutor(this._tableName).select({ _val: col }).from(table)
     const whereExpr = rel._buildFinalWhere()
     if (whereExpr) q = q.where(whereExpr)
     return q
@@ -1075,7 +1075,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     const table = rel.getTable()
     const where = rel._buildFinalWhere()
 
-    let q: any = getExecutor().select(build(table, Fn)).from(table)
+    let q: any = getExecutor(this._tableName).select(build(table, Fn)).from(table)
     if (where) q = q.where(where)
     if (rel._group.length > 0) q = q.groupBy(...rel._group.map(g => g.col))
     if (rel._having) q = q.having(rel._having)
@@ -1092,7 +1092,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   public except(other: Relation<TModel>): Promise<TModel[]>    { return this._setOp(except, other) }
 
   private async _setOp(op: any, other: Relation<TModel>): Promise<TModel[]> {
-    const db = getExecutor()
+    const db = getExecutor(this._tableName)
     const leg = (r: Relation<TModel>) => {
       const s = r._withDefaultScopes()
       let q: any = db.select().from(s.getTable())
@@ -1258,7 +1258,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     // none() short-circuit — always resolves to empty array, zero DB round-trips
     if ((this as any)._isNone) return Promise.resolve([])
 
-    const db = getExecutor()
+    const db = getExecutor(this._tableName)
     const whereExpr = this._buildFinalWhere()
 
     // FOR UPDATE / DISTINCT / DISTINCT ON all require the core select builder

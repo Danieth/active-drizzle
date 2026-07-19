@@ -191,7 +191,7 @@ export class ApplicationRecord {
     const table = getSchema()[(this as any).tableName]
     if (!table) throw new Error(`Table "${(this as any).tableName}" not found. Did you call boot()?`)
     const pkWhereExpr = _buildPkWhere(this as any, table, id)
-    const [row] = await getExecutor().select().from(table).where(pkWhereExpr).limit(1)
+    const [row] = await getExecutor(((this as any).tableName ?? (this as any).constructor?.tableName) as string).select().from(table).where(pkWhereExpr).limit(1)
     if (!row) throw new RecordNotFound(modelClassName(this), id)
     return new (this as any)(row, false)
   }
@@ -235,7 +235,7 @@ export class ApplicationRecord {
       for (const [k, v] of Object.entries(r)) out[k] = Ctor[k]?._isAttr && Ctor[k].set ? Ctor[k].set(v) : v
       return out
     })
-    await getExecutor().insert(table).values(rows)
+    await getExecutor(((this as any).tableName ?? (this as any).constructor?.tableName) as string).insert(table).values(rows)
     return rows.length
   }
 
@@ -502,7 +502,7 @@ export class ApplicationRecord {
       return false
     }
 
-    const db = getExecutor()
+    const db = getExecutor(((this as any).tableName ?? (this as any).constructor?.tableName) as string)
     const table = getSchema()[(this.constructor as any).tableName]
     if (!table) throw new Error(`Table "${(this.constructor as any).tableName}" not found. Did you call boot()?`)
 
@@ -651,7 +651,7 @@ export class ApplicationRecord {
     if (this.isNewRecord) return false
     if (!(await runHooks(this, 'beforeDestroy', false))) return false
 
-    const db = getExecutor()
+    const db = getExecutor(((this as any).tableName ?? (this as any).constructor?.tableName) as string)
     const ctor = this.constructor as any
     const table = getSchema()[ctor.tableName]
     if (!table) throw new Error(`Table "${ctor.tableName}" not found.`)
@@ -700,7 +700,7 @@ export class ApplicationRecord {
     const table = getSchema()[ctor.tableName]
     if (!table) throw new Error(`Table "${ctor.tableName}" not found.`)
 
-    const [row] = await getExecutor().select().from(table).where(_buildPkWhere(ctor, table, pkVal)).limit(1)
+    const [row] = await getExecutor(((this as any).tableName ?? (this as any).constructor?.tableName) as string).select().from(table).where(_buildPkWhere(ctor, table, pkVal)).limit(1)
     if (!row) throw new Error(`${modelClassName(ctor)} with pk=${JSON.stringify(pkVal)} not found — was it deleted?`)
 
     this._attributes = row
@@ -1052,7 +1052,7 @@ function _resolveAssociation(marker: any, prop: string, target: any, ctor: any):
     const joinTargetCol = joinTableObj[targetFk]
     if (!joinOwnerCol || !joinTargetCol) return new Relation(TargetModel)
 
-    const db = getExecutor()
+    const db = getExecutor(TargetModel._activeDrizzleTableName)
     const subquery = db.select({ _val: joinTargetCol }).from(joinTableObj).where(eq(joinOwnerCol, ownerId))
     const targetTableObj = schema[TargetModel._activeDrizzleTableName]
     if (!targetTableObj) return new Relation(TargetModel)
@@ -1087,7 +1087,7 @@ function _resolveAssociation(marker: any, prop: string, target: any, ctor: any):
       const throughTargetCol = throughTableObj[targetFk]
       if (!throughOwnerCol || !throughTargetCol) return new Relation(TargetModel)
 
-      const db = getExecutor()
+      const db = getExecutor(TargetModel._activeDrizzleTableName)
       const subquery = db.select({ _val: throughTargetCol }).from(throughTableObj).where(eq(throughOwnerCol, ownerId))
       const targetTableObj = schema[TargetModel._activeDrizzleTableName]
       if (!targetTableObj) return new Relation(TargetModel)
@@ -1312,7 +1312,7 @@ async function _processHabtmIds(record: any, ctor: any, snapshot: Record<string,
       }
     }
 
-    const db = getExecutor()
+    const db = getExecutor(TargetModel._activeDrizzleTableName)
     const currentRows = await db.select({ _val: joinTargetCol }).from(joinTable).where(eq(joinOwnerCol, ownerId))
     const current: number[] = currentRows.map((r: any) => Number(r._val))
     const currentSet = new Set(current)                       // O(1) membership
@@ -1517,7 +1517,7 @@ async function _adjustCounterCaches(record: any, ctor: any, delta: 1 | -1): Prom
       const parentTable = getSchema()[ParentModel._activeDrizzleTableName ?? ParentModel.tableName]
       if (!parentTable || !parentTable[counterCol]) continue
 
-      const db = getExecutor()
+      const db = getExecutor((ParentModel._activeDrizzleTableName ?? ParentModel.tableName) as string)
       await db
         .update(parentTable)
         .set({ [counterCol]: sql`${parentTable[counterCol]} + ${delta}` })
@@ -1597,7 +1597,7 @@ async function _withAttachmentSlotLock<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   return transaction(async () => {
-    const db: any = getExecutor()
+    const db: any = getExecutor()   // advisory locks live on the DEFAULT db
     if (typeof db.execute === 'function') {
       const slotKey = `${attachableType}:${name}`
       try {

@@ -732,3 +732,20 @@ includes.
 Also: GETTING-STARTED.md now exists — the one-command path
 (`trails new` → three files you write → `@gen` imports → config → the
 dev loop).
+
+
+## Real Postgres first + multi-database binding (built)
+
+`trails new` apps are PG-first: `DATABASE_URL` set → node-postgres +
+`npm run db:push` (drizzle-kit owns schema lifecycle — we DEFER to
+drizzle, no shim; a shim would own the driver matrix forever for zero
+gain). No `DATABASE_URL` → loud in-memory PGlite fallback so `npm run
+dev` still works with zero setup. Proven both ways: fallback boots +
+serves; real PG pushed, booted, and a write SURVIVED a server restart.
+
+Multi-database: the framework owns BINDING, not connections —
+`bindDatabase('analytics', analyticsDb, { events: aSchema.events })`
+routes per TABLE (`getExecutor(table)`), transactions take `{ database }`
+and NEVER capture queries against other databases (different connections
+— pretending otherwise would silently break atomicity; pinned by tests).
+Cross-database associations/includes are unsupported by design.

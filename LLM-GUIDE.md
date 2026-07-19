@@ -34,6 +34,44 @@ boot(db, { deals: schema.deals, notes: schema.notes /* export-name keys */ })
 const { router } = buildRouter(DealController)   // oRPC router
 ```
 
+## 0.5 WORKING the framework (the operational loop)
+
+```sh
+npx trails new myapp && cd myapp && npm install   # scaffold a WORKING app
+npm run dev            # API (tsx watch) + client (vite, codegen plugin) together
+npm run regen          # clean-room codegen WITHOUT vite (stale suspicion, CI)
+npm run typecheck      # tsc --noEmit — generated code is tsc-clean by contract
+npm run db:push        # drizzle-kit syncs schema to REAL Postgres (needs DATABASE_URL)
+```
+
+DATABASE — defer-to-drizzle: `server/db/index.ts` builds the drizzle
+instance (node-postgres when `DATABASE_URL`/config.database.url is set;
+loud in-memory PGlite fallback otherwise — dev-only, resets on restart).
+The framework never owns connections; it owns BINDING:
+```ts
+boot(db as any, { posts: schema.posts })                          // default database
+bindDatabase('analytics', analyticsDb, { events: aSchema.events })// more databases, per TABLE
+// getExecutor routes by table; transaction(fn, { database: 'analytics' }) scopes a tx;
+// a tx NEVER captures queries against a different database (different connections).
+// LIMIT: associations/includes cannot cross databases — load separately.
+```
+
+RECIPE — add a field end to end (the canonical loop):
+1. schema.ts: add the column → 2. Model: `static score = Attr.integer({ label: 'Score' })`
+3. Controller: add to `expose` (visible) and/or `permit` (writable), maybe
+   `filterable`/`sortable` → 4. save — codegen reruns → 5. JSX: `<post.score edit />`
+   just works; typecheck catches anything the door disagrees with.
+
+RECIPE — new resource: schema export + `X.model.ts` + export from
+models/index.ts barrel + `X.ctrl.ts` → save → `import { Xs, useXEditForm }
+from '@gen/controllers'`. RECIPE — security check in any test:
+`expect(await runContractProbes(buildContractProbes(XController), call)).toEqual([])`.
+
+Files you edit: `server/db/schema.ts`, `server/models/*.model.ts`,
+`server/controllers/*.ctrl.ts`, `trails.config.ts`, your React code.
+Files you NEVER edit: everything in `.gen/` (rebuilt on save; gitignored).
+`_client.ts` (controllers dir) is user-owned wiring — created once, yours.
+
 ## 1. Model DSL
 
 ```ts
