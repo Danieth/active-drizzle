@@ -68,6 +68,11 @@ export { applyEntityChange, type CoherenceEdges, type EntityChange, type QueryCl
 export {
   createIndexSurface,
   IndexSession,
+  registerFilterPresenter,
+  setDefaultFilterPresenters,
+  clearFilterPresenters,
+  type FilterPresenterProps,
+  type FilterPresenterDef,
   type IndexSurface,
   type IndexSurfaceConfig,
   type IndexMeta,

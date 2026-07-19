@@ -284,3 +284,55 @@ describe('buildRecordEnvelope — STI subclass inherits governance', () => {
     expect(Object.keys(env.can).sort()).toEqual(['go', 'stop'])
   })
 })
+
+// ── $or combinator — depth-1, allowlisted, capped ────────────────────────────
+
+import { defaultIndex } from '../src/crud-handlers.js'
+import { BadRequest as BR } from '../src/errors.js'
+
+describe('defaultIndex $or', () => {
+  function makeRel() {
+    const rel: any = {
+      where: vi.fn(() => rel),
+      whereAny: vi.fn(() => rel),
+      order: vi.fn(() => rel),
+      count: vi.fn(async () => 0),
+      limit: vi.fn(() => rel),
+      offset: vi.fn(() => rel),
+      includes: vi.fn(() => rel),
+      load: vi.fn(async () => []),
+    }
+    return rel
+  }
+  const model: any = { name: 'Deal' }
+  const config: any = { index: { filterable: ['stage', 'priority'] } }
+
+  it('valid branches route through whereAny with converted values', async () => {
+    const rel = makeRel()
+    await defaultIndex(rel, model, config, { filters: { $or: [{ stage: 'draft' }, { priority: 'high' }] } } as any)
+    expect(rel.whereAny).toHaveBeenCalledWith([{ stage: 'draft' }, { priority: 'high' }])
+  })
+
+  it('rejects non-allowlisted fields inside branches', async () => {
+    const rel = makeRel()
+    await expect(defaultIndex(rel, model, config, { filters: { $or: [{ secret: 1 }] } } as any))
+      .rejects.toBeInstanceOf(BR)
+  })
+
+  it('rejects nesting and over-cap branch counts', async () => {
+    const rel = makeRel()
+    await expect(defaultIndex(rel, model, config, { filters: { $or: [{ stage: { $or: [] } }] } } as any))
+      .rejects.toBeInstanceOf(BR)
+    const eleven = Array.from({ length: 11 }, () => ({ stage: 'draft' }))
+    await expect(defaultIndex(rel, model, config, { filters: { $or: eleven } } as any))
+      .rejects.toBeInstanceOf(BR)
+  })
+
+  it('rejects non-array / non-object shapes', async () => {
+    const rel = makeRel()
+    await expect(defaultIndex(rel, model, config, { filters: { $or: { stage: 'x' } } } as any))
+      .rejects.toBeInstanceOf(BR)
+    await expect(defaultIndex(rel, model, config, { filters: { $or: ['nope'] } } as any))
+      .rejects.toBeInstanceOf(BR)
+  })
+})

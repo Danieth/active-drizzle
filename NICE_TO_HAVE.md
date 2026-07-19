@@ -4,7 +4,37 @@ Non-blocking ideas — the "makes people love it, not just use it" pile. Launch 
 
 ---
 
-## 1. Observability: N+1 detection + query instrumentation
+## 1. Max out the query system — advanced SQL, ActiveRecord-ergonomic  ⭐
+
+**Thesis:** Drizzle already gives us the full power of Postgres underneath — "maxing out" isn't adding SQL *capability*, it's **surfacing it as type-safe, chainable `Relation` methods** so users never hit the "raw SQL cliff" for common analytical/hierarchical work, and results still **hydrate into typed models / typed row shapes** (the thing raw Drizzle makes you give up). Keep `.where(sql\`…\`)` as the escape hatch for the long tail.
+
+### Tier 1 — grouped & analytical aggregation (what every dashboard needs)
+- **`.group(...)` + `.having(...)`** — grouped aggregation (the two you asked for, hence top billing). `Order.group('status').sum('total')` → `{ pending: 1200, paid: 5000 }`; `.having(...)` filters the groups.
+- **Filtered aggregates** — `COUNT(*) FILTER (WHERE paid)` — count paid vs pending in one pass instead of `CASE` gymnastics.
+- **Window functions** *(the "whatever that is" one)* — compute a value **across a set of rows related to the current row, without collapsing them**: `OVER (PARTITION BY team ORDER BY score DESC)`. Powers leaderboards / ranking (`ROW_NUMBER`, `RANK`, `DENSE_RANK`), **running totals** & moving averages, **`LAG`/`LEAD`** (compare a row to the previous/next — month-over-month deltas), `NTILE` (percentile buckets). Single biggest analytics unlock.
+- **`DISTINCT ON`** — Postgres superpower: **one row per group** ("the latest order per customer") in a single clause, no subquery.
+
+### Tier 2 — composition & subqueries
+- **CTEs / "pinning" a subquery** (`WITH … AS`) — name a subquery once and reuse it; `AS MATERIALIZED` **pins** it so PG computes it exactly once instead of re-inlining. Drizzle exposes `$with`.
+- **Recursive CTEs** (`WITH RECURSIVE`) — walk trees/graphs: category trees, org charts, threaded comments, "all descendants of node X." The killer feature for hierarchical data, and miserable to hand-roll.
+- **LATERAL joins** *(the other unfamiliar one)* — a join whose right side **can reference each left row** (a correlated subquery in `FROM`). Canonical use: **"top 3 posts per user"** / "most recent N per group," which is awkward any other way.
+- **Correlated subqueries** — `.whereExists(sub)` / `EXISTS`/`NOT EXISTS`, scalar subquery in `SELECT`, `IN (subquery)`. You already have `.where({ id: SomeRelation })` (IN-subquery) + `toSubquery()`; this generalizes them.
+- **Set operations** — `.union()` / `.unionAll()` / `.intersect()` / `.except()`.
+
+### Tier 3 — Postgres-native types you already store
+- **JSONB querying** — `->`, `->>`, `@>`, `jsonb_path_query`; and **aggregate → JSON** (`json_agg`, `jsonb_build_object`) to shape an entire API payload in the DB in one round-trip. You have `Attr.json`.
+- **Array operators** — `@>` contains, `&&` overlap, `ANY`/`ALL`, `unnest`. You have Attr arrays.
+- **Full-text search** — `websearch_to_tsquery` + `ts_rank`. *(Already in flight — see `DESIGN-search-pg-first.md`; `.search()` is `ILIKE`-only today.)*
+
+### Tier 4 — pagination & row-value tricks
+- **Keyset / cursor pagination** — `(created_at, id) < (?, ?)` row-value comparison → **O(1) deep pagination** that `OFFSET` can't give (OFFSET scans + discards everything it skips). The correct way to page large sets and the backbone of a real cursor API.
+
+### The opinionated design rule
+Don't reimplement SQL. Surface the **~20% of advanced features that cover 80% of real reporting / analytics / hierarchy needs** as first-class, chainable, **type-safe** methods (window/rank, group/having, `DISTINCT ON`, recursive CTE, lateral, keyset). Everything past that stays reachable via the `sql` escape hatch — but even then, **the result hydrates into a typed model or typed row shape, never `any`.** Type-safety all the way through the chain is the differentiator vs. raw Drizzle and vs. every other ORM's raw-SQL cliff.
+
+---
+
+## 2. Observability: N+1 detection + query instrumentation
 
 The lazy `await post.author` N+1 is **by design** (with `.includes()` as the escape hatch), so a dev-mode detector isn't fixing a bug — it's teaching the escape hatch at the exact moment it's needed. This is Rails' **Bullet gem**, which people adore.
 
@@ -17,7 +47,7 @@ The lazy `await post.author` N+1 is **by design** (with `.includes()` as the esc
 
 ---
 
-## 2. Error-handling roadmap  (the "error stuff from above")
+## 3. Error-handling roadmap  (the "error stuff from above")
 
 The spine is already good — `translateDbError` + `onError`/`reportError` (server) + `parseControllerError`/`handleControllerError` + `onClientError` (client), with a clean seam per boundary. These are the *enhancements*:
 
@@ -30,7 +60,7 @@ The spine is already good — `translateDbError` + `onError`/`reportError` (serv
 
 ---
 
-## 3. Query & data-layer DX
+## 4. Query & data-layer DX  (basics — see §1 for the advanced query system)
 
 The query builder is already deep (`sum`/`average`/`minimum`/`maximum`/`tally`, `exists`/`any`/`many`, `findOrCreateBy`, `inBatches`, `SELECT … FOR UPDATE` locking, composite keys). Two genuine gaps:
 
@@ -40,7 +70,7 @@ The query builder is already deep (`sum`/`average`/`minimum`/`maximum`/`tally`, 
 
 ---
 
-## 4. Ecosystem reach
+## 5. Ecosystem reach
 
 - **More framework adapters.** We have `hono`; Express / Next route-handlers / Remix / Fastify would widen the funnel a lot (the controller layer is already framework-agnostic; adapters are thin).
 - **`generate:scaffold`** end-to-end (model + Drizzle table stub + controller + factory + a React form) — the "wow, one command" demo. (Lives in the DESIGN doc's `ad generate:*`.)
@@ -48,7 +78,7 @@ The query builder is already deep (`sum`/`average`/`minimum`/`maximum`/`tally`, 
 
 ---
 
-## 5. Adoption & docs
+## 6. Adoption & docs
 
 - **Client bundle size with N models — measure first, it's probably fine.** The react package ships generated runtime per model, so the worry is 50–100 models bloating the client. Honest guess: **it's fine**, because generated per-model code is thin and tree-shakes. **But if a measurement ever shows growth**, the fix Daniel floated is the right one: a **shared generated base type/class that every model's generated type inherits from**. `_globals.gen.d.ts` already establishes this pattern (ambient aliases) — push the common structure into one base so each per-model file emits only its *delta*. That keeps the bundle DRY and effectively "pre-tree-shaken." Rule: measure → only build the base if the number demands it.
 - **SSR / hydration story — currently UNKNOWN, needs investigation.** How do client model instances behave under Next/Remix SSR + hydration? Open questions: are proxy-wrapped records serializable across the RSC/hydration boundary? Do they survive `JSON.stringify` → rehydrate as live models or as plain objects? Does `boot()` run on the server, the client, or both? We genuinely don't know yet — this is a **find-out-and-document** item, not a feature. People *will* ask on day one, so it needs a real answer before it becomes a support fire.

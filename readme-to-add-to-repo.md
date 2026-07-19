@@ -418,3 +418,49 @@ Events are SEMANTIC (what happened), never presentational (how to show
 it) — the framework stays toast-library-agnostic, mirroring
 onClientError. Nested structural changes report the association name;
 no-op refetches emit nothing.
+
+## Filter presenters — the socket, not the bulb (built)
+
+`<Deals.Filters/>` now mirrors `<deal.name edit>` exactly. Three altitudes:
+
+```tsx
+// register once at startup — kind-defaults take over everywhere
+registerFilterPresenter('segmented', { kind: 'facet', component: MySegmented })
+setDefaultFilterPresenters({ facet: 'segmented', toggle: 'mySwitch' })
+
+<Deals.Filters />                                  // all filters, resolved by kind
+<Deals.Filters.stage presenter="segmented" />      // per-site override (kind-gated)
+<Deals.Filter name="stage">                        {/* render-prop: raw state, no registry */}
+  {({ meta, value, set, clear }) => <MyWidget options={meta.options} value={value} onChange={set} />}
+</Deals.Filter>
+```
+
+`FilterPresenterProps = { name, meta, value, set, clear, session, counts? }`
+— the list-state analogue of PresenterProps (`counts` reserved for facet
+counts). Until you register presenters, built-in SCAFFOLDING renders so
+demos work out of the box — unstyled, marked `data-ad-scaffold`, and it
+announces itself once in the console. It is demo furniture, not the
+product; the framework yields state and owns no display logic.
+
+## Combinators — "this or this", weightless and airtight (built)
+
+The default stays boring and right: array = OR-within a field, separate
+keys = AND-across. Two additions, no query-builder:
+
+```ts
+// value operators (Attr-codec-transformed, work in where() and filters):
+{ priority: { nin: ['low'] } }          // NOT IN
+{ tags: { all: ['hot', 'q3'] } }        // array column contains ALL
+
+// ONE cross-field combinator — depth-1 $or of flat allowlisted branches:
+filters: { $or: [{ stage: 'submitted' }, { priority: 'high' }],
+           bigDeals: true }             // → bigDeals AND (submitted OR high)
+```
+
+Security by construction: every branch key must be tier-1 allowlisted,
+every value runs the same codecs, max 10 branches, nesting rejected
+(`$or cannot nest`), named filters excluded from branches, and the whole
+group ANDs onto the door-scoped relation — narrowing only. Anything more
+complex than one flat OR belongs in a NAMED filter's server-side
+`apply()` — that escape hatch already takes arbitrary logic and changes
+without a client redeploy. Runtime primitive: `Relation.whereAny([...])`.

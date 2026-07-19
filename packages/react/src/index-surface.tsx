@@ -107,6 +107,64 @@ export interface IndexMeta {
   filters?: Record<string, IndexFilterMeta>
 }
 
+// ── Filter presenters — the SOCKET, mirroring form presenters ────────────────
+//
+// The framework yields STATE; the app owns the bulbs. Same contract as
+// <deal.name edit="myPresenter">: register once, resolve by kind, override
+// per call site, or drop to the render-prop for full control:
+//
+//   registerFilterPresenter('segmented', { kind: 'facet', component: MySegmented })
+//   setDefaultFilterPresenters({ facet: 'segmented' })
+//   <Deals.Filters.stage presenter="segmented" />          // per-site override
+//   <Deals.Filter name="stage">{p => <MyWidget {...p}/>}</Deals.Filter>
+//
+// Built-in SCAFFOLDING presenters keep <Deals.Filters/> working out of the
+// box but announce themselves (console, data-ad-scaffold) — they are demo
+// furniture, not the product. Ship your own.
+
+export interface FilterPresenterProps {
+  name: string
+  meta: IndexFilterMeta
+  value: any
+  /** Write the filter (session.setFilter — resets paging, clears on empty). */
+  set: (value: any) => void
+  clear: () => void
+  session: IndexSession
+  /** Facet counts, when an engine provides them (reserved). */
+  counts?: Record<string, number>
+}
+
+export interface FilterPresenterDef {
+  /** The filter kind this presenter serves, or '*' for any. */
+  kind: string
+  component: FC<FilterPresenterProps>
+}
+
+const _filterRegistry = new Map<string, FilterPresenterDef>()
+let _filterDefaults: Record<string, string> = {}
+
+export function registerFilterPresenter(name: string, def: FilterPresenterDef): void {
+  _filterRegistry.set(name, def)
+}
+export function setDefaultFilterPresenters(map: Record<string, string>): void {
+  _filterDefaults = { ..._filterDefaults, ...map }
+}
+export function clearFilterPresenters(): void {
+  _filterRegistry.clear()
+  _filterDefaults = {}
+}
+
+let _scaffoldWarned = false
+function warnScaffold(name: string): void {
+  if (_scaffoldWarned) return
+  _scaffoldWarned = true
+  console.info(
+    `[active-drizzle] filter "${name}" is rendering a SCAFFOLDING presenter (unstyled demo furniture). `
+    + `Register real ones: registerFilterPresenter('myFacet', { kind: 'facet', component }) + `
+    + `setDefaultFilterPresenters({ facet: 'myFacet' }) — or use <Surface.Filter name>{p => …}</Surface.Filter>.`,
+  )
+}
+
 // ── Surface factory (consumed by codegen) ────────────────────────────────────
 
 export interface IndexSurfaceConfig {
@@ -135,6 +193,8 @@ export interface IndexSurface {
   }>
   Search: FC<{ placeholder?: string; className?: string; debounceMs?: number }>
   Filters: FC<{ className?: string }> & Record<string, any>
+  /** Render-prop filter — full control, no registry: <Surface.Filter name="x">{p => …}</Surface.Filter> */
+  Filter: FC<{ name: string; children: (p: FilterPresenterProps) => ReactNode }>
   Items: FC<{ children: (handle: any, row: Record<string, any>) => ReactNode; empty?: ReactNode }>
   Pagination: FC<{ className?: string }>
   One: FC<{ id: number; poll?: { every: number; until?: (r: any) => boolean }; children: (form: any) => ReactNode; loading?: ReactNode }>
@@ -196,53 +256,79 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
   }
   ;(Search as any).displayName = 'AdIndexSearch'
 
-  // One filter widget — headless-ish defaults per kind, overridable by
-  // NOT rendering <Filters/> and driving the session via use()
-  const FilterWidget: FC<{ name: string; className?: string }> = ({ name, className }) => {
+  // ── SCAFFOLDING presenters — demo furniture with a name tag ─────────────
+  const ScaffoldFacet: FC<FilterPresenterProps> = ({ name, meta: fm, value, set }) => {
+    const selected: string[] = Array.isArray(value) ? value : value != null ? [value] : []
+    return (
+      <span data-ad-filter={name} data-ad-scaffold role="group" aria-label={fm.label}>
+        {(fm.options ?? []).map(opt => (
+          <button key={opt} type="button"
+            data-active={selected.includes(opt) || undefined}
+            aria-pressed={selected.includes(opt)}
+            onClick={() => set(selected.includes(opt) ? selected.filter(o => o !== opt) : [...selected, opt])}>
+            {opt}
+          </button>
+        ))}
+      </span>
+    )
+  }
+  const ScaffoldToggle: FC<FilterPresenterProps> = ({ name, meta: fm, value, set }) => (
+    <label data-ad-filter={name} data-ad-scaffold>
+      <input type="checkbox" checked={Boolean(value)} onChange={(e) => set(e.target.checked)} />
+      {fm.label}
+    </label>
+  )
+  const ScaffoldText: FC<FilterPresenterProps> = ({ name, meta: fm, value, set }) => (
+    <input data-ad-filter={name} data-ad-scaffold placeholder={fm.label}
+      defaultValue={value ?? ''} onChange={(e) => set(e.target.value)} />
+  )
+
+  /**
+   * The SOCKET. Resolution order (mirrors form fields):
+   *   props.presenter (component | registered name)
+   *   → setDefaultFilterPresenters[kind]
+   *   → scaffolding (announced once, marked data-ad-scaffold)
+   */
+  const FilterWidget: FC<{ name: string; presenter?: string | FC<FilterPresenterProps>; className?: string; props?: Record<string, any> }> = ({ name, presenter, className, props: extra }) => {
     const { session, meta } = useCtx()
     const fm = meta.filters?.[name]
     if (!fm) return null
     const state = useSessionState(session)
-    const value = state.filters[name]
 
-    if (fm.kind === 'facet' && fm.options) {
-      const selected: string[] = Array.isArray(value) ? value : value != null ? [value] : []
-      return (
-        <span {...(className !== undefined ? { className } : {})} data-ad-filter={name} role="group" aria-label={fm.label}>
-          {fm.options.map(opt => (
-            <button
-              key={opt}
-              type="button"
-              data-active={selected.includes(opt) || undefined}
-              aria-pressed={selected.includes(opt)}
-              onClick={() => {
-                const next = selected.includes(opt) ? selected.filter(o => o !== opt) : [...selected, opt]
-                session.setFilter(name, next)
-              }}
-            >
-              {opt}
-            </button>
-          ))}
-        </span>
-      )
+    let Component: FC<FilterPresenterProps> | null = null
+    let scaffold = false
+    if (typeof presenter === 'function') {
+      Component = presenter
+    } else {
+      const presenterName = presenter ?? _filterDefaults[fm.kind] ?? _filterDefaults['*']
+      if (presenterName) {
+        const def = _filterRegistry.get(presenterName)
+        if (!def) throw new Error(`[active-drizzle] filter presenter "${presenterName}" (filter "${name}") is not registered`)
+        if (def.kind !== '*' && def.kind !== fm.kind) {
+          throw new Error(`[active-drizzle] filter presenter "${presenterName}" serves kind "${def.kind}", not "${fm.kind}" (filter "${name}")`)
+        }
+        Component = def.component
+      }
     }
-    if (fm.kind === 'toggle') {
-      return (
-        <label {...(className !== undefined ? { className } : {})} data-ad-filter={name}>
-          <input type="checkbox" checked={Boolean(value)} onChange={(e) => session.setFilter(name, e.target.checked)} />
-          {fm.label}
-        </label>
-      )
+    if (!Component) {
+      scaffold = true
+      Component = fm.kind === 'facet' ? ScaffoldFacet : fm.kind === 'toggle' ? ScaffoldToggle : ScaffoldText
     }
-    // text fallback (also covers custom kinds until a presenter is registered)
+    if (scaffold) warnScaffold(name)
+
+    const p: FilterPresenterProps = {
+      name,
+      meta: fm,
+      value: state.filters[name],
+      set: (v: any) => session.setFilter(name, v),
+      clear: () => session.setFilter(name, undefined),
+      session,
+      ...(extra ?? {}),
+    }
     return (
-      <input
-        {...(className !== undefined ? { className } : {})}
-        data-ad-filter={name}
-        placeholder={fm.label}
-        defaultValue={value ?? ''}
-        onChange={(e) => session.setFilter(name, e.target.value)}
-      />
+      <span {...(className !== undefined ? { className } : {})} data-ad-filter-slot={name}>
+        <Component {...p} />
+      </span>
     )
   }
 
@@ -257,17 +343,38 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
     )
   }
   ;(FiltersBase as any).displayName = 'AdIndexFilters'
-  // Per-filter placement: <Surface.Filters.stage className=.../>
+  // Per-filter placement + presenter override: <Surface.Filters.stage presenter="segmented"/>
   const Filters = new Proxy(FiltersBase as IndexSurface['Filters'], {
     get(target, prop: string | symbol) {
       if (typeof prop === 'string' && cfg.meta.filters?.[prop]) {
-        const Single: FC<{ className?: string }> = (p) => <FilterWidget name={prop} {...p} />
+        const Single: FC<{ presenter?: string | FC<FilterPresenterProps>; className?: string; props?: Record<string, any> }> =
+          (p) => <FilterWidget name={prop} {...p} />
         Single.displayName = `AdIndexFilter(${prop})`
         return Single
       }
       return (target as any)[prop]
     },
   })
+
+  // Full-control escape hatch — no registry, no defaults, just state:
+  // <Surface.Filter name="stage">{({ value, set, meta }) => …}</Surface.Filter>
+  const Filter: FC<{ name: string; children: (p: FilterPresenterProps) => ReactNode }> = ({ name, children }) => {
+    const { session, meta } = useCtx()
+    const fm = meta.filters?.[name]
+    const state = useSessionState(session)
+    if (!fm) return null
+    return (
+      <>{children({
+        name,
+        meta: fm,
+        value: state.filters[name],
+        set: (v: any) => session.setFilter(name, v),
+        clear: () => session.setFilter(name, undefined),
+        session,
+      })}</>
+    )
+  }
+  ;(Filter as any).displayName = 'AdIndexFilterRP'
 
   const Items: IndexSurface['Items'] = ({ children, empty }) => {
     const { query } = useCtx()
@@ -328,5 +435,5 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
     }
   }
 
-  return { Index, Search, Filters, Items, Pagination, One, use }
+  return { Index, Search, Filters, Filter, Items, Pagination, One, use }
 }

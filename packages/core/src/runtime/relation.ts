@@ -1,4 +1,5 @@
-import { eq, and, or, inArray, isNull, ilike, desc, asc, gte, lte, gt, lt, ne, sql, type SQL } from 'drizzle-orm'
+import { eq, and, or, inArray, notInArray, arrayContains, isNull, ilike, desc, asc, gte, lte, gt, lt, ne, sql, type SQL } from 'drizzle-orm'
+import { union, unionAll, intersect, except } from 'drizzle-orm/pg-core'
 import { getExecutor, getSchema, MODEL_REGISTRY, transaction, RecordNotFound } from './boot.js'
 import { modelClassName } from './class-name.js'
 import type { ApplicationRecord } from './application-record.js'
@@ -36,6 +37,12 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   
   protected _skipAllDefaultScopes = false
   protected _excludedDefaultScopes = new Set<string>()
+
+  // ── Advanced query state (group/having, distinct, window select) ──────────
+  protected _group: { col: any; field: string | null }[] = []
+  protected _having: SQL | undefined
+  protected _distinct = false
+  protected _distinctOn: any[] | undefined
 
   constructor(modelClass: any) {
     this._ctor = modelClass
@@ -87,6 +94,33 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
       return ilike(col, pattern)
     })
     this._where.push(conds.length === 1 ? conds[0]! : or(...conds)!)
+    return this
+  }
+
+  /**
+   * OR across hash-condition branches — each branch AND-composes internally,
+   * the branches OR together, and the whole group ANDs with everything else:
+   *
+   *   Deal.all().whereAny([{ stage: 'draft' }, { priority: 'high' }])
+   *   → WHERE (stage = 0 OR priority = 2)
+   *
+   * Branches use the SAME hash grammar as where() (codec transforms,
+   * arrays → IN, operator objects) — depth 1 by design: no nested boolean
+   * trees. Empty/blank branches are skipped; no valid branches = no-op.
+   */
+  public whereAny(branches: Array<Record<string, any>>): this {
+    const exprs: SQL[] = []
+    for (const branch of branches) {
+      if (!branch || typeof branch !== 'object' || Array.isArray(branch)) continue
+      if (Object.keys(branch).length === 0) continue
+      const scratch = this._clone()
+      scratch._where = []
+      scratch._applyHashWhere(branch)
+      if (scratch._where.length === 1) exprs.push(scratch._where[0]!)
+      else if (scratch._where.length > 1) exprs.push(and(...scratch._where) as SQL)
+    }
+    if (exprs.length === 1) this._where.push(exprs[0]!)
+    else if (exprs.length > 1) this._where.push(or(...exprs) as SQL)
     return this
   }
 
@@ -229,6 +263,73 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
       next._skipAllDefaultScopes = true
     }
     return next
+  }
+
+  // ── Advanced query modifiers ──────────────────────────────────────────────
+
+  /** Resolves a camelCase field (honoring `Attr.for` column maps) to its drizzle column. */
+  protected _col(field: string): any {
+    const table = this.getTable()
+    const col = table[_resolveColKey(this._ctor, field)]
+    if (!col) throw new Error(`Column "${field}" not found on table "${this._tableName}"`)
+    return col
+  }
+
+  /**
+   * GROUP BY. Turns the aggregate terminals (`count`/`sum`/`average`/`minimum`/
+   * `maximum`) into `{ groupKey → value }` maps, exactly like Rails'
+   * `Order.group(:status).sum(:total)`. Accepts field names or raw `sql`.
+   */
+  public group(...fields: (string | SQL)[]): this {
+    for (const f of fields) {
+      if (typeof f === 'string') this._group.push({ col: this._col(f), field: f })
+      else this._group.push({ col: f, field: null })
+    }
+    return this
+  }
+
+  /** HAVING — filter groups. `.group('userId').having(sql`count(*) > 5`)`. */
+  public having(condition: SQL): this {
+    this._having = this._having ? (and(this._having, condition) as SQL) : condition
+    return this
+  }
+
+  /**
+   * `.distinct()`            → SELECT DISTINCT
+   * `.distinct('userId')`    → SELECT DISTINCT ON (user_id) …  (one row per group;
+   *                            pair with `.order('userId').order('placedAt','desc')`
+   *                            for "latest per user")
+   */
+  public distinct(on?: string | string[]): this {
+    if (on === undefined) { this._distinct = true; return this }
+    this._distinctOn = (Array.isArray(on) ? on : [on]).map(f => this._col(f))
+    return this
+  }
+
+  /**
+   * Keyset / cursor pagination — O(1) deep paging that OFFSET can't do.
+   * Orders by `fields` and, when `after` is given, keeps only rows strictly
+   * past that cursor via a row-value comparison `(a,b) > (va,vb)`.
+   *
+   *   const page1 = await Product.all().seek(['createdAt', 'id']).limit(20)
+   *   const page2 = await Product.all().seek(['createdAt','id'], { after: page1.at(-1)! }).limit(20)
+   */
+  public seek(fields: string[], opts: { after?: Record<string, any>; dir?: 'asc' | 'desc' } = {}): this {
+    const dir  = opts.dir ?? 'asc'
+    const cols = fields.map(f => this._col(f))
+    for (const c of cols) this._order.push((dir === 'desc' ? desc(c) : asc(c)) as SQL)
+    if (opts.after) {
+      const vals = fields.map(f => {
+        const attr = (this._ctor as any)[f]
+        const v = (opts.after as any)[f]
+        return attr?._isAttr && attr.set ? attr.set(v) : v
+      })
+      const cmp = dir === 'desc' ? sql`<` : sql`>`
+      this._where.push(
+        sql`(${sql.join(cols, sql`, `)}) ${cmp} (${sql.join(vals.map(v => sql`${v}`), sql`, `)})` as SQL,
+      )
+    }
+    return this
   }
 
   // ── Execution ───────────────────────────────────────────────────────────
@@ -394,76 +495,69 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
 
   // ── Aggregates ────────────────────────────────────────────────────────────
 
-  /** Returns the count of matching records. */
+  /**
+   * Shared aggregate engine. Without `.group(...)` returns the scalar; with
+   * `.group(...)` returns a `{ groupKey → value }` map (Rails-style overload),
+   * applying `.having(...)` and Attr.get on the group keys (enum ints → labels).
+   */
+  private async _agg(aggExpr: SQL, scalarDefault: any, toScalar: (v: any) => any): Promise<any> {
+    const grouped = this._group.length > 0
+    if ((this as any)._isNone) return grouped ? {} : scalarDefault
+
+    const rel   = this._withDefaultScopes()
+    const table = rel.getTable()
+    const where = rel._buildFinalWhere()
+
+    if (!grouped) {
+      let q: any = getExecutor().select({ n: aggExpr }).from(table)
+      if (where) q = q.where(where)
+      const [row] = await q
+      return toScalar((row as any)?.n)
+    }
+
+    const sel: Record<string, any> = { n: aggExpr }
+    rel._group.forEach((g, i) => { sel['_g' + i] = g.col })
+    let q: any = getExecutor().select(sel).from(table)
+    if (where) q = q.where(where)
+    q = q.groupBy(...rel._group.map(g => g.col))
+    if (rel._having) q = q.having(rel._having)
+
+    const rows: any[] = await q
+    const out: Record<string, any> = {}
+    for (const r of rows) {
+      const key = rel._group.map((g, i) => {
+        const raw  = r['_g' + i]
+        const attr = g.field ? (rel._ctor as any)[g.field] : undefined
+        return attr?._isAttr && attr.get ? String(attr.get(raw)) : String(raw ?? 'null')
+      }).join(',')
+      out[key] = toScalar(r.n)
+    }
+    return out
+  }
+
+  /** Count of matching records — or, with `.group(...)`, a `{ groupKey → count }` map. */
   public async count(): Promise<number> {
-    if ((this as any)._isNone) return 0
-    const rel       = this._withDefaultScopes()
-    const table     = rel.getTable()
-    const whereExpr = rel._buildFinalWhere()
-    let q: any = getExecutor().select({ n: sql`count(*)::int` }).from(table)
-    if (whereExpr) q = q.where(whereExpr)
-    const [row] = await q
-    return Number((row as any)?.n ?? 0)
+    return this._agg(sql`count(*)::int`, 0, v => Number(v ?? 0))
   }
 
-  /** Returns the SUM of a column. Applies Attr.for column mapping. */
+  /** SUM of a column (Attr.for aware) — scalar, or a `{ groupKey → sum }` map when grouped. */
   public async sum(field: string): Promise<number> {
-    if ((this as any)._isNone) return 0
-    const rel    = this._withDefaultScopes()
-    const table  = rel.getTable()
-    const colKey = _resolveColKey(rel._ctor, field)
-    const col    = table[colKey]
-    if (!col) throw new Error(`Column "${colKey}" not found on "${rel._tableName}"`)
-    const whereExpr = rel._buildFinalWhere()
-    let q: any = getExecutor().select({ n: sql`coalesce(sum(${col}), 0)::numeric` }).from(table)
-    if (whereExpr) q = q.where(whereExpr)
-    const [row] = await q
-    return Number((row as any)?.n ?? 0)
+    return this._agg(sql`coalesce(sum(${this._col(field)}), 0)::numeric`, 0, v => Number(v ?? 0))
   }
 
-  /** Returns the AVERAGE of a column, or null if no rows. */
+  /** AVERAGE of a column (null if no rows) — or a `{ groupKey → avg }` map when grouped. */
   public async average(field: string): Promise<number | null> {
-    if ((this as any)._isNone) return null
-    const rel    = this._withDefaultScopes()
-    const table  = rel.getTable()
-    const colKey = _resolveColKey(rel._ctor, field)
-    const col    = table[colKey]
-    if (!col) throw new Error(`Column "${colKey}" not found on "${rel._tableName}"`)
-    const whereExpr = rel._buildFinalWhere()
-    let q: any = getExecutor().select({ n: sql`avg(${col})::numeric` }).from(table)
-    if (whereExpr) q = q.where(whereExpr)
-    const [row] = await q
-    return (row as any)?.n == null ? null : Number((row as any).n)
+    return this._agg(sql`avg(${this._col(field)})::numeric`, null, v => (v == null ? null : Number(v)))
   }
 
-  /** Returns the minimum value of a column. */
+  /** Minimum value of a column — or a `{ groupKey → min }` map when grouped. */
   public async minimum(field: string): Promise<any> {
-    if ((this as any)._isNone) return null
-    const rel    = this._withDefaultScopes()
-    const table  = rel.getTable()
-    const colKey = _resolveColKey(rel._ctor, field)
-    const col    = table[colKey]
-    if (!col) throw new Error(`Column "${colKey}" not found on "${rel._tableName}"`)
-    const whereExpr = rel._buildFinalWhere()
-    let q: any = getExecutor().select({ n: sql`min(${col})` }).from(table)
-    if (whereExpr) q = q.where(whereExpr)
-    const [row] = await q
-    return (row as any)?.n ?? null
+    return this._agg(sql`min(${this._col(field)})`, null, v => v ?? null)
   }
 
-  /** Returns the maximum value of a column. */
+  /** Maximum value of a column — or a `{ groupKey → max }` map when grouped. */
   public async maximum(field: string): Promise<any> {
-    if ((this as any)._isNone) return null
-    const rel    = this._withDefaultScopes()
-    const table  = rel.getTable()
-    const colKey = _resolveColKey(rel._ctor, field)
-    const col    = table[colKey]
-    if (!col) throw new Error(`Column "${colKey}" not found on "${rel._tableName}"`)
-    const whereExpr = rel._buildFinalWhere()
-    let q: any = getExecutor().select({ n: sql`max(${col})` }).from(table)
-    if (whereExpr) q = q.where(whereExpr)
-    const [row] = await q
-    return (row as any)?.n ?? null
+    return this._agg(sql`max(${this._col(field)})`, null, v => v ?? null)
   }
 
   /**
@@ -871,6 +965,66 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     })
   }
 
+  /**
+   * Arbitrary projection — the window-function / computed-column escape hatch.
+   * The callback receives the drizzle table (real columns) and `Fn` (window
+   * helpers) and returns a selection map. Honors current where/group/having/
+   * order/limit and returns plain typed rows (NOT model instances).
+   *
+   *   // rank products by price within their type
+   *   await Product.all().select((t, fn) => ({
+   *     name: t.name,
+   *     rank: fn.rank().over({ partitionBy: t.type, orderBy: desc(t.priceInCents) }),
+   *   }))
+   */
+  public async select<S extends Record<string, any>>(
+    build: (t: any, fn: typeof Fn) => S,
+  ): Promise<{ [K in keyof S]: any }[]> {
+    if ((this as any)._isNone) return []
+    const rel   = this._withDefaultScopes()
+    const table = rel.getTable()
+    const where = rel._buildFinalWhere()
+
+    let q: any = getExecutor().select(build(table, Fn)).from(table)
+    if (where) q = q.where(where)
+    if (rel._group.length > 0) q = q.groupBy(...rel._group.map(g => g.col))
+    if (rel._having) q = q.having(rel._having)
+    if (rel._order.length > 0) q = q.orderBy(...rel._order)
+    if (rel._limit) q = q.limit(rel._limit)
+    if (rel._offset > 0) q = q.offset(rel._offset)
+    return await q
+  }
+
+  // ── Set operations (UNION / INTERSECT / EXCEPT) → model instances ─────────
+  public union(other: Relation<TModel>): Promise<TModel[]>     { return this._setOp(union, other) }
+  public unionAll(other: Relation<TModel>): Promise<TModel[]>  { return this._setOp(unionAll, other) }
+  public intersect(other: Relation<TModel>): Promise<TModel[]> { return this._setOp(intersect, other) }
+  public except(other: Relation<TModel>): Promise<TModel[]>    { return this._setOp(except, other) }
+
+  private async _setOp(op: any, other: Relation<TModel>): Promise<TModel[]> {
+    const db = getExecutor()
+    const leg = (r: Relation<TModel>) => {
+      const s = r._withDefaultScopes()
+      let q: any = db.select().from(s.getTable())
+      const w = s._buildFinalWhere()
+      return w ? q.where(w) : q
+    }
+    let combined: any = op(leg(this), leg(other))
+    if (this._order.length > 0) combined = combined.orderBy(...this._order)
+    if (this._limit) combined = combined.limit(this._limit)
+    const rows: any[] = await combined
+    return rows.map((r: any) => new (this._ctor as any)(r, false))
+  }
+
+  /**
+   * Compiles the current query to `{ sql, params }` without running it — the
+   * "let me see the SQL" debugging tool every ORM should have.
+   */
+  public toSQL(): { sql: string; params: unknown[] } {
+    if ((this as any)._isNone) return { sql: 'select where false', params: [] }
+    return (this._buildQuery() as any).toSQL()
+  }
+
   // ── Internals ────────────────────────────────────────────────────────────
 
   /**
@@ -924,6 +1078,10 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     c._offset   = this._offset
     c._order    = [...this._order]
     c._includes = { ...this._includes }
+    c._group    = [...this._group]
+    c._having   = this._having
+    c._distinct = this._distinct
+    if (this._distinctOn) c._distinctOn = [...this._distinctOn]
     if ((this as any)._isNone) (c as any)._isNone = true
     if ((this as any)._ftsRank) (c as any)._ftsRank = (this as any)._ftsRank
     // Association create-defaults survive chaining (deal.comments.order(...).create(...))
@@ -974,8 +1132,20 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
         const OPS: Record<string, (c: any, v: any) => SQL> = { gte, lte, gt, lt, ne } as any
         for (const [op, bound] of Object.entries(rawVal)) {
           if (bound === undefined || bound === null || bound === '') continue
+          if (op === 'nin') {
+            // NOT IN — "everything except these"
+            const vals = (Array.isArray(bound) ? bound : [bound]).map(transform)
+            this._where.push(notInArray(col, vals) as SQL)
+            continue
+          }
+          if (op === 'all') {
+            // array-column contains ALL of these (tags: has every one)
+            const vals = (Array.isArray(bound) ? bound : [bound]).map(transform)
+            this._where.push(arrayContains(col, vals) as SQL)
+            continue
+          }
           const fn = OPS[op]
-          if (!fn) throw new Error(`Unknown where operator "${op}" for "${key}" (supported: gte, lte, gt, lt, ne)`)
+          if (!fn) throw new Error(`Unknown where operator "${op}" for "${key}" (supported: gte, lte, gt, lt, ne, nin, all)`)
           this._where.push(fn(col, transform(bound)))
         }
       } else {
@@ -991,15 +1161,21 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     const db = getExecutor()
     const whereExpr = this._buildFinalWhere()
 
-    // FOR UPDATE requires the select builder (not findMany)
-    if ((this as any)._forUpdate) {
+    // FOR UPDATE / DISTINCT / DISTINCT ON all require the core select builder
+    // (the relational `findMany` API can't express them). Rows come back flat
+    // and instantiate straight into model proxies.
+    const forUpdate = (this as any)._forUpdate
+    if (forUpdate || this._distinct || this._distinctOn) {
       const table = this.getTable()
-      let q: any = db.select().from(table)
+      let q: any =
+        this._distinctOn ? db.selectDistinctOn(this._distinctOn).from(table)
+        : this._distinct  ? db.selectDistinct().from(table)
+        :                   db.select().from(table)
       if (whereExpr) q = q.where(whereExpr)
+      if (this._order.length > 0) q = q.orderBy(...this._order)
       if (this._limit) q = q.limit(this._limit)
       if (this._offset > 0) q = q.offset(this._offset)
-      if (this._order.length > 0) q = q.orderBy(...this._order)
-      return q.for('update')
+      return forUpdate ? q.for('update') : q
     }
 
     const config: Record<string, any> = {}
@@ -1012,6 +1188,50 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     return (db.query as any)[this._tableName].findMany(config)
   }
 }
+
+// ── Window functions (for `.select((t, Fn) => …)`) ───────────────────────────
+
+/** OVER (PARTITION BY … ORDER BY …). Each field accepts a column or a drizzle expr (e.g. `desc(col)`). */
+export type OverSpec = { partitionBy?: any | any[]; orderBy?: any | any[] }
+
+function _buildOver(spec: OverSpec): SQL {
+  const parts: SQL[] = []
+  if (spec.partitionBy != null) {
+    const cols = Array.isArray(spec.partitionBy) ? spec.partitionBy : [spec.partitionBy]
+    parts.push(sql`partition by ${sql.join(cols, sql`, `)}`)
+  }
+  if (spec.orderBy != null) {
+    const cols = Array.isArray(spec.orderBy) ? spec.orderBy : [spec.orderBy]
+    parts.push(sql`order by ${sql.join(cols, sql`, `)}`)
+  }
+  return sql`over (${sql.join(parts, sql` `)})`
+}
+
+/** Wraps a bare aggregate/window expression so `.over(...)` turns it into a window function. */
+function _win(expr: SQL): { over: (spec: OverSpec) => SQL } {
+  return { over: (spec: OverSpec) => sql<number>`${expr} ${_buildOver(spec)}` }
+}
+
+/**
+ * Window-function helpers passed to `.select((t, Fn) => …)`. Ranking, running
+ * totals, moving windows, LAG/LEAD — all Postgres window functions, typed and
+ * composable, without dropping to raw SQL.
+ */
+export const Fn = {
+  rowNumber: ()                       => _win(sql`row_number()`),
+  rank:      ()                       => _win(sql`rank()`),
+  denseRank: ()                       => _win(sql`dense_rank()`),
+  ntile:     (buckets: number)        => _win(sql`ntile(${buckets})`),
+  count:     (col?: any)              => _win(col != null ? sql`count(${col})` : sql`count(*)`),
+  sum:       (col: any)               => _win(sql`sum(${col})`),
+  avg:       (col: any)               => _win(sql`avg(${col})`),
+  min:       (col: any)               => _win(sql`min(${col})`),
+  max:       (col: any)               => _win(sql`max(${col})`),
+  lag:       (col: any, n = 1)        => _win(sql`lag(${col}, ${n})`),
+  lead:      (col: any, n = 1)        => _win(sql`lead(${col}, ${n})`),
+  firstValue:(col: any)               => _win(sql`first_value(${col})`),
+  lastValue: (col: any)               => _win(sql`last_value(${col})`),
+} as const
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -1048,7 +1268,7 @@ function _toDrizzleWith(spec: any): any {
 function _isOperatorObject(v: any): boolean {
   if (!v || typeof v !== 'object' || Array.isArray(v) || v instanceof Date) return false
   const keys = Object.keys(v)
-  return keys.length > 0 && keys.every(k => ['gte', 'lte', 'gt', 'lt', 'ne'].includes(k))
+  return keys.length > 0 && keys.every(k => ['gte', 'lte', 'gt', 'lt', 'ne', 'nin', 'all'].includes(k))
 }
 
 function _isPlainObject(val: unknown): val is Record<string, unknown> {

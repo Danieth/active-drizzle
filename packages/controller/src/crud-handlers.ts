@@ -231,6 +231,37 @@ export async function defaultIndex(
   // 4. Column filters (tier 1 — allowlisted, codec-converted)
   const filterableFields = idx.filterable ?? []
   const rawFilters = params.filters ?? {}
+
+  // 4.0 `$or` — the ONLY cross-field combinator, deliberately depth-1:
+  // an array of flat branches, every key allowlisted tier-1, every value
+  // codec-converted, capped at 10 branches, no nesting, named filters
+  // excluded. Branches OR together; the group ANDs with everything else.
+  // Arbitrary boolean logic beyond this belongs in a NAMED filter's
+  // server-side apply() — never in a client-supplied tree.
+  const orBranches = (rawFilters as any)['$or']
+  if (orBranches !== undefined) {
+    if (!Array.isArray(orBranches)) throw new BadRequest(`$or must be an array of filter branches`)
+    if (orBranches.length > 10) throw new BadRequest(`$or supports at most 10 branches`)
+    const converted: Array<Record<string, any>> = []
+    for (const branch of orBranches) {
+      if (!branch || typeof branch !== 'object' || Array.isArray(branch)) {
+        throw new BadRequest(`$or branches must be objects`)
+      }
+      const clean: Record<string, any> = {}
+      for (const [key, raw] of Object.entries(branch)) {
+        if (!filterableFields.includes(key)) throw new BadRequest(`Cannot filter by '${key}' (in $or)`)
+        if (raw !== null && typeof raw === 'object' && !Array.isArray(raw) && '$or' in (raw as any)) {
+          throw new BadRequest(`$or cannot nest`)
+        }
+        clean[key] = convertFilterValue(model, key, raw)
+      }
+      if (Object.keys(clean).length) converted.push(clean)
+    }
+    if (converted.length) {
+      if (typeof rel.whereAny !== 'function') throw new BadRequest(`$or requires a Relation with .whereAny()`)
+      rel = rel.whereAny(converted)
+    }
+  }
   for (const field of filterableFields) {
     const raw = rawFilters[field]
     if (raw === undefined || raw === null) continue
@@ -250,8 +281,9 @@ export async function defaultIndex(
     if (applied) rel = applied
   }
 
-  // Reject undeclared filter keys — never a silent no-op
+  // Reject undeclared filter keys — never a silent no-op ($or handled above)
   for (const key of Object.keys(rawFilters)) {
+    if (key === '$or') continue
     if (!filterableFields.includes(key) && !(key in namedFilters)) {
       throw new BadRequest(`Cannot filter by '${key}'`)
     }

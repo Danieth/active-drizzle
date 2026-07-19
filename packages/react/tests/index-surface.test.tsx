@@ -34,3 +34,62 @@ describe('surface probe', () => {
     expect(screen.getByText('Acme')).toBeTruthy()
   })
 })
+
+describe('filter presenter SOCKET (mirrors form presenters)', async () => {
+  const { registerFilterPresenter, setDefaultFilterPresenters, clearFilterPresenters } = await import('../src/index.js')
+
+  function makeSurface() {
+    return createIndexSurface({
+      meta: { searchable: false, filters: {
+        stage: { kind: 'facet', label: 'Stage', options: ['draft', 'won'] },
+        hot: { kind: 'toggle', label: 'Hot' },
+      } },
+      useIndexQuery: () => ({ data: { data: [], pagination: null }, isLoading: false, isError: false }),
+      makeRowHandle: (r) => r,
+    })
+  }
+
+  it('scaffolding renders by default and is LABELED as scaffolding', () => {
+    clearFilterPresenters()
+    const S = makeSurface()
+    render(<S.Index><S.Filters /></S.Index>)
+    expect(document.querySelectorAll('[data-ad-scaffold]').length).toBeGreaterThan(0)
+  })
+
+  it('a registered kind-default REPLACES scaffolding for every matching filter', () => {
+    clearFilterPresenters()
+    registerFilterPresenter('segmented', { kind: 'facet', component: ({ name }) => <b data-custom={name}>SEG</b> })
+    setDefaultFilterPresenters({ facet: 'segmented' })
+    const S = makeSurface()
+    render(<S.Index><S.Filters /></S.Index>)
+    expect(document.querySelector('[data-custom="stage"]')).toBeTruthy()          // custom took over
+    expect(document.querySelector('[data-ad-filter="stage"][data-ad-scaffold]')).toBeNull()
+    expect(document.querySelector('[data-ad-filter="hot"][data-ad-scaffold]')).toBeTruthy()  // toggle still scaffold
+    clearFilterPresenters()
+  })
+
+  it('per-site presenter override + kind gating', () => {
+    clearFilterPresenters()
+    registerFilterPresenter('special', { kind: 'facet', component: () => <i data-special /> })
+    const S = makeSurface()
+    render(<S.Index><S.Filters.stage presenter="special" /></S.Index>)
+    expect(document.querySelector('[data-special]')).toBeTruthy()
+    // a facet presenter on a toggle filter must throw (kind gate)
+    expect(() => render(<S.Index><S.Filters.hot presenter="special" /></S.Index>)).toThrow(/serves kind/)
+    clearFilterPresenters()
+  })
+
+  it('the render-prop Filter yields raw state — no registry involved', () => {
+    clearFilterPresenters()
+    const S = makeSurface()
+    let got: any = null
+    render(
+      <S.Index>
+        <S.Filter name="stage">{(p) => { got = p; return <u>{String(p.value ?? 'none')}</u> }}</S.Filter>
+      </S.Index>,
+    )
+    expect(got.meta.kind).toBe('facet')
+    expect(typeof got.set).toBe('function')
+    expect(typeof got.clear).toBe('function')
+  })
+})

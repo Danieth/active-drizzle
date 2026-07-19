@@ -65,4 +65,5 @@ For a financial app, encrypting PII/secrets is often a compliance line, not a fe
 | 1 | Generated code typechecks clean | Correctness/trust | First thing evaluators run |
 | 2 | No internal-error leakage | Security | Data exposure across boundary |
 | 3 | Stable error codes | API contract | Breaking to add post-launch |
-| 4 | CHANGELOG / semver / example / runtime matrix | Trust | Adoption + "safe to build on" |
+| 4 | Encryption at rest (field + S3 file) | Compliance/format | Backfill + key ceremony painful post-launch |
+| 5 | CHANGELOG / semver / example / runtime matrix | Trust | Adoption + "safe to build on" |

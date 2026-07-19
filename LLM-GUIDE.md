@@ -257,6 +257,20 @@ onFormEvents(e => {   // types: 'rehydrated' | 'conflict' | 'saved' | 'draft-res
 
 <Deals.One id={5}>{form => <form.Form>…</form.Form>}</Deals.One>
 
+// filter presenters — register once, resolve by kind (mirrors form presenters):
+registerFilterPresenter('segmented', { kind: 'facet', component: MySegmented })
+setDefaultFilterPresenters({ facet: 'segmented' })
+<Deals.Filters.stage presenter="segmented" />   // per-site override, kind-gated
+<Deals.Filter name="stage">{({ meta, value, set, clear }) => <MyWidget/>}</Deals.Filter>  // raw state
+// FilterPresenterProps = { name, meta, value, set, clear, session, counts? }
+// unregistered kinds render SCAFFOLDING (data-ad-scaffold, console notice) — replace in real apps
+
+// combinators (all allowlisted + codec-transformed; depth-1 by design):
+ix.session.setFilter('priority', { nin: ['low'] })          // NOT IN
+ix.session.setFilter('tags', { all: ['hot', 'q3'] })        // array contains ALL
+ix.session.setFilter('$or', [{ stage: 'submitted' }, { priority: 'high' }])  // (a OR b) AND rest
+// max 10 branches, no nesting, tier-1 fields only; richer logic = a NAMED filter's apply()
+
 // custom widgets / tier-2 named filters via the session:
 const ix = Deals.use()   // { session, state, meta, rows, pagination, isLoading }
 ix.session.setFilter('bigDeals', true)     // wire name from the controller's filters config
