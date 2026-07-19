@@ -225,6 +225,16 @@ export interface PaginationResult {
 export interface IndexResult {
   data: any[]
   pagination: PaginationResult
+  /** Disjunctive facet counts (index.facets) — { field: { label: n } }. */
+  facets?: Record<string, Record<string, number>>
+  /** Categorical aggregation (chart param) — [{ x, y }] with label keys. */
+  chart?: Array<{ x: string; y: number }>
+  /** Scalar aggregation (metric param). */
+  metric?: number | string | null
+  /** Present ONLY when the page is empty: why. 'no-records' = the door
+   *  scope is empty; 'no-matches' = records exist but filters/search
+   *  excluded them all. Costs one extra COUNT, only on empty pages. */
+  emptyReason?: 'no-records' | 'no-matches'
 }
 
 export interface IndexParams {
@@ -235,7 +245,12 @@ export interface IndexParams {
   ids?: number[]
   sort?: { field: string; dir?: 'asc' | 'desc' }
   page?: number
+  /** perPage: 0 is legal for chart/metric-only calls — skips data + count. */
   perPage?: number
+  /** Categorical chart request: x ∈ index.chartable, y = 'count' | 'sum:F' | 'avg:F' (F ∈ index.measures). */
+  chart?: { x: string; y?: string }
+  /** Scalar metric request: 'count' | 'sum:F' | 'avg:F' (F ∈ index.measures). */
+  metric?: string
 }
 
 // ── Index ─────────────────────────────────────────────────────────────────────
@@ -276,6 +291,9 @@ export async function defaultIndex(
   // 4. Column filters (tier 1 — allowlisted, codec-converted)
   const filterableFields = idx.filterable ?? []
   const rawFilters = params.filters ?? {}
+  const namedFilters = idx.filters ?? {}
+  const q = typeof params.q === 'string' ? params.q.trim() : ''
+  let searchedFts = false
 
   // 4.0 `$or` — the ONLY cross-field combinator, deliberately depth-1:
   // an array of flat branches, every key allowlisted tier-1, every value
@@ -284,10 +302,10 @@ export async function defaultIndex(
   // Arbitrary boolean logic beyond this belongs in a NAMED filter's
   // server-side apply() — never in a client-supplied tree.
   const orBranches = (rawFilters as any)['$or']
+  let convertedOr: Array<Record<string, any>> = []
   if (orBranches !== undefined) {
     if (!Array.isArray(orBranches)) throw new BadRequest(`$or must be an array of filter branches`)
     if (orBranches.length > 10) throw new BadRequest(`$or supports at most 10 branches`)
-    const converted: Array<Record<string, any>> = []
     for (const branch of orBranches) {
       if (!branch || typeof branch !== 'object' || Array.isArray(branch)) {
         throw new BadRequest(`$or branches must be objects`)
@@ -300,30 +318,8 @@ export async function defaultIndex(
         }
         clean[key] = convertFilterValue(model, key, raw)
       }
-      if (Object.keys(clean).length) converted.push(clean)
+      if (Object.keys(clean).length) convertedOr.push(clean)
     }
-    if (converted.length) {
-      if (typeof rel.whereAny !== 'function') throw new BadRequest(`$or requires a Relation with .whereAny()`)
-      rel = rel.whereAny(converted)
-    }
-  }
-  for (const field of filterableFields) {
-    const raw = rawFilters[field]
-    if (raw === undefined || raw === null) continue
-    const converted = convertFilterValue(model, field, raw)
-    rel = rel.where({ [field]: converted })
-  }
-
-  // 4.2 NAMED filters (tier 2 — product semantics live server-side).
-  // apply() receives the already-scoped relation: narrowing-only by
-  // construction. A falsy value means "filter not engaged" for toggles;
-  // param-shaped filters (ranges etc.) pass their object through.
-  const namedFilters = idx.filters ?? {}
-  for (const [name, def] of Object.entries(namedFilters)) {
-    const value = rawFilters[name]
-    if (value === undefined || value === null || value === false || value === '') continue
-    const applied = def.apply(rel, value, ctx, ctrl)
-    if (applied) rel = applied
   }
 
   // Reject undeclared filter keys — never a silent no-op ($or handled above)
@@ -334,24 +330,58 @@ export async function defaultIndex(
     }
   }
 
-  // 4.5 Substring search (q ORed across the searchable allowlist).
-  // The SQL is built by Relation.search — core's drizzle instance — so the
-  // controller stays free of drizzle imports (mixed copies don't compose).
-  const q = typeof params.q === 'string' ? params.q.trim() : ''
-  let searchedFts = false
-  if (q) {
-    const fts = (idx as any).search
-    if (fts?.fields && typeof rel.ftsSearch === 'function') {
-      // Weighted websearch + rank — the badass path
-      rel = rel.ftsSearch(q, fts.fields)
-      searchedFts = true
-    } else if (idx.searchable?.length) {
-      if (typeof rel.search !== 'function') throw new BadRequest(`Search requires a Relation with .search()`)
-      rel = rel.search(q, idx.searchable)
-    } else {
-      throw new BadRequest(`This index does not support search (no 'search'/'searchable' config)`)
+  // The narrowing pipeline as a FUNCTION of (base, excludedField) — the
+  // main query applies everything; facet counts re-run it per facet field
+  // with that field's own filter excluded (disjunctive faceting: options
+  // must not zero themselves out).
+  const applyNarrowing = (base: any, excludeField?: string): any => {
+    // Fresh clone every run — group()/order() mutate in place, and the
+    // facet loop must never leak GROUP BYs into the main query (or each
+    // other). With zero filters active, base would otherwise flow through
+    // UNTOUCHED and shared.
+    let r = typeof base.clone === 'function' ? base.clone() : base
+    if (convertedOr.length) {
+      if (typeof r.whereAny !== 'function') throw new BadRequest(`$or requires a Relation with .whereAny()`)
+      r = r.whereAny(convertedOr)
     }
+    for (const field of filterableFields) {
+      if (field === excludeField) continue
+      const raw = rawFilters[field]
+      if (raw === undefined || raw === null) continue
+      r = r.where({ [field]: convertFilterValue(model, field, raw) })
+    }
+    // NAMED filters (tier 2 — product semantics live server-side).
+    // apply() receives the already-scoped relation: narrowing-only by
+    // construction. A falsy value means "filter not engaged" for toggles;
+    // param-shaped filters (ranges etc.) pass their object through.
+    for (const [name, def] of Object.entries(namedFilters)) {
+      if (name === excludeField) continue
+      const value = rawFilters[name]
+      if (value === undefined || value === null || value === false || value === '') continue
+      const applied = def.apply(r, value, ctx, ctrl)
+      if (applied) r = applied
+    }
+    // Substring search (q ORed across the searchable allowlist). The SQL is
+    // built by Relation.search — core's drizzle instance — so the controller
+    // stays free of drizzle imports (mixed copies don't compose).
+    if (q) {
+      const fts = (idx as any).search
+      if (fts?.fields && typeof r.ftsSearch === 'function') {
+        // Weighted websearch + rank — the badass path
+        r = r.ftsSearch(q, fts.fields)
+        searchedFts = true
+      } else if (idx.searchable?.length) {
+        if (typeof r.search !== 'function') throw new BadRequest(`Search requires a Relation with .search()`)
+        r = r.search(q, idx.searchable)
+      } else {
+        throw new BadRequest(`This index does not support search (no 'search'/'searchable' config)`)
+      }
+    }
+    return r
   }
+
+  const scopedRel = rel   // door + scopes, BEFORE narrowing — facets/empty re-derive from here
+  rel = applyNarrowing(rel)
 
   // 5. ids param (for combobox hydration — still respects scope)
   if (params.ids?.length) {
@@ -374,22 +404,84 @@ export async function defaultIndex(
     rel = rel.order(idx.defaultSort.field, idx.defaultSort.dir ?? 'asc')
   }
 
-  // 7. Count BEFORE pagination
-  const totalCount = await rel.count()
+  // 6.5 Aggregations over the SAME narrowed door scope — allowlisted like
+  // everything else. A measure spec is 'count' | 'sum:F' | 'avg:F' with
+  // F ∈ index.measures; chart.x ∈ index.chartable. Group keys come back as
+  // LABELS (the aggregate engine runs Attr.get on them); measure values run
+  // through the field's codec when it has one (money cents → decimal string).
+  const measureValue = (field: string | null, v: any): any => {
+    if (field == null || v == null) return v
+    const attr = (model as any)[field]
+    return typeof attr?.get === 'function' ? attr.get(v) : v
+  }
+  const runAggregate = async (r: any, spec: string): Promise<any> => {
+    if (spec === 'count') return r.count()
+    const m = /^(sum|avg|average):(\w+)$/.exec(spec)
+    if (!m) throw new BadRequest(`Unknown aggregate '${spec}' — use count | sum:field | avg:field`)
+    const field = m[2]!
+    if (!(idx.measures ?? []).includes(field)) throw new BadRequest(`Cannot aggregate '${field}' (not in measures)`)
+    const raw = m[1] === 'sum' ? await r.sum(field) : await r.average(field)
+    return raw
+  }
+
+  let chart: Array<{ x: string; y: number }> | undefined
+  if (params.chart) {
+    const { x, y = 'count' } = params.chart
+    if (!(idx.chartable ?? []).includes(x)) throw new BadRequest(`Cannot chart by '${x}' (not in chartable)`)
+    const grouped = await runAggregate(applyNarrowing(scopedRel).group(x), y)
+    const yField = y === 'count' ? null : y.split(':')[1]!
+    chart = Object.entries(grouped ?? {}).map(([k, v]) => ({ x: k, y: measureValue(yField, v) }))
+  }
+
+  let metric: any
+  if (typeof params.metric === 'string' && params.metric) {
+    const raw = await runAggregate(applyNarrowing(scopedRel), params.metric)
+    const mField = params.metric === 'count' ? null : params.metric.split(':')[1]!
+    metric = measureValue(mField, raw)
+  }
+
+  // 6.6 Facet counts (disjunctive: each facet field re-runs the narrowing
+  // with its OWN filter excluded). Configured server-side; one grouped
+  // count per facet field, same pass, same door scope.
+  let facets: Record<string, Record<string, number>> | undefined
+  const facetFields = idx.facets === true ? filterableFields
+    : Array.isArray(idx.facets) ? idx.facets : []
+  if (facetFields.length) {
+    facets = {}
+    for (const f of facetFields) {
+      if (!filterableFields.includes(f)) throw new BadRequest(`facets field '${f}' must be filterable`)
+      const grouped = await applyNarrowing(scopedRel, f).group(f).count()
+      facets[f] = Object.fromEntries(Object.entries(grouped ?? {}).map(([k, v]) => [k, Number(v)]))
+    }
+  }
+
+  // 7. Count BEFORE pagination. perPage: 0 = aggregation-only call (chart/
+  // metric/facets) — skip the row query entirely.
+  const dataWanted = params.perPage !== 0
+  const totalCount = dataWanted ? await rel.count() : 0
 
   // 8. Pagination
   const maxPerPage = idx.maxPerPage ?? 100
-  const perPage = Math.min(params.perPage ?? idx.perPage ?? 25, maxPerPage)
+  const perPage = dataWanted ? Math.min(params.perPage ?? idx.perPage ?? 25, maxPerPage) : 0
   const page = params.page ?? 0
   rel = rel.limit(perPage).offset(page * perPage)
 
   // 9. Includes
-  if (idx.include?.length) {
+  if (dataWanted && idx.include?.length) {
     rel = rel.includes(...idx.include)
   }
 
   // 10. Execute
-  const data = await rel.load()
+  const data = dataWanted ? await rel.load() : []
+
+  // 10.5 Empty page → say WHY (one extra COUNT, only here): records exist
+  // but narrowing excluded them ('no-matches', → offer "clear filters") vs
+  // the door scope is genuinely empty ('no-records', → offer "create").
+  let emptyReason: 'no-records' | 'no-matches' | undefined
+  if (dataWanted && totalCount === 0) {
+    const narrowed = q !== '' || Object.keys(rawFilters).length > 0 || (params.scopes?.length ?? 0) > 0
+    emptyReason = narrowed && (await scopedRel.count()) > 0 ? 'no-matches' : 'no-records'
+  }
 
   // 11. The read ceiling applies to index too — a list endpoint must not
   // leak columns the GET envelope hides. (Included associations serialize
@@ -409,9 +501,13 @@ export async function defaultIndex(
       page,
       perPage,
       totalCount,
-      totalPages: Math.ceil(totalCount / perPage),
-      hasMore: (page + 1) * perPage < totalCount,
+      totalPages: perPage > 0 ? Math.ceil(totalCount / perPage) : 0,
+      hasMore: perPage > 0 && (page + 1) * perPage < totalCount,
     },
+    ...(facets !== undefined ? { facets } : {}),
+    ...(chart !== undefined ? { chart } : {}),
+    ...(metric !== undefined ? { metric } : {}),
+    ...(emptyReason !== undefined ? { emptyReason } : {}),
   }
 }
 

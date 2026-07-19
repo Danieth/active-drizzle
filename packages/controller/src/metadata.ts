@@ -44,6 +44,26 @@ export interface IndexConfig {
   defaultSort?: { field: string; dir: 'asc' | 'desc' }
   filterable?: string[]
   /**
+   * Facet counts — the payoff of faceting. `true` counts every filterable
+   * field; an array names a subset (must be ⊆ filterable). Each index
+   * response then carries `facets: { field: { label: n } }` computed
+   * DISJUNCTIVELY (all OTHER filters + search applied, the field's own
+   * filter excluded — so options never zero themselves out). Enum/state
+   * group keys come back as labels via the aggregate engine.
+   */
+  facets?: boolean | string[]
+  /**
+   * Chart dimension allowlist — fields the client may GROUP BY via the
+   * `chart: { x, y }` index param (categorical v1: enum/state/boolean/fk).
+   */
+  chartable?: string[]
+  /**
+   * Measure allowlist — numeric fields the client may aggregate via
+   * `chart.y: 'sum:amount' | 'avg:amount'` or `metric: 'sum:amount'`.
+   * `count` is always allowed once `chartable`/`measures` is declared.
+   */
+  measures?: string[]
+  /**
    * NAMED filters — product concepts with server-side meaning (Rails-scope-
    * shaped, presentationally declared). The client only ever sees
    * { name, label, kind, param shape }; the SEMANTICS live here and can

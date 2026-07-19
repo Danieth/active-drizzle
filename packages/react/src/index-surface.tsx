@@ -21,6 +21,7 @@
  * the 90%, hooks demoted to plumbing.
  */
 import React, { createContext, useContext, useMemo, useRef, useSyncExternalStore, type FC, type ReactNode } from 'react'
+import { parseControllerError } from './errors.js'
 
 // ── IndexSession — headless list state ───────────────────────────────────────
 
@@ -130,7 +131,8 @@ export interface FilterPresenterProps {
   set: (value: any) => void
   clear: () => void
   session: IndexSession
-  /** Facet counts, when an engine provides them (reserved). */
+  /** Disjunctive facet counts (index.facets) — { label: n }, all OTHER
+   *  filters applied, this field's own filter excluded. */
   counts?: Record<string, number>
 }
 
@@ -138,6 +140,31 @@ export interface FilterPresenterDef {
   /** The filter kind this presenter serves, or '*' for any. */
   kind: string
   component: FC<FilterPresenterProps>
+}
+
+/** What <Surface.Board> hands your presenter — data + legal moves only. */
+export interface BoardApi {
+  groupBy: string
+  columns: Array<{ key: string; label: string; rows: any[]; count: number | null }>
+  /** Move a row to a column. State-machine fields resolve the TRANSITION
+   *  (drag draft→submitted IS advance('submit')); plain fields PATCH the
+   *  column value. Server re-guards either way. */
+  move: (row: any, toKey: string) => Promise<any>
+  /** Client-side legality (transition graph) — for drag affordances;
+   *  the server's guard is the law. */
+  canMove: (row: any, toKey: string) => boolean
+  isLoading: boolean
+}
+
+/** What <Surface.Table> hands your presenter. */
+export interface TableApi {
+  columns: Array<{ name: string; label: string; kind: string; sortable: boolean }>
+  rows: any[]
+  sort: { field: string; dir: 'asc' | 'desc' } | undefined
+  setSort: (field: string, dir?: 'asc' | 'desc') => void
+  /** Row-level PATCH (coherence-wired) for inline edits — may be absent. */
+  mutateRow?: (id: number | string, data: Record<string, any>) => Promise<any>
+  isLoading: boolean
 }
 
 const _filterRegistry = new Map<string, FilterPresenterDef>()
@@ -175,6 +202,18 @@ export interface IndexSurfaceConfig {
   makeRowHandle: (row: Record<string, any>) => any
   /** Injected by codegen for Surface.One: the generated edit-form hook. */
   useEditForm?: (id: number, opts?: any) => { status: string; form: any }
+  /** State machine meta (emitted when the model declares Attr.state) —
+   *  powers <Surface.Board>: states are columns, transitions are moves. */
+  stateMeta?: {
+    field: string
+    states: string[]
+    transitions: Array<{ event: string; from: string[] | '*'; to: string }>
+  }
+  /** Projected field meta — powers Table columns and Skeletons. */
+  fields?: Array<{ name: string; kind: string; label: string }>
+  /** Row-level PATCH transport (coherence-wired by codegen) — powers
+   *  Board.move and inline table edits. */
+  mutateRow?: (id: number | string, data: Record<string, any>) => Promise<any>
   /**
    * Aggregation/computed GET @actions as first-class surface members —
    * `<Deals.Stats>{(data) => …}</Deals.Stats>`. Keyed PascalCase; each value
@@ -205,6 +244,21 @@ export interface IndexSurface {
   Items: FC<{ children: (handle: any, row: Record<string, any>) => ReactNode; empty?: ReactNode }>
   Pagination: FC<{ className?: string }>
   One: FC<{ id: number; poll?: { every: number; until?: (r: any) => boolean }; children: (form: any) => ReactNode; loading?: ReactNode }>
+  /** Error surface — parsed controller error, or nothing while healthy. */
+  Error: FC<{ children?: (e: { kind: string; message: string; parsed: any }) => ReactNode; className?: string }>
+  /** Empty surface — renders only on an empty page, and knows WHY. */
+  Empty: FC<{ children?: (api: { reason: 'no-records' | 'no-matches'; clearFilters: () => void }) => ReactNode; className?: string }>
+  /** The state machine as columns — data only; you paint the board. */
+  Board: FC<{ groupBy?: string; children?: (b: BoardApi) => ReactNode; className?: string }>
+  /** Allowlisted categorical aggregation — points, no chart lib. */
+  Chart: FC<{ x: string; y?: string; filtered?: boolean; children?: (points: Array<{ x: string; y: number }>, q: any) => ReactNode; className?: string }>
+  /** Allowlisted scalar aggregation — one number. */
+  Metric: FC<{ agg: string; filtered?: boolean; children?: (value: any, q: any) => ReactNode; className?: string }>
+  /** Data grid contract — columns/rows/sort; scaffold table by default. */
+  Table: FC<{ columns?: string[]; children?: (t: TableApi) => ReactNode; className?: string }>
+  /** Loading placeholders shaped like the real thing (field meta). */
+  FormSkeleton: FC<{ className?: string }>
+  ListSkeleton: FC<{ rows?: number; className?: string }>
   /** Context accessor for custom widgets: session + live query + meta. */
   use: () => { session: IndexSession; state: IndexState; meta: IndexMeta; rows: any[]; pagination: any; isLoading: boolean }
   /** Query components from cfg.queries (aggregation @actions), keyed PascalCase. */
@@ -299,7 +353,7 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
    *   → scaffolding (announced once, marked data-ad-scaffold)
    */
   const FilterWidget: FC<{ name: string; presenter?: string | FC<FilterPresenterProps>; className?: string; props?: Record<string, any> }> = ({ name, presenter, className, props: extra }) => {
-    const { session, meta } = useCtx()
+    const { session, meta, query } = useCtx()
     const fm = meta.filters?.[name]
     if (!fm) return null
     const state = useSessionState(session)
@@ -325,6 +379,7 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
     }
     if (scaffold) warnScaffold(name)
 
+    const counts = (query.data as any)?.facets?.[name]
     const p: FilterPresenterProps = {
       name,
       meta: fm,
@@ -332,6 +387,7 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
       set: (v: any) => session.setFilter(name, v),
       clear: () => session.setFilter(name, undefined),
       session,
+      ...(counts !== undefined ? { counts } : {}),
       ...(extra ?? {}),
     }
     return (
@@ -368,14 +424,16 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
   // Full-control escape hatch — no registry, no defaults, just state:
   // <Surface.Filter name="stage">{({ value, set, meta }) => …}</Surface.Filter>
   const Filter: FC<{ name: string; children: (p: FilterPresenterProps) => ReactNode }> = ({ name, children }) => {
-    const { session, meta } = useCtx()
+    const { session, meta, query } = useCtx()
     const fm = meta.filters?.[name]
     const state = useSessionState(session)
     if (!fm) return null
+    const counts = (query.data as any)?.facets?.[name]
     return (
       <>{children({
         name,
         meta: fm,
+        ...(counts !== undefined ? { counts } : {}),
         value: state.filters[name],
         set: (v: any) => session.setFilter(name, v),
         clear: () => session.setFilter(name, undefined),
@@ -444,6 +502,184 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
     }
   }
 
+  // ── Error: parsed controller error or nothing (data-to-presenter) ────────
+  const ErrorC: IndexSurface['Error'] = ({ children, className }) => {
+    const { query } = useCtx()
+    if (!query.isError) return null
+    const parsed = parseControllerError((query as any).error)
+    const kind = parsed?.isForbidden ? 'forbidden'
+      : parsed?.isNotFound ? 'not-found'
+      : parsed?.isUnauthorized ? 'unauthenticated'
+      : parsed?.isValidation ? 'invalid-request'
+      : 'unknown'
+    const message = parsed?.message ?? 'Something went wrong'
+    if (children) return <div role="alert" data-ad-error={kind} {...(className !== undefined ? { className } : {})}>{children({ kind, message, parsed })}</div>
+    return <div role="alert" data-ad-error={kind} data-ad-scaffold="" {...(className !== undefined ? { className } : {})}>{message}</div>
+  }
+  ;(ErrorC as any).displayName = 'AdIndexError'
+
+  // ── Empty: an empty page that knows WHY (server-computed emptyReason) ────
+  const Empty: IndexSurface['Empty'] = ({ children, className }) => {
+    const { session, query } = useCtx()
+    const rows = query.data?.data ?? []
+    if (query.isLoading || query.isError || rows.length > 0 || query.data == null) return null
+    const reason: 'no-records' | 'no-matches' = (query.data as any)?.emptyReason ?? 'no-records'
+    const clearFilters = () => session.clearFilters()
+    if (children) return <div data-ad-empty={reason} {...(className !== undefined ? { className } : {})}>{children({ reason, clearFilters })}</div>
+    return (
+      <div data-ad-empty={reason} data-ad-scaffold="" {...(className !== undefined ? { className } : {})}>
+        {reason === 'no-matches'
+          ? <>No matches. <button type="button" onClick={clearFilters}>Clear filters</button></>
+          : <>Nothing here yet.</>}
+      </div>
+    )
+  }
+  ;(Empty as any).displayName = 'AdIndexEmpty'
+
+  // ── Board: the state machine AS columns — data only, you paint it ────────
+  // states = columns, a drag IS a transition (advance via _event), guards
+  // stay server-enforced; plain enum/facet fields group + PATCH instead.
+  const Board: IndexSurface['Board'] = ({ groupBy, children, className }) => {
+    const { meta, query } = useCtx()
+    const sm = cfg.stateMeta
+    const field = groupBy ?? sm?.field
+    if (!field) throw new Error('[active-drizzle] <Board> needs groupBy (this model declares no state machine)')
+    const rows: any[] = query.data?.data ?? []
+    const isState = sm != null && field === sm.field
+    const keys: string[] = isState ? sm!.states
+      : (meta.filters?.[field]?.options as string[] | undefined) ?? [...new Set(rows.map((r) => String(r[field])))]
+    const facetCounts = (query.data as any)?.facets?.[field]
+    const columns = keys.map((key) => ({
+      key,
+      label: key,
+      rows: rows.filter((r) => String(r[field]) === key),
+      count: facetCounts?.[key] ?? null,
+    }))
+    const findTransition = (fromKey: string, toKey: string) =>
+      sm!.transitions.find((t) => t.to === toKey && (t.from === '*' || t.from.includes(fromKey)))
+    const canMove = (row: any, toKey: string): boolean => {
+      if (String(row[field]) === toKey) return false
+      if (!cfg.mutateRow) return false
+      if (isState) return findTransition(String(row[field]), toKey) != null
+      return true
+    }
+    const move = async (row: any, toKey: string): Promise<any> => {
+      if (!cfg.mutateRow) throw new Error('[active-drizzle] Board.move needs a row transport (envelope controller)')
+      if (isState) {
+        const tr = findTransition(String(row[field]), toKey)
+        if (!tr) throw new Error(`[active-drizzle] no transition from '${String(row[field])}' to '${toKey}'`)
+        return cfg.mutateRow(row.id, { _event: tr.event })
+      }
+      return cfg.mutateRow(row.id, { [field]: toKey })
+    }
+    const api: BoardApi = { groupBy: field, columns, move, canMove, isLoading: query.isLoading }
+    if (children) return <div data-ad-board={field} {...(className !== undefined ? { className } : {})}>{children(api)}</div>
+    // Scaffold: honest columns with legal-move buttons — replace with your DnD
+    return (
+      <div data-ad-board={field} data-ad-scaffold="" style={{ display: 'flex', gap: '1rem', alignItems: 'flex-start' }} {...(className !== undefined ? { className } : {})}>
+        {columns.map((c) => (
+          <div key={c.key} data-ad-board-column={c.key} style={{ flex: 1 }}>
+            <strong>{c.label}{c.count != null ? ` (${c.count})` : ''}</strong>
+            {c.rows.map((r) => (
+              <div key={r.id} data-ad-board-card="">
+                {String(r.name ?? r.title ?? `#${r.id}`)}
+                {columns.filter((t) => canMove(r, t.key)).map((t) => (
+                  <button key={t.key} type="button" onClick={() => void move(r, t.key)}>→ {t.key}</button>
+                ))}
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    )
+  }
+  ;(Board as any).displayName = 'AdBoard'
+
+  // ── Chart / Metric: allowlisted aggregation → data, NEVER a chart lib ────
+  // Inside <Index> they inherit the live filters (filtered={false} opts out);
+  // standalone they aggregate the whole door scope.
+  const useAggParams = (filtered: boolean, extra: Record<string, any>) => {
+    const ctx = useContext(Ctx)
+    useSyncExternalStore(
+      (cb) => (ctx ? ctx.session.subscribe(cb) : () => {}),
+      () => (ctx ? ctx.session.getVersion() : 0),
+      () => (ctx ? ctx.session.getVersion() : 0),
+    )
+    const base = filtered && ctx ? ctx.session.params() : {}
+    return { ...base, page: 0, perPage: 0, ...extra }
+  }
+  const Chart: IndexSurface['Chart'] = ({ x, y = 'count', filtered = true, children, className }) => {
+    const params = useAggParams(filtered, { chart: { x, y } })
+    const q = cfg.useIndexQuery(params)
+    const points: Array<{ x: string; y: number }> = (q.data as any)?.chart ?? []
+    if (children) return <>{children(points, q)}</>
+    return <pre data-ad-scaffold="" data-ad-chart={x} {...(className !== undefined ? { className } : {})}>{JSON.stringify(points)}</pre>
+  }
+  ;(Chart as any).displayName = 'AdChart'
+  const Metric: IndexSurface['Metric'] = ({ agg, filtered = true, children, className }) => {
+    const params = useAggParams(filtered, { metric: agg })
+    const q = cfg.useIndexQuery(params)
+    const value = (q.data as any)?.metric ?? null
+    if (children) return <>{children(value, q)}</>
+    return <span data-ad-scaffold="" data-ad-metric={agg} {...(className !== undefined ? { className } : {})}>{value == null ? '—' : String(value)}</span>
+  }
+  ;(Metric as any).displayName = 'AdMetric'
+
+  // ── Table: the grid CONTRACT (columns/rows/sort/row transport) ───────────
+  const Table: IndexSurface['Table'] = ({ columns: colNames, children, className }) => {
+    const { session, meta, query } = useCtx()
+    const state = useSessionState(session)
+    const fieldDefs = cfg.fields ?? []
+    const columns = (colNames ?? fieldDefs.map((f) => f.name)).map((n) => {
+      const fd = fieldDefs.find((f) => f.name === n)
+      return { name: n, label: fd?.label ?? n, kind: fd?.kind ?? 'string', sortable: (meta.sortable ?? []).includes(n) }
+    })
+    const api: TableApi = {
+      columns,
+      rows: query.data?.data ?? [],
+      sort: state.sort,
+      setSort: (f, dir) => session.setSort(f, dir ?? (state.sort?.field === f && state.sort.dir === 'asc' ? 'desc' : 'asc')),
+      ...(cfg.mutateRow ? { mutateRow: cfg.mutateRow } : {}),
+      isLoading: query.isLoading,
+    }
+    if (children) return <>{children(api)}</>
+    return (
+      <table data-ad-table="" data-ad-scaffold="" {...(className !== undefined ? { className } : {})}>
+        <thead><tr>{columns.map((c) => (
+          <th key={c.name}>{c.sortable
+            ? <button type="button" onClick={() => api.setSort(c.name)}>{c.label}{state.sort?.field === c.name ? (state.sort.dir === 'asc' ? ' ↑' : ' ↓') : ''}</button>
+            : c.label}</th>
+        ))}</tr></thead>
+        <tbody>{api.rows.map((r) => (
+          <tr key={r.id}>{columns.map((c) => <td key={c.name}>{r[c.name] == null ? '' : String(r[c.name])}</td>)}</tr>
+        ))}</tbody>
+      </table>
+    )
+  }
+  ;(Table as any).displayName = 'AdTable'
+
+  // ── Skeletons shaped like the real thing (field meta → placeholder rows) ─
+  const blockStyle = { display: 'block', background: 'color-mix(in srgb, currentColor 12%, transparent)', borderRadius: 4 }
+  const FormSkeleton: IndexSurface['FormSkeleton'] = ({ className }) => (
+    <div data-ad-skeleton="form" aria-hidden="true" {...(className !== undefined ? { className } : {})}>
+      {(cfg.fields ?? [{ name: 'a', kind: 'string', label: '' }, { name: 'b', kind: 'string', label: '' }, { name: 'c', kind: 'string', label: '' }]).map((f) => (
+        <div key={f.name} data-ad-skeleton-field={f.kind} style={{ margin: '0.75rem 0' }}>
+          <span style={{ ...blockStyle, width: '30%', height: '0.7em', marginBottom: 6 }} />
+          <span style={{ ...blockStyle, width: f.kind === 'boolean' ? '2.5em' : '100%', height: f.kind === 'text' ? '4.5em' : '2em' }} />
+        </div>
+      ))}
+    </div>
+  )
+  ;(FormSkeleton as any).displayName = 'AdFormSkeleton'
+  const ListSkeleton: IndexSurface['ListSkeleton'] = ({ rows = 5, className }) => (
+    <div data-ad-skeleton="list" aria-hidden="true" {...(className !== undefined ? { className } : {})}>
+      {Array.from({ length: rows }, (_, i) => (
+        <span key={i} style={{ ...blockStyle, height: '2.4em', margin: '0.5rem 0' }} />
+      ))}
+    </div>
+  )
+  ;(ListSkeleton as any).displayName = 'AdListSkeleton'
+
   // ── Aggregation query components — <Surface.Stats>{(data, q) => …} ──────
   // Standalone by design: they do NOT require <Surface.Index> context (an
   // aggregate header can render above the list, or on a page of its own).
@@ -464,5 +700,5 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
     queryComponents[qname] = QueryComponent
   }
 
-  return { Index, Search, Filters, Filter, Items, Pagination, One, use, ...queryComponents }
+  return { Index, Search, Filters, Filter, Items, Pagination, One, use, Error: ErrorC, Empty, Board, Chart, Metric, Table, FormSkeleton, ListSkeleton, ...queryComponents }
 }

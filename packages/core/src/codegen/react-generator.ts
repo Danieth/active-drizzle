@@ -1225,7 +1225,7 @@ function emitFormHooks(
   const keysName = `${lcFirst(modelName)}Keys`
   // Non-bulk @mutations become PascalCase action members on the handle
   // (<deal.Archive/>). Reserved component names can't be shadowed.
-  const RESERVED_HANDLE_MEMBERS = new Set(['Form', 'Submit', 'SaveStatus', 'BaseErrors', 'Conflict', 'Changes'])
+  const RESERVED_HANDLE_MEMBERS = new Set(['Form', 'Submit', 'SaveStatus', 'BaseErrors', 'Conflict', 'Changes', 'Can'])
   const actionMuts = ctrl.mutations.filter(m => !m.bulk && !RESERVED_HANDLE_MEMBERS.has(capitalize(m.method)))
   const emitActionsOption = (indent: string, idExpr: string, scopePrefix = '', guardCreatedId = false): string[] => {
     const out: string[] = []
@@ -1311,7 +1311,7 @@ function emitFormHooks(
   // maps to the child controller's create/update/destroy; the nested manager
   // fires these optimistically when the parent row is already persisted.
   const transportsName = `_${lcFirst(modelName)}NestedTransports`
-  const needsAdQc = instantResources.size > 0 || actionMuts.length > 0
+  const needsAdQc = instantResources.size > 0 || actionMuts.length > 0 || ctrl.scopes.length === 0
   if (needsAdQc) {
     // Module-scope query-client ref — the form hooks stamp it on render so
     // instant nested writes AND @mutation action buttons (which run outside
@@ -1446,16 +1446,13 @@ function emitFormHooks(
     L.push(`    searchable: ${Boolean((idx as any).searchable?.length)},`)
     if (filterMetaParts.length) L.push(`    filters: { ${filterMetaParts.join(', ')} },`)
     L.push(`  },`)
-    if (actionMuts.length > 0) {
-      // The surface's own query hook stamps the query-client ref so row
-      // action buttons (running outside hook context) can fan coherence
-      L.push(`  useIndexQuery: (params) => { _adQc = useQueryClient(); return useQuery({`)
-    } else {
-      L.push(`  useIndexQuery: (params) => useQuery({`)
-    }
+    // The surface's own query hook stamps the query-client ref so row
+    // transports (Board.move, action buttons — running outside hook
+    // context) can fan coherence invalidation
+    L.push(`  useIndexQuery: (params) => { _adQc = useQueryClient(); return useQuery({`)
     L.push(`    queryKey: ${keysName}.list({} as Record<string, never>, params as any),`)
     L.push(`    queryFn: () => client.${clientKey}.index(params as any),`)
-    L.push(`  })${actionMuts.length > 0 ? ' }' : ''},`)
+    L.push(`  }) },`)
     if (actionMuts.length > 0) {
       L.push(`  makeRowHandle: (row) => createFormHandle(`)
       L.push(`    new FormSession({ draft: new ${modelName}Client(row), mode: 'edit', abilities: null }),`)
@@ -1470,6 +1467,25 @@ function emitFormHooks(
       L.push(`    { fieldMeta: (${modelName}Client as any).fieldMeta ?? {} },`)
       L.push(`  ),`)
     }
+    // State machine → Board columns/moves; field meta → Table/Skeletons;
+    // row transport → Board.move + inline edits (coherence-wired)
+    const stateDef = (model.states ?? [])[0]
+    if (stateDef) {
+      const states = Object.keys(stateDef.values).map(s => `'${s}'`).join(', ')
+      const transitions = stateDef.transitions.map(t =>
+        `{ event: '${t.event}', from: ${t.from === '*' ? `'*'` : `[${(t.from as string[]).map(f => `'${f}'`).join(', ')}]`}, to: '${t.to}' }`,
+      ).join(', ')
+      L.push(`  stateMeta: { field: '${stateDef.propertyName}', states: [${states}], transitions: [${transitions}] },`)
+    }
+    const fieldEntries = fields.map(f => {
+      const label = JSON.stringify((model.fieldMeta as any)?.[f]?.label ?? capitalize(String(f).replace(/([A-Z])/g, ' $1')))
+      // fieldKind targets TYPE positions and may yield a union ('email' | 'string');
+      // a VALUE position wants the first (most specific) kind only
+      const kind = fieldKind(f, model, colTypes).split("'")[0]
+      return `{ name: '${f}', kind: '${kind}', label: ${label} }`
+    })
+    if (fieldEntries.length) L.push(`  fields: [${fieldEntries.join(', ')}],`)
+    L.push(`  mutateRow: (id: number | string, data: Record<string, any>) => client.${clientKey}.update({ id, data }).then((r: any) => { _adCohere('${model.tableName}', 'update'); return r }),`)
     L.push(`  useEditForm: use${modelName}EditForm,`)
     // Aggregation GET @actions become first-class surface members —
     // <Deals.Stats>{(data) => …}. Keys live under the family root, so the

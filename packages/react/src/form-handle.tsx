@@ -135,6 +135,10 @@ export interface FormHandleApi<T extends Record<string, any> = Record<string, an
    *  receives resolve('reload' | 'overwrite'). Style it however; the
    *  machinery (withheld token, fresh envelope) is already armed. */
   Conflict: FC<{ children: (resolve: (mode: 'reload' | 'overwrite') => Promise<boolean>) => ReactNode; className?: string }>
+  /** Declarative gate over the SAME mask the server enforces: `edit` reads
+   *  the abilities verdict for a field, `action` the can-map verdict for a
+   *  state event or @mutation. Never trusted — the server re-checks. */
+  Can: FC<{ edit?: string; action?: string; not?: boolean; fallback?: ReactNode; children?: ReactNode }>
   /** "Changes have happened" — renders only when rehydrate() adopted
    *  changes from elsewhere. Render-prop gets the affected field names +
    *  dismiss; without children a minimal default notice renders. */
@@ -702,6 +706,22 @@ export function createFormHandle<T extends Record<string, any>>(
   }
   ConflictComponent.displayName = 'AdConflict'
 
+  // <deal.Can edit="amount"> / <deal.Can action="markWon" not fallback={…}> —
+  // hide/swap UI from the envelope's own verdicts; zero hardcoded roles
+  const CanComponent: FC<{ edit?: string; action?: string; not?: boolean; fallback?: ReactNode; children?: ReactNode }> = ({ edit, action, not, fallback, children }) => {
+    useSyncExternalStore(
+      (cb) => session.subscribe('*', cb),
+      () => session.fieldVersion('*'),
+      () => session.fieldVersion('*'),
+    )
+    let allowed = true
+    if (edit !== undefined) allowed = session.canEdit(edit)
+    else if (action !== undefined) allowed = session.verdict(action)
+    if (not) allowed = !allowed
+    return <>{allowed ? children : fallback ?? null}</>
+  }
+  CanComponent.displayName = 'AdCan'
+
   const ChangesComponent: FC<{ children?: (info: ChangesRenderApi) => ReactNode; className?: string }> = ({ children, className }) => {
     useSyncExternalStore(
       (cb) => session.subscribe('*', cb),
@@ -858,6 +878,7 @@ export function createFormHandle<T extends Record<string, any>>(
         case 'BaseErrors': return BaseErrorsComponent
         case 'Conflict': return ConflictComponent
         case 'Changes': return ChangesComponent
+        case 'Can': return CanComponent
         // React/JS runtime probes that must not become field components.
         // Without this, `${handle}` would resolve toString to a Field and
         // invoke a React component as a plain function.

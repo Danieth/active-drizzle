@@ -66,6 +66,7 @@ export {
 } from './form-handle.js'
 export { NestedArrayManager, NestedOneManager, type NestedChild, type NestedTransport } from './nested.js'
 export { useForm, useEditForm, useNewForm, type UseFormOptions } from './use-form.js'
+export { useAbilities, type Abilities } from './use-abilities.js'
 export { onFormEvents, type FormEvent, type IncomingChange } from './form-session.js'
 export { useGeneratedForm, type UseGeneratedFormOptions } from './generated-form.js'
 export { DraftStore, defaultDraftStore, type ParkedDraft } from './draft-store.js'
@@ -83,6 +84,8 @@ export {
   type IndexMeta,
   type IndexFilterMeta,
   type IndexState,
+  type BoardApi,
+  type TableApi,
 } from './index-surface.js'
 
 // Error utilities

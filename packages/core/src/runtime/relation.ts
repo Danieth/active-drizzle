@@ -281,17 +281,21 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    * `Order.group(:status).sum(:total)`. Accepts field names or raw `sql`.
    */
   public group(...fields: (string | SQL)[]): this {
+    // Clone like every other chainable — a shared base relation must never
+    // accumulate GROUP BYs from separate chains (facet loops do exactly this)
+    const next = this._clone() as this
     for (const f of fields) {
-      if (typeof f === 'string') this._group.push({ col: this._col(f), field: f })
-      else this._group.push({ col: f, field: null })
+      if (typeof f === 'string') next._group.push({ col: next._col(f), field: f })
+      else next._group.push({ col: f, field: null })
     }
-    return this
+    return next
   }
 
   /** HAVING — filter groups. `.group('userId').having(sql`count(*) > 5`)`. */
   public having(condition: SQL): this {
-    this._having = this._having ? (and(this._having, condition) as SQL) : condition
-    return this
+    const next = this._clone() as this
+    next._having = next._having ? (and(next._having, condition) as SQL) : condition
+    return next
   }
 
   /**
@@ -1130,6 +1134,16 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
       }
     }
     return null
+  }
+
+  /**
+   * Public snapshot of this relation's current chain state. NOTE: most
+   * chainables MUTATE in place (where/order/...); clone() is the escape
+   * hatch when one base relation must fan into independent chains
+   * (disjunctive facet counts, aggregate side-queries).
+   */
+  public clone(): this {
+    return this._clone() as this
   }
 
   protected _clone(): Relation<TModel, TRelations> {
