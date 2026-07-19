@@ -1,5 +1,6 @@
 import { eq, and, or, inArray, isNull, ilike, desc, asc, sql, type SQL } from 'drizzle-orm'
 import { getExecutor, getSchema, MODEL_REGISTRY, transaction, RecordNotFound } from './boot.js'
+import { modelClassName } from './class-name.js'
 import type { ApplicationRecord } from './application-record.js'
 
 /**
@@ -242,7 +243,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   /** Like first() but raises RecordNotFound if nothing matches. */
   public async firstBang(): Promise<TModel> {
     const rec = await this.first()
-    if (rec == null) throw new RecordNotFound(this._ctor.name, '(first)')
+    if (rec == null) throw new RecordNotFound(modelClassName(this._ctor), '(first)')
     return rec
   }
 
@@ -280,7 +281,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   /** last() variant that raises RecordNotFound if nothing matches. */
   public async lastBang(): Promise<TModel> {
     const rec = await this.last()
-    if (rec == null) throw new RecordNotFound(this._ctor.name, '(last)')
+    if (rec == null) throw new RecordNotFound(modelClassName(this._ctor), '(last)')
     return rec as TModel
   }
 
@@ -967,8 +968,8 @@ function _lookupAssocTarget(marker: any, prop: string): any {
 
   return (
     reg[plural] ??
-    Object.values(reg).find((m: any) => m.name === prop[0]!.toUpperCase() + prop.slice(1)) ??
-    Object.values(reg).find((m: any) => m.name === singular[0]!.toUpperCase() + singular.slice(1)) ??
+    Object.values(reg).find((m: any) => modelClassName(m) === prop[0]!.toUpperCase() + prop.slice(1)) ??
+    Object.values(reg).find((m: any) => modelClassName(m) === singular[0]!.toUpperCase() + singular.slice(1)) ??
     null
   )
 }

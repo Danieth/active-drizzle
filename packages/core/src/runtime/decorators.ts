@@ -1,5 +1,6 @@
 import { registerHook } from './hooks.js'
 import { MODEL_REGISTRY, transaction } from './boot.js'
+import { modelClassName } from './class-name.js'
 
 export type HookCondition = string | (() => boolean)
 
@@ -18,16 +19,31 @@ export type ValidateOptions = HookOptions & {
   deps?: string[]
 }
 
+export type ModelOptions = {
+  /**
+   * Explicit registry name for the class. Normally inferred — even when a
+   * `static name = Attr…` field shadows the class's `.name` — but minified
+   * builds that rename classes need it spelled out for STI / polymorphic
+   * lookups keyed on the class name.
+   */
+  className?: string
+}
+
 /**
  * @model('table_name') — binds the class to a database table.
  * Sets _activeDrizzleTableName so ApplicationRecord.tableName returns it.
  * Also registers the class in MODEL_REGISTRY for STI subclass resolution.
  */
-export function model(table: string): ClassDecorator {
+export function model(table: string, options?: ModelOptions): ClassDecorator {
   return (target: any) => {
     target._activeDrizzleTableName = table
-    MODEL_REGISTRY[target.name] = target  // by class name (STI, polymorphic type resolution)
-    MODEL_REGISTRY[table] = target         // by table name (association inference)
+    // Static fields initialize before decorators run, so `static name = Attr…`
+    // has already shadowed `.name` here — resolve the declared name and stamp
+    // it where every class-name lookup can trust it.
+    const className = options?.className ?? modelClassName(target)
+    target._activeDrizzleClassName = className
+    MODEL_REGISTRY[className] = target  // by class name (STI, polymorphic type resolution)
+    MODEL_REGISTRY[table] = target      // by table name (association inference)
   }
 }
 
