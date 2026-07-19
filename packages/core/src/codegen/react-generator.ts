@@ -204,6 +204,19 @@ function generateControllerFile(
     ])
     const assocImports = resolveAssocImports(allIncludes, model, projectMeta)
 
+    // habtm `<singular>Ids` — Rails' collection_singular_ids as a wire key.
+    // Only keys the controller actually exposes or statically permits type
+    // through; the runtime permit governs regardless.
+    const habtmIdsCandidates = model.associations
+      .filter(a => a.kind === 'habtm')
+      .map(a => ({ idsKey: `${singularize(a.propertyName)}Ids`, assoc: a }))
+    const habtmScope = new Set([
+      ...(ctrl.crudConfig?.get?.expose ?? []),
+      ...(ctrl.crudConfig?.create?.permit ?? []),
+      ...(ctrl.crudConfig?.update?.permit ?? []),
+    ])
+    const habtmIdsInScope = habtmIdsCandidates.filter(({ idsKey }) => habtmScope.has(idsKey))
+
     // TAttrs
     L.push(`/** All fields the backend may return — columns + eager-loaded associations. */`)
     L.push(`export interface ${modelName}Attrs {`)
@@ -222,6 +235,13 @@ function generateControllerFile(
       for (const ai of assocImports) {
         const shape = ai.isArray ? `${ai.attrsType}[]` : ai.attrsType
         L.push(`  ${ai.assocName}?: ${shape}`)
+      }
+    }
+    if (habtmIdsInScope.length) {
+      L.push('')
+      L.push('  // habtm id sets — assigning one on save REPLACES the join rows')
+      for (const { idsKey } of habtmIdsInScope) {
+        L.push(`  ${idsKey}?: number[]`)
       }
     }
     L.push('}')
@@ -300,6 +320,12 @@ function generateControllerFile(
         L.push(`  declare ${ai.assocName}?: ${shape}`)
       }
     }
+    if (habtmIdsInScope.length) {
+      L.push('')
+      for (const { idsKey } of habtmIdsInScope) {
+        L.push(`  declare ${idsKey}?: number[]`)
+      }
+    }
     if (model.enums.length) {
       L.push('')
       for (const e of model.enums) {
@@ -373,6 +399,13 @@ function generateControllerFile(
         if (!stateProjection.has(fk)) continue
         const label = capitalize(assoc.propertyName.replace(/([A-Z])/g, ' $1'))
         refEntries.push(`    ${assoc.propertyName}: { kind: 'ref', fk: '${fk}', label: ${JSON.stringify(label)} },`)
+      }
+      // habtm: <deal.owners> is the `<singular>Ids` set wearing the
+      // association's name — same aliasing, plural (kind 'refMany')
+      for (const { idsKey, assoc } of habtmIdsInScope) {
+        if (!stateProjection.has(idsKey)) continue
+        const label = capitalize(assoc.propertyName.replace(/([A-Z])/g, ' $1'))
+        refEntries.push(`    ${assoc.propertyName}: { kind: 'refMany', ids: '${idsKey}', label: ${JSON.stringify(label)} },`)
       }
       // Every field the typed handle declares gets a meta entry — a handle
       // field whose meta lookup comes up empty would promise presenters the
@@ -999,6 +1032,13 @@ function emitFormHooks(
     if (!projection.has(fk) || fields.includes(assoc.propertyName)) continue
     L.push(`  ${assoc.propertyName}: TypedFieldComponent<'ref'>`)
   }
+  // habtm sugar members — <deal.owners> aliases the projected `<singular>Ids` set
+  for (const assoc of model.associations) {
+    if (assoc.kind !== 'habtm') continue
+    const idsKey = `${singularize(assoc.propertyName)}Ids`
+    if (!projection.has(idsKey) || fields.includes(assoc.propertyName)) continue
+    L.push(`  ${assoc.propertyName}: TypedFieldComponent<'refMany'>`)
+  }
   L.push(`}`)
   L.push('')
 
@@ -1212,4 +1252,11 @@ function columnToClientType(col: ColumnMeta, enumByProp: Map<string, string>): s
 }
 
 function lcFirst(s: string): string { return s.charAt(0).toLowerCase() + s.slice(1) }
+/** Mirrors the runtime's _singularize — the habtm ids key MUST match what save() accepts. */
+function singularize(word: string): string {
+  if (word.endsWith('ies')) return word.slice(0, -3) + 'y'
+  if (word.endsWith('ses') || word.endsWith('xes') || word.endsWith('zes')) return word.slice(0, -2)
+  if (word.endsWith('s') && !word.endsWith('ss')) return word.slice(0, -1)
+  return word
+}
 function capitalize(s: string): string { return s.charAt(0).toUpperCase() + s.slice(1) }

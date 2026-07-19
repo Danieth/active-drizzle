@@ -270,6 +270,7 @@ export async function defaultGet(
   if (includes.length) rel = rel.includes(...includes)
   const record = await rel.first()
   if (!record) throw new NotFound(model.name)
+  await hydrateHabtmIds(record, model, config)
 
   if (usesEnvelope(config)) return buildRecordEnvelope(record, model, config, ctx, ctrl)
   if (config.get?.expose?.length && typeof record.toJSON === 'function') {
@@ -316,7 +317,7 @@ export async function defaultCreate(
     const pk = typeof model?.primaryKey === 'string' ? model.primaryKey : 'id'
     const pkVal = (record as any)[pk] ?? record._attributes?.[pk]
     return buildRecordEnvelope(
-      await reloadWithIncludes(relation, config, pkVal, record), model, config, ctx, ctrl, issues,
+      await reloadWithIncludes(relation, config, pkVal, record, model), model, config, ctx, ctrl, issues,
     )
   }
   return record
@@ -384,7 +385,7 @@ export async function defaultUpdate(
     // ride too: without them, freshly created nested rows come back without
     // ids and the client can never settle them (next save = duplicates).
     return buildRecordEnvelope(
-      await reloadWithIncludes(relation, config, id, record), model, config, ctx, ctrl, issues,
+      await reloadWithIncludes(relation, config, id, record, model), model, config, ctx, ctrl, issues,
     )
   }
   return record
@@ -395,13 +396,46 @@ export async function defaultUpdate(
  * envelope carries eager-loaded associations — nested-attribute saves need
  * the children (with ids) echoed back. Falls back to the bare record.
  */
-async function reloadWithIncludes(relation: any, config: CrudConfig, id: any, record: any): Promise<any> {
+async function reloadWithIncludes(relation: any, config: CrudConfig, id: any, record: any, model?: any): Promise<any> {
   const includes = config.get?.include ?? []
-  if (!includes.length) return record
+  if (!includes.length) {
+    await hydrateHabtmIds(record, model ?? null, config)
+    return record
+  }
   try {
-    return (await relation.where({ id }).includes(...includes).first()) ?? record
+    const fresh = (await relation.where({ id }).includes(...includes).first()) ?? record
+    await hydrateHabtmIds(fresh, model ?? null, config)
+    return fresh
   } catch {
     return record
+  }
+}
+
+/**
+ * Habtm `<singular>Ids` are not columns — when the expose ceiling names one,
+ * compute it onto the record before serialization by plucking the target pk
+ * through the association. Duck-types through @active-drizzle/core (same
+ * pattern as sanitizeNestedWrites); without core it's a silent no-op and the
+ * key simply doesn't serialize.
+ */
+async function hydrateHabtmIds(record: any, model: any, config: CrudConfig): Promise<void> {
+  const expose = config.get?.expose ?? []
+  if (!record || !expose.length) return
+  let resolveIds: ((m: any) => Array<{ idsKey: string; prop: string }>) | null = null
+  try {
+    const core = await import('@active-drizzle/core' as string) as any
+    if (typeof core.resolveHabtmIdsAssociations === 'function') resolveIds = core.resolveHabtmIdsAssociations
+  } catch { /* controller used without core — nothing to hydrate */ }
+  if (!resolveIds) return
+  const m = model ?? record.constructor
+  for (const { idsKey, prop } of resolveIds(m)) {
+    if (!expose.includes(idsKey)) continue
+    try {
+      const relation = (record as any)[prop]
+      if (relation && typeof relation.pluck === 'function') {
+        record._attributes[idsKey] = await relation.pluck('id')
+      }
+    } catch { /* leave the key unserialized rather than 500 the read */ }
   }
 }
 

@@ -20,6 +20,7 @@ import {
   Attr,
   hasMany,
   belongsTo,
+  habtm,
 } from '@active-drizzle/core'
 
 // Controller imports
@@ -62,7 +63,19 @@ const team_settings = pgTable('team_settings', {
   timezone: varchar('timezone', { length: 100 }).notNull().default('UTC'),
 })
 
-const schema = { teams, campaigns, team_settings }
+const labels = pgTable('labels', {
+  id:   serial('id').primaryKey(),
+  name: varchar('name', { length: 100 }).notNull(),
+})
+
+// eslint-disable-next-line @typescript-eslint/naming-convention
+const campaign_labels = pgTable('campaign_labels', {
+  id:         serial('id').primaryKey(),
+  campaignId: integer('campaign_id').notNull(),
+  labelId:    integer('label_id').notNull(),
+})
+
+const schema = { teams, campaigns, team_settings, labels, campaign_labels }
 
 // ── Models ────────────────────────────────────────────────────────────────────
 
@@ -74,9 +87,13 @@ class Team extends ApplicationRecord {
   static campaigns = hasMany()
 }
 
+@modelDecorator('labels')
+class Label extends ApplicationRecord {}
+
 @modelDecorator('campaigns')
 class Campaign extends ApplicationRecord {
   static team   = belongsTo()
+  static labels = habtm('campaign_labels')
   static status = Attr.enum({ draft: 0, active: 1, paused: 2 } as const)
 
   static active()  { return this.where({ status: 1 }) }
@@ -118,6 +135,15 @@ beforeAll(async () => {
       team_id INTEGER NOT NULL UNIQUE,
       timezone VARCHAR(100) NOT NULL DEFAULT 'UTC'
     );
+    CREATE TABLE labels (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(100) NOT NULL
+    );
+    CREATE TABLE campaign_labels (
+      id SERIAL PRIMARY KEY,
+      campaign_id INTEGER NOT NULL,
+      label_id INTEGER NOT NULL
+    );
   `)
 }, 60_000)
 
@@ -127,7 +153,7 @@ afterAll(async () => {
 })
 
 async function truncate() {
-  await pool.query('TRUNCATE campaigns, team_settings, teams RESTART IDENTITY CASCADE')
+  await pool.query('TRUNCATE campaign_labels, labels, campaigns, team_settings, teams RESTART IDENTITY CASCADE')
 }
 
 // ── Controller definitions ────────────────────────────────────────────────────
@@ -934,5 +960,88 @@ describe('applyFormErrors', () => {
     expect(calls).toHaveLength(2)
     expect(calls.find(c => c.field === 'name')?.result.errors).toEqual(['required'])
     expect(calls.find(c => c.field === 'budget')?.result.errors).toEqual(['must be >= 0'])
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// habtm `<singular>Ids` — expose hydration + permit-governed join sync
+// ═══════════════════════════════════════════════════════════════════════════
+
+@controller()
+@crud(Campaign, {
+  get: { expose: ['id', 'name', 'labelIds'], abilities: true },
+  update: { permit: ['name', 'labelIds'] },
+  create: { permit: ['name', 'labelIds'], autoSet: { teamId: (ctx: AppContext) => ctx.teamId } },
+})
+@scope('teamId')
+class LabelledCampaignController extends BaseController {}
+
+@controller()
+@crud(Campaign, {
+  get: { expose: ['id', 'name', 'labelIds'], abilities: true },
+  update: { permit: ['name'] },        // labelIds exposed but NOT writable
+})
+@scope('teamId')
+class ReadOnlyLabelsController extends BaseController {}
+
+describe('habtm labelIds — hydration, sync, permit governance', () => {
+  let teamId: number
+  let urgent: number, q3: number, vip: number
+
+  beforeAll(async () => {
+    await truncate()
+    const team = await Team.create({ name: 'HabtmTeam' })
+    teamId = team.id
+    urgent = (await Label.create({ name: 'urgent' })).id
+    q3     = (await Label.create({ name: 'q3' })).id
+    vip    = (await Label.create({ name: 'vip' })).id
+  })
+
+  it('get hydrates labelIds through the association and masks it edit', async () => {
+    const c = await Campaign.create({ name: 'Hydrate me', teamId, status: 0 })
+    await (c as any).update({ labelIds: [urgent, q3] })
+    const res = await call(LabelledCampaignController, 'get', { teamId, id: c.id }, { teamId })
+    expect([...res.record.labelIds].sort()).toEqual([urgent, q3].sort())
+    expect(res.abilities.labelIds).toBe('edit')
+  })
+
+  it('update replaces the join set and the envelope reflects it', async () => {
+    const c = await Campaign.create({ name: 'Sync me', teamId, status: 0 })
+    await (c as any).update({ labelIds: [urgent] })
+    const res = await call(LabelledCampaignController, 'update',
+      { teamId, id: c.id, data: { labelIds: [q3, vip] } }, { teamId })
+    expect([...res.record.labelIds].sort()).toEqual([q3, vip].sort())
+    const rows = await pool.query('SELECT label_id FROM campaign_labels WHERE campaign_id = $1', [c.id])
+    expect(rows.rows.map(r => r.label_id).sort()).toEqual([q3, vip].sort())
+  })
+
+  it('create accepts labelIds in the same request', async () => {
+    const res = await call(LabelledCampaignController, 'create',
+      { teamId, data: { name: 'Born labelled', labelIds: [vip] } }, { teamId })
+    expect(res.record.labelIds).toEqual([vip])
+  })
+
+  it('an id with no label row is a 422, and the join set is untouched', async () => {
+    const c = await Campaign.create({ name: 'Guard me', teamId, status: 0 })
+    await (c as any).update({ labelIds: [urgent] })
+    try {
+      await call(LabelledCampaignController, 'update',
+        { teamId, id: c.id, data: { labelIds: [urgent, 999999] } }, { teamId })
+      expect.unreachable('expected a validation error')
+    } catch (e: any) {
+      expect(e.status).toBe(422)
+    }
+    const rows = await pool.query('SELECT label_id FROM campaign_labels WHERE campaign_id = $1', [c.id])
+    expect(rows.rows.map(r => r.label_id)).toEqual([urgent])
+  })
+
+  it('a non-permitted labelIds write strips with an issue and syncs nothing', async () => {
+    const c = await Campaign.create({ name: 'Locked labels', teamId, status: 0 })
+    await (c as any).update({ labelIds: [urgent] })
+    const res = await call(ReadOnlyLabelsController, 'update',
+      { teamId, id: c.id, data: { name: 'renamed', labelIds: [q3, vip] } }, { teamId })
+    expect(res.abilities.labelIds).toBe('view')
+    expect(res.issues).toEqual([{ field: 'labelIds', code: 'forbidden' }])
+    expect(res.record.labelIds).toEqual([urgent])
   })
 })

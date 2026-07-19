@@ -560,8 +560,22 @@ function isBelongsToNullable(assoc: AssociationMeta, ownerModel: ModelMeta, proj
 let _resolveAssocCache: Map<string, string | null> = new Map();
 
 function resolveAssocClass(assoc: AssociationMeta, project: ProjectMeta): string | null {
-  const cacheKey = `${assoc.propertyName}|${assoc.explicitTable ?? ''}|${assoc.resolvedTable ?? ''}`;
+  const cacheKey = `${assoc.kind}|${assoc.propertyName}|${assoc.explicitTable ?? ''}|${assoc.resolvedTable ?? ''}`;
   if (_resolveAssocCache.has(cacheKey)) return _resolveAssocCache.get(cacheKey)!;
+
+  // habtm: marker.table is the JOIN table, never the target — the target is
+  // className (Rails' class_name) or inferred from the property name,
+  // mirroring the runtime's _findModelByMarker
+  if (assoc.kind === 'habtm') {
+    const cn = assoc.options?.['className'];
+    const inferred = typeof cn === 'string' && cn
+      ? cn
+      : pluralize.singular(assoc.propertyName).replace(/^\w/, c => c.toUpperCase());
+    const m = project.models.find(mm => mm.className === inferred);
+    const habtmResult = m ? m.className : inferred;
+    _resolveAssocCache.set(cacheKey, habtmResult);
+    return habtmResult;
+  }
 
   const tableName = assoc.explicitTable || assoc.resolvedTable;
   let result: string | null;

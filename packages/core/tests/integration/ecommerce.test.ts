@@ -366,6 +366,68 @@ describe('habtm — many-to-many through join table', () => {
     expect(tagNames).toContain('bestseller')
     expect(tagNames).not.toContain('apparel')
   })
+
+  // ── `<singular>Ids` collection sync (Rails collection_singular_ids) ────────
+
+  it('tagIds on update REPLACES the join-row set — add, remove, keep overlap', async () => {
+    const seed = await seedAll(ctx.db)
+    const tshirt = await Product.find(seed.products.tshirt.id) as any
+    // current: apparel + bestseller → keep bestseller, drop apparel, add digital
+    const ok = await tshirt.update({ tagIds: [seed.tags.bestseller.id, seed.tags.digital.id] })
+    expect(ok).toBe(true)
+
+    const names = (await ((await Product.find(tshirt.id) as any).tags as any).load())
+      .map((t: any) => t._attributes.name).sort()
+    expect(names).toEqual(['bestseller', 'digital'])
+  })
+
+  it('tagIds on create attaches tags in the same save', async () => {
+    const seed = await seedAll(ctx.db)
+    const p = await Product.create({
+      name: 'Tagged at birth', priceInCents: 500, stock: 1,
+      tagIds: [seed.tags.digital.id],
+    }) as any
+    expect(p.isNewRecord).toBe(false)
+    const names = (await (p.tags as any).load()).map((t: any) => t._attributes.name)
+    expect(names).toEqual(['digital'])
+  })
+
+  it('empty tagIds clears every join row', async () => {
+    const seed = await seedAll(ctx.db)
+    const tshirt = await Product.find(seed.products.tshirt.id) as any
+    await tshirt.update({ tagIds: [] })
+    expect((await (tshirt.tags as any).load()).length).toBe(0)
+  })
+
+  it('an id with no target row fails the save with an error on tagIds', async () => {
+    const seed = await seedAll(ctx.db)
+    const tshirt = await Product.find(seed.products.tshirt.id) as any
+    const ok = await tshirt.update({ tagIds: [seed.tags.apparel.id, 999999] })
+    expect(ok).toBe(false)
+    expect(tshirt.errors.on('tagIds').length).toBeGreaterThan(0)
+    // and the join rows are untouched
+    const names = (await ((await Product.find(tshirt.id) as any).tags as any).load())
+      .map((t: any) => t._attributes.name).sort()
+    expect(names).toEqual(['apparel', 'bestseller'])
+  })
+
+  it('duplicate ids collapse to one join row', async () => {
+    const seed = await seedAll(ctx.db)
+    const tshirt = await Product.find(seed.products.tshirt.id) as any
+    await tshirt.update({ tagIds: [seed.tags.digital.id, seed.tags.digital.id] })
+    const rows = await ctx.db.select().from(schema.products_tags)
+      .where(eq(schema.products_tags.productId, tshirt.id))
+    expect(rows.length).toBe(1)
+  })
+
+  it('tagIds never lands as a column on the products row', async () => {
+    const seed = await seedAll(ctx.db)
+    const p = await Product.create({
+      name: 'No stray column', priceInCents: 100, stock: 1,
+      tagIds: [seed.tags.apparel.id],
+    }) as any
+    expect(p._attributes.tagIds).toBeUndefined()
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────

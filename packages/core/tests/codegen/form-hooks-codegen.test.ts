@@ -364,11 +364,12 @@ export const deals = pgTable('deals', {
 `
 
 const dealModel = `
-import { ApplicationRecord, model, Attr, belongsTo } from 'active-drizzle'
+import { ApplicationRecord, model, Attr, belongsTo, habtm } from 'active-drizzle'
 
 @model('deals')
 export class Deal extends ApplicationRecord {
   static owner = belongsTo('users', { foreignKey: 'ownerId' })
+  static watchers = habtm('dealWatchers', { className: 'User' })
   static name = Attr.string({ label: 'Name' })
 }
 `
@@ -414,5 +415,24 @@ describe('belongsTo ref sugar emission', () => {
     })
     expect(out).not.toContain(`TypedFieldComponent<'ref'>`)
     expect(out).not.toContain(`kind: 'ref'`)
+  })
+
+  it('habtm: emits refMany member + ids meta + typed ownerIds when exposed', () => {
+    const out = generateDeal({
+      get: { expose: ['id', 'name', 'watcherIds'], abilities: true },
+      update: { permit: ['name', 'watcherIds'] },
+    })
+    expect(out).toContain(`watchers: TypedFieldComponent<'refMany'>`)
+    expect(out).toContain(`watchers: { kind: 'refMany', ids: 'watcherIds', label: "Watchers" }`)
+    expect(out).toContain(`watcherIds?: number[]`)
+  })
+
+  it('habtm: emits nothing when the ids key is neither exposed nor permitted', () => {
+    const out = generateDeal({
+      get: { expose: ['id', 'name'], abilities: true },
+      update: { permit: ['name'] },
+    })
+    expect(out).not.toContain(`refMany`)
+    expect(out).not.toContain(`watcherIds`)
   })
 })

@@ -769,3 +769,53 @@ describe('ref fields (belongsTo sugar)', () => {
     expect(screen.getByRole('note').textContent).toBe('is not a teammate')
   })
 })
+
+// ── habtm sugar: a 'refMany' field aliases its `<singular>Ids` set ───────────
+
+describe('refMany fields (habtm sugar)', () => {
+  const MANY_META: Record<string, Record<string, any>> = {
+    ownerIds: { kind: 'json' },
+    owners: { kind: 'refMany', ids: 'ownerIds', label: 'Owners' },
+  }
+
+  function IdsProbe({ value, bind }: PresenterProps) {
+    return (
+      <button type="button" onClick={() => bind.onChange([...(value ?? []), 9])}>
+        add-nine ({JSON.stringify(value)})
+      </button>
+    )
+  }
+
+  beforeEach(() => {
+    registerPresenter('idsProbe', { kind: '*', commit: 'change', component: IdsProbe })
+    setDefaultPresenters({
+      string: { edit: 'text', view: 'textView' },
+      refMany: { edit: 'idsProbe', view: 'textView' },
+    })
+  })
+
+  function makeManyHandle(abilities: Record<string, 'edit' | 'view'> | null = { ownerIds: 'edit' }) {
+    const session = new FormSession<any>({
+      draft: { id: 1, ownerIds: [7] },
+      mode: 'edit',
+      abilities,
+      can: {},
+    })
+    return { handle: createFormHandle(session, { fieldMeta: MANY_META }), session }
+  }
+
+  it('reads the ids array and writes changes back to the ids key', () => {
+    const { handle: deal, session } = makeManyHandle()
+    render(<deal.owners edit />)
+    expect(deal.owners.value).toEqual([7])
+    fireEvent.click(screen.getByRole('button'))
+    expect(session.getValue('ownerIds')).toEqual([7, 9])
+    expect((session.draft as any).owners).toBeUndefined()
+  })
+
+  it('the ids-key mask governs: view renders read-only', () => {
+    const { handle: deal } = makeManyHandle({ ownerIds: 'view' })
+    render(<deal.owners edit />)
+    expect(screen.queryByRole('button')).toBeNull()
+  })
+})

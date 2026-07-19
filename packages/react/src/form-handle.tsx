@@ -247,11 +247,14 @@ export function createFormHandle<T extends Record<string, any>>(
     // subscribes to the session-wide channel. Plain fields subscribe only to
     // themselves, keeping keystrokes single-field re-renders.
     const staticMeta = fieldMeta[field] ?? {}
-    // belongsTo sugar: a 'ref' field is the FK column wearing the
-    // association's name — value, writes, abilities mask, and errors all
-    // alias to meta.fk (same trick as attachment `<name>AssetId` below)
-    const isRef = staticMeta.kind === 'ref' && typeof staticMeta.fk === 'string'
-    const dataField = isRef ? (staticMeta.fk as string) : field
+    // Association sugar: a 'ref' field is the FK column wearing the
+    // association's name; a 'refMany' field is the habtm `<singular>Ids`
+    // set. Value, writes, abilities mask, and errors all alias to the
+    // underlying wire key (same trick as attachment `<name>AssetId` below)
+    const aliasKey = staticMeta.kind === 'ref' && typeof staticMeta.fk === 'string' ? staticMeta.fk
+      : staticMeta.kind === 'refMany' && typeof staticMeta.ids === 'string' ? staticMeta.ids
+      : null
+    const dataField = (aliasKey as string | null) ?? field
     const dependsOnOthers = Boolean(
       staticMeta.presentIf || staticMeta.requiredIf || staticMeta.lockedIf || staticMeta.copy,
     )

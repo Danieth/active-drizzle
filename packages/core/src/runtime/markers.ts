@@ -47,6 +47,12 @@ export type HabtmOptions = {
   joinTable?: string
   foreignKey?: string
   associationForeignKey?: string
+  /**
+   * Target model class when it can't be inferred from the association name —
+   * Rails' class_name. `static owners = habtm('dealOwners', { className: 'User' })`
+   * reads through join table `dealOwners` into User rows.
+   */
+  className?: string
 }
 
 export type EnumDefinition<T extends Record<string, number>> = {

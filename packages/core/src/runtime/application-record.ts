@@ -469,6 +469,8 @@ export class ApplicationRecord {
 
     // Snapshot nested *Attributes data before _attributes is overwritten by the DB row
     const nestedSnapshot = _captureNestedAttributes(this, ctor)
+    // Same for habtm `<singular>Ids` sets — they sync join rows post-persist
+    const habtmSnapshot = _captureHabtmIds(this, ctor)
 
     // DB phase — database failures land in _handleDbError: raw error to
     // the onError handlers, translated message onto this.errors.
@@ -476,14 +478,15 @@ export class ApplicationRecord {
       if (isNew) {
         const payload: Record<string, any> = {}
 
-        // Start with raw constructor-passed attributes (strips nested *Attributes keys)
+        // Start with raw constructor-passed attributes (strips nested
+        // *Attributes and habtm *Ids keys — they are not columns)
         for (const [k, v] of Object.entries(this._attributes)) {
-          if (_isNestedAttrsKey(k, ctor)) continue
+          if (_isNestedAttrsKey(k, ctor) || _isHabtmIdsKey(k, ctor)) continue
           payload[k] = v
         }
         // _changes override (from proxy set calls after construction)
         for (const [k, { is }] of this._changes) {
-          if (_isNestedAttrsKey(k, ctor)) continue
+          if (_isNestedAttrsKey(k, ctor) || _isHabtmIdsKey(k, ctor)) continue
           payload[k] = is
         }
 
@@ -504,9 +507,12 @@ export class ApplicationRecord {
         const [row] = await db.insert(table).values(payload).returning()
         if (row) this._attributes = row
       } else {
-        // Strip *Attributes keys before checking if there are real changes
-        const realChanges = Array.from(this._changes.entries()).filter(([k]) => !_isNestedAttrsKey(k, ctor))
-        const hasAnything = realChanges.length > 0 || Object.keys(nestedSnapshot).length > 0
+        // Strip *Attributes / habtm *Ids keys before checking for real changes
+        const realChanges = Array.from(this._changes.entries())
+          .filter(([k]) => !_isNestedAttrsKey(k, ctor) && !_isHabtmIdsKey(k, ctor))
+        const hasAnything = realChanges.length > 0
+          || Object.keys(nestedSnapshot).length > 0
+          || Object.keys(habtmSnapshot).length > 0
 
         // Even with no parent changes, autosave still needs to run below
         if (!hasAnything) {
@@ -531,6 +537,9 @@ export class ApplicationRecord {
 
       // Process acceptsNestedAttributesFor associations after parent is persisted
       await _processNestedAttributes(this, ctor, nestedSnapshot)
+
+      // Sync habtm join rows to any assigned `<singular>Ids` set
+      await _processHabtmIds(this, ctor, habtmSnapshot)
 
       // counterCache: increment parent counter on first create
       if (isNew) await _adjustCounterCaches(this, ctor, 1)
@@ -1079,6 +1088,18 @@ function _warnMissingModel(table: string, prop: string): null {
 function _findModelByMarker(marker: any, prop: string): any {
   const reg = MODEL_REGISTRY
 
+  // habtm with explicit className (Rails' class_name) — the association name
+  // says what the rows ARE TO THIS MODEL ('coOwners'), className what they
+  // are. NEVER compare `.name`: a model with a `name` Attr shadows the
+  // class's own — resolve through registry keys (class-name key when it
+  // survived registration, else the naively pluralized table key).
+  if (marker._type === 'habtm' && marker.options?.className) {
+    const cn = marker.options.className as string
+    return reg[cn]
+      ?? reg[_pluralizeClassName(cn)]
+      ?? _warnMissingModel(cn, prop)
+  }
+
   // For belongsTo / hasMany / hasOne: marker.table is the TARGET table (if explicit)
   if (marker._type !== 'habtm' && marker.table) {
     return Object.values(reg).find((m: any) => m._activeDrizzleTableName === marker.table)
@@ -1105,6 +1126,14 @@ function _findModelByMarker(marker: any, prop: string): any {
   )
 }
 
+/** 'User' → 'users', 'Company' → 'companies' — the inverse of _singularize. */
+function _pluralizeClassName(cn: string): string {
+  const s = cn.charAt(0).toLowerCase() + cn.slice(1)
+  if (s.endsWith('y')) return s.slice(0, -1) + 'ies'
+  if (s.endsWith('s') || s.endsWith('x') || s.endsWith('z')) return s + 'es'
+  return s + 's'
+}
+
 /** Naive singularizer — strips trailing 's' for common English plurals. */
 function _singularize(word: string): string {
   if (word.endsWith('ies')) return word.slice(0, -3) + 'y'
@@ -1120,6 +1149,103 @@ function _isNestedAttrsKey(key: string, ctor: any): boolean {
   const marker = ctor[assocName]
   // acceptsNested: true | { allowDestroy?: boolean } — any truthy value opts in
   return marker?._type === 'hasMany' && Boolean(marker.options?.acceptsNested)
+}
+
+// ── habtm `<singular>Ids` collection sync ────────────────────────────────────
+
+/**
+ * The habtm associations of a model with their Rails-style ids write key:
+ * `static owners = habtm('dealOwners', …)` ⇒ `{ idsKey: 'ownerIds', prop: 'owners' }`.
+ * Assigning that key on create/update REPLACES the join-row set to match.
+ */
+export function resolveHabtmIdsAssociations(model: any): Array<{ idsKey: string; prop: string }> {
+  const out: Array<{ idsKey: string; prop: string }> = []
+  if (!model) return out
+  for (const key of Object.getOwnPropertyNames(model)) {
+    const marker = (model as any)[key]
+    if (!marker || typeof marker !== 'object' || marker._type !== 'habtm') continue
+    out.push({ idsKey: `${_singularize(key)}Ids`, prop: key })
+  }
+  return out
+}
+
+/** True when the key is the `<singular>Ids` write key of a habtm association. */
+function _isHabtmIdsKey(key: string, ctor: any): boolean {
+  return key.endsWith('Ids') && resolveHabtmIdsAssociations(ctor).some(a => a.idsKey === key)
+}
+
+/**
+ * Captures habtm ids arrays from `_attributes` (constructor-passed) and
+ * `_changes` (proxy-set) BEFORE the parent DB operation overwrites them.
+ * Returns a map of associationName → raw value (validated in processing).
+ */
+function _captureHabtmIds(record: any, ctor: any): Record<string, any> {
+  const result: Record<string, any> = {}
+  for (const { idsKey, prop } of resolveHabtmIdsAssociations(ctor)) {
+    const fromChanges = record._changes.get(idsKey)?.is
+    const data = fromChanges !== undefined ? fromChanges : record._attributes[idsKey]
+    if (data !== undefined) result[prop] = data
+  }
+  return result
+}
+
+/**
+ * Syncs habtm join rows to the assigned id set — insert what's missing,
+ * delete what's gone, leave the rest. Runs after the owner is persisted.
+ *
+ * Fails loud (NestedAttributesError → 422), never silently: a non-array, a
+ * non-integer, or an id with no target row is a validation error, because a
+ * "sync" that quietly drops ids would lie to the form that sent them.
+ */
+async function _processHabtmIds(record: any, ctor: any, snapshot: Record<string, any>): Promise<void> {
+  const ownerId = record._attributes['id']
+  if (!ownerId || Object.keys(snapshot).length === 0) return
+
+  for (const [prop, raw] of Object.entries(snapshot)) {
+    const idsKey = `${_singularize(prop)}Ids`
+    if (!Array.isArray(raw)) throw new NestedAttributesError(idsKey, 'must be an array of ids')
+    const desired: number[] = []
+    for (const v of raw) {
+      const n = Number(v)
+      if (!Number.isInteger(n) || n <= 0) throw new NestedAttributesError(idsKey, `'${String(v)}' is not a valid id`)
+      if (!desired.includes(n)) desired.push(n)
+    }
+
+    const marker = ctor[prop]
+    const TargetModel = _findModelByMarker(marker, prop)
+    if (!TargetModel) throw new NestedAttributesError(idsKey, `association '${prop}' has no resolvable model`)
+    const schema = getSchema()
+    const joinTable = schema[marker.table]
+    if (!joinTable) throw new NestedAttributesError(idsKey, `join table '${marker.table}' not found in schema`)
+    const ownerFk = marker.options?.foreignKey ?? `${_singularize(ctor.tableName)}Id`
+    const targetFk = marker.options?.associationForeignKey
+      ?? `${_singularize(TargetModel._activeDrizzleTableName ?? TargetModel.name.toLowerCase())}Id`
+    const joinOwnerCol = joinTable[ownerFk]
+    const joinTargetCol = joinTable[targetFk]
+    if (!joinOwnerCol || !joinTargetCol) {
+      throw new NestedAttributesError(idsKey, `join table '${marker.table}' is missing '${ownerFk}'/'${targetFk}'`)
+    }
+
+    // Existence gate: every desired id must be a real target row
+    if (desired.length > 0) {
+      const found = await new Relation(TargetModel).where({ id: desired }).count()
+      if (Number(found) !== desired.length) {
+        throw new NestedAttributesError(idsKey, 'contains ids that do not exist')
+      }
+    }
+
+    const db = getExecutor()
+    const currentRows = await db.select({ _val: joinTargetCol }).from(joinTable).where(eq(joinOwnerCol, ownerId))
+    const current: number[] = currentRows.map((r: any) => Number(r._val))
+    const toAdd = desired.filter((id) => !current.includes(id))
+    const toRemove = current.filter((id) => !desired.includes(id))
+    if (toAdd.length > 0) {
+      await db.insert(joinTable).values(toAdd.map((id) => ({ [ownerFk]: ownerId, [targetFk]: id })))
+    }
+    if (toRemove.length > 0) {
+      await db.delete(joinTable).where(and(eq(joinOwnerCol, ownerId), inArray(joinTargetCol, toRemove)))
+    }
+  }
 }
 
 /**
