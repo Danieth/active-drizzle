@@ -109,9 +109,9 @@ describe('activeDrizzle — full codegen run on disk', () => {
     ;(plugin as any).configResolved({ root: dir })
     await (plugin as any).buildStart()
 
-    expect(existsSync(join(dir, 'src/models/Asset.model.gen.d.ts'))).toBe(true)
+    expect(existsSync(join(dir, 'src/models/Asset.model.types.gen.d.ts'))).toBe(true)
     expect(existsSync(join(dir, 'src/models/Asset.model.gen.ts'))).toBe(true)
-    expect(existsSync(join(dir, 'src/models/Business.model.gen.d.ts'))).toBe(true)
+    expect(existsSync(join(dir, 'src/models/Business.model.types.gen.d.ts'))).toBe(true)
   })
 
   it('writes _registry.gen.ts to the output dir', async () => {
@@ -165,7 +165,7 @@ describe('activeDrizzle — full codegen run on disk', () => {
     ;(plugin as any).configResolved({ root: dir })
     await (plugin as any).buildStart()
 
-    const genContent = readFileSync(join(dir, 'src/models/Asset.model.gen.d.ts'), 'utf8')
+    const genContent = readFileSync(join(dir, 'src/models/Asset.model.types.gen.d.ts'), 'utf8')
     expect(genContent).toContain('business: Promise<BusinessRecord>')
     expect(genContent).toContain('titleChanged(): boolean')
     expect(genContent).toContain('AssetWhere')

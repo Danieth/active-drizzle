@@ -37,7 +37,7 @@ describe('generator — association types', () => {
     const result = project.run()
     expectNoErrors(result)
 
-    const genFile = result.files['Asset.model.gen.d.ts'] ?? ''
+    const genFile = result.files['Asset.model.types.gen.d.ts'] ?? ''
     expect(genFile).toContain('business: Promise<BusinessRecord>')
   })
 
@@ -55,7 +55,7 @@ describe('generator — association types', () => {
     })
 
     const result = project.run()
-    const genFile = result.files['Asset.model.gen.d.ts'] ?? ''
+    const genFile = result.files['Asset.model.types.gen.d.ts'] ?? ''
     expect(genFile).toContain('creator: Promise<UserRecord | null>')
   })
 
@@ -69,7 +69,7 @@ describe('generator — association types', () => {
     })
 
     const result = project.run()
-    const genFile = result.files['Business.model.gen.d.ts'] ?? ''
+    const genFile = result.files['Business.model.types.gen.d.ts'] ?? ''
     expect(genFile).toContain('assets: Relation<AssetRecord, AssetAssociations>')
   })
 })
@@ -92,7 +92,7 @@ describe('generator — enum types', () => {
     })
 
     const result = project.run()
-    const genFile = result.files['Asset.model.gen.d.ts'] ?? ''
+    const genFile = result.files['Asset.model.types.gen.d.ts'] ?? ''
 
     expect(genFile).toContain('isJpg(): boolean')
     expect(genFile).toContain('isPng(): boolean')
@@ -112,7 +112,7 @@ describe('generator — enum types', () => {
     })
 
     const result = project.run()
-    const genFile = result.files['Asset.model.gen.d.ts'] ?? ''
+    const genFile = result.files['Asset.model.types.gen.d.ts'] ?? ''
 
     expect(genFile).toContain('toJpg(): AssetRecord')
     expect(genFile).toContain('toPng(): AssetRecord')
@@ -133,10 +133,13 @@ describe('generator — enum types', () => {
     })
 
     const result = project.run()
-    const genFile = result.files['Asset.model.gen.d.ts'] ?? ''
+    const genFile = result.files['Asset.model.types.gen.d.ts'] ?? ''
 
-    expect(genFile).toContain('images: Relation<AssetRecord, AssetAssociations>')
-    expect(genFile).toContain('videos: Relation<AssetRecord, AssetAssociations>')
+    // Enum-group statics are OWN statics on the class — redeclaring them in
+    // the merged namespace is TS2451 the moment the augmentation applies,
+    // so the namespace stays silent about them (the class declaration types)
+    expect(genFile).not.toContain('images: Relation<AssetRecord, AssetAssociations>')
+    expect(genFile).not.toContain('videos: Relation<AssetRecord, AssetAssociations>')
     expect(genFile).toContain('isImages(): boolean')
     expect(genFile).toContain('isVideos(): boolean')
   })
@@ -154,9 +157,14 @@ describe('generator — enum types', () => {
     })
 
     const result = project.run()
-    const genFile = result.files['Asset.model.gen.d.ts'] ?? ''
+    const genFile = result.files['Asset.model.types.gen.d.ts'] ?? ''
 
-    expect(genFile).toContain('assetType: { jpg: 116; png: 125 }')
+    // No namespace `const assetType` — the class already declares
+    // `static assetType = Attr.enum(...)`; a same-named namespace const is a
+    // redeclaration error once the augmentation is loaded into a program.
+    expect(genFile).not.toContain('const assetType')
+    // The instance side still gets the readonly label union.
+    expect(genFile).toContain('readonly assetType:')
   })
 })
 
@@ -180,7 +188,7 @@ describe('generator — dirty tracking types', () => {
     })
 
     const result = project.run()
-    const genFile = result.files['Asset.model.gen.d.ts'] ?? ''
+    const genFile = result.files['Asset.model.types.gen.d.ts'] ?? ''
 
     expect(genFile).toContain('titleChanged(): boolean')
     expect(genFile).toContain('businessIdChanged(): boolean')
@@ -199,7 +207,7 @@ describe('generator — dirty tracking types', () => {
     })
 
     const result = project.run()
-    const genFile = result.files['Asset.model.gen.d.ts'] ?? ''
+    const genFile = result.files['Asset.model.types.gen.d.ts'] ?? ''
 
     expect(genFile).toContain('isChanged(): boolean')
     expect(genFile).toContain('changedFields(): string[]')
@@ -227,9 +235,12 @@ describe('generator — scope types', () => {
     })
 
     const result = project.run()
-    const genFile = result.files['Asset.model.gen.d.ts'] ?? ''
+    const genFile = result.files['Asset.model.types.gen.d.ts'] ?? ''
 
-    expect(genFile).toContain('recent: Relation<AssetRecord, AssetAssociations>')
+    // OWN scopes are typed by the class's own static method (whose
+    // this.where resolves through the namespace `where`) — a namespace
+    // redeclaration of the same name is TS2451 once the augmentation applies
+    expect(genFile).not.toContain('recent: Relation<AssetRecord, AssetAssociations>')
   })
 
   it('generates parameterized scope as method', () => {
@@ -245,9 +256,10 @@ describe('generator — scope types', () => {
     })
 
     const result = project.run()
-    const genFile = result.files['Asset.model.gen.d.ts'] ?? ''
+    const genFile = result.files['Asset.model.types.gen.d.ts'] ?? ''
 
-    expect(genFile).toContain('since(date: Date): Relation<AssetRecord, AssetAssociations>')
+    // Same own-static rule as zero-arg scopes — no namespace redeclaration
+    expect(genFile).not.toContain('since(date: Date): Relation<AssetRecord, AssetAssociations>')
   })
 })
 
@@ -278,7 +290,7 @@ describe('generator — acceptsNestedAttributesFor', () => {
     })
 
   it('adds campaignsAttributes to AssetCreate when acceptsNested is true', () => {
-    const gen = makeProject().run().files['Asset.model.gen.d.ts'] ?? ''
+    const gen = makeProject().run().files['Asset.model.types.gen.d.ts'] ?? ''
     expect(gen).toContain('campaignsAttributes?: CampaignCreate[]')
   })
 
@@ -293,7 +305,7 @@ describe('generator — acceptsNestedAttributesFor', () => {
         'Campaign.model.ts': modelBuilder('Campaign', 'campaigns').belongsTo('asset').build(),
       },
     })
-    const gen = project.run().files['Asset.model.gen.d.ts'] ?? ''
+    const gen = project.run().files['Asset.model.types.gen.d.ts'] ?? ''
     expect(gen).not.toContain('campaignsAttributes')
   })
 })
@@ -340,7 +352,7 @@ describe('generator — snapshot tests', () => {
     const result = project.run()
     expectNoErrors(result)
 
-    expect(result.files['Asset.model.gen.d.ts']).toMatchSnapshot()
+    expect(result.files['Asset.model.types.gen.d.ts']).toMatchSnapshot()
     expect(result.files['Asset.model.gen.ts']).toMatchSnapshot()
   })
 })
@@ -438,11 +450,13 @@ describe('generator — @computed scope types', () => {
       },
     }).run()
 
-    const dts = result.files['Asset.model.gen.d.ts'] ?? ''
-    expect(dts).toContain('function aggregateStats(): Promise<unknown>')
+    const dts = result.files['Asset.model.types.gen.d.ts'] ?? ''
+    // Own statics never redeclare in the namespace (TS2451 when merging
+    // applies) — the class's own method signature is the type
+    expect(dts).not.toContain('function aggregateStats(): Promise<unknown>')
   })
 
-  it('@scope still emits Relation<> type', () => {
+  it('own @scope statics stay out of the namespace too', () => {
     const result = createTestProject({
       schema: schemaBuilder()
         .table('assets', t => t.integer('id').primaryKey().notNull())
@@ -454,8 +468,8 @@ describe('generator — @computed scope types', () => {
       },
     }).run()
 
-    const dts = result.files['Asset.model.gen.d.ts'] ?? ''
-    expect(dts).toContain('const recent: Relation<')
+    const dts = result.files['Asset.model.types.gen.d.ts'] ?? ''
+    expect(dts).not.toContain('const recent: Relation<')
   })
 })
 
@@ -552,7 +566,7 @@ describe('generator — columnToTsType for expanded column types', () => {
       },
     })
     const result = project.run()
-    const genFile = result.files['Token.model.gen.d.ts'] ?? ''
+    const genFile = result.files['Token.model.types.gen.d.ts'] ?? ''
     expect(genFile).toContain('id: string')
   })
 
@@ -566,7 +580,7 @@ describe('generator — columnToTsType for expanded column types', () => {
       },
     })
     const result = project.run()
-    const genFile = result.files['Item.model.gen.d.ts'] ?? ''
+    const genFile = result.files['Item.model.types.gen.d.ts'] ?? ''
     expect(genFile).toContain('id: number')
   })
 
@@ -582,7 +596,7 @@ describe('generator — columnToTsType for expanded column types', () => {
       },
     })
     const result = project.run()
-    const genFile = result.files['Product.model.gen.d.ts'] ?? ''
+    const genFile = result.files['Product.model.types.gen.d.ts'] ?? ''
     // The column is nullable (no .notNull()), so the type includes '| null'
     expect(genFile).toContain('string | null')
   })
@@ -655,7 +669,7 @@ describe('generator — columnToDefault for various column types with hasDefault
 // ---------------------------------------------------------------------------
 
 describe('generator — generateGlobals', () => {
-  it('is called as part of generate() and produces a placeholder comment', () => {
+  it('is called as part of generate() and produces ambient global aliases', () => {
     const project = createTestProject({
       schema: schemaBuilder()
         .table('posts', t => t.integer('id').primaryKey().notNull())
@@ -665,8 +679,14 @@ describe('generator — generateGlobals', () => {
       },
     })
     const result = project.run()
-    // _globals.gen.d.ts is emitted by generateGlobals — it must exist
+    // _globals.gen.d.ts carries the ambient cross-model aliases the per-model
+    // .gen.d.ts augmentations reference (they cannot import). It must stay a
+    // global script: no top-level import/export statements.
     const globals = result.files['_globals.gen.d.ts'] ?? ''
-    expect(globals).toContain('placeholder')
+    expect(globals).toContain(`type PostRecord = InstanceType<typeof import('./Post.model.js').Post>`)
+    expect(globals).toContain(`type PostClient = InstanceType<typeof import('./Post.model.js').Post.Client>`)
+    expect(globals).toContain('interface PostAssociations')
+    expect(globals).not.toMatch(/^import /m)
+    expect(globals).not.toMatch(/^export /m)
   })
 })

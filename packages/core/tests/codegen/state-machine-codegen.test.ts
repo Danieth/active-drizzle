@@ -158,7 +158,7 @@ describe('validator: state machine build gates', () => {
 describe('generators: .d.ts, schema.md, model Client', () => {
   it('emits label-union field, can/advance, per-event methods in .d.ts', () => {
     const result = projectFor(loanModel).run()
-    const dts = result.files['Loan.model.gen.d.ts']!
+    const dts = result.files['Loan.model.types.gen.d.ts']!
 
     expect(dts).toContain(`status: 'draft' | 'submitted' | 'approved' | null`)
     expect(dts).toContain(`can(event: 'submit' | 'approve' | 'reopen'): boolean`)

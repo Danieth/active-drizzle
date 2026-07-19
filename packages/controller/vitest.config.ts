@@ -23,6 +23,11 @@ export default defineConfig({
     typecheck: {
       tsconfig: './tsconfig.test.json',
     },
+    // maxForks:1 is deliberate and OPTIMAL here — not a Docker constraint.
+    // Only 6 test files, but each fork re-transforms the whole core src tree
+    // (imported via the @active-drizzle/core alias). A single fork transforms
+    // it once and reuses the module cache across all files (~3.8s); fanning out
+    // duplicates that transform per fork and is measurably SLOWER (~5.8s).
     pool: 'forks',
     poolOptions: { forks: { maxForks: 1 } },
     testTimeout: 300_000,

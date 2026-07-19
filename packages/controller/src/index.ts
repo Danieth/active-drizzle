@@ -6,6 +6,7 @@ export {
   Forbidden,
   NotFound,
   ValidationError,
+  Conflict,
   toValidationError,
   serializeError,
 } from './errors.js'

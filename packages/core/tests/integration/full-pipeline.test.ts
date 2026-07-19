@@ -71,12 +71,12 @@ describe('full pipeline — Asset model (the canonical example)', () => {
     const project = createTestProject({ schema, models: { 'Asset.model.ts': assetSrc } })
     const result = project.run()
 
-    expect('Asset.model.gen.d.ts' in result.files).toBe(true)
+    expect('Asset.model.types.gen.d.ts' in result.files).toBe(true)
   })
 
   it('generated file contains all 5 enum predicates', () => {
     const project = createTestProject({ schema, models: { 'Asset.model.ts': assetSrc } })
-    const gen = project.run().files['Asset.model.gen.d.ts'] ?? ''
+    const gen = project.run().files['Asset.model.types.gen.d.ts'] ?? ''
 
     expect(gen).toContain('isJpg(): boolean')
     expect(gen).toContain('isPng(): boolean')
@@ -87,7 +87,7 @@ describe('full pipeline — Asset model (the canonical example)', () => {
 
   it('generated file contains 3 group predicates', () => {
     const project = createTestProject({ schema, models: { 'Asset.model.ts': assetSrc } })
-    const gen = project.run().files['Asset.model.gen.d.ts'] ?? ''
+    const gen = project.run().files['Asset.model.types.gen.d.ts'] ?? ''
 
     expect(gen).toContain('isImages(): boolean')
     expect(gen).toContain('isVideos(): boolean')
@@ -96,7 +96,7 @@ describe('full pipeline — Asset model (the canonical example)', () => {
 
   it('generated file contains both association types', () => {
     const project = createTestProject({ schema, models: { 'Asset.model.ts': assetSrc } })
-    const gen = project.run().files['Asset.model.gen.d.ts'] ?? ''
+    const gen = project.run().files['Asset.model.types.gen.d.ts'] ?? ''
 
     expect(gen).toContain('business: Promise<BusinessRecord>')
     expect(gen).toContain('creator: Promise<UserRecord | null>')
@@ -104,17 +104,20 @@ describe('full pipeline — Asset model (the canonical example)', () => {
     expect(gen).toContain('ads: Relation<AdRecord, AdAssociations>')
   })
 
-  it('generated file contains both scope types', () => {
+  it('own scopes stay OUT of the namespace (class statics are the type)', () => {
     const project = createTestProject({ schema, models: { 'Asset.model.ts': assetSrc } })
-    const gen = project.run().files['Asset.model.gen.d.ts'] ?? ''
+    const gen = project.run().files['Asset.model.types.gen.d.ts'] ?? ''
 
-    expect(gen).toContain('recent: Relation<AssetRecord, AssetAssociations>')
-    expect(gen).toContain('since(date: Date): Relation<AssetRecord, AssetAssociations>')
+    // Redeclaring an own static in the merged namespace is TS2451 once the
+    // augmentation actually lands in the program — only INHERITED (STI)
+    // scopes get namespace declarations (covered by the STI suite below)
+    expect(gen).not.toContain('recent: Relation<AssetRecord, AssetAssociations>')
+    expect(gen).not.toContain('since(date: Date): Relation<AssetRecord, AssetAssociations>')
   })
 
   it('generated file contains dirty tracking for key columns', () => {
     const project = createTestProject({ schema, models: { 'Asset.model.ts': assetSrc } })
-    const gen = project.run().files['Asset.model.gen.d.ts'] ?? ''
+    const gen = project.run().files['Asset.model.types.gen.d.ts'] ?? ''
 
     expect(gen).toContain('titleChanged(): boolean')
     expect(gen).toContain('businessIdChanged(): boolean')
@@ -123,7 +126,7 @@ describe('full pipeline — Asset model (the canonical example)', () => {
 
   it('generated file contains instance method', () => {
     const project = createTestProject({ schema, models: { 'Asset.model.ts': assetSrc } })
-    const gen = project.run().files['Asset.model.gen.d.ts'] ?? ''
+    const gen = project.run().files['Asset.model.types.gen.d.ts'] ?? ''
 
     expect(gen).toContain('assetFormat(): string | null')
   })
@@ -146,7 +149,7 @@ describe('full pipeline — STI (TextMessage hierarchy)', () => {
     })
 
     const result = project.run()
-    const gen = result.files['OutboundTemplate.model.gen.d.ts'] ?? ''
+    const gen = result.files['OutboundTemplate.model.types.gen.d.ts'] ?? ''
 
     // Child should inherit parent scopes
     expect(gen).toContain('recent: Relation<OutboundTemplateRecord, OutboundTemplateAssociations>')

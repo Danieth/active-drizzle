@@ -73,13 +73,35 @@ function warn(modelFile: string, message: string, suggestion?: string): Diagnost
 
 function validateAssociations(model: ModelMeta, project: ProjectMeta, out: Diagnostic[]) {
   for (const assoc of model.associations) {
+    // Polymorphic belongsTo has no static target table — the target is read
+    // from `<name>Type` at runtime. Check the discriminator/FK columns instead.
+    if (assoc.kind === 'belongsTo' && assoc.polymorphic) {
+      const ownerTable = project.schema.tables[model.tableName];
+      if (ownerTable) {
+        for (const col of [`${assoc.propertyName}Type`, `${assoc.propertyName}Id`]) {
+          const found = ownerTable.columns.some(c => c.name === col || c.dbName === toSnakeCase(col));
+          if (!found) {
+            out.push(err(
+              model.filePath,
+              `Association "${assoc.propertyName}": polymorphic belongsTo expects column "${col}" on table "${model.tableName}" but it was not found.`,
+            ));
+          }
+        }
+      }
+      continue;
+    }
+
     const targetTable = assoc.explicitTable ?? pluralize(assoc.propertyName);
     const allTables = Object.keys(project.schema.tables);
 
     const tableExists = targetTable in project.schema.tables;
     if (!tableExists) {
-      // Suggest closest matching table using both computed table name and raw property name
-      const suggestion = findClose(targetTable, allTables) ?? findClose(assoc.propertyName, allTables);
+      // A SQL table name where the export identifier belongs is the most common
+      // miss — point straight at the export when the dbName matches exactly.
+      const dbNameMatch = Object.values(project.schema.tables).find(t => t.dbName === targetTable);
+      const suggestion = dbNameMatch
+        ? `${dbNameMatch.name} ('${targetTable}' is the SQL name — use the schema export identifier)`
+        : findClose(targetTable, allTables) ?? findClose(assoc.propertyName, allTables);
       out.push(err(
         model.filePath,
         `Association "${assoc.propertyName}": table "${targetTable}" not found in schema.${suggestion ? ` Did you mean "${suggestion}"?` : ''}`,
@@ -103,27 +125,48 @@ function validateAssociations(model: ModelMeta, project: ProjectMeta, out: Diagn
       }
     }
 
-    // FK check for hasMany — check the target table for the foreign key
-    if (assoc.kind === 'hasMany' && !assoc.through) {
-      const fkCol = assoc.foreignKey ?? `${pluralize.singular(model.className.toLowerCase())}Id`;
+    // FK check for hasMany/hasOne — check the target table for the foreign key
+    if ((assoc.kind === 'hasMany' || assoc.kind === 'hasOne') && !assoc.through) {
+      const asName = (assoc.options as any)?.['as'] as string | undefined;
       const targetSchema = project.schema.tables[targetTable];
-      const hasFk = targetSchema?.columns.some(c =>
-        c.name === fkCol || c.dbName === toSnakeCase(fkCol)
-      );
-      if (targetSchema && !hasFk) {
-        out.push(err(
-          model.filePath,
-          `Association "${assoc.propertyName}": column "${fkCol}" not found on table "${targetTable}".`,
-        ));
+      if (asName) {
+        // Polymorphic inverse (as:) — the target carries the PAIR
+        // `${as}Id` + `${as}Type`, not the default `<owner>Id` (demanding
+        // that column here was the build-blocking half of the polymorphic
+        // gap: runtime and validator must agree on the shape)
+        for (const col of [`${asName}Id`, `${asName}Type`]) {
+          const has = targetSchema?.columns.some(c =>
+            c.name === col || c.dbName === toSnakeCase(col)
+          );
+          if (targetSchema && !has) {
+            out.push(err(
+              model.filePath,
+              `Association "${assoc.propertyName}": polymorphic inverse (as: '${asName}') expects column "${col}" on table "${targetTable}" but it was not found.`,
+            ));
+          }
+        }
+      } else if (assoc.kind === 'hasMany') {
+        const fkCol = assoc.foreignKey ?? `${pluralize.singular(model.className.toLowerCase())}Id`;
+        const hasFk = targetSchema?.columns.some(c =>
+          c.name === fkCol || c.dbName === toSnakeCase(fkCol)
+        );
+        if (targetSchema && !hasFk) {
+          out.push(err(
+            model.filePath,
+            `Association "${assoc.propertyName}": column "${fkCol}" not found on table "${targetTable}".`,
+          ));
+        }
       }
     }
 
     // Through-table validation for hasMany :through
     if (assoc.kind === 'hasMany' && assoc.through) {
       if (!(assoc.through in project.schema.tables)) {
+        const dbNameMatch = Object.values(project.schema.tables).find(t => t.dbName === assoc.through);
         out.push(err(
           model.filePath,
-          `Association "${assoc.propertyName}": through table "${assoc.through}" not found in schema.`,
+          `Association "${assoc.propertyName}": through table "${assoc.through}" not found in schema.` +
+            (dbNameMatch ? ` Did you mean "${dbNameMatch.name}"? ('${assoc.through}' is the SQL name — use the schema export identifier)` : ''),
         ));
       }
     }
@@ -137,16 +180,25 @@ function validateAssociations(model: ModelMeta, project: ProjectMeta, out: Diagn
           `Association "${assoc.propertyName}": target model for table "${targetTable}" not found. Cannot verify bidirectional association.`,
         ));
       } else {
-        // Inverse must be a belongsTo that points back at this model's table
+        // Inverse must be a belongsTo that points back at this model's table.
+        // A polymorphic inverse (as:) is satisfied by the target's
+        // POLYMORPHIC belongsTo of that name — it points back at every
+        // parent type by construction, table-matching doesn't apply.
         const ownerTable = model.tableName;
+        const asName = (assoc.options as any)?.['as'] as string | undefined;
         const hasInverse = targetModel.associations.some(a =>
-          a.kind === 'belongsTo' &&
-          (a.explicitTable === ownerTable || (!a.explicitTable && pluralize(a.propertyName) === ownerTable))
+          a.kind === 'belongsTo' && (
+            asName
+              ? (a.polymorphic && a.propertyName === asName)
+              : (a.explicitTable === ownerTable || (!a.explicitTable && pluralize(a.propertyName) === ownerTable))
+          )
         );
         if (!hasInverse) {
           out.push(warn(
             model.filePath,
-            `Association "${assoc.propertyName}": no bidirectional belongsTo found on "${targetModel.className}" pointing back to "${ownerTable}". Consider adding it.`,
+            asName
+              ? `Association "${assoc.propertyName}": no polymorphic belongsTo "${asName}" found on "${targetModel.className}" (expected \`static ${asName} = belongsTo({ polymorphic: true })\`). Consider adding it.`
+              : `Association "${assoc.propertyName}": no bidirectional belongsTo found on "${targetModel.className}" pointing back to "${ownerTable}". Consider adding it.`,
           ));
         }
       }
@@ -299,9 +351,10 @@ function validateSti(model: ModelMeta, project: ProjectMeta, out: Diagnostic[]) 
     ));
   }
 
-  // Warn if no defaultScope on the STI child model — encourage the stiType pattern.
+  // Warn when the STI child has neither `static stiType` nor a defaultScope —
+  // without one of them, parent-table queries won't scope to the subclass.
   const hasDefaultScope = model.scopes.some(s => s.name === 'defaultScope');
-  if (!hasDefaultScope) {
+  if (!hasDefaultScope && model.stiTypeValue == null) {
     out.push(warn(
       model.filePath,
       `STI model "${model.className}": add \`static stiType = <discriminatorValue>\` to your class so active-drizzle automatically injects WHERE type = <value> on all queries and instantiates the correct subclass when loading from the parent table.`,
@@ -350,6 +403,15 @@ function validateFieldMeta(model: ModelMeta, project: ProjectMeta, out: Diagnost
   const discriminants = new Map<string, Set<string>>();
   for (const e of model.enums) discriminants.set(e.propertyName, new Set(Object.keys(e.values)));
   for (const s of model.states) discriminants.set(s.propertyName, new Set(Object.keys(s.values)));
+
+  // The STI discriminator is a legal copy.by source on an STI parent — its
+  // labels are the subclasses' `static stiType` values (e.g. per-facility copy).
+  const stiLabels = new Set(
+    project.models
+      .filter(m => m.stiParent === model.className && m.stiTypeValue != null)
+      .map(m => m.stiTypeValue as string),
+  );
+  if (stiLabels.size > 0 && !discriminants.has('type')) discriminants.set('type', stiLabels);
 
   for (const [prop, entry] of Object.entries(model.fieldMeta ?? {})) {
     for (const msg of entry.errors) out.push(err(model.filePath, msg));

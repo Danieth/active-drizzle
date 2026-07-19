@@ -14,6 +14,7 @@ import {
   runAsyncValidators,
   normalizeMessage,
   type AttrValidator,
+  type AsyncAttrValidator,
 } from './validation-errors.js'
 
 /**
@@ -77,12 +78,34 @@ export interface AttrConfig extends AttrPresentationalMeta {
   validate?: AttrValidator | AttrValidator[]
   /** Alias for `validate` (Rails-ish). */
   validates?: AttrValidator | AttrValidator[]
-  serverValidate?:
-    | ((val: any) => Promise<string | null | undefined>)
-    | Array<(val: any) => Promise<string | null | undefined>>
-  serverValidates?:
-    | ((val: any) => Promise<string | null | undefined>)
-    | Array<(val: any) => Promise<string | null | undefined>>
+  /**
+   * Server-only async validators (DB-backed rules like uniqueness). Typed as
+   * AsyncAttrValidator — which may ALSO return a sync string — so
+   * `serverValidates: Validates.uniqueness()` typechecks as documented.
+   */
+  serverValidate?: AsyncAttrValidator | AsyncAttrValidator[]
+  serverValidates?: AsyncAttrValidator | AsyncAttrValidator[]
+}
+
+/**
+ * Static [key, value] pairs of a model class INCLUDING statics inherited from
+ * STI parents (walks the constructor chain, stopping at ApplicationRecord).
+ * `Object.getOwnPropertyNames(ctor)` alone makes an STI subclass blind to
+ * every Attr / state machine / association its parent declares — subclass
+ * instances would lose isDraft(), advance(), belongsTo resolution, etc.
+ * Subclass declarations shadow the parent's (first hit wins).
+ */
+export function modelStaticEntries(ctor: any): Array<[string, any]> {
+  const out: Array<[string, any]> = []
+  const seen = new Set<string>()
+  for (let c = ctor; c && c !== ApplicationRecord && c !== Function.prototype; c = Object.getPrototypeOf(c)) {
+    for (const key of Object.getOwnPropertyNames(c)) {
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push([key, c[key]])
+    }
+  }
+  return out
 }
 
 export class ApplicationRecord {
@@ -246,8 +269,8 @@ export class ApplicationRecord {
     }
 
     // Attr.* property-level validations (validate / validates — single or array)
-    for (const key of Object.getOwnPropertyNames(ctor)) {
-      const attr = ctor[key] as AttrConfig | undefined
+    for (const [key, attrVal] of modelStaticEntries(ctor)) {
+      const attr = attrVal as AttrConfig | undefined
       if (attr?._isAttr !== true) continue
       const syncFns = attr.validates ?? attr.validate
       const asyncFns = attr.serverValidates ?? attr.serverValidate
@@ -277,8 +300,8 @@ export class ApplicationRecord {
     // move with no legal transition path can never persist. New records skip
     // the check: creation may start in any state (imports, seeds, tests).
     if (!this.isNewRecord) {
-      for (const key of Object.getOwnPropertyNames(ctor)) {
-        const stateCfg = ctor[key] as AttrStateConfig | undefined
+      for (const [key, stateVal] of modelStaticEntries(ctor)) {
+        const stateCfg = stateVal as AttrStateConfig | undefined
         if (stateCfg?._type !== 'state') continue
         const change = this._changes.get(key)
         if (!change) continue
@@ -322,8 +345,7 @@ export class ApplicationRecord {
 
     // Columns that an Attr default will fill during save()
     const attrDefaulted = new Set<string>()
-    for (const key of Object.getOwnPropertyNames(ctor)) {
-      const attr = ctor[key]
+    for (const [key, attr] of modelStaticEntries(ctor)) {
       if (attr?._isAttr === true && attr.default !== undefined) {
         attrDefaulted.add(attr._column ?? key)
       }
@@ -391,8 +413,8 @@ export class ApplicationRecord {
    */
   can(event: string): boolean {
     const ctor = this.constructor as any
-    for (const key of Object.getOwnPropertyNames(ctor)) {
-      const cfg = ctor[key] as AttrStateConfig | undefined
+    for (const [key, cfgVal] of modelStaticEntries(ctor)) {
+      const cfg = cfgVal as AttrStateConfig | undefined
       // Object.hasOwn: `'toString' in transitions` finds Object.prototype and
       // would crash stateCanFire instead of reporting an unknown event.
       if (cfg?._type !== 'state' || !Object.hasOwn(cfg.transitions, event)) continue
@@ -413,8 +435,8 @@ export class ApplicationRecord {
    */
   async advance(event: string): Promise<boolean> {
     const ctor = this.constructor as any
-    for (const key of Object.getOwnPropertyNames(ctor)) {
-      const cfg = ctor[key] as AttrStateConfig | undefined
+    for (const [key, cfgVal] of modelStaticEntries(ctor)) {
+      const cfg = cfgVal as AttrStateConfig | undefined
       // Object.hasOwn: `'toString' in transitions` finds Object.prototype and
       // would crash stateCanFire instead of reporting an unknown event.
       if (cfg?._type !== 'state' || !Object.hasOwn(cfg.transitions, event)) continue
@@ -490,8 +512,8 @@ export class ApplicationRecord {
         }
 
         // Apply defaults for fields not yet set
-        for (const key of Object.getOwnPropertyNames(ctor)) {
-          const attr = ctor[key] as AttrConfig | undefined
+        for (const [key, attrVal] of modelStaticEntries(ctor)) {
+          const attr = attrVal as AttrConfig | undefined
           if (attr?._isAttr !== true || attr.default === undefined) continue
           if (key in payload) continue
           const def = typeof attr.default === 'function' ? attr.default() : attr.default
@@ -617,8 +639,7 @@ export class ApplicationRecord {
 
     try {
       // Cascade destroy: any hasMany with dependent: 'destroy' fires destroy() per record
-      for (const key of Object.getOwnPropertyNames(ctor)) {
-        const marker = ctor[key]
+      for (const [key, marker] of modelStaticEntries(ctor)) {
         if (!marker || typeof marker !== 'object') continue
         if ((marker._type === 'hasMany' || marker._type === 'hasOne') && marker.options?.dependent === 'destroy') {
           const assocVal = (this as any)[key]
@@ -983,11 +1004,16 @@ function _resolveAssociation(marker: any, prop: string, target: any, ctor: any):
 
   // ── hasOne — FK lives on the target table ────────────────────────────────
   if (marker._type === 'hasOne') {
+    const asName = marker.options?.as as string | undefined
     const ownerSingular = _singularize(ctor.tableName)
-    const fkField = marker.options?.foreignKey ?? `${ownerSingular}Id`
+    const fkField = marker.options?.foreignKey ?? (asName ? `${asName}Id` : `${ownerSingular}Id`)
     const ownerId = target._attributes.id
     if (ownerId === null || ownerId === undefined) return Promise.resolve(null)
-    return new Relation(TargetModel).where({ [fkField]: ownerId }).first()
+    const scope: Record<string, any> = { [fkField]: ownerId }
+    // Polymorphic inverse (as:): the id alone is ambiguous across parent
+    // types — the type column MUST scope too or rows leak between parents
+    if (asName) scope[`${asName}Type`] = modelClassName(ctor)
+    return new Relation(TargetModel).where(scope).first()
   }
 
   // ── habtm — join table is marker.table ──────────────────────────────────
@@ -1028,7 +1054,14 @@ function _resolveAssociation(marker: any, prop: string, target: any, ctor: any):
       if (!throughTableObj) return new Relation(TargetModel)
 
       const ownerFk = marker.options?.foreignKey ?? `${_singularize(ctor.tableName)}Id`
-      const targetFk = marker.options?.sourceForeignKey ?? `${_singularize(TargetModel._activeDrizzleTableName ?? modelClassName(TargetModel).toLowerCase())}Id`
+      // Target column on the through table, in precedence order:
+      //   sourceForeignKey (explicit column) → source (the through model's
+      //   belongsTo of that name — Rails' :source) → naive `<target>Id`.
+      // `source` was documented but previously NEVER read: it silently fell
+      // through to the naive default and returned an unscoped relation.
+      const targetFk = marker.options?.sourceForeignKey
+        ?? _throughSourceFk(marker.options?.source as string | undefined, marker.options.through as string)
+        ?? `${_singularize(TargetModel._activeDrizzleTableName ?? modelClassName(TargetModel).toLowerCase())}Id`
 
       const throughOwnerCol = throughTableObj[ownerFk]
       const throughTargetCol = throughTableObj[targetFk]
@@ -1045,19 +1078,45 @@ function _resolveAssociation(marker: any, prop: string, target: any, ctor: any):
     }
 
     // Simple hasMany
+    const asName = marker.options?.as as string | undefined
     const ownerSingular = _singularize(ctor.tableName)
-    const fkField = marker.options?.foreignKey ?? `${ownerSingular}Id`
-    let rel = new Relation(TargetModel).where({ [fkField]: ownerId })
+    const fkField = marker.options?.foreignKey ?? (asName ? `${asName}Id` : `${ownerSingular}Id`)
+    const scope: Record<string, any> = { [fkField]: ownerId }
+    // Polymorphic inverse (as:): scope by the type column too — the id
+    // alone leaks rows between parent types that happen to share an id
+    if (asName) scope[`${asName}Type`] = modelClassName(ctor)
+    let rel = new Relation(TargetModel).where(scope)
     // Apply declarative order from the association options
     if (marker.options?.order) {
       for (const [col, dir] of Object.entries(marker.options.order as Record<string, 'asc' | 'desc'>)) {
         rel = rel.order(col, dir)
       }
     }
+    // Association-scoped create: `deal.comments.create({...})` inherits the
+    // fk (and polymorphic type) from the association it came through
+    ;(rel as any)._createDefaults = { ...scope }
     return rel
   }
 
   return undefined
+}
+
+/**
+ * Rails' :source resolution for has-many-through — `source` names an
+ * association ON THE THROUGH MODEL; the target column is that association's
+ * foreign key. `Company.stakeholders = hasMany('users', { through: 'deals',
+ * source: 'owner' })` → Deal.owner is `belongsTo('users', { foreignKey:
+ * 'ownerId' })` → the through column is `ownerId`. Without a registered
+ * through model (raw join table) it falls back to `${source}Id`.
+ */
+function _throughSourceFk(source: string | undefined, throughTable: string): string | null {
+  if (!source) return null
+  const ThroughModel: any = MODEL_REGISTRY[throughTable]
+  const srcMarker = ThroughModel?.[source]
+  if (srcMarker && typeof srcMarker === 'object' && srcMarker._type === 'belongsTo') {
+    return (srcMarker.options?.foreignKey as string | undefined) ?? `${source}Id`
+  }
+  return `${source}Id`
 }
 
 /**
@@ -1141,13 +1200,13 @@ function _singularize(word: string): string {
   return word
 }
 
-/** True when the key ends in 'Attributes' AND matches an acceptsNested hasMany on the model. */
+/** True when the key ends in 'Attributes' AND matches an acceptsNested hasMany/hasOne on the model. */
 function _isNestedAttrsKey(key: string, ctor: any): boolean {
   if (!key.endsWith('Attributes')) return false
   const assocName = key.slice(0, -'Attributes'.length)
   const marker = ctor[assocName]
   // acceptsNested: true | { allowDestroy?: boolean } — any truthy value opts in
-  return marker?._type === 'hasMany' && Boolean(marker.options?.acceptsNested)
+  return (marker?._type === 'hasMany' || marker?._type === 'hasOne') && Boolean(marker.options?.acceptsNested)
 }
 
 // ── habtm `<singular>Ids` collection sync ────────────────────────────────────
@@ -1160,8 +1219,7 @@ function _isNestedAttrsKey(key: string, ctor: any): boolean {
 export function resolveHabtmIdsAssociations(model: any): Array<{ idsKey: string; prop: string }> {
   const out: Array<{ idsKey: string; prop: string }> = []
   if (!model) return out
-  for (const key of Object.getOwnPropertyNames(model)) {
-    const marker = (model as any)[key]
+  for (const [key, marker] of modelStaticEntries(model)) {
     if (!marker || typeof marker !== 'object' || marker._type !== 'habtm') continue
     out.push({ idsKey: `${_singularize(key)}Ids`, prop: key })
   }
@@ -1272,22 +1330,29 @@ export function resolveNestedAssociations(model: any): Array<{
   fkField: string
   allowDestroy: boolean
   childModel: any
+  /** 'many' → `<assoc>Attributes` is an array of rows; 'one' → a single object. */
+  kind: 'many' | 'one'
 }> {
-  const out: Array<{ name: string; attrsKey: string; fkField: string; allowDestroy: boolean; childModel: any }> = []
+  const out: Array<{ name: string; attrsKey: string; fkField: string; allowDestroy: boolean; childModel: any; kind: 'many' | 'one' }> = []
   if (!model) return out
-  for (const key of Object.getOwnPropertyNames(model)) {
-    const marker = (model as any)[key]
-    if (!marker || typeof marker !== 'object' || marker._type !== 'hasMany') continue
+  for (const [key, marker] of modelStaticEntries(model)) {
+    if (!marker || typeof marker !== 'object') continue
+    if (marker._type !== 'hasMany' && marker._type !== 'hasOne') continue
     const accepts = marker.options?.acceptsNested
     if (!accepts) continue
     let ownerSingular: string
     try { ownerSingular = _singularize(model.tableName) } catch { continue }
+    const asName = marker.options?.as as string | undefined
     out.push({
       name: key,
       attrsKey: `${key}Attributes`,
-      fkField: (marker.options?.foreignKey as string | undefined) ?? `${ownerSingular}Id`,
+      // Polymorphic inverse (as:) defaults the fk to `${as}Id` — the
+      // sanitizer must strip the ACTUAL wire fk, not a guessed one
+      fkField: (marker.options?.foreignKey as string | undefined)
+        ?? (asName ? `${asName}Id` : `${ownerSingular}Id`),
       allowDestroy: accepts === true ? false : accepts?.allowDestroy === true,
       childModel: (() => { try { return _findModelByMarker(marker, key) } catch { return null } })(),
+      kind: marker._type === 'hasOne' ? 'one' : 'many',
     })
   }
   return out
@@ -1298,32 +1363,44 @@ export function resolveNestedAssociations(model: any): Array<{
  * and `_changes` (proxy-set) BEFORE the parent DB operation overwrites `_attributes`.
  * Returns a map of associationName → array.
  */
-function _captureNestedAttributes(record: any, ctor: any): Record<string, any[]> {
-  const result: Record<string, any[]> = {}
-  for (const key of Object.getOwnPropertyNames(ctor)) {
-    const marker = ctor[key]
-    if (!marker || typeof marker !== 'object' || marker._type !== 'hasMany') continue
+function _captureNestedAttributes(record: any, ctor: any): Record<string, any> {
+  const result: Record<string, any> = {}
+  for (const [key, marker] of modelStaticEntries(ctor)) {
+    if (!marker || typeof marker !== 'object') continue
+    if (marker._type !== 'hasMany' && marker._type !== 'hasOne') continue
     if (!marker.options?.acceptsNested) continue
 
     const attrsKey = `${key}Attributes`
     const fromAttrs = record._attributes[attrsKey]
     const fromChanges = record._changes.get(attrsKey)?.is
     const data = fromChanges ?? fromAttrs
-    if (Array.isArray(data)) result[key] = data
+    // Shape gate matches the association's arity: hasMany takes an array of
+    // rows, hasOne a single object. The wrong shape is silently not captured
+    // (same stance as a non-array on hasMany today).
+    if (marker._type === 'hasMany') {
+      if (Array.isArray(data)) result[key] = data
+    } else if (data && typeof data === 'object' && !Array.isArray(data)) {
+      result[key] = data
+    }
   }
   return result
 }
 
 /**
- * Processes `*Attributes` arrays for `acceptsNestedAttributesFor` associations.
+ * Processes `*Attributes` payloads for `acceptsNestedAttributesFor` associations.
  * Called after the parent record is persisted (so parent id is available).
  *
- * Each item in the array:
+ * hasMany: an ARRAY of items. hasOne: a SINGLE object with the same protocol.
+ * Each item:
  *   { id, ...fields }           → update existing child
  *   { ...fields } (no id)       → create new child
  *   { id, _destroy: true }      → destroy child
+ *
+ * hasOne only: an id-less item when a child row already exists UPDATES that
+ * row instead of inserting a second one — the singular invariant beats
+ * create semantics (Rails' update_only, on by default here).
  */
-async function _processNestedAttributes(record: any, ctor: any, snapshot: Record<string, any[]>): Promise<void> {
+async function _processNestedAttributes(record: any, ctor: any, snapshot: Record<string, any>): Promise<void> {
   const ownerId = record._attributes['id']
   if (!ownerId || Object.keys(snapshot).length === 0) return
 
@@ -1332,15 +1409,29 @@ async function _processNestedAttributes(record: any, ctor: any, snapshot: Record
     const TargetModel = _findModelByMarker(marker, key)
     if (!TargetModel) continue
 
+    const asName = marker.options?.as as string | undefined
     const ownerSingular = _singularize(ctor.tableName)
-    const fkField = (marker.options?.foreignKey as string | undefined) ?? `${ownerSingular}Id`
+    const fkField = (marker.options?.foreignKey as string | undefined)
+      ?? (asName ? `${asName}Id` : `${ownerSingular}Id`)
+    // Polymorphic inverse (as:): every ownership check and every write must
+    // carry the TYPE column too — the id alone is ambiguous across parent
+    // types, in write form exactly the same leak as the read-side scope
+    const forced: Record<string, any> = { [fkField]: ownerId }
+    if (asName) forced[`${asName}Type`] = modelClassName(ctor)
+    const ownsChild = (child: any): boolean => {
+      if (String(child[fkField]) !== String(ownerId)) return false
+      if (asName && String(child[`${asName}Type`]) !== String(forced[`${asName}Type`])) return false
+      return true
+    }
     // Rails semantics: destroying children through nesting is an explicit
     // opt-in — acceptsNested: { allowDestroy: true }. Bare `true` updates
     // and creates only; a _destroy marker is ignored.
     const accepts = marker.options?.acceptsNested
     const allowDestroy = accepts !== true && accepts?.allowDestroy === true
+    const items: any[] = marker._type === 'hasOne' ? [nested] : nested
+    const singular = marker._type === 'hasOne'
 
-    for (const item of nested) {
+    for (const item of items) {
       // _key is the client's ephemeral identity for NEW rows (form error
       // routing) — never a column, always stripped before create/update
       const { _destroy, _key, id, ...fields } = item
@@ -1352,16 +1443,22 @@ async function _processNestedAttributes(record: any, ctor: any, snapshot: Record
         // Ownership gate: an id that is not a child of THIS record must not
         // be reachable — otherwise any row in the child table could be
         // updated, re-parented onto this record, or destroyed by forging ids
-        if (!child || String((child as any)[fkField]) !== String(ownerId)) {
+        if (!child || !ownsChild(child)) {
           throw new NestedAttributesError(key, `row ${id} is not part of this record's ${key}`)
         }
         if (_destroy) {
           if (allowDestroy) await child.destroy()
         } else {
-          await child.update({ ...fields, [fkField]: ownerId })
+          await child.update({ ...fields, ...forced })
         }
       } else if (!_destroy) {
-        await TargetModel.create({ ...fields, [fkField]: ownerId })
+        // hasOne: an id-less write lands on the existing child when there is
+        // one — creating a second row would break the singular invariant
+        const existing = singular
+          ? await new Relation(TargetModel).where(forced).first()
+          : null
+        if (existing) await (existing as any).update({ ...fields, ...forced })
+        else await TargetModel.create({ ...fields, ...forced })
       }
     }
   }
@@ -1374,8 +1471,7 @@ async function _processNestedAttributes(record: any, ctor: any, snapshot: Record
  * `counterCache: true | 'columnName'`.
  */
 async function _adjustCounterCaches(record: any, ctor: any, delta: 1 | -1): Promise<void> {
-  for (const key of Object.getOwnPropertyNames(ctor)) {
-    const marker = ctor[key]
+  for (const [key, marker] of modelStaticEntries(ctor)) {
     if (!marker || typeof marker !== 'object') continue
     if (marker._type !== 'belongsTo') continue
 
@@ -1387,8 +1483,7 @@ async function _adjustCounterCaches(record: any, ctor: any, delta: 1 | -1): Prom
     if (!ParentModel) continue
 
     // Find the hasMany on the parent that points to this child's table and has counterCache
-    for (const parentKey of Object.getOwnPropertyNames(ParentModel)) {
-      const parentMarker = ParentModel[parentKey]
+    for (const [parentKey, parentMarker] of modelStaticEntries(ParentModel)) {
       if (!parentMarker || typeof parentMarker !== 'object' || parentMarker._type !== 'hasMany') continue
       if (!parentMarker.options?.counterCache) continue
 
@@ -1414,8 +1509,7 @@ async function _adjustCounterCaches(record: any, ctor: any, delta: 1 | -1): Prom
  * that have `autosave: true` and have unsaved changes.
  */
 async function _autosaveAssociations(record: any, ctor: any): Promise<void> {
-  for (const key of Object.getOwnPropertyNames(ctor)) {
-    const marker = ctor[key]
+  for (const [key, marker] of modelStaticEntries(ctor)) {
     if (!marker || typeof marker !== 'object') continue
     if (marker._type !== 'hasMany' && marker._type !== 'hasOne' && marker._type !== 'belongsTo') continue
     if (!marker.options?.autosave) continue
@@ -1552,7 +1646,7 @@ function _wrapRecord<T extends ApplicationRecord>(record: T): T {
 
       // ── State machine synthetics from Attr.state ────────────────────────
       // canSubmit() → can('submit'); submit() → assign target state if legal.
-      for (const [stateProp, stateCfg] of Object.entries(ctor) as [string, any][]) {
+      for (const [stateProp, stateCfg] of modelStaticEntries(ctor) as [string, any][]) {
         if (stateCfg?._type !== 'state') continue
         if (prop.length > 3 && prop.startsWith('can')) {
           const eventKey = prop[3]!.toLowerCase() + prop.slice(4)
@@ -1575,7 +1669,7 @@ function _wrapRecord<T extends ApplicationRecord>(record: T): T {
         const prefix = prop.slice(0, 2)
         if (prefix === 'is' || prefix === 'to') {
           const labelKey = prop[2]!.toLowerCase() + prop.slice(3)
-          for (const [enumProp, enumConfig] of Object.entries(ctor) as [string, any][]) {
+          for (const [enumProp, enumConfig] of modelStaticEntries(ctor) as [string, any][]) {
             if (enumConfig?._type !== 'enum' && enumConfig?._type !== 'state') continue
             if (!Object.hasOwn((enumConfig as AttrEnumConfig).values, labelKey)) continue
             if (prefix === 'is') {

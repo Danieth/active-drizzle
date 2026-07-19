@@ -20,7 +20,7 @@
  */
 
 import { Project, type CompilerOptions } from 'ts-morph'
-import { mkdirSync, writeFileSync, readFileSync, existsSync, statSync } from 'fs'
+import { mkdirSync, writeFileSync, readFileSync, existsSync, statSync, realpathSync } from 'fs'
 import { dirname, join, resolve, relative } from 'path'
 import { glob } from 'glob'
 import { extractSchema, extractModel } from '../codegen/extractor.js'
@@ -79,6 +79,79 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
   const ctrlCache = new Map<string, { mtime: number }>()
   let lastRouteHash: string | null = null
 
+  // ── Dev-watcher scheduler state ────────────────────────────────────────────
+  // The watcher must never let a codegen error escape as an unhandled rejection
+  // (over a long dev session that wedges auto-regeneration — it "just stops").
+  // Runs are serialized + coalesced; on failure we reset all caches so the next
+  // save rebuilds from a clean slate.
+  let codegenInFlight: Promise<void> | null = null
+  let pendingRun: null | (() => Promise<boolean>) = null
+  let reloadPage: () => void = () => {}
+
+  /** Drop every cache so the next codegen run rebuilds the ts-morph project + metadata from scratch. */
+  function resetCodegenState(): void {
+    schemaCache    = null
+    lastGlobalHash = null
+    lastRouteHash  = null
+    modelCache.clear()
+    diagCache.clear()
+    ctrlCache.clear()
+    project = null
+  }
+
+  /**
+   * Serialized, crash-proof codegen scheduler for the dev watcher.
+   * Coalesces rapid saves to a single trailing run; a thrown codegen error is
+   * logged and self-healed (caches reset) instead of rejecting the handler.
+   * Fires a full-reload only when the run reports a runtime file actually changed.
+   */
+  // Returns the in-flight drain promise. It NEVER rejects (errors are caught
+  // and self-healed below), so Vite's watcher can ignore it while tests await it.
+  function scheduleCodegen(run: () => Promise<boolean>): Promise<void> {
+    pendingRun = run
+    if (!codegenInFlight) codegenInFlight = drainCodegen()
+    return codegenInFlight
+  }
+  async function drainCodegen(): Promise<void> {
+    try {
+      while (pendingRun) {
+        const run = pendingRun
+        pendingRun = null
+        let runtimeChanged = false
+        try {
+          runtimeChanged = await run()
+        } catch (err) {
+          console.error(
+            `\x1b[31m[active-drizzle] codegen failed — auto-regeneration will retry on the next save.\x1b[0m`,
+            err instanceof Error ? (err.stack ?? err.message) : err,
+          )
+          resetCodegenState()
+        }
+        if (runtimeChanged) reloadPage()
+      }
+    } finally {
+      codegenInFlight = null
+    }
+  }
+
+  /**
+   * Whether a changed path IS the configured schema file. Exact string equality
+   * (`file === resolve(root, options.schema)`) silently misses schema edits when
+   * the watcher emits a path that differs only by symlink/normalization — a
+   * symlinked root (macOS /tmp→/private/tmp), a pnpm store, or differing
+   * separators. Fall back to comparing realpaths so those still regenerate.
+   * (Model files are immune — matched by `.endsWith('.model.ts')`.)
+   */
+  function isSchemaFile(file: string): boolean {
+    const schemaAbs = resolve(root, options.schema)
+    if (file === schemaAbs) return true
+    try {
+      return realpathSync(file) === realpathSync(schemaAbs)
+    } catch {
+      return false
+    }
+  }
+
   function getOrCreateProject(): Project {
     if (project) return project
     const tsconfigPath = resolve(root, options.tsconfig ?? 'tsconfig.json')
@@ -92,19 +165,20 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     return project
   }
 
-  async function runCodegen(): Promise<void> {
+  /** Runs the full model codegen pipeline. Returns whether any *runtime* file (a `.gen.ts`, not a `.d.ts`) changed — i.e. whether a page reload is warranted. */
+  async function runCodegen(): Promise<boolean> {
     const schemaPath = resolve(root, options.schema)
     const modelGlob  = resolve(root, options.models)
 
     if (!existsSync(schemaPath)) {
       console.error(`\x1b[31m[active-drizzle] Schema file not found: ${schemaPath}\x1b[0m`)
-      return
+      return false
     }
 
     const modelPaths = await glob(modelGlob.replace(/\\/g, '/'))
     if (modelPaths.length === 0) {
       console.warn(`\x1b[33m[active-drizzle] No model files found matching: ${options.models}\x1b[0m`)
-      return
+      return false
     }
 
     const p = getOrCreateProject()
@@ -157,7 +231,7 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     }
 
     // ── Early exit — nothing relevant changed ────────────────────────────────
-    if (!schemaChanged && changedFilePaths.size === 0) return
+    if (!schemaChanged && changedFilePaths.size === 0) return false
 
     resolveAssociations(models, schema.tables)
     const projectMeta: ProjectMeta = { schema, models }
@@ -201,23 +275,32 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     lastGlobalHash = globalHash
 
     const files: GeneratedFile[] = []
+    const firstModelDir = dirname(modelPaths[0]!)
+    const outDir = resolve(root, options.outputDir ?? firstModelDir)
 
     for (const model of models) {
       const base = model.filePath.split('/').pop()!.replace('.model.ts', '.model.gen')
-      files.push({ path: `${base}.d.ts`, content: generateModelTypes(model, projectMeta) })
+      // .types.gen.d.ts — NOT `${base}.d.ts`: a d.ts sharing its basename
+      // with the sibling .gen.ts is treated by tsc's include rules as that
+      // file's build output and silently dropped from the program, which
+      // killed every `declare module` augmentation under `tsc --noEmit`.
+      const typesBase = base.replace(/\.model\.gen$/, '.model.types.gen')
+      files.push({ path: `${typesBase}.d.ts`, content: generateModelTypes(model, projectMeta) })
       files.push({ path: `${base}.ts`,   content: generateClientRuntime(model, projectMeta) })
     }
 
     if (globalsNeedRegen) {
       files.push({ path: '_registry.gen.ts',       content: generateRegistry(projectMeta) })
       files.push({ path: '.active-drizzle/schema.md', content: generateDocs(projectMeta) })
-      files.push({ path: '_globals.gen.d.ts',      content: generateGlobals(projectMeta) })
+      files.push({ path: '_globals.gen.d.ts',      content: generateGlobals(projectMeta, outDir) })
     }
 
     // ── Write — skip unchanged files ─────────────────────────────────────────
-    const firstModelDir = dirname(modelPaths[0]!)
-    const outDir = resolve(root, options.outputDir ?? firstModelDir)
     let writtenCount = 0
+    // A page reload is only warranted when an *executable* artifact changes.
+    // `.d.ts` (types) and `.md` (docs) don't affect the running bundle, so a
+    // save that only touches those must NOT trigger a full-reload.
+    let runtimeChanged = false
 
     for (const file of files) {
       let targetPath: string
@@ -229,7 +312,7 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
         targetPath = join(outDir, file.path)
       } else {
         const modelFile = modelPaths.find(mp =>
-          mp.endsWith(file.path.replace('.gen.d.ts', '.ts').replace('.gen.ts', '.ts'))
+          mp.endsWith(file.path.replace('.types.gen.d.ts', '.ts').replace('.gen.d.ts', '.ts').replace('.gen.ts', '.ts'))
         )
         const dir = modelFile ? dirname(modelFile) : outDir
         targetPath = join(dir, file.path)
@@ -239,6 +322,7 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
       if (existing !== file.content) {
         writeFileSync(targetPath, file.content, 'utf8')
         writtenCount++
+        if (targetPath.endsWith('.ts') && !targetPath.endsWith('.d.ts')) runtimeChanged = true
       }
     }
 
@@ -260,16 +344,19 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     }
 
     // ── Controller codegen (optional) ─────────────────────────────────────────
+    let ctrlRuntimeChanged = false
     if (options.controllers) {
-      await runControllerCodegen()
+      ctrlRuntimeChanged = await runControllerCodegen()
     }
+    return runtimeChanged || ctrlRuntimeChanged
   }
 
-  async function runControllerCodegen(): Promise<void> {
-    if (!options.controllers) return
+  /** Runs controller/route codegen. Returns whether a runtime file (_routes.gen.ts or a React hook) changed. */
+  async function runControllerCodegen(): Promise<boolean> {
+    if (!options.controllers) return false
     const ctrlGlob = resolve(root, options.controllers)
     const ctrlPaths = await glob(ctrlGlob.replace(/\\/g, '/'))
-    if (ctrlPaths.length === 0) return
+    if (ctrlPaths.length === 0) return false
 
     // Check if any ctrl file changed
     let anyChanged = false
@@ -289,7 +376,7 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
 
     // Global hash guard — skip regeneration if routes haven't changed
     const routeHash = ctrlPaths.sort().join(':')
-    if (!anyChanged && routeHash === lastRouteHash) return
+    if (!anyChanged && routeHash === lastRouteHash) return false
     lastRouteHash = routeHash
 
     const p = getOrCreateProject()
@@ -308,7 +395,8 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     const routesContent  = generateRoutesFile(ctrlMeta, routesFilePath)
     const routesDocContent = generateRoutesDoc(ctrlMeta)
 
-    writeIfChanged(routesFilePath, routesContent)
+    // _routes.gen.ts is executable (runtime) → reload-worthy; the .md is docs.
+    const routesChanged = writeIfChanged(routesFilePath, routesContent)
     writeIfChanged(routesDocPath, routesDocContent)
 
     let hookCount = 0
@@ -353,6 +441,8 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
       (hookCount > 0 ? ` + ${hookCount} React hooks` : '') +
       '\x1b[0m',
     )
+
+    return routesChanged || hookCount > 0
   }
 
   return {
@@ -375,24 +465,25 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
 
     configureServer(server: { watcher: any; ws: any; config: { root: string } }) {
       root = server.config.root
+      reloadPage = () => server.ws.send({ type: 'full-reload' })
 
-      server.watcher.on('change', async (file: string) => {
-        if (file.endsWith('.model.ts') || file === resolve(root, options.schema)) {
-          await runCodegen()
-          server.ws.send({ type: 'full-reload' })
+      // NOTE: hand each event to scheduleCodegen (crash-proof + serialized +
+      // coalesced). We deliberately do NOT `await` here or send an unconditional
+      // full-reload — the scheduler reloads only when a runtime file changed,
+      // and swallows/heals codegen errors so a bad mid-edit save can't wedge
+      // auto-regeneration for the rest of the session.
+      // Returns the scheduler promise so tests (and any awaiting caller) can
+      // wait for the run; Vite's watcher ignores the return value.
+      const onChange = (file: string): Promise<void> | undefined => {
+        if (file.endsWith('.model.ts') || isSchemaFile(file)) {
+          return scheduleCodegen(runCodegen)
         } else if (file.endsWith('.ctrl.ts') && options.controllers) {
-          await runControllerCodegen()
-          server.ws.send({ type: 'full-reload' })
+          return scheduleCodegen(runControllerCodegen)
         }
-      })
-
-      server.watcher.on('add', async (file: string) => {
-        if (file.endsWith('.model.ts')) {
-          await runCodegen()
-        } else if (file.endsWith('.ctrl.ts') && options.controllers) {
-          await runControllerCodegen()
-        }
-      })
+        return undefined
+      }
+      server.watcher.on('change', onChange)
+      server.watcher.on('add', onChange)
     },
   }
 }

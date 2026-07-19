@@ -14,11 +14,14 @@ export interface ParsedControllerError {
    * @example { name: ["can't be blank"], status: ["is invalid"] }
    */
   fields?: Record<string, string[]>
+  /** 409 only: the server's CURRENT envelope (fresh record + version). */
+  envelope?: Record<string, any>
   isValidation: boolean
   isNotFound: boolean
   isUnauthorized: boolean
   isForbidden: boolean
   isBadRequest: boolean
+  isConflict: boolean
 }
 
 /**
@@ -55,19 +58,23 @@ export function parseControllerError(error: unknown): ParsedControllerError | nu
   const code: string    = e['code']
   const message: string = typeof e['message'] === 'string' ? e['message'] : 'Unknown error'
 
-  // Validation errors carry `data.errors` (field → messages[])
+  // Validation errors carry `data.errors` (field → messages[]);
+  // conflicts carry `data.envelope` (the server's current record + version)
   const rawData = e['data'] as Record<string, any> | undefined
   const fields: Record<string, string[]> | undefined = rawData?.['errors'] ?? undefined
+  const envelope: Record<string, any> | undefined = rawData?.['envelope'] ?? undefined
 
   return {
     code,
     message,
     ...(fields !== undefined ? { fields } : {}),
+    ...(envelope !== undefined ? { envelope } : {}),
     isValidation:  code === 'UNPROCESSABLE_ENTITY',
     isNotFound:    code === 'NOT_FOUND',
     isUnauthorized: code === 'UNAUTHORIZED',
     isForbidden:   code === 'FORBIDDEN',
     isBadRequest:  code === 'BAD_REQUEST',
+    isConflict:    code === 'CONFLICT',
   }
 }
 

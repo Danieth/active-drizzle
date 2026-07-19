@@ -13,7 +13,7 @@
  */
 import React, { createContext, useContext, useEffect, useSyncExternalStore, Fragment, type FC, type ReactNode } from 'react'
 import { FormSession, type SessionStatus } from './form-session.js'
-import { NestedArrayManager, type NestedChild } from './nested.js'
+import { NestedArrayManager, NestedOneManager, type NestedChild } from './nested.js'
 import { resolvePresenter, checkRequiredMeta, type PresenterBind } from './presenters.js'
 
 /**
@@ -80,6 +80,24 @@ export type ArrayFieldHandle = FC<{ children: (child: NestedFormHandle) => React
 }
 
 /**
+ * `deal.brief` (hasOne) — callable with a render-prop over the SINGLE child
+ * handle; renders nothing while no child exists. `Build` is the singular Add.
+ */
+export type OneFieldHandle = FC<{ children: (child: NestedFormHandle) => ReactNode }> & {
+  /** The child form handle, or null when no child exists (or it was removed). */
+  form: NestedFormHandle | null
+  /** True when a live child exists. */
+  exists: boolean
+  /** Ensure the child exists (no-op when it already does). */
+  build: (defaults?: Record<string, any>) => void
+  /** Remove the child; persisted children require allowDestroy. */
+  remove: () => void
+  /** Subscribe to child changes (for custom widgets reading `form`/`exists`). */
+  use: () => void
+  Build: FC<{ defaults?: Record<string, any>; children?: ReactNode; className?: string }>
+}
+
+/**
  * The non-field surface of a handle — generated typed handles compose this
  * with per-field TypedFieldComponents:
  *
@@ -94,11 +112,15 @@ export interface FormHandleApi<T extends Record<string, any> = Record<string, an
   $status: SessionStatus
   $submit: (opts?: { event?: string }) => Promise<boolean>
   $can: (event: string) => boolean
-  Form: FC<{ children?: ReactNode; onSuccess?: () => void; autosave?: boolean | { debounceMs?: number } }>
-  Submit: FC<{ children?: ReactNode; event?: string }>
+  /** The server's fresh envelope from a 409 — null when not in conflict. */
+  $conflict: import('./form-session.js').ServerEnvelope | null
+  /** Exit a conflict: 'reload' takes the server's truth, 'overwrite' resubmits yours. */
+  $resolveConflict: (mode: 'reload' | 'overwrite') => Promise<boolean>
+  Form: FC<{ children?: ReactNode; onSuccess?: () => void; autosave?: boolean | { debounceMs?: number }; className?: string }>
+  Submit: FC<{ children?: ReactNode; event?: string; className?: string }>
   /** Floating save affordance: saving… / saved ✓ / unsaved / offline / error. */
-  SaveStatus: FC<{ className?: string; labels?: Partial<Record<'saving' | 'saved' | 'unsaved' | 'offline' | 'error' | 'idle', string>> }>
-  BaseErrors: FC
+  SaveStatus: FC<{ className?: string; labels?: Partial<Record<'saving' | 'saved' | 'unsaved' | 'offline' | 'error' | 'conflict' | 'idle', string>> }>
+  BaseErrors: FC<{ className?: string }>
 }
 
 /** Field props narrowed by the field's kind — presenter names are gated. */
@@ -158,7 +180,9 @@ export function createFormHandle<T extends Record<string, any>>(
       (session.draft as any)[name],
       {
         ...(meta.validate ? { validate: meta.validate } : {}),
-        nestedKeys: Object.keys(childFields).filter(k => childFields[k]?.kind === 'nested'),
+        nestedKeys: Object.keys(childFields).filter(
+          k => childFields[k]?.kind === 'nested' || childFields[k]?.kind === 'nestedOne',
+        ),
         ...(meta.orderBy ? { positionField: meta.orderBy } : {}),
         ...(meta.allowDestroy !== undefined ? { allowDestroy: Boolean(meta.allowDestroy) } : {}),
         ...(instantTransport ? { instant: true, transport: instantTransport, foreignKey: meta.foreignKey } : {}),
@@ -244,6 +268,92 @@ export function createFormHandle<T extends Record<string, any>>(
       Add: { value: AddComponent },
     })
     return arrayHandle
+  }
+
+  // ── Singular nested form: meta kind 'nestedOne' → OneFieldHandle ─────────
+  const makeOneHandle = (name: string, meta: Record<string, any>): OneFieldHandle => {
+    const childFields = (meta.fields ?? {}) as Record<string, Record<string, any>>
+    const manager = new NestedOneManager(
+      session,
+      name,
+      (session.draft as any)[name],
+      {
+        ...(meta.validate ? { validate: meta.validate } : {}),
+        nestedKeys: Object.keys(childFields).filter(
+          k => childFields[k]?.kind === 'nested' || childFields[k]?.kind === 'nestedOne',
+        ),
+        ...(meta.allowDestroy !== undefined ? { allowDestroy: Boolean(meta.allowDestroy) } : {}),
+      },
+    )
+    session.registerNested(name, manager)
+
+    const childHandles = new Map<string, NestedFormHandle>()
+    const childHandle = (child: NestedChild): NestedFormHandle => {
+      let h = childHandles.get(child.key)
+      if (h) return h
+      const RemoveComponent: FC<{ children?: ReactNode; className?: string }> = ({ children, className }) => {
+        if (manager.isLocked()) return null
+        if (!child.isNew && !manager.allowDestroy) return null
+        return (
+          <button type="button" {...(className !== undefined ? { className } : {})} onClick={() => manager.remove()}>
+            {children ?? 'Remove'}
+          </button>
+        )
+      }
+      RemoveComponent.displayName = `AdRemove(${name})`
+      h = createFormHandle(child.session as FormSession<any>, {
+        fieldMeta: childFields,
+        extras: { key: child.key, isNew: child.isNew, Remove: RemoveComponent },
+        nestedTransports,
+      }) as NestedFormHandle
+      childHandles.set(child.key, h)
+      return h
+    }
+
+    const OneComponent: FC<{ children: (child: NestedFormHandle) => ReactNode }> = ({ children }) => {
+      useSyncExternalStore(
+        (cb) => session.subscribe(name, cb),
+        () => session.fieldVersion(name),
+        () => session.fieldVersion(name),
+      )
+      const child = manager.current()
+      if (!child) return null
+      return <>{children(childHandle(child))}</>
+    }
+    ;(OneComponent as any).displayName = `AdOne(${name})`
+
+    const BuildComponent: FC<{ defaults?: Record<string, any>; children?: ReactNode; className?: string }> = ({ defaults, children, className }) => {
+      useSyncExternalStore(
+        (cb) => session.subscribe(name, cb),
+        () => session.fieldVersion(name),
+        () => session.fieldVersion(name),
+      )
+      // Hidden while a child exists — there is only ever one to build
+      if (manager.isLocked() || manager.current()) return null
+      return (
+        <button type="button" {...(className !== undefined ? { className } : {})} onClick={() => manager.build(defaults)}>
+          {children ?? 'Add'}
+        </button>
+      )
+    }
+    BuildComponent.displayName = `AdBuild(${name})`
+
+    const oneHandle = OneComponent as OneFieldHandle
+    Object.defineProperties(oneHandle, {
+      form: { get: () => { const c = manager.current(); return c ? childHandle(c) : null } },
+      exists: { get: () => manager.current() !== null },
+      build: { value: (defaults?: Record<string, any>) => { manager.build(defaults) } },
+      remove: { value: () => { manager.remove() } },
+      use: { value: () => {
+        useSyncExternalStore(
+          (cb) => session.subscribe(name, cb),
+          () => session.fieldVersion(name),
+          () => session.fieldVersion(name),
+        )
+      } },
+      Build: { value: BuildComponent },
+    })
+    return oneHandle
   }
 
   const makeFieldComponent = (field: string): FieldComponent => {
@@ -449,15 +559,16 @@ export function createFormHandle<T extends Record<string, any>>(
    * beyond a default label set: style via className + [data-state], or
    * override labels per state.
    */
-  const SaveStatusComponent: FC<{ className?: string; labels?: Partial<Record<'saving' | 'saved' | 'unsaved' | 'offline' | 'error' | 'idle', string>> }> = ({ className, labels }) => {
+  const SaveStatusComponent: FC<{ className?: string; labels?: Partial<Record<'saving' | 'saved' | 'unsaved' | 'offline' | 'error' | 'conflict' | 'idle', string>> }> = ({ className, labels }) => {
     useSyncExternalStore(
       (cb) => session.subscribe('*', cb),
       () => session.fieldVersion('*'),
       () => session.fieldVersion('*'),
     )
     const st = session.getStatus()
-    const state: 'saving' | 'saved' | 'unsaved' | 'offline' | 'error' | 'idle' =
+    const state: 'saving' | 'saved' | 'unsaved' | 'offline' | 'error' | 'conflict' | 'idle' =
       st === 'saving' ? 'saving'
+      : st === 'conflict' ? 'conflict'
       : session.hasPending() ? 'offline'
       : st === 'error' || st === 'unauthenticated' ? 'error'
       : session.isDirty() ? 'unsaved'
@@ -469,6 +580,7 @@ export function createFormHandle<T extends Record<string, any>>(
       unsaved: 'Unsaved changes',
       offline: 'Offline — changes queued',
       error: "Couldn't save",
+      conflict: 'Changed elsewhere',
       idle: '',
     }
     const text = labels?.[state] ?? DEFAULTS[state]
@@ -514,6 +626,8 @@ export function createFormHandle<T extends Record<string, any>>(
         case '$status': return session.getStatus()
         case '$submit': return (opts?: { event?: string }) => session.submit(opts)
         case '$can': return (event: string) => session.can(event)
+        case '$conflict': return session.getConflict()
+        case '$resolveConflict': return (mode: 'reload' | 'overwrite') => session.resolveConflict(mode)
         case 'Form': return FormComponent
         case 'Submit': return SubmitComponent
         case 'SaveStatus': return SaveStatusComponent
@@ -532,6 +646,8 @@ export function createFormHandle<T extends Record<string, any>>(
       if (!field) {
         field = fieldMeta[prop]?.kind === 'nested'
           ? makeArrayHandle(prop, fieldMeta[prop]!)
+          : fieldMeta[prop]?.kind === 'nestedOne'
+          ? makeOneHandle(prop, fieldMeta[prop]!)
           : makeFieldComponent(prop)
         cache.set(prop, field)
       }

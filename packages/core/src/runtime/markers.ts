@@ -22,7 +22,23 @@ export type HasManyOptions = {
   foreignKey?: string
   primaryKey?: string
   through?: string
+  /**
+   * has-many-through: the association ON THE THROUGH MODEL that yields the
+   * target rows (Rails' :source). `Company.stakeholders = hasMany('users',
+   * { through: 'deals', source: 'owner' })` reads Deal.owner's foreign key
+   * (ownerId) off the deals table. Overridable with `sourceForeignKey`.
+   */
   source?: string
+  /** Explicit through-table column for the target id — wins over `source`. */
+  sourceForeignKey?: string
+  /**
+   * Polymorphic inverse (Rails' :as). `hasMany('comments', { as:
+   * 'commentable' })` scopes by BOTH columns of the polymorphic pair:
+   * `commentableId = this.id AND commentableType = '<ClassName>'` — without
+   * it a plain foreignKey inverse leaks rows across parent types that
+   * share an id. Also defaults the foreign key to `${as}Id`.
+   */
+  as?: string
   order?: Record<string, 'asc' | 'desc'>
   dependent?: 'destroy' | 'delete' | 'nullify' | 'restrict'
   autosave?: boolean
@@ -41,7 +57,7 @@ export type HasManyOptions = {
   acceptsNested?: boolean | { allowDestroy?: boolean; instant?: boolean }
 }
 
-export type HasOneOptions = Omit<HasManyOptions, 'through' | 'source'>
+export type HasOneOptions = Omit<HasManyOptions, 'through' | 'source' | 'sourceForeignKey'>
 
 export type HabtmOptions = {
   joinTable?: string

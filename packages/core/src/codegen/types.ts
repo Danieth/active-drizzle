@@ -63,13 +63,22 @@ export type ColumnMeta = {
 }
 
 export type TableMeta = {
-  name: string          // e.g. 'assets'
+  /**
+   * The schema EXPORT identifier (e.g. 'bidCovenants' for
+   * `export const bidCovenants = pgTable('bid_covenants', …)`).
+   * This is the name the runtime resolves — boot()'s schema object and
+   * drizzle's `db.query.*` are both keyed by export name — so @model()
+   * and association targets must use it too.
+   */
+  name: string
+  /** The SQL table name (pgTable's first argument), e.g. 'bid_covenants'. */
+  dbName: string
   columns: ColumnMeta[]
 }
 
 /** Everything the extractor finds about a schema file */
 export type SchemaMeta = {
-  tables: Record<string, TableMeta>  // keyed by table name
+  tables: Record<string, TableMeta>  // keyed by schema export identifier
   filePath: string
 }
 
@@ -200,6 +209,8 @@ export type ModelMeta = {
   extendsClass: string          // 'ApplicationRecord' or another model name
   isSti: boolean                // true if extendsClass !== 'ApplicationRecord'
   stiParent: string | null
+  /** Literal value of `static stiType = '…'` on STI subclasses (null when absent). */
+  stiTypeValue: string | null
   associations: AssociationMeta[]
   enums: EnumMeta[]
   enumGroups: EnumGroupMeta[]

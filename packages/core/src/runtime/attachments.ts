@@ -10,6 +10,7 @@
  */
 
 import { modelClassName } from './class-name.js'
+import { modelStaticEntries } from './application-record.js'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -87,11 +88,12 @@ export function registerAttachments(className: string, entries: AttachmentEntry[
   ATTACHMENT_REGISTRY.set(className, entries)
 }
 
-/** Scans a model class's static properties for attachment markers. */
+/** Scans a model class's static properties for attachment markers —
+ *  INHERITED ones included, so an STI subclass keeps its parent's
+ *  attachments (an own-properties-only scan is blind to them). */
 function _scanClassAttachments(modelClass: any): AttachmentEntry[] {
   const entries: AttachmentEntry[] = []
-  for (const key of Object.getOwnPropertyNames(modelClass)) {
-    const prop = modelClass[key]
+  for (const [, prop] of modelStaticEntries(modelClass)) {
     if (!prop || typeof prop !== 'object') continue
     if (prop._type === 'hasOneAttachment') {
       entries.push({

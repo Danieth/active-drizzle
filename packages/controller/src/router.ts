@@ -17,7 +17,7 @@ import {
   defaultIndex, defaultGet, defaultCreate, defaultUpdate, defaultDestroy,
   singletonFindOrCreate,
 } from './crud-handlers.js'
-import { BadRequest, HttpError, NotFound, ValidationError, toValidationError, serializeError } from './errors.js'
+import { BadRequest, Conflict, HttpError, NotFound, ValidationError, toValidationError, serializeError } from './errors.js'
 
 // ── Route record (for REST adapter + CLI) ─────────────────────────────────────
 
@@ -619,10 +619,13 @@ function httpToOrpc(e: HttpError): ORPCError<string, unknown> {
     401: 'UNAUTHORIZED',
     403: 'FORBIDDEN',
     404: 'NOT_FOUND',
+    409: 'CONFLICT',
     422: 'UNPROCESSABLE_ENTITY',
   }
   const code = STATUS_TO_CODE[e.status] ?? 'INTERNAL_SERVER_ERROR'
-  const data = e instanceof ValidationError ? { errors: e.errors } : undefined
+  const data = e instanceof ValidationError ? { errors: e.errors }
+    : e instanceof Conflict ? { envelope: e.envelope }
+    : undefined
   // status explicitly — cross-package ORPCError copies don't all derive it from code
   return new ORPCError(code, { status: e.status, message: e.message, data })
 }

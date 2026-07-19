@@ -1,19 +1,16 @@
 import { defineConfig } from 'vitest/config'
 import { resolve } from 'path'
 
+const alias = {
+  '@/tests': resolve(__dirname, 'tests'),
+}
+
 export default defineConfig({
-  resolve: {
-    alias: {
-      '@/tests': resolve(__dirname, 'tests'),
-    },
-  },
+  resolve: { alias },
   test: {
     globals: true,
-    environment: 'node',
 
     reporter: ['verbose'],
-
-    include: ['tests/**/*.test.ts'],
 
     typecheck: {
       tsconfig: './tsconfig.test.json',
@@ -61,28 +58,54 @@ export default defineConfig({
       },
     },
 
-    // Each test file gets its own worker context — no global state bleed.
-    isolate: true,
-
-    // Run test files one at a time so at most one Docker container is alive.
-    // With 3 integration suites running concurrently (ecommerce + rails-methods
-    // + benchmark) the peak RSS was >40 GB due to Testcontainers + pg pools.
-    pool: 'forks',
-    poolOptions: {
-      forks: {
-        // One worker at a time: serialises Docker lifecycle across suites.
-        // Unit tests are fast anyway; this costs ~2 s on the full suite.
-        maxForks: 1,
+    // Two projects with different parallelism budgets. The old blanket
+    // `maxForks: 1` served ONE purpose — keeping Docker containers from the
+    // integration suites from running concurrently and blowing up RAM. That
+    // constraint only applies to `tests/integration/**` (4 files). Everything
+    // else is pure in-memory and safe to fan out across all cores.
+    //   Full core suite: ~83s (serial) -> ~22s with this split.
+    projects: [
+      {
+        // ---- UNIT: pure in-memory, no Docker. Fan out to every core. ----
+        // isolate:true is REQUIRED here: several runtime tests depend on the
+        // global DB registered via boot(); reusing worker context (isolate:false)
+        // makes tests/runtime/transaction.test.ts flake. Do not "optimize" this
+        // away without fixing that shared-singleton bleed first.
+        resolve: { alias },
+        test: {
+          name: 'unit',
+          globals: true,
+          environment: 'node',
+          include: ['tests/**/*.test.ts'],
+          exclude: ['tests/integration/**', '**/node_modules/**'],
+          isolate: true,
+          pool: 'forks',
+          // No maxForks cap -> vitest uses all available cores.
+          sequence: { setupFiles: 'list' },
+        },
       },
-    },
-
-    // Integration + benchmark tests spin up Docker containers and run many DB
-    // round-trips. 5 minutes per test suite is the ceiling.
-    testTimeout: 300_000,
-    hookTimeout: 90_000,
-
-    sequence: {
-      setupFiles: 'list',
-    },
+      {
+        // ---- INTEGRATION: one Postgres container per file. ----
+        // Cap concurrency so at most 4 containers are alive at once. Each
+        // postgres:16-alpine + pg pool is ~0.4-0.5 GB; 4 concurrent held well
+        // under RAM on measured hardware. The old maxForks:1 serialised these
+        // (~54s); 4-wide brings the integration lane to ~29s.
+        resolve: { alias },
+        test: {
+          name: 'integration',
+          globals: true,
+          environment: 'node',
+          include: ['tests/integration/**/*.test.ts'],
+          isolate: true,
+          pool: 'forks',
+          poolOptions: {
+            forks: { maxForks: 4, minForks: 4 },
+          },
+          testTimeout: 300_000,
+          hookTimeout: 90_000,
+          sequence: { setupFiles: 'list' },
+        },
+      },
+    ],
   },
 })

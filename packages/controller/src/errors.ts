@@ -38,6 +38,18 @@ export class ValidationError extends HttpError {
   }
 }
 
+/**
+ * Optimistic-concurrency violation (409): the record changed since the
+ * client last read it. Carries the CURRENT server envelope so the client
+ * can offer "reload" (fold the server truth in) or "overwrite" (resubmit
+ * against the fresh version) without another round-trip.
+ */
+export class Conflict extends HttpError {
+  constructor(public readonly envelope?: unknown) {
+    super(409, 'The record was changed elsewhere')
+  }
+}
+
 
 /** Convert a model's `.errors` map (or ValidationErrors) to a ValidationError. */
 export function toValidationError(
@@ -54,6 +66,9 @@ export function toValidationError(
 export function serializeError(err: HttpError): { status: number; body: unknown } {
   if (err instanceof ValidationError) {
     return { status: 422, body: { errors: err.errors } }
+  }
+  if (err instanceof Conflict) {
+    return { status: 409, body: { error: err.message, envelope: err.envelope } }
   }
   return { status: err.status, body: { error: err.message } }
 }

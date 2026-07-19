@@ -66,7 +66,7 @@ export function extractSchema(project: Project, schemaPath: string): SchemaMeta 
     const columnsArg = args[1];
     if (!Node.isStringLiteral(tableNameArg) || !Node.isObjectLiteralExpression(columnsArg)) continue;
 
-    const tableName = tableNameArg.getLiteralValue();
+    const dbName = tableNameArg.getLiteralValue();
     const columns: ColumnMeta[] = [];
 
     for (const prop of columnsArg.getProperties()) {
@@ -77,7 +77,12 @@ export function extractSchema(project: Project, schemaPath: string): SchemaMeta 
       columns.push(extractColumn(colName, colInit, pgEnumMap));
     }
 
-    tables[tableName] = { name: tableName, columns };
+    // Key by the EXPORT identifier, not the SQL name — the runtime resolves
+    // tables through boot()'s schema object and db.query.*, both keyed by
+    // export name. (They only coincide when the export matches the SQL name,
+    // e.g. `users`; they diverge for `bidCovenants` → 'bid_covenants'.)
+    const exportName = decl.getName();
+    tables[exportName] = { name: exportName, dbName, columns };
   }
 
   if (Object.keys(tables).length === 0) {
@@ -252,6 +257,7 @@ export function extractModel(project: Project, modelPath: string): ModelMeta {
   const extendsClass = classDecl.getExtends()?.getExpression().getText() ?? 'ApplicationRecord';
   const isSti = extendsClass !== 'ApplicationRecord';
   const stiParent = isSti ? extendsClass : null;
+  const stiTypeValue = extractStiTypeValue(classDecl);
 
   // Table name from @model() decorator
   const tableName = extractModelTableName(classDecl);
@@ -274,6 +280,7 @@ export function extractModel(project: Project, modelPath: string): ModelMeta {
     extendsClass,
     isSti,
     stiParent,
+    stiTypeValue,
     associations,
     enums,
     enumGroups,
@@ -287,6 +294,17 @@ export function extractModel(project: Project, modelPath: string): ModelMeta {
     propertyDefaults,
     attrSetReturnTypes,
   };
+}
+
+/** Literal value of `static stiType = '…'` — the runtime STI discriminator. */
+function extractStiTypeValue(classDecl: ClassDeclaration): string | null {
+  for (const prop of classDecl.getStaticProperties()) {
+    if (!Node.isPropertyDeclaration(prop)) continue;
+    if (prop.getName() !== 'stiType') continue;
+    const init = prop.getInitializer();
+    if (init && Node.isStringLiteral(init)) return init.getLiteralValue();
+  }
+  return null;
 }
 
 function extractModelTableName(classDecl: ClassDeclaration): string {
@@ -339,6 +357,10 @@ function extractAssociations(classDecl: ClassDeclaration): AssociationMeta[] {
     } else if (args[0] && Node.isObjectLiteralExpression(args[0])) {
       // No explicit table — first arg is the options object
       options = parseObjectLiteral(args[0]);
+    } else if (args[1] && Node.isObjectLiteralExpression(args[1])) {
+      // Explicit-but-empty table slot — `belongsTo(undefined, { polymorphic: true })`
+      // (the documented polymorphic form): options ride in the second arg.
+      options = parseObjectLiteral(args[1]);
     }
 
     result.push({

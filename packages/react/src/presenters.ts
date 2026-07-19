@@ -52,7 +52,7 @@ export interface PresenterProps<V = any> {
   /** The ENTIRE projected draft — safe by construction (unexposed fields don't exist). */
   draft: any
   errors: string[]
-  state: 'ready' | 'saving' | 'saved' | 'error' | 'unauthenticated' | 'pending'
+  state: 'ready' | 'saving' | 'saved' | 'error' | 'unauthenticated' | 'conflict' | 'pending'
   /** True while this field's draft value differs from the server baseline — render an "unsaved" marker. */
   dirty: boolean
 }

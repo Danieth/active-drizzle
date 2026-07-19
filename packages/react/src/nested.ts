@@ -351,7 +351,9 @@ export class NestedArrayManager {
    * grandchildren re-key/drop too instead of staying `isNew` and being
    * re-created by the next save.
    */
-  commitBaselines(savedRows?: any[]): void {
+  commitBaselines(saved?: any): void {
+    // The session hands the server echo raw — rows only if it's actually rows
+    const savedRows: any[] | undefined = Array.isArray(saved) ? saved : undefined
     // Drop destroyed rows and re-key new rows against the server's response
     this.children = this.children.filter(c => !c.destroyed)
     const byId = new Map<any, any>()
@@ -397,8 +399,9 @@ export class NestedArrayManager {
    * identity) with fresh values folded in via applyEnvelope, which recurses
    * into clean grandchild managers the same way.
    */
-  syncFromServer(rows: any[]): void {
-    this.children = rows.map(row => {
+  syncFromServer(rows: any): void {
+    if (!Array.isArray(rows)) return   // an array association only syncs to rows
+    this.children = rows.map((row: any) => {
       const existing = this.children.find(
         c => !c.isNew && row?.id != null && (c.session.draft as any).id === row.id,
       )
@@ -413,6 +416,205 @@ export class NestedArrayManager {
         destroyed: false,
       }
     })
+    this.parent.notifyExternal(this.name)
+  }
+}
+
+/**
+ * NestedOneManager — the singular (hasOne) sibling of NestedArrayManager.
+ *
+ * `<owner>.<assoc>` holds AT MOST ONE child: `<assoc>Attributes` on the wire
+ * is a single object, not an array. The protocol per save:
+ *
+ *   new + present        → { ...fields }               (no id; server creates —
+ *                           or updates an existing row: the singular invariant)
+ *   persisted + dirty    → { id, ...changedFields }
+ *   persisted + removed  → { id, _destroy: true }      (allowDestroy opt-in)
+ *   new + removed        → nothing (the draft just drops)
+ *
+ * Server error routing is path-scoped as `<name>.<field>` (no row key —
+ * there is only one row). Staged-only: singular children always ride the
+ * parent save; there is no instant transport mode.
+ */
+export class NestedOneManager {
+  readonly name: string
+  private parent: FormSession
+  private child: NestedChild | null = null
+  private seq = 0
+  private validateChild?: (draft: any) => Record<string, string[]>
+  /** Child fields that are THEMSELVES nested associations (nested-nested). */
+  private nestedKeys: Set<string>
+  private locked = false
+  readonly allowDestroy: boolean
+
+  constructor(
+    parent: FormSession<any>,
+    name: string,
+    initial: any,
+    opts: {
+      validate?: (draft: any) => Record<string, string[]>
+      nestedKeys?: string[]
+      allowDestroy?: boolean
+    } = {},
+  ) {
+    this.parent = parent
+    this.name = name
+    this.allowDestroy = opts.allowDestroy !== false
+    this.nestedKeys = new Set(opts.nestedKeys ?? [])
+    if (opts.validate) this.validateChild = opts.validate
+    if (initial && typeof initial === 'object' && !Array.isArray(initial)) {
+      this.child = this.makeChild({ ...initial }, initial.id == null)
+    }
+  }
+
+  private makeChild(draft: any, isNew: boolean): NestedChild {
+    return {
+      key: !isNew && draft?.id != null ? `id:${draft.id}` : `new:${++this.seq}`,
+      session: new FormSession({
+        draft,
+        abilities: this.locked ? viewMaskOf(draft) : null,
+        mode: isNew ? 'new' : 'edit',
+        ...(this.validateChild ? { validate: this.validateChild } : {}),
+        // no transport: the child NEVER submits — the parent owns the wire
+      }),
+      isNew,
+      destroyed: false,
+    }
+  }
+
+  /** The parent envelope's verdict for `<name>Attributes` (self-locking). */
+  setLocked(locked: boolean): void {
+    if (locked === this.locked) return
+    this.locked = locked
+    if (this.child) {
+      this.child.session.setAbilities(locked ? viewMaskOf(this.child.session.draft) : null)
+    }
+    this.parent.notifyExternal(this.name)
+  }
+
+  isLocked(): boolean { return this.locked }
+
+  /** The child currently in the form — null when absent or removed. */
+  current(): NestedChild | null {
+    return this.child && !this.child.destroyed ? this.child : null
+  }
+
+  /**
+   * Ensure a child exists (the singular Add). A destroy-marked persisted
+   * child revives instead of double-building — one association, one row.
+   */
+  build(defaults: Record<string, any> = {}): NestedChild | null {
+    if (this.locked) return null
+    if (this.child) {
+      if (this.child.destroyed) {
+        this.child.destroyed = false
+        this.parent.notifyExternal(this.name)
+      }
+      return this.child
+    }
+    this.child = this.makeChild({ ...defaults }, true)
+    this.parent.notifyExternal(this.name)
+    return this.child
+  }
+
+  /** New child → drops entirely; persisted → marks _destroy (opt-in). */
+  remove(): void {
+    if (this.locked || !this.child) return
+    if (this.child.isNew) {
+      this.child = null
+    } else {
+      if (!this.allowDestroy) return
+      this.child.destroyed = true
+    }
+    this.parent.notifyExternal(this.name)
+  }
+
+  /**
+   * The `<name>Attributes` payload for the parent submit — a single object,
+   * or null when the child has nothing to say (clean submits stay clean).
+   */
+  attributesPayload(): Record<string, any> | null {
+    if (this.locked || !this.child) return null
+    const draft: any = this.child.session.draft
+    if (this.child.destroyed) {
+      return this.allowDestroy ? { id: draft.id, _destroy: true } : null
+    }
+    if (this.child.isNew) {
+      // A brand-new child's ENTIRE draft is its payload — except raw nested
+      // association keys: those fold through the child session's own managers
+      const data = { ...this.child.session.changedData() }
+      for (const [k, v] of Object.entries(draft)) {
+        if (this.nestedKeys.has(k) || this.child.session.getNested(k)) continue
+        if (typeof v !== 'function' && data[k] === undefined && v !== undefined) data[k] = v
+      }
+      delete data.id
+      return data
+    }
+    const diff = this.child.session.changedData()
+    return Object.keys(diff).length > 0 ? { id: draft.id, ...diff } : null
+  }
+
+  /** Client-side validity of the child — blocks the parent submit. */
+  errors(): Record<string, string[]> {
+    const out: Record<string, string[]> = {}
+    const child = this.current()
+    if (!child) return out
+    for (const [field, msgs] of Object.entries(child.session.gateErrors())) {
+      out[`${this.name}.${field}`] = msgs
+    }
+    return out
+  }
+
+  markSubmitAttempted(): void {
+    this.current()?.session.markSubmitAttempted()
+  }
+
+  /** Route server errors addressed as `<name>.<field>` to the child. */
+  routeServerError(path: string, msgs: string[]): boolean {
+    const m = path.match(new RegExp(`^${this.name}\\.(.+)$`))
+    if (!m || !this.child) return false
+    this.child.session.applyExternalErrors({ [m[1]!]: msgs })
+    return true
+  }
+
+  /**
+   * Post-save settle. `saved` is the server's echo for this association:
+   * a row → adopt its id (new child becomes persisted); null/undefined with
+   * a destroy-marked child → the destroy landed, drop it. A missing echo is
+   * benign for hasOne — the next id-less save UPDATES the existing row
+   * (singular invariant), so nothing can duplicate.
+   */
+  commitBaselines(saved?: any): void {
+    if (this.child?.destroyed) { this.child = null; this.parent.notifyExternal(this.name); return }
+    if (!this.child) return
+    const row = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : undefined
+    if (row?.id != null && this.child.isNew) {
+      ;(this.child.session.draft as any).id = row.id
+      this.child.isNew = false
+      this.child.key = `id:${row.id}`
+    }
+    this.child.session.settleNested(row)
+    this.child.session.resetBaseline()
+    this.parent.notifyExternal(this.name)
+  }
+
+  /**
+   * Server truth outside the submit path (refetch/rehydrate), only called
+   * when no local edits are pending. null → the child is gone; a row →
+   * fold into the live session (persisted, same id) or rebuild.
+   */
+  syncFromServer(row: any): void {
+    if (Array.isArray(row)) return   // a singular association never syncs to rows
+    if (!row || typeof row !== 'object') {
+      this.child = null
+      this.parent.notifyExternal(this.name)
+      return
+    }
+    if (this.child && !this.child.isNew && row.id != null && (this.child.session.draft as any).id === row.id) {
+      this.child.session.applyEnvelope({ record: row })
+    } else {
+      this.child = this.makeChild({ ...row }, row.id == null)
+    }
     this.parent.notifyExternal(this.name)
   }
 }

@@ -16,8 +16,10 @@ export default defineConfig({
     globals: true,
     environment: 'jsdom',
     include: ['tests/**/*.test.ts', 'tests/**/*.test.tsx'],
+    // No Docker here — pure jsdom. Fan out across all cores (was capped at 2).
+    // isolate stays at vitest's default (true): react tests also touch the
+    // global boot() registry, so reusing worker context can bleed.
     pool: 'forks',
-    poolOptions: { forks: { maxForks: 2 } },
     coverage: {
       provider: 'v8',
       all: true,

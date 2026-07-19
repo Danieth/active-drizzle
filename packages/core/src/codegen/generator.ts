@@ -36,7 +36,13 @@ export function generate(project: ProjectMeta): GeneratedFile[] {
 
   for (const model of project.models) {
     const base = model.filePath.split('/').pop()!.replace('.model.ts', '.model.gen');
-    files.push({ path: `${base}.d.ts`, content: generateModelTypes(model, project) });
+    // The declarations CANNOT share a basename with the runtime file:
+    // `X.model.gen.d.ts` next to `X.model.gen.ts` is treated by tsc's
+    // include-glob rules as that file's BUILD OUTPUT and silently excluded
+    // from the program — so every `declare module` augmentation (instance
+    // field types, statics, scopes) never applied under `tsc --noEmit`.
+    const typesBase = base.replace(/\.model\.gen$/, '.model.types.gen');
+    files.push({ path: `${typesBase}.d.ts`, content: generateModelTypes(model, project) });
     files.push({ path: `${base}.ts`, content: generateClientRuntime(model, project) });
   }
 
@@ -76,6 +82,10 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta): stri
   const lines: string[] = [];
   const recordName = `${model.className}Record`;
   const table = project.schema.tables[model.tableName];
+  // STI parent, when it's a model in this project (used to inherit types).
+  const stiParentWithModel = model.stiParent && project.models.some(m => m.className === model.stiParent)
+    ? model.stiParent
+    : null;
 
   lines.push(`// AUTO-GENERATED — do not edit manually`);
   lines.push(`import type { Relation, IncludeArg, MapInclude } from 'active-drizzle'`);
@@ -125,6 +135,25 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta): stri
     }
   }
 
+  // Column value properties — the record proxy auto-exposes every column, so
+  // the interface must declare them or `this.<col>` is invisible to TS (and
+  // collides with the static Attr declaration in error messages). Skip columns
+  // already typed by an enum, state, or association declaration — on this
+  // model OR an STI ancestor (a subclass re-declaring `status: string` would
+  // conflict with the parent's narrowed label union).
+  if (table) {
+    const covered = new Set<string>();
+    for (let m: ModelMeta | undefined = model; m; m = project.models.find(p => p.className === m!.stiParent)) {
+      for (const e of m.enums) covered.add(e.propertyName);
+      for (const s of m.states) covered.add(s.propertyName);
+      for (const a of m.associations) covered.add(a.propertyName);
+    }
+    for (const col of table.columns) {
+      if (covered.has(col.name)) continue;
+      lines.push(`    ${col.name}: ${columnToTsType(col)}`);
+    }
+  }
+
   if (table) {
     for (const col of table.columns) {
       if (col.primaryKey) continue;
@@ -156,8 +185,17 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta): stri
   lines.push(`    function first(): Promise<${recordName} | null>`);
   lines.push(`    function find(id: number | string): Promise<${recordName}>`);
 
+  // OWN statics must NOT be redeclared in the merged namespace — a class's
+  // own `static open()` plus a namespace `const open` is TS2451 the moment
+  // the augmentation actually applies. Own scopes are typed by the user's
+  // static method itself (whose `this.where(...)` resolves through the
+  // namespace `where` above, so the return IS the typed Relation). Only
+  // scopes this class doesn't declare directly — inherited STI scopes —
+  // need a namespace declaration.
+  const ownScopeNames = new Set(model.scopes.map(s => s.name));
   const allScopes = collectAllScopes(model, project);
   for (const scope of allScopes) {
+    if (ownScopeNames.has(scope.name)) continue;
     if (scope.isComputed) {
       // @computed scopes return aggregate data, not a Relation
       const paramStr = scope.parameters.map(p => `${p.name}: ${p.type}`).join(', ');
@@ -170,25 +208,24 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta): stri
     }
   }
 
-  for (const group of model.enumGroups) {
-    lines.push(`    const ${group.propertyName}: Relation<${recordName}, ${model.className}Associations>`);
-  }
+  // enum-group statics are own statics too (`static images = enumGroup(...)`)
+  // — same TS2451 collision; the class declaration is the type.
 
-  for (const enumDef of model.enums) {
-    lines.push(`    const ${enumDef.propertyName}: { ${Object.entries(enumDef.values).map(([k, v]) => `${k}: ${v}`).join('; ')} }`);
-  }
+  // NOTE: no namespace `const` for enum/state statics — the class already
+  // declares `static <prop> = Attr.enum/state(...)` and TS types it from the
+  // initializer; a same-named namespace const is a redeclaration error when
+  // the augmentation is actually loaded into the program.
 
-  for (const st of model.states) {
-    const valuePairs = Object.entries(st.values)
-      .map(([k, v]) => `${k}: ${typeof v === 'string' ? `'${v}'` : v}`)
-      .join('; ');
-    const transitionPairs = st.transitions
-      .map(t => `${t.event}: { from: ${t.from === '*' ? `'*'` : JSON.stringify(t.from)}; to: '${t.to}' }`)
-      .join('; ');
-    lines.push(`    const ${st.propertyName}: { values: { ${valuePairs} }; initial: ${st.initial ? `'${st.initial}'` : 'null'}; transitions: { ${transitionPairs} } }`);
-  }
-
-  // Client class type declaration (implementation lives in .gen.ts)
+  // Client class type declaration (implementation lives in .gen.ts).
+  // For STI subclasses the body is the MERGED ancestor chain — an ambient
+  // `extends Parent.Client` can't be used because names inside a `declare
+  // module` block resolve in the d.ts file's own scope (where the parent isn't
+  // imported), and skipLibCheck would mask the failure. A structural superset
+  // keeps the runtime class's static `extends` side compatible.
+  const chain = stiChain(model, project);
+  const chainAssocs = dedupeBy(chain.flatMap(m => m.associations), a => a.propertyName);
+  const chainStates = chain.flatMap(m => m.states);
+  const chainMethods = dedupeBy(chain.flatMap(m => m.instanceMethods), im => im.name);
   lines.push(`    class Client {`);
   if (table) {
     for (const col of table.columns) {
@@ -197,17 +234,19 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta): stri
       lines.push(`      ${col.name}${isOptional ? '?' : ''}: ${tsType};`);
     }
   }
-  for (const assoc of model.associations) {
+  for (const assoc of chainAssocs) {
     const targetClass = resolveAssocClass(assoc, project);
     if (!targetClass) continue;
+    // `<X>Client` is a global alias from _globals.gen.d.ts — the augmented
+    // module can't import, so cross-model references go through globals.
     if (assoc.kind === 'hasMany' || assoc.kind === 'habtm') {
-      lines.push(`      ${assoc.propertyName}: ${targetClass}.Client[];`);
+      lines.push(`      ${assoc.propertyName}: ${targetClass}Client[];`);
     } else {
       const nullable = assoc.kind === 'belongsTo' ? isBelongsToNullable(assoc, model, project) : true;
-      lines.push(`      ${assoc.propertyName}: ${targetClass}.Client${nullable ? ' | null' : ''};`);
+      lines.push(`      ${assoc.propertyName}: ${targetClass}Client${nullable ? ' | null' : ''};`);
     }
   }
-  for (const method of model.instanceMethods) {
+  for (const method of chainMethods) {
     if (method.isServerOnly || method.isValidation) continue;
     const paramStr = method.parameters.map(p => `${p.name}: ${p.type}`).join(', ');
     lines.push(`      ${method.name}(${paramStr}): ${method.returnType}`);
@@ -217,11 +256,11 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta): stri
   lines.push(`      isChanged(): boolean`);
   lines.push(`      restoreAttributes(): void`);
   lines.push(`      validate(path?: string): Record<string, string[]>`);
-  const clientEvents = model.states.flatMap(st => st.transitions.map(t => t.event));
+  const clientEvents = chainStates.flatMap(st => st.transitions.map(t => t.event));
   if (clientEvents.length > 0) {
     lines.push(`      can(event: ${clientEvents.map(e => `'${e}'`).join(' | ')}): boolean`);
   }
-  if (Object.keys(model.fieldMeta ?? {}).length > 0) {
+  if (chain.some(m => Object.keys(m.fieldMeta ?? {}).length > 0)) {
     lines.push(`      static fieldMeta: Record<string, unknown>`);
   }
   lines.push(`    }`);
@@ -235,17 +274,11 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta): stri
   lines.push('');
 
   lines.push(`// --- Advanced Type Sorcery ---`);
-  lines.push(`export interface ${model.className}Associations {`);
-  for (const assoc of model.associations) {
-    const targetClass = resolveAssocClass(assoc, project);
-    if (!targetClass) continue;
-    if (assoc.kind === 'belongsTo' || assoc.kind === 'hasOne') {
-      const nullable = assoc.kind === 'belongsTo' ? isBelongsToNullable(assoc, model, project) : true;
-      lines.push(`  ${assoc.propertyName}: ${targetClass}Record${nullable ? ' | null' : ''};`);
-    } else {
-      lines.push(`  ${assoc.propertyName}: ${targetClass}Record[];`);
-    }
-  }
+  // STI subclasses inherit the parent's associations at runtime — the type
+  // extends the parent's interface (resolved via the _globals.gen.d.ts alias).
+  const assocExtends = stiParentWithModel ? `extends ${stiParentWithModel}Associations ` : '';
+  lines.push(`export interface ${model.className}Associations ${assocExtends}{`);
+  for (const line of renderAssociationMembers(model, project)) lines.push(line);
   lines.push(`}`);
   lines.push('');
 
@@ -291,12 +324,13 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta): stri
       lines.push(`  ${col.name}${isOptional ? '?' : ''}: ${tsType};`);
     }
   }
-  // acceptsNestedAttributesFor: embed nested Create type recursively
+  // acceptsNestedAttributesFor: embed nested Create type recursively —
+  // hasMany takes an array of child rows, hasOne a single one
   for (const assoc of model.associations) {
     if (!assoc.acceptsNested) continue;
     const targetClass = resolveAssocClass(assoc, project);
     if (!targetClass) continue;
-    lines.push(`  ${assoc.propertyName}Attributes?: ${targetClass}Create[];`);
+    lines.push(`  ${assoc.propertyName}Attributes?: ${targetClass}Create${assoc.kind === 'hasOne' ? '' : '[]'};`);
   }
   lines.push(`}`);
   lines.push('');
@@ -530,6 +564,38 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta): s
   return lines.join('\n');
 }
 
+/** The model plus its STI ancestors (self first), for merged type emission. */
+function stiChain(model: ModelMeta, project: ProjectMeta): ModelMeta[] {
+  const chain: ModelMeta[] = [];
+  for (let m: ModelMeta | undefined = model; m; m = project.models.find(p => p.className === m!.stiParent)) {
+    chain.push(m);
+    if (chain.length > 16) break; // cycle guard — validator reports real cycles
+  }
+  return chain;
+}
+
+/** First-wins dedupe (subclass overrides ancestor) preserving order. */
+function dedupeBy<T>(items: T[], key: (item: T) => string): T[] {
+  const seen = new Set<string>();
+  return items.filter(item => (seen.has(key(item)) ? false : (seen.add(key(item)), true)));
+}
+
+/** Members of a model's `<X>Associations` interface (shared with _globals.gen.d.ts). */
+function renderAssociationMembers(model: ModelMeta, project: ProjectMeta): string[] {
+  const lines: string[] = [];
+  for (const assoc of model.associations) {
+    const targetClass = resolveAssocClass(assoc, project);
+    if (!targetClass) continue;
+    if (assoc.kind === 'belongsTo' || assoc.kind === 'hasOne') {
+      const nullable = assoc.kind === 'belongsTo' ? isBelongsToNullable(assoc, model, project) : true;
+      lines.push(`  ${assoc.propertyName}: ${targetClass}Record${nullable ? ' | null' : ''};`);
+    } else {
+      lines.push(`  ${assoc.propertyName}: ${targetClass}Record[];`);
+    }
+  }
+  return lines;
+}
+
 function generateAssociationType(assoc: AssociationMeta, ownerModel: ModelMeta, project: ProjectMeta): string | null {
   const targetClass = resolveAssocClass(assoc, project);
   if (!targetClass) return null;
@@ -562,6 +628,14 @@ let _resolveAssocCache: Map<string, string | null> = new Map();
 function resolveAssocClass(assoc: AssociationMeta, project: ProjectMeta): string | null {
   const cacheKey = `${assoc.kind}|${assoc.propertyName}|${assoc.explicitTable ?? ''}|${assoc.resolvedTable ?? ''}`;
   if (_resolveAssocCache.has(cacheKey)) return _resolveAssocCache.get(cacheKey)!;
+
+  // Polymorphic belongsTo has NO static target class — the row's type column
+  // decides at runtime. Inferring one from the property name fabricated
+  // references to classes that don't exist (`CommentableClient`).
+  if (assoc.kind === 'belongsTo' && assoc.polymorphic) {
+    _resolveAssocCache.set(cacheKey, null);
+    return null;
+  }
 
   // habtm: marker.table is the JOIN table, never the target — the target is
   // className (Rails' class_name) or inferred from the property name,
@@ -758,8 +832,55 @@ export function generateRegistry(project: ProjectMeta): string {
   return lines.join('\n');
 }
 
-export function generateGlobals(_project: ProjectMeta): string {
-  return '// _globals.gen.d.ts — placeholder\n';
+/**
+ * Generates `_globals.gen.d.ts` — AMBIENT global type aliases for every model.
+ *
+ * The per-model `.gen.d.ts` files augment their model module via
+ * `declare module './X.model'`; inside an augmentation block you cannot add
+ * imports, so every cross-model type reference (`ProposalRecord`,
+ * `OrganizationClient`, …) resolves through these globals instead.
+ *
+ * The file must stay import/export-free — a d.ts with no top-level
+ * import/export is a global script, which is exactly what makes these names
+ * visible everywhere. (`import('…')` in type position does not modularize it.)
+ *
+ * @param outDir absolute directory the file is written to (used to compute
+ *               relative import() specifiers; defaults to the first model's dir)
+ */
+export function generateGlobals(project: ProjectMeta, outDir?: string): string {
+  const lines: string[] = [];
+  lines.push(`// AUTO-GENERATED — do not edit manually`);
+  lines.push(`// Ambient global aliases: cross-model references in the .gen.d.ts`);
+  lines.push(`// module augmentations resolve through these (augmentation blocks`);
+  lines.push(`// cannot import). This file must not contain import/export statements.`);
+  lines.push('');
+
+  const baseDir = outDir ?? (project.models[0] ? path.dirname(project.models[0].filePath) : process.cwd());
+
+  for (const model of project.models) {
+    let rel = path.relative(baseDir, model.filePath);
+    if (!rel.startsWith('.')) rel = './' + rel;
+    rel = rel.replace(/\.ts$/, '.js');
+    const imp = `import('${rel}').${model.className}`;
+    lines.push(`type ${model.className}Record = InstanceType<typeof ${imp}>`);
+    lines.push(`type ${model.className}Client = InstanceType<typeof ${imp}.Client>`);
+  }
+  lines.push('');
+
+  // Association shapes — global so an STI subclass's d.ts can extend its
+  // parent's interface, and so Relation-typed helpers can name them anywhere.
+  // (Structurally identical to the module-scoped export in each .gen.d.ts.)
+  for (const model of project.models) {
+    const parent = model.stiParent && project.models.some(m => m.className === model.stiParent)
+      ? model.stiParent
+      : null;
+    lines.push(`interface ${model.className}Associations ${parent ? `extends ${parent}Associations ` : ''}{`);
+    for (const line of renderAssociationMembers(model, project)) lines.push(line);
+    lines.push(`}`);
+  }
+  lines.push('');
+
+  return lines.join('\n');
 }
 
 /**

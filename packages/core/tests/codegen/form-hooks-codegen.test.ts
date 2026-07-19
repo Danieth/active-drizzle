@@ -90,13 +90,12 @@ describe('typed form handle emission', () => {
     expect(out).toContain('formKey: id,')
     expect(out).toContain('data: query.data ?? null,')
     expect(out).toContain('makeDraft: (r) => new LoanClient(r),')
-    expect(out).toContain(`data: _event ? { ...data, _event } : data`)
+    // _event and _version (optimistic lock echo) both ride the PATCH as protocol keys
+    expect(out).toContain(`data: { ...data, ...(_event ? { _event } : {}), ...(_version != null ? { _version } : {}) }`)
     expect(out).toContain('qc.invalidateQueries')
     expect(out).toContain(`fieldMeta: (LoanClient as any).fieldMeta`)
     // envelope-shaped responses ALWAYS flow through (abilities re-mask)
     expect(out).toContain(`'record' in res ? { envelope: res }`)
-    // no versioning machinery anywhere
-    expect(out).not.toContain('version')
   })
 
   it('wires useNewForm with a defaults draft and create transport', () => {

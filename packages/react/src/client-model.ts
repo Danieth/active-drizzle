@@ -41,8 +41,11 @@ export class ClientModel<
 > {
   protected readonly _attrs: TAttrs
 
-  constructor(attrs: TAttrs) {
-    this._attrs = Object.freeze({ ...attrs })
+  // Partial: drafts are built from projections and empty new-form payloads —
+  // demanding the full attrs shape made every generated makeDraft a type
+  // error while the runtime was always fine with sparse input
+  constructor(attrs: Partial<TAttrs>) {
+    this._attrs = Object.freeze({ ...attrs }) as TAttrs
     // Define attrs onto `this` so `model.name` works without explicit getters.
     // defineProperty (not Object.assign) — assignment would invoke prototype
     // accessors like `get id()` and throw; defining shadows them cleanly and
@@ -94,8 +97,33 @@ export class ClientModel<
    * (It was once a prototype accessor — which made `draft.id = 9` THROW on
    * drafts constructed from empty payloads, e.g. new-record forms receiving
    * their created id. Never again.)
+   *
+   * OPTIONAL: generated subclasses redeclare it `id?: number` (a new-form
+   * draft genuinely has none) — a required base made every subclass a
+   * TS2415 "incorrectly extends" error.
    */
-  declare id: any
+  declare id?: any
+}
+
+// ── Envelope unwrap ───────────────────────────────────────────────────────────
+
+/**
+ * The record inside a controller `get()` response — whatever the shape.
+ *
+ * A controller with `abilities: true` responds with the Forms envelope
+ * `{ record, abilities, can }`; one without responds with the bare row. A
+ * picker (or any presenter) pointed at an arbitrary "door" must not care:
+ *
+ *   const row = recordOf(await DoorController.get({ id }))
+ *   label = row?.name
+ *
+ * Without this every UI kit independently rediscovers `data.record ?? data`
+ * — or worse, renders `#1` because `data.name` is undefined on an enveloped
+ * door while working fine on a bare one.
+ */
+export function recordOf<T = Record<string, any>>(payload: unknown): T | null {
+  if (payload == null || typeof payload !== 'object') return (payload ?? null) as T | null
+  return ('record' in (payload as any) ? (payload as any).record : payload) as T
 }
 
 // ── Cache key factories ───────────────────────────────────────────────────────

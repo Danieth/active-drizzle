@@ -135,7 +135,22 @@ export interface CrudConfig {
    */
   scopeBy?: (ctrl: any) => Record<string, any>
   create?: WriteConfig
-  update?: Omit<WriteConfig, 'autoSet'>
+  update?: Omit<WriteConfig, 'autoSet'> & {
+    /**
+     * Optimistic concurrency for updates. The envelope gains a `version`
+     * token read from this field; the client echoes it as `_version` on
+     * PATCH; a mismatch throws 409 Conflict carrying the CURRENT envelope
+     * (so the client can offer reload/overwrite without a round-trip).
+     *
+     *   true       → version from `updatedAt` (the model must touch it on
+     *                save — a @beforeSave hook or DB trigger)
+     *   '<field>'  → version from that field; NUMERIC fields (lock_version
+     *                style) auto-increment on every governed update
+     *
+     * A PATCH without `_version` skips the check (old clients still work).
+     */
+    optimisticLock?: boolean | string
+  }
   get?: GetConfig
 }
 

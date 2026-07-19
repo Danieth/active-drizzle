@@ -6,6 +6,7 @@ export { Validates, isBlank } from '@active-drizzle/core/validators'
 export {
   ClientModel,
   modelCacheKeys,
+  recordOf,
   type PaginationMeta,
   type ModelIndexResult,
   type ModelCacheKeys,
@@ -55,9 +56,10 @@ export {
   type TypedFieldProps,
   type TypedFieldComponent,
   type ArrayFieldHandle,
+  type OneFieldHandle,
   type NestedFormHandle,
 } from './form-handle.js'
-export { NestedArrayManager, type NestedChild, type NestedTransport } from './nested.js'
+export { NestedArrayManager, NestedOneManager, type NestedChild, type NestedTransport } from './nested.js'
 export { useForm, useEditForm, useNewForm, type UseFormOptions } from './use-form.js'
 export { useGeneratedForm, type UseGeneratedFormOptions } from './generated-form.js'
 

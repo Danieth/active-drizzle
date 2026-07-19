@@ -170,7 +170,9 @@ describe('validator — association errors', () => {
       schema,
       models: {
         'Asset.model.ts': modelBuilder('Asset', 'assets')
-          .hasMany('campaigns', 'campaigns', { through: 'asset_campaigns' })
+          // `through` takes the schema EXPORT identifier (what the runtime
+          // resolves via boot()'s schema object), not the SQL table name.
+          .hasMany('campaigns', 'campaigns', { through: 'assetCampaigns' })
           .build(),
       },
     })
@@ -493,5 +495,88 @@ describe('validator — STI parent model not found', () => {
 
     const result = project.run()
     expectErrors(result, /DigitalProduct.*Product.*not found/i)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Polymorphic inverse (as:) — the validator layer of the polymorphic story
+// ---------------------------------------------------------------------------
+
+describe('validator — polymorphic inverse (as:)', () => {
+  const polySchema = schemaBuilder()
+    .table('deals', t => t.integer('id').primaryKey().notNull())
+    .table('companies', t => t.integer('id').primaryKey().notNull())
+    .table('comments', t => t.integer('id').primaryKey().notNull()
+      .text('commentable_type').integer('commentable_id').text('body'))
+    .build()
+
+  it('passes a well-formed polymorphic pair — no errors, no inverse warnings', () => {
+    const result = createTestProject({
+      schema: polySchema,
+      models: {
+        'Comment.model.ts': modelBuilder('Comment', 'comments')
+          .belongsTo('commentable', undefined, { polymorphic: true })
+          .build(),
+        'Deal.model.ts': modelBuilder('Deal', 'deals')
+          .hasMany('comments', undefined, { as: 'commentable' })
+          .build(),
+        'Company.model.ts': modelBuilder('Company', 'companies')
+          .hasMany('comments', undefined, { as: 'commentable' })
+          .build(),
+      },
+    }).run()
+
+    expectNoErrors(result)
+    // Previously this errored with `column "dealId" not found on table
+    // "comments"` AND warned about a missing bidirectional belongsTo —
+    // the polymorphic belongsTo IS the inverse
+    const bidirectional = result.warnings.filter(w => w.message.includes('bidirectional'))
+    expect(bidirectional).toHaveLength(0)
+  })
+
+  it('errors when the target table is missing the polymorphic pair', () => {
+    const result = createTestProject({
+      schema: schemaBuilder()
+        .table('deals', t => t.integer('id').primaryKey().notNull())
+        .table('comments', t => t.integer('id').primaryKey().notNull().text('body'))
+        .build(),
+      models: {
+        'Deal.model.ts': modelBuilder('Deal', 'deals')
+          .hasMany('comments', undefined, { as: 'commentable' })
+          .build(),
+      },
+    }).run()
+
+    expectErrors(result,
+      /polymorphic inverse \(as: 'commentable'\) expects column "commentableId"/,
+      /polymorphic inverse \(as: 'commentable'\) expects column "commentableType"/,
+    )
+  })
+
+  it('warns when the target model lacks the polymorphic belongsTo of that name', () => {
+    const result = createTestProject({
+      schema: polySchema,
+      models: {
+        'Comment.model.ts': modelBuilder('Comment', 'comments').build(),   // no commentable
+        'Deal.model.ts': modelBuilder('Deal', 'deals')
+          .hasMany('comments', undefined, { as: 'commentable' })
+          .build(),
+      },
+    }).run()
+
+    expectWarnings(result, /no polymorphic belongsTo "commentable" found on "Comment"/)
+  })
+
+  it('a PLAIN hasMany still demands the conventional fk (regression)', () => {
+    const result = createTestProject({
+      schema: polySchema,
+      models: {
+        'Deal.model.ts': modelBuilder('Deal', 'deals')
+          .hasMany('comments')   // no as:, no foreignKey — expects dealId
+          .build(),
+      },
+    }).run()
+
+    expectErrors(result, /column "dealId" not found on table "comments"/)
   })
 })

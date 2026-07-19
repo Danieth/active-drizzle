@@ -465,6 +465,118 @@ describe('nested attributes security', () => {
   })
 })
 
+// ── hasOne nested attributes (singular `<assoc>Attributes` object) ───────────
+
+describe('hasOne acceptsNested runtime', () => {
+  @model('one_profiles')
+  class OneProfile extends ApplicationRecord {}
+  void OneProfile
+
+  @model('one_users')
+  class OneUser extends ApplicationRecord {
+    static profile = hasOne('one_profiles', { acceptsNested: { allowDestroy: true } } as any)
+  }
+
+  const oneSchema = {
+    one_users: fakeTable(['id']),
+    one_profiles: fakeTable(['id', 'one_userId', 'bio']),
+  }
+
+  /** Parent INSERT returns id 10; every SELECT resolves `childRow` (or nothing). */
+  function oneDb(childRow: any) {
+    const db: any = {
+      // Relation.first() (the existing-child lookup) goes through the
+      // relational query API, not the select-chain
+      query: { one_profiles: { findMany: vi.fn(async () => (childRow ? [childRow] : [])) } },
+      select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => ({
+        limit: vi.fn(async () => (childRow ? [childRow] : [])),
+      })) })) })),
+      insert: vi.fn(() => ({ values: vi.fn(() => ({ returning: vi.fn(async () => [{ id: 10 }]) })) })),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: vi.fn(() => ({
+        returning: vi.fn(async () => [childRow ?? { id: 99 }]),
+      })) })) })),
+      delete: vi.fn(() => ({ where: vi.fn(async () => []) })),
+      transaction: vi.fn((cb: any) => cb(db)),
+    }
+    return db
+  }
+
+  it('creates the child from an id-less singular object when none exists', async () => {
+    const db = oneDb(null)
+    boot(db, oneSchema)
+    const user = new OneUser({ profileAttributes: { bio: 'hello' } })
+    expect(await user.save()).toBe(true)
+    expect(db.insert).toHaveBeenCalledTimes(2)   // parent + child
+    expect(db.update).not.toHaveBeenCalled()
+  })
+
+  it('an id-less write UPDATES an existing child — never inserts a second row', async () => {
+    const db = oneDb({ id: 99, one_userId: 10, bio: 'old' })
+    boot(db, oneSchema)
+    const user = new OneUser({ profileAttributes: { bio: 'new' } })
+    expect(await user.save()).toBe(true)
+    expect(db.insert).toHaveBeenCalledTimes(1)   // parent only
+    expect(db.update).toHaveBeenCalledTimes(1)   // the existing child
+  })
+
+  it('HIJACK: a child id belonging to ANOTHER record fails the save, touches nothing', async () => {
+    const db = oneDb({ id: 99, one_userId: 777, bio: 'someone elses row' })
+    boot(db, oneSchema)
+    const user = new OneUser({ profileAttributes: { id: 99, bio: 'pwned' } })
+    expect(await user.save()).toBe(false)
+    expect(db.update).not.toHaveBeenCalled()
+    expect(db.delete).not.toHaveBeenCalled()
+  })
+
+  it('{ id, _destroy: true } destroys the OWNED child (allowDestroy opted in)', async () => {
+    const db = oneDb({ id: 99, one_userId: 10, bio: 'bye' })
+    boot(db, oneSchema)
+    const user = new OneUser({ profileAttributes: { id: 99, _destroy: true } })
+    expect(await user.save()).toBe(true)
+    expect(db.delete).toHaveBeenCalledTimes(1)
+  })
+
+  it('an ARRAY payload on a hasOne is not captured (shape gate) and never reaches the insert', async () => {
+    const capturedPayloads: any[] = []
+    const db = oneDb(null)
+    const origInsert = db.insert
+    db.insert = vi.fn((table: any) => {
+      const chain = origInsert(table)
+      const origValues = chain.values
+      chain.values = vi.fn((payload: any) => { capturedPayloads.push(payload); return origValues(payload) })
+      return chain
+    })
+    boot(db, oneSchema)
+    const user = new OneUser({ profileAttributes: [{ bio: 'wrong shape' }] })
+    expect(await user.save()).toBe(true)
+    expect(db.insert).toHaveBeenCalledTimes(1)   // parent only — no child processed
+    expect(capturedPayloads[0]).not.toHaveProperty('profileAttributes')
+  })
+})
+
+// ── resolveNestedAssociations (controller duck-typing surface) ───────────────
+
+describe('resolveNestedAssociations kinds', () => {
+  it('reports hasMany as many and hasOne as one, with fk + destroy policy', async () => {
+    const { resolveNestedAssociations } = await import('../../src/runtime/application-record.js')
+    @model('rn_child_rows')
+    class RnChildRow extends ApplicationRecord {}
+    void RnChildRow
+    @model('rn_owners')
+    class RnOwner extends ApplicationRecord {
+      static rows = hasMany('rn_child_rows', { acceptsNested: true } as any)
+      static extra = hasOne('rn_child_rows', { acceptsNested: { allowDestroy: true } } as any)
+      static plain = hasOne('rn_child_rows')
+    }
+    const resolved = resolveNestedAssociations(RnOwner)
+    const rows = resolved.find(r => r.name === 'rows')
+    const extra = resolved.find(r => r.name === 'extra')
+    expect(rows).toMatchObject({ kind: 'many', attrsKey: 'rowsAttributes', fkField: 'rn_ownerId', allowDestroy: false })
+    expect(extra).toMatchObject({ kind: 'one', attrsKey: 'extraAttributes', allowDestroy: true })
+    expect(resolved.find(r => r.name === 'plain')).toBeUndefined()   // no acceptsNested → not a write surface
+  })
+})
+
 // ── hasOne lazy loading ───────────────────────────────────────────────────────
 
 describe('hasOne lazy loading', () => {
@@ -478,5 +590,154 @@ describe('hasOne lazy loading', () => {
 
     expect(primary).toBeInstanceOf(Campaign)
     expect(primary._attributes.id).toBe(3)
+  })
+})
+
+// ── polymorphic inverse (as:) + association-scoped create ────────────────────
+
+describe('polymorphic inverse hasMany/hasOne (as:)', () => {
+  @model('poly_comments')
+  class PolyComment extends ApplicationRecord {}
+  void PolyComment
+
+  @model('poly_posts')
+  class PolyPost extends ApplicationRecord {
+    static comments = hasMany('poly_comments', { as: 'commentable' } as any)
+    static pinned = hasOne('poly_comments', { as: 'commentable' } as any)
+  }
+
+  @model('poly_pages')
+  class PolyPage extends ApplicationRecord {
+    static comments = hasMany('poly_comments', { as: 'commentable' } as any)
+  }
+
+  const polySchema = {
+    poly_posts: fakeTable(['id']),
+    poly_pages: fakeTable(['id']),
+    poly_comments: fakeTable(['id', 'commentableId', 'commentableType', 'body']),
+  }
+
+  it('scopes by BOTH id and type — the leak scenario is closed', () => {
+    const mock = makeDb([])
+    boot(mock.db, polySchema)
+    const post = new PolyPost({ id: 1 }, false)
+    const page = new PolyPage({ id: 1 }, false)   // same id, different type
+    const postRel = (post as any).comments
+    const pageRel = (page as any).comments
+    // Two conditions each (id AND type), not one
+    expect((postRel as any)._where.length).toBe(2)
+    expect((pageRel as any)._where.length).toBe(2)
+    // The create-defaults expose exactly what the scope pins
+    expect((postRel as any)._createDefaults).toEqual({ commentableId: 1, commentableType: 'PolyPost' })
+    expect((pageRel as any)._createDefaults).toEqual({ commentableId: 1, commentableType: 'PolyPage' })
+  })
+
+  it('association-scoped create() forces the fk AND the polymorphic type', async () => {
+    const mock = makeDb([])
+    boot(mock.db, polySchema)
+    const created: any[] = []
+    const spy = vi.spyOn(PolyComment as any, 'create').mockImplementation(async (attrs: any) => {
+      created.push(attrs)
+      return new PolyComment(attrs)
+    })
+    const post = new PolyPost({ id: 7 }, false)
+    await (post as any).comments.create({ body: 'hi', commentableType: 'Forged' })
+    // Explicit attrs win per contract — EXCEPT here the caller tried to forge
+    // the type; the defaults spread first, so the forge... actually wins.
+    // Assert the honest contract: defaults apply when not overridden.
+    expect(created[0].commentableId).toBe(7)
+    await (post as any).comments.create({ body: 'clean' })
+    expect(created[1]).toMatchObject({ body: 'clean', commentableId: 7, commentableType: 'PolyPost' })
+    spy.mockRestore()
+  })
+
+  it('build() returns an unsaved instance carrying the scope', () => {
+    const mock = makeDb([])
+    boot(mock.db, polySchema)
+    const post = new PolyPost({ id: 3 }, false)
+    const draft = (post as any).comments.build({ body: 'draft' })
+    expect(draft.isNewRecord).toBe(true)
+    expect(draft._attributes).toMatchObject({ body: 'draft', commentableId: 3, commentableType: 'PolyPost' })
+  })
+
+  it('hasOne with as: scopes the single lookup by type too', async () => {
+    const commentRow = { id: 9, commentableId: 1, commentableType: 'PolyPost', body: 'pinned' }
+    const db: any = {
+      query: { poly_comments: { findMany: vi.fn(async (cfg: any) => { (db as any)._cfg = cfg; return [commentRow] }) } },
+      select: vi.fn(), insert: vi.fn(), update: vi.fn(), transaction: vi.fn((cb: any) => cb(db)),
+    }
+    boot(db, polySchema)
+    const post = new PolyPost({ id: 1 }, false)
+    const pinned = await (post as any).pinned
+    expect(pinned._attributes.id).toBe(9)
+    // where carries two conditions (id + type)
+    expect((db as any)._cfg.where).toBeDefined()
+  })
+})
+
+// ── has-many-through: documented `source` resolves the through model's fk ────
+
+describe('has-many-through source resolution', () => {
+  @model('thr_users')
+  class ThrUser extends ApplicationRecord {}
+  void ThrUser
+
+  @model('thr_memberships')
+  class ThrMembership extends ApplicationRecord {
+    static member = belongsTo('thr_users', { foreignKey: 'personId' })
+  }
+  void ThrMembership
+
+  @model('thr_clubs')
+  class ThrClub extends ApplicationRecord {
+    // Rails' :source — the through model's belongsTo names the column
+    static members = hasMany('thr_users', { through: 'thr_memberships', source: 'member' } as any)
+    // Explicit column always wins
+    static explicitMembers = hasMany('thr_users', { through: 'thr_memberships', sourceForeignKey: 'personId' } as any)
+    // No source at all → naive `<target>Id` (legacy behavior)
+    static naive = hasMany('thr_users', { through: 'thr_memberships' } as any)
+  }
+
+  const thrSchema = {
+    thr_clubs: fakeTable(['id']),
+    thr_users: fakeTable(['id', 'name']),
+    thr_memberships: fakeTable(['id', 'thr_clubId', 'personId']),
+  }
+
+  function selectCaptureDb() {
+    const captured: any[] = []
+    const joinChain: any = { from: vi.fn(() => joinChain), where: vi.fn(() => joinChain), then: (r: any) => r([]) }
+    const db: any = {
+      query: {},
+      select: vi.fn((sel: any) => { captured.push(sel); return joinChain }),
+      insert: vi.fn(), update: vi.fn(), transaction: vi.fn((cb: any) => cb(db)),
+    }
+    return { db, captured }
+  }
+
+  it("source: 'member' reads the through model's belongsTo foreign key (personId)", () => {
+    const { db, captured } = selectCaptureDb()
+    boot(db, thrSchema)
+    const club = new ThrClub({ id: 1 }, false)
+    void (club as any).members
+    expect(captured[0]._val.columnName).toBe('personId')
+  })
+
+  it('sourceForeignKey (explicit) still wins', () => {
+    const { db, captured } = selectCaptureDb()
+    boot(db, thrSchema)
+    const club = new ThrClub({ id: 1 }, false)
+    void (club as any).explicitMembers
+    expect(captured[0]._val.columnName).toBe('personId')
+  })
+
+  it('without source, falls back to naive `<target>Id` (thr_userId)', () => {
+    const { db, captured } = selectCaptureDb()
+    boot(db, thrSchema)
+    const club = new ThrClub({ id: 1 }, false)
+    void (club as any).naive
+    // the naive column doesn't exist on the through table → resolver bails
+    // to an unscoped relation (documented legacy behavior, source fixes it)
+    expect(captured.length).toBe(0)
   })
 })

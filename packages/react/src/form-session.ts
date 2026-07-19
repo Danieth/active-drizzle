@@ -17,22 +17,32 @@
  */
 
 export type Ability = 'edit' | 'view'
-export type SessionStatus = 'ready' | 'saving' | 'saved' | 'error' | 'unauthenticated'
+export type SessionStatus = 'ready' | 'saving' | 'saved' | 'error' | 'unauthenticated' | 'conflict'
 
 export interface ServerEnvelope {
   record?: Record<string, any>
   abilities?: Record<string, Ability>
   can?: Record<string, boolean>
   issues?: Array<{ field: string; code: string }>
+  /** Optimistic-lock token — echoed back as `_version` on every submit. */
+  version?: string
 }
 
 export type SubmitResult =
   | { ok: true; envelope?: ServerEnvelope }
-  | { ok: false; status: number; errors?: Record<string, string[]> }
+  | {
+      ok: false
+      status: number
+      errors?: Record<string, string[]>
+      /** 409 only: the server's CURRENT envelope (fresh record + version). */
+      envelope?: ServerEnvelope
+    }
 
 export interface SubmitPayload {
   data: Record<string, any>
   _event?: string
+  /** Optimistic-lock echo — the version token from the last envelope. */
+  _version?: string
 }
 
 export interface FormSessionOptions<T extends Record<string, any>> {
@@ -42,6 +52,8 @@ export interface FormSessionOptions<T extends Record<string, any>> {
   abilities?: Record<string, Ability> | null
   /** Server-computed Attr.state verdicts. */
   can?: Record<string, boolean> | null
+  /** Optimistic-lock token from the initial envelope (edit forms). */
+  version?: string | null
   /**
    * Client validation over the draft. Defaults to calling `draft.validate()`
    * when the generated Client provides one.
@@ -70,6 +82,11 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   /** Offline autosave queue — field → newest value, retried by flushPending(). */
   private pendingWrites = new Map<string, any>()
 
+  /** Optimistic-lock token — rides every submit as `_version`. */
+  private version: string | null = null
+  /** The server's CURRENT envelope from a 409 — fuel for resolveConflict(). */
+  private conflictEnvelope: ServerEnvelope | null = null
+
   /** Baseline for the submit diff — reset on load and on successful submit. */
   private baseline: Record<string, any>
 
@@ -77,14 +94,16 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   private versions = new Map<string, number>()
   private globalVersion = 0
 
-  /** Nested attribute arrays (accepts_nested_attributes_for client half). */
+  /** Nested attribute managers (accepts_nested_attributes_for client half).
+   *  hasMany managers speak arrays; hasOne managers speak a single object —
+   *  the session treats payloads and server echoes opaquely either way. */
   private nested = new Map<string, {
-    attributesPayload(): Array<Record<string, any>> | null
+    attributesPayload(): Array<Record<string, any>> | Record<string, any> | null
     errors(): Record<string, string[]>
     routeServerError(path: string, msgs: string[]): boolean
-    commitBaselines(savedRows?: any[]): void
+    commitBaselines(saved?: any): void
     markSubmitAttempted(): void
-    syncFromServer(rows: any[]): void
+    syncFromServer(rows: any): void
     setLocked(locked: boolean): void
   }>()
 
@@ -96,6 +115,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     this.mode = opts.mode
     this.abilities = opts.abilities ?? null
     this.canMap = opts.can ?? {}
+    this.version = opts.version ?? null
     this.validateFn = opts.validate
       ?? ((d: T) => (typeof (d as any).validate === 'function' ? (d as any).validate() : {}))
     if (opts.submit) this.submitFn = opts.submit
@@ -154,14 +174,14 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     return out
   }
 
-  /** Wire a nested attribute array in (called by the handle on first use). */
+  /** Wire a nested attribute manager in (called by the handle on first use). */
   registerNested(name: string, manager: {
-    attributesPayload(): Array<Record<string, any>> | null
+    attributesPayload(): Array<Record<string, any>> | Record<string, any> | null
     errors(): Record<string, string[]>
     routeServerError(path: string, msgs: string[]): boolean
-    commitBaselines(savedRows?: any[]): void
+    commitBaselines(saved?: any): void
     markSubmitAttempted(): void
-    syncFromServer(rows: any[]): void
+    syncFromServer(rows: any): void
     setLocked(locked: boolean): void
   }): void {
     this.nested.set(name, manager)
@@ -207,8 +227,9 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
    */
   settleNested(record?: Record<string, any>): void {
     for (const [name, manager] of this.nested) {
-      const saved = record?.[name]
-      manager.commitBaselines(Array.isArray(saved) ? saved : undefined)
+      // Shape is the manager's business: array managers expect rows, singular
+      // managers a single object (or null = destroyed) — pass the echo raw
+      manager.commitBaselines(record?.[name])
     }
   }
 
@@ -358,6 +379,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
 
     const payload: SubmitPayload = { data: this.changedData() }
     if (opts.event) payload._event = opts.event
+    if (this.version != null) payload._version = this.version
 
     let result: SubmitResult
     try {
@@ -383,6 +405,8 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
 
     if (result.status === 401 || result.status === 403) {
       this.status = 'unauthenticated'   // draft untouched — re-auth then retry
+    } else if (result.status === 409) {
+      this.enterConflict(result.envelope)   // draft untouched — user decides
     } else {
       this.serverErrors = this.refieldErrors(result.errors ?? {})
       // A failure must never be invisible: 500s (or empty bodies) get a base
@@ -408,6 +432,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     this.touch(field)
     if (mode !== 'autosave' || !this.submitFn) return true
     if (this.composing.has(field)) return true
+    if (this.status === 'conflict') return false   // paused until resolved
 
     const now = this.snapshotDraft()
     if (valueEquals(this.baseline[field], now[field])) return true   // clean → no PATCH
@@ -425,7 +450,10 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
 
     let result: SubmitResult
     try {
-      result = await this.submitFn({ data: { [field]: now[field] } })
+      result = await this.submitFn({
+        data: { [field]: now[field] },
+        ...(this.version != null ? { _version: this.version } : {}),
+      })
     } catch {
       result = { ok: false, status: 0 }
     }
@@ -447,6 +475,16 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
       this.pendingWrites.set(field, now[field])
       this.fieldStates.set(field, 'pending')
       this.notify(field)
+      return false
+    }
+
+    // Conflict: the record changed elsewhere. The optimistic value STAYS on
+    // the draft (never silently drop a user's edit) — resolveConflict decides.
+    if (result.status === 409) {
+      this.pendingWrites.delete(field)
+      this.fieldStates.set(field, 'error')
+      this.enterConflict(result.envelope)
+      this.notifyAll()
       return false
     }
 
@@ -525,6 +563,9 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   async autoFlush(): Promise<boolean> {
     if (this.autoFlushInFlight) { this.autoFlushQueued = true; return false }
     if (!this.submitFn) return false
+    // A standing conflict PAUSES autosave — retrying with the stale token
+    // would 409 forever; resolveConflict() re-arms the flush
+    if (this.status === 'conflict') return false
     if (!this.isDirty()) return true
     if (Object.keys(this.gateErrors()).length > 0) return false   // stays local
 
@@ -535,7 +576,10 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
 
     let result: SubmitResult
     try {
-      result = await this.submitFn({ data: this.changedData() })
+      result = await this.submitFn({
+        data: this.changedData(),
+        ...(this.version != null ? { _version: this.version } : {}),
+      })
     } catch {
       result = { ok: false, status: 0 }
     }
@@ -555,6 +599,11 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
       this.notifyAll()
     } else if (result.status === 401 || result.status === 403) {
       this.status = 'unauthenticated'   // draft untouched (C15)
+      this.notifyAll()
+    } else if (result.status === 409) {
+      // The whole point of the lock under autosave: two tabs both flushing
+      // must not silently clobber each other — surface it, don't retry
+      this.enterConflict(result.envelope)
       this.notifyAll()
     } else {
       this.serverErrors = this.refieldErrors(result.errors ?? {})
@@ -582,6 +631,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
    * way, so mid-flight edits stay dirty and ride the next flush.
    */
   private applyFlushSuccess(envelope: ServerEnvelope | undefined, flushed: Record<string, any>): void {
+    if (envelope?.version !== undefined) this.version = envelope.version ?? null
     const rec = envelope?.record
     if (rec) {
       const now = this.snapshotDraft()
@@ -622,6 +672,63 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     }
   }
 
+  // ── Optimistic concurrency (409 conflicts) ───────────────────────────────
+
+  /** The current lock token (null when the server doesn't version this form). */
+  getVersion(): string | null { return this.version }
+
+  /** The server's CURRENT envelope from the 409 — null when not in conflict. */
+  getConflict(): ServerEnvelope | null { return this.conflictEnvelope }
+
+  /**
+   * A 409 landed: the record changed since this client read it. The draft is
+   * left UNTOUCHED (no user keystroke is ever dropped by a race) and the
+   * session enters 'conflict' — autosave pauses, a base error explains, and
+   * resolveConflict() offers the two honest exits.
+   */
+  private enterConflict(envelope?: ServerEnvelope): void {
+    this.conflictEnvelope = envelope ?? null
+    this.serverErrors = {
+      ...this.serverErrors,
+      base: ['This record was changed elsewhere — reload it or overwrite.'],
+    }
+    this.status = 'conflict'
+  }
+
+  /**
+   * The two exits from a conflict:
+   *   'reload'    → take the SERVER's truth: fold the 409's envelope into
+   *                 the draft (nested children force-sync too) and drop
+   *                 local edits. Returns true.
+   *   'overwrite' → keep MINE: adopt the fresh version token and resubmit
+   *                 the still-dirty diff. Returns the resubmit's outcome.
+   */
+  async resolveConflict(mode: 'reload' | 'overwrite'): Promise<boolean> {
+    const env = this.conflictEnvelope
+    this.conflictEnvelope = null
+    delete this.serverErrors['base']
+    if (mode === 'reload') {
+      if (env) {
+        this.applyEnvelope(env)
+        // Reload means the server wins EVERYWHERE — dirty nested managers
+        // (which applyEnvelope deliberately never clobbers) force-sync here
+        if (env.record) {
+          for (const [name, manager] of this.nested) {
+            if (name in env.record) manager.syncFromServer((env.record as any)[name])
+          }
+        }
+        this.baseline = this.snapshotDraft()
+      }
+      this.status = 'ready'
+      this.notifyAll()
+      return true
+    }
+    if (env?.version != null) this.version = env.version
+    this.status = 'ready'
+    this.notifyAll()
+    return this.submit()
+  }
+
   /** Fold a server envelope in: new record values, mask, can, version. */
   applyEnvelope(envelope: ServerEnvelope): void {
     if (envelope.record) {
@@ -634,15 +741,17 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
           Object.defineProperty(this.draft, k, { value: v, writable: true, enumerable: true, configurable: true })
         }
       }
-      // Nested arrays: a manager with NO pending local edits syncs to the
-      // server's rows (a refetch picked up children added/changed elsewhere).
+      // Nested children: a manager with NO pending local edits syncs to the
+      // server's echo (a refetch picked up children added/changed elsewhere).
       // A manager holding unsaved child edits is left alone — the same
       // never-clobber rule the flat draft gets. The submit path is unaffected:
       // its managers are still dirty here, and settleNested() handles them.
+      // The key must be PRESENT: an envelope without the association carries
+      // no verdict (null on a singular association means "destroyed" — real).
       for (const [name, manager] of this.nested) {
-        const rows = (envelope.record as any)[name]
-        if (Array.isArray(rows) && manager.attributesPayload() === null) {
-          manager.syncFromServer(rows)
+        if (!(name in envelope.record)) continue
+        if (manager.attributesPayload() === null) {
+          manager.syncFromServer((envelope.record as any)[name])
         }
       }
     }
@@ -654,6 +763,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
       }
     }
     if (envelope.can !== undefined) this.canMap = envelope.can ?? {}
+    if (envelope.version !== undefined) this.version = envelope.version ?? null
     this.serverIssues = envelope.issues ?? []
     // A save that silently dropped fields is a permit/UI mismatch — never
     // invisible. Loud in the console for the developer, on base for the user.

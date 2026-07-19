@@ -3,7 +3,7 @@
  * These are the 12-step index, get, create, update, destroy implementations.
  * Controllers that define their own methods override these automatically.
  */
-import { BadRequest, NotFound, ValidationError, toValidationError } from './errors.js'
+import { BadRequest, Conflict, NotFound, ValidationError, toValidationError } from './errors.js'
 import type { CrudConfig, IndexConfig } from './metadata.js'
 
 // ── Forms envelope (expose / abilities / can) ─────────────────────────────────
@@ -14,15 +14,59 @@ export interface RecordEnvelope {
   can: Record<string, boolean>
   /** Non-fatal write problems, e.g. stripped non-permitted fields. */
   issues?: Array<{ field: string; code: string }>
+  /** Optimistic-lock token (update.optimisticLock) — echo as `_version` on PATCH. */
+  version?: string
+}
+
+/** The optimistic-lock field name, or null when locking is off. */
+function lockField(config: CrudConfig): string | null {
+  const lock = (config.update as any)?.optimisticLock
+  if (!lock) return null
+  return lock === true ? 'updatedAt' : String(lock)
+}
+
+/**
+ * The record's current version as an OPAQUE wire token. Dates compare by
+ * epoch millis (serialization round-trips must not change the token);
+ * everything else by String(). A record without the field yields null —
+ * no token, no check.
+ */
+function versionToken(record: any, field: string): string | null {
+  const raw = record?.[field] ?? record?._attributes?.[field]
+  if (raw == null) return null
+  if (raw instanceof Date) return String(raw.getTime())
+  return String(raw)
+}
+
+/**
+ * Static [key, value] pairs INCLUDING statics inherited from STI parents —
+ * the controller-side mirror of core's modelStaticEntries (duck-typed, no
+ * core dep). An own-properties-only scan makes an STI subclass controller
+ * blind to the state machine / nested associations its parent declares.
+ * Walks to Function.prototype; first hit wins so subclasses shadow.
+ */
+function staticEntries(model: any): Array<[string, any]> {
+  const out: Array<[string, any]> = []
+  const seen = new Set<string>()
+  for (let c = model; c && c !== Function.prototype; c = Object.getPrototypeOf(c)) {
+    for (const key of Object.getOwnPropertyNames(c)) {
+      if (seen.has(key)) continue
+      seen.add(key)
+      try { out.push([key, c[key]]) } catch { /* getter that throws — skip */ }
+    }
+  }
+  return out
 }
 
 /** acceptsNestedAttributesFor association names (duck-typed, no core dep). */
 function collectNestedAssocs(model: any): string[] {
   const out: string[] = []
-  for (const key of Object.getOwnPropertyNames(model)) {
-    const marker = (model as any)[key]
-    if (marker && typeof marker === 'object' && marker._type === 'hasMany'
-      && marker.options?.acceptsNested === true) out.push(key)
+  for (const [key, marker] of staticEntries(model)) {
+    // Any truthy acceptsNested opts in — `true` AND `{ allowDestroy: true }`
+    // (the object form previously slipped past this and lost its abilities key)
+    if (marker && typeof marker === 'object'
+      && (marker._type === 'hasMany' || marker._type === 'hasOne')
+      && Boolean(marker.options?.acceptsNested)) out.push(key)
   }
   return out
 }
@@ -42,11 +86,11 @@ function topLevelIncludeNames(includes: any[]): string[] {
   return names
 }
 
-/** All Attr.state event names declared on the model (duck-typed, no core dep). */
+/** All Attr.state event names declared on the model — inherited STI parent
+ *  machines included (duck-typed, no core dep). */
 function collectStateEvents(model: any): string[] {
   const events: string[] = []
-  for (const key of Object.getOwnPropertyNames(model)) {
-    const cfg = (model as any)[key]
+  for (const [, cfg] of staticEntries(model)) {
     if (cfg && typeof cfg === 'object' && cfg._type === 'state' && cfg.transitions) {
       events.push(...Object.keys(cfg.transitions))
     }
@@ -108,6 +152,13 @@ export function buildRecordEnvelope(
     record: serialized,
     abilities,
     can,
+  }
+  // Optimistic lock: the version token rides every envelope so the client
+  // can echo it back on PATCH
+  const lock = lockField(config)
+  if (lock) {
+    const token = versionToken(record, lock)
+    if (token != null) envelope.version = token
   }
   if (issues && issues.length > 0) envelope.issues = issues
   return envelope
@@ -340,14 +391,37 @@ export async function defaultUpdate(
 
   const envelope = usesEnvelope(config)
 
-  // `_event` rides the PATCH but is a state-machine instruction, not a field
-  const { _event, ...fields } = rawInput ?? {}
+  // `_event` (state-machine instruction) and `_version` (optimistic-lock
+  // echo) ride the PATCH but are protocol, not fields
+  const { _event, _version, ...fields } = rawInput ?? {}
+
+  // Optimistic lock: a stale echo means the record changed since this
+  // client read it — 409 BEFORE any field applies, carrying the CURRENT
+  // envelope so the client can offer reload/overwrite without a round-trip.
+  // No `_version` on the wire → no check (pre-lock clients keep working).
+  const lock = lockField(config)
+  if (lock && _version != null) {
+    const current = versionToken(record, lock)
+    if (current != null && String(_version) !== current) {
+      throw new Conflict(envelope
+        ? buildRecordEnvelope(await reloadWithIncludes(relation, config, id, record, model), model, config, ctx, ctrl)
+        : undefined)
+    }
+  }
 
   const permitted = applyNestedAutoSet(await sanitizeNestedWrites(
     buildPermittedData(fields, config.update, ctx, model, ctrl, record), model,
   ), config.update, ctx, ctrl)
   for (const [k, v] of Object.entries(permitted)) {
     (record as any)[k] = v
+  }
+
+  // lock_version-style NUMERIC lock fields advance server-side on every
+  // governed update — the client never writes them (timestamp locks advance
+  // via the model's own touch instead)
+  if (lock) {
+    const rawLockVal = (record as any)[lock] ?? (record as any)._attributes?.[lock]
+    if (typeof rawLockVal === 'number') (record as any)[lock] = rawLockVal + 1
   }
 
   // Fire the transition in the SAME save as the field diff — there is no
@@ -482,10 +556,14 @@ export async function sanitizeNestedWrites(
   permitted: Record<string, any>,
   model: any,
 ): Promise<Record<string, any>> {
-  const attrsKeys = Object.keys(permitted).filter(k => k.endsWith('Attributes') && Array.isArray(permitted[k]))
+  const isRow = (v: any): boolean => Boolean(v) && typeof v === 'object' && !Array.isArray(v)
+  // hasMany rides as an array of rows, hasOne as a single row object
+  const attrsKeys = Object.keys(permitted).filter(
+    k => k.endsWith('Attributes') && (Array.isArray(permitted[k]) || isRow(permitted[k])),
+  )
   if (attrsKeys.length === 0) return permitted
 
-  let resolveNested: ((m: any) => Array<{ attrsKey: string; fkField: string; childModel: any }>) | null = null
+  let resolveNested: ((m: any) => Array<{ attrsKey: string; fkField: string; childModel: any; kind?: 'many' | 'one' }>) | null = null
   try {
     const core = await import('@active-drizzle/core' as string) as any
     if (typeof core.resolveNestedAssociations === 'function') resolveNested = core.resolveNestedAssociations
@@ -497,7 +575,7 @@ export async function sanitizeNestedWrites(
     const grandAssocs = rowModel && resolveNested ? resolveNested(rowModel) : []
     const out: any[] = []
     for (const item of items) {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+      if (!isRow(item)) continue
       const clean: Record<string, any> = {}
       if (typeof item.id === 'number' || typeof item.id === 'string') clean['id'] = item.id
       if (item._destroy === true) clean['_destroy'] = true
@@ -508,7 +586,13 @@ export async function sanitizeNestedWrites(
         if (fkField && k === fkField) continue
         if (k.endsWith('Attributes')) {
           const grand = grandAssocs.find(a => a.attrsKey === k)
-          if (grand && Array.isArray(v)) clean[k] = sanitizeRows(v, grand.fkField, grand.childModel)
+          // Shape must match the association's arity — array for 'many',
+          // single row for 'one'. A mismatch drops (fail closed).
+          if (grand && grand.kind !== 'one' && Array.isArray(v)) {
+            clean[k] = sanitizeRows(v, grand.fkField, grand.childModel)
+          } else if (grand && grand.kind === 'one' && isRow(v)) {
+            clean[k] = sanitizeRows([v], grand.fkField, grand.childModel)[0]
+          }
           continue   // undeclared nested keys never pass
         }
         clean[k] = v
@@ -522,7 +606,16 @@ export async function sanitizeNestedWrites(
   const topAssocs = resolveNested ? resolveNested(model) : []
   for (const key of attrsKeys) {
     const meta = topAssocs.find(a => a.attrsKey === key)
-    out[key] = sanitizeRows(out[key], meta?.fkField ?? null, meta?.childModel ?? null)
+    const value = out[key]
+    if (Array.isArray(value)) {
+      // An array on a declared hasOne is a shape violation — drop it whole
+      if (meta?.kind === 'one') { delete out[key]; continue }
+      out[key] = sanitizeRows(value, meta?.fkField ?? null, meta?.childModel ?? null)
+    } else {
+      // A single row on a declared hasMany is a shape violation — drop it
+      if (meta && meta.kind !== 'one') { delete out[key]; continue }
+      out[key] = sanitizeRows([value], meta?.fkField ?? null, meta?.childModel ?? null)[0] ?? {}
+    }
   }
   return out
 }
@@ -549,6 +642,10 @@ export function applyNestedAutoSet(
 ): Record<string, any> {
   const config = writeConfig?.nestedAutoSet
   if (!config) return permitted
+  // hasMany payloads are arrays of rows; hasOne payloads are a single row —
+  // normalize to a row list so the walk covers both arities
+  const asRows = (v: any): any[] =>
+    Array.isArray(v) ? v : (v && typeof v === 'object' ? [v] : [])
   for (const [path, fields] of Object.entries(config)) {
     const segs = path.split('.')
     const walk = (rows: any[], depth: number): void => {
@@ -560,13 +657,11 @@ export function applyNestedAutoSet(
             else delete row[f]
           }
         } else {
-          const next = row[`${segs[depth + 1]}Attributes`]
-          if (Array.isArray(next)) walk(next, depth + 1)
+          walk(asRows(row[`${segs[depth + 1]}Attributes`]), depth + 1)
         }
       }
     }
-    const top = permitted[`${segs[0]}Attributes`]
-    if (Array.isArray(top)) walk(top, 0)
+    walk(asRows(permitted[`${segs[0]}Attributes`]), 0)
   }
   return permitted
 }

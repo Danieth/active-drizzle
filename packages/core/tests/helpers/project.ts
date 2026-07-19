@@ -36,12 +36,12 @@
  *
  *   // Test generation:
  *   const files = project.generate()
- *   expect(files['Asset.model.gen.d.ts']).toContain('business: Promise<BusinessRecord>')
+ *   expect(files['Asset.model.types.gen.d.ts']).toContain('business: Promise<BusinessRecord>')
  *
  *   // Or do it all at once and inspect the results:
  *   const result = project.run()
  *   expect(result.errors).toHaveLength(0)
- *   expect(result.files['Asset.model.gen.d.ts']).toMatchSnapshot()
+ *   expect(result.files['Asset.model.types.gen.d.ts']).toMatchSnapshot()
  */
 
 import { Project } from 'ts-morph'

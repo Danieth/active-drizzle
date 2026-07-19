@@ -247,6 +247,27 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     return rec
   }
 
+  /** Association create-defaults — set by the hasMany/hasOne resolver. */
+  protected _createDefaults?: Record<string, any>
+
+  /**
+   * Create a record THROUGH this relation. Association-scoped relations
+   * contribute their scope automatically — `deal.comments.create({ body })`
+   * sets the foreign key AND (for an `as:` polymorphic inverse) the type
+   * column, so a child can never be created unparented or mistyped.
+   * Explicit attrs win over the defaults. On a bare relation this is just
+   * Model.create. (through/habtm relations carry no defaults — create the
+   * join row through its own model, or sync via `<singular>Ids`.)
+   */
+  public async create(attrs: Record<string, any> = {}): Promise<TModel> {
+    return (this._ctor as any).create({ ...(this._createDefaults ?? {}), ...attrs })
+  }
+
+  /** Like create() but returns the UNSAVED instance (Rails' build). */
+  public build(attrs: Record<string, any> = {}): TModel {
+    return new (this._ctor as any)({ ...(this._createDefaults ?? {}), ...attrs })
+  }
+
   /**
    * Returns last record(s) by reversing the current order (or defaulting to
    * descending id). Returns a single record when called without arguments,
@@ -831,6 +852,8 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     c._order    = [...this._order]
     c._includes = { ...this._includes }
     if ((this as any)._isNone) (c as any)._isNone = true
+    // Association create-defaults survive chaining (deal.comments.order(...).create(...))
+    if ((this as any)._createDefaults) (c as any)._createDefaults = { ...(this as any)._createDefaults }
     return c
   }
 

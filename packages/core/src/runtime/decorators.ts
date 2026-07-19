@@ -34,7 +34,11 @@ export type ModelOptions = {
  * Sets _activeDrizzleTableName so ApplicationRecord.tableName returns it.
  * Also registers the class in MODEL_REGISTRY for STI subclass resolution.
  */
-export function model(table: string, options?: ModelOptions): ClassDecorator {
+// NOT lib.d.ts's ClassDecorator: that constrains the target to `Function`,
+// and a model with `static name = Attr.string(...)` shadows Function.name
+// with an AttrConfig — making the class unassignable to Function and the
+// whole decorator expression a type error. A free generic sidesteps it.
+export function model(table: string, options?: ModelOptions): <T>(target: T) => void {
   return (target: any) => {
     target._activeDrizzleTableName = table
     // Static fields initialize before decorators run, so `static name = Attr…`
@@ -43,7 +47,15 @@ export function model(table: string, options?: ModelOptions): ClassDecorator {
     const className = options?.className ?? modelClassName(target)
     target._activeDrizzleClassName = className
     MODEL_REGISTRY[className] = target  // by class name (STI, polymorphic type resolution)
-    MODEL_REGISTRY[table] = target      // by table name (association inference)
+    // By table name (association inference): the BASE model owns this slot.
+    // Static fields initialize before decorators run, so `static stiType` is
+    // readable here. An STI subclass must not clobber the base — associations
+    // resolved by table would silently auto-scope to whichever subclass
+    // happened to register last (WHERE type='Rbf' on `rfp.proposals`).
+    const incumbent = MODEL_REGISTRY[table]
+    if (!incumbent || target.stiType === undefined || incumbent.stiType !== undefined) {
+      MODEL_REGISTRY[table] = target
+    }
   }
 }
 

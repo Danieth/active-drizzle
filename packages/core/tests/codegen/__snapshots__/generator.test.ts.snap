@@ -22,6 +22,11 @@ declare module './Asset.model' {
     readonly assetType: {jpg:116,png:125,gif:111,mp4:202,mp3:305}
     isImages(): boolean
     isVideos(): boolean
+    id: number
+    title: string | null
+    businessId: number
+    createdAt: Date
+    updatedAt: Date
     assetTypeChanged(): boolean
     assetTypeWas(): number | null
     assetTypeChange(): [number | null, number | null] | null
@@ -50,11 +55,6 @@ declare module './Asset.model' {
     function includes<TArg extends IncludeArg<AssetAssociations>, TArgs extends IncludeArg<AssetAssociations>[]>(arg: TArg, ...args: TArgs): Relation<AssetRecord & MapInclude<AssetAssociations, TArg> & MapInclude<AssetAssociations, TArgs[number]>, AssetAssociations>
     function first(): Promise<AssetRecord | null>
     function find(id: number | string): Promise<AssetRecord>
-    const recent: Relation<AssetRecord, AssetAssociations>
-    function since(date: Date): Relation<AssetRecord, AssetAssociations>
-    const images: Relation<AssetRecord, AssetAssociations>
-    const videos: Relation<AssetRecord, AssetAssociations>
-    const assetType: { jpg: 116; png: 125; gif: 111; mp4: 202; mp3: 305 }
     class Client {
       id: number;
       assetType?: number | null;
@@ -62,8 +62,8 @@ declare module './Asset.model' {
       businessId: number;
       createdAt: Date;
       updatedAt: Date;
-      business: Business.Client;
-      campaigns: Campaign.Client[];
+      business: BusinessClient;
+      campaigns: CampaignClient[];
       assetFormat(): string | null
       constructor(payload?: Record<string, any>)
       toJSON(): Record<string, unknown>

@@ -53,13 +53,18 @@ export function generateReactHooks(
   // Client namespaces that actually exist — an instant nested write only
   // ships when the child resource has a controller to hit
   const controllerKeys = new Set(ctrlProject.controllers.map(toClientKey))
+  // Model classes that get their own .gen file — an Attrs type may only be
+  // IMPORTED from a controller's gen file; controller-less children inline
+  const controllerModelClasses = new Set(
+    ctrlProject.controllers.map(c => c.modelClass).filter(Boolean) as string[],
+  )
 
   for (const ctrl of ctrlProject.controllers) {
     const model = ctrl.modelClass
       ? (projectMeta?.models.find(m => m.className === ctrl.modelClass) ?? null)
       : null
 
-    const content = generateControllerFile(ctrl, model, projectMeta, outputDir, controllerKeys)
+    const content = generateControllerFile(ctrl, model, projectMeta, outputDir, controllerKeys, controllerModelClasses)
     const fileName = `${toFileName(ctrl.className)}.gen.ts`
 
     files.push({ filePath: join(outputDir, fileName), content })
@@ -89,6 +94,7 @@ function generateControllerFile(
   projectMeta: ProjectMeta | null,
   outputDir: string,
   controllerKeys: Set<string> = new Set(),
+  controllerModelClasses: Set<string> = new Set(),
 ): string {
   const L: string[] = []
   // Instant nested resources discovered while rendering meta — the hook wires
@@ -109,6 +115,24 @@ function generateControllerFile(
   const envelopeEnabled = ctrl.kind === 'crud'
     && Boolean(ctrl.crudConfig?.get?.abilities)
     && Boolean(ctrl.crudConfig?.get?.expose?.length)
+
+  // Nested form members the typed handle must declare — same permit gate as
+  // the nested-meta emission (an unpermitted array never becomes a handle,
+  // so it must not be typed as one either)
+  const gateCreatePermit = ctrl.crudConfig?.create?.permit
+  const gateUpdatePermit = ctrl.crudConfig?.update?.permit
+  const gatePermitDynamic =
+    (ctrl.crudConfig?.create !== undefined && gateCreatePermit === undefined) ||
+    (ctrl.crudConfig?.update !== undefined && gateUpdatePermit === undefined)
+  const nestedHandleMembers = (envelopeEnabled && model ? model.associations : [])
+    .filter(a => {
+      if (!a.acceptsNested) return false
+      const attrsKey = `${a.propertyName}Attributes`
+      return (gateCreatePermit ?? []).includes(attrsKey)
+        || (gateUpdatePermit ?? []).includes(attrsKey)
+        || gatePermitDynamic
+    })
+    .map(a => ({ name: a.propertyName, handleType: a.kind === 'hasOne' ? 'OneFieldHandle' : 'ArrayFieldHandle' }))
 
   const rqImports: string[] = []
   if (needsQuery) rqImports.push('useQuery', 'useInfiniteQuery')
@@ -154,6 +178,8 @@ function generateControllerFile(
     if (envelopeEnabled) {
       adImports.push('useGeneratedForm', 'parseControllerError')
       adTypeImports.push('FormHandleApi', 'TypedFieldComponent', 'SubmitResult')
+      // Nested form members type through their handle interfaces
+      for (const t of new Set(nestedHandleMembers.map(m => m.handleType))) adTypeImports.push(t)
     }
     if (needsValidates) adImports.push('Validates')
     L.push(`import { ${adImports.join(', ')} } from '@active-drizzle/react'`)
@@ -167,22 +193,36 @@ function generateControllerFile(
 
   L.push(`import { client } from './_client'`)
 
-  // Cross-model association imports (for includes)
+  // Cross-model association imports (for includes). A child Attrs type can
+  // only be IMPORTED when the child has its own controller (that's what
+  // emits `./{child}.gen`) — controller-less children INLINE their shape
+  // below, otherwise `import type` resolves at runtime (esbuild erases it)
+  // but the module doesn't exist and `tsc` fails.
+  const inlineAttrs: string[] = []
   if (!isPlain && model && projectMeta) {
     const allIncludes = new Set([
       ...(ctrl.crudConfig?.get?.include ?? []),
       ...(ctrl.crudConfig?.index?.include ?? []),
     ])
     const assocImports = resolveAssocImports(allIncludes, model, projectMeta)
+    const seen = new Set<string>()
     for (const { attrsType } of assocImports.filter(a => a.attrsType !== 'Record<string, any>')) {
       const srcModel = attrsType.replace(/Attrs$/, '')
-      if (srcModel !== ctrl.modelClass) {
+      if (srcModel === ctrl.modelClass || seen.has(srcModel)) continue
+      seen.add(srcModel)
+      if (controllerModelClasses.has(srcModel)) {
         L.push(`import type { ${attrsType} } from './${toFileName(`${srcModel}Controller`)}.gen'`)
+      } else {
+        inlineAttrs.push(...renderInlineAttrs(attrsType, projectMeta))
       }
     }
   }
 
   L.push('')
+  if (inlineAttrs.length) {
+    L.push(...inlineAttrs)
+    L.push('')
+  }
 
   // ── Model types (CRUD/singleton only) ────────────────────────────────────
   if (!isPlain && model && projectMeta) {
@@ -265,11 +305,14 @@ function generateControllerFile(
     // entries — `notesAttributes` in a permit is a WRITE SURFACE for the
     // association, not a column, so it types as a nested rows array
     const attachmentNames = new Set((ctrl.attachments ?? []).map(a => a.name))
-    const nestedAttrNames = new Set(
+    // `<assoc>Attributes` write-key → association kind ('hasMany' rides as an
+    // array of rows, 'hasOne' as a single row object)
+    const nestedAttrKinds = new Map(
       model.associations
         .filter(a => a.acceptsNested)
-        .map(a => `${a.propertyName}Attributes`),
+        .map(a => [`${a.propertyName}Attributes`, a.kind] as const),
     )
+    const nestedAttrNames = new Set(nestedAttrKinds.keys())
     const regularWritable = writableFields.filter(f => !attachmentNames.has(f) && !nestedAttrNames.has(f))
     const attachableWritable = writableFields.filter(f => attachmentNames.has(f))
     const nestedWritable = writableFields.filter(f => nestedAttrNames.has(f))
@@ -291,7 +334,9 @@ function generateControllerFile(
         }
       }
       for (const name of nestedWritable) {
-        attachParts.push(`${name}?: Array<Record<string, any> & { id?: number; _destroy?: boolean; _key?: string }>`)
+        attachParts.push(nestedAttrKinds.get(name) === 'hasOne'
+          ? `${name}?: Record<string, any> & { id?: number; _destroy?: boolean }`
+          : `${name}?: Array<Record<string, any> & { id?: number; _destroy?: boolean; _key?: string }>`)
       }
       if (regularWritable.length > 0 && attachParts.length > 0) {
         L.push(`export type ${modelName}Write = ${parts[0]} & { ${attachParts.join('; ')} }`)
@@ -554,7 +599,7 @@ function generateControllerFile(
 
     // ── Typed form handle + wired hooks (envelope controllers only) ────────
     if (envelopeEnabled) {
-      emitFormHooks(L, ctrl, model, projectMeta!, stateProjection, modelName, scopeFields, scopeType, instantResources)
+      emitFormHooks(L, ctrl, model, projectMeta!, stateProjection, modelName, scopeFields, scopeType, instantResources, nestedHandleMembers)
     }
   }
 
@@ -911,7 +956,9 @@ function renderNestedMetaEntry(
   const childTable = childModel.tableName
   const childCols = projectMeta?.schema.tables[childTable]?.columns ?? []
   const childColTypes = new Map(childCols.map(c => [c.name, c.type as string]))
-  const parentFk = assoc.foreignKey ?? `${pluralize.singular(ownerTableName)}Id`
+  // `as:` (polymorphic inverse) defaults the fk to `${as}Id` — mirror the runtime
+  const parentFk = assoc.foreignKey
+    ?? ((assoc.options as any)?.as ? `${(assoc.options as any).as}Id` : `${pluralize.singular(ownerTableName)}Id`)
 
   const parts: string[] = []
   for (const col of childCols) {
@@ -941,13 +988,17 @@ function renderNestedMetaEntry(
     if (grandEntry) parts.push(grandEntry)
   }
 
-  const orderBy = assoc.order && typeof assoc.order === 'object' ? Object.keys(assoc.order)[0] : undefined
+  // hasOne → 'nestedOne': a singular child handle, object payload, no
+  // orderBy (nothing to reorder) and no instant transport (staged only —
+  // the child always rides the parent save)
+  const singular = assoc.kind === 'hasOne'
+  const orderBy = !singular && assoc.order && typeof assoc.order === 'object' ? Object.keys(assoc.order)[0] : undefined
   const acceptsOpt = (assoc.options as any)?.acceptsNested
   const allowDestroy = typeof acceptsOpt === 'object' && acceptsOpt?.allowDestroy === true
   // Instant nested writes: opted in on the association AND a controller exists
   // for the child resource. resource = the child's client namespace; foreignKey
   // is forced server-side so the widget never sends it.
-  const instantOptedIn = typeof acceptsOpt === 'object' && acceptsOpt?.instant === true
+  const instantOptedIn = !singular && typeof acceptsOpt === 'object' && acceptsOpt?.instant === true
   const instantOn = instantOptedIn && Boolean(instantCtx?.controllerKeys.has(childTable))
   if (instantOn) instantCtx!.sink.add(childTable)
   const instantPart = instantOn ? `, instant: true, resource: '${childTable}', foreignKey: '${parentFk}'` : ''
@@ -959,7 +1010,7 @@ function renderNestedMetaEntry(
     const runs = childShippable.map(([p, code]) => `_run('${p}', (${code}), (d as any).${p})`).join('; ')
     validatePart = `, validate: (d: any) => { const e: Record<string, string[]> = {}; const _push = (f: string, m: unknown) => { if (typeof m === 'string' && m.trim()) (e[f] ??= []).push(m.trim()) }; const _run = (f: string, v: any, val: any) => { const l = Array.isArray(v) ? v : [v]; for (const fn of l) { if (typeof fn !== 'function') continue; try { _push(f, fn(val, d, f)) } catch { /* server-only gate */ } } }; ${runs}; return e }`
   }
-  return `${assoc.propertyName}: { kind: 'nested', allowDestroy: ${allowDestroy}${instantPart}${orderBy ? `, orderBy: '${orderBy}'` : ''}${validatePart}, fields: { ${parts.join(', ')} } }`
+  return `${assoc.propertyName}: { kind: '${singular ? 'nestedOne' : 'nested'}', allowDestroy: ${allowDestroy}${instantPart}${orderBy ? `, orderBy: '${orderBy}'` : ''}${validatePart}, fields: { ${parts.join(', ')} } }`
 }
 
 function fieldKind(
@@ -1005,6 +1056,7 @@ function emitFormHooks(
   scopeFields: string[],
   scopeType: string,
   instantResources: Set<string> = new Set(),
+  nestedHandleMembers: Array<{ name: string; handleType: string }> = [],
 ): void {
   const clientKey = toClientKey(ctrl)
   const keysName = `${lcFirst(modelName)}Keys`
@@ -1041,6 +1093,12 @@ function emitFormHooks(
     if (!projection.has(idsKey) || fields.includes(assoc.propertyName)) continue
     L.push(`  ${assoc.propertyName}: TypedFieldComponent<'refMany'>`)
   }
+  // Nested form handles — <deal.notes> unfurls rows, <deal.brief> the ONE
+  // child. Without these the JSX that the runtime fully supports won't type.
+  for (const m of nestedHandleMembers) {
+    if (fields.includes(m.name)) continue
+    L.push(`  ${m.name}: ${m.handleType}`)
+  }
   L.push(`}`)
   L.push('')
 
@@ -1055,8 +1113,9 @@ function emitFormHooks(
   L.push(`  const status = parsed?.isValidation ? 422`)
   L.push(`    : parsed?.isUnauthorized ? 401`)
   L.push(`    : parsed?.isForbidden ? 403`)
+  L.push(`    : parsed?.isConflict ? 409`)
   L.push(`    : 500`)
-  L.push(`  return { ok: false, status, ...(parsed?.fields ? { errors: parsed.fields } : {}) }`)
+  L.push(`  return { ok: false, status, ...(parsed?.fields ? { errors: parsed.fields } : {}), ...(parsed?.envelope ? { envelope: parsed.envelope } : {}) }`)
   L.push(`}`)
   L.push('')
 
@@ -1095,16 +1154,19 @@ function emitFormHooks(
   L.push(`    makeDraft: (r) => new ${modelName}Client(r),`)
   L.push(`    fieldMeta: (${modelName}Client as any).fieldMeta ?? {},`)
   if (transportsLine) L.push(transportsLine)
-  L.push(`    submit: async ({ data, _event }) => {`)
+  L.push(`    submit: async ({ data, _event, _version }) => {`)
   L.push(`      try {`)
-  L.push(`        const res: any = await client.${clientKey}.update({ ${scopeSpread}id, data: _event ? { ...data, _event } : data })`)
+  L.push(`        // _event / _version are protocol keys, not fields — the controller peels them off`)
+  L.push(`        const res: any = await client.${clientKey}.update({ ${scopeSpread}id, data: { ...data, ...(_event ? { _event } : {}), ...(_version != null ? { _version } : {}) } })`)
   L.push(`        qc.invalidateQueries({ queryKey: ${keysName}.root(_scopes as any) })`)
   L.push(`        // Envelope responses always flow through so abilities/can re-mask`)
   L.push(`        return { ok: true, ...(res && typeof res === 'object' && 'record' in res ? { envelope: res } : {}) }`)
   L.push(`      } catch (e) { return _${lcFirst(modelName)}SubmitResult(e) }`)
   L.push(`    },`)
   L.push(`  })`)
-  L.push(`  return { status: query.isError ? 'error' : form ? 'ready' : 'loading', form: form as ${modelName}FormHandle | null }`)
+  // via unknown: the runtime handle is a Proxy — its static type is the
+  // declared per-field surface, which structurally exceeds FormHandle<T>
+  L.push(`  return { status: query.isError ? 'error' : form ? 'ready' : 'loading', form: form as unknown as ${modelName}FormHandle | null }`)
   L.push(`}`)
   L.push('')
 
@@ -1127,11 +1189,11 @@ function emitFormHooks(
   L.push(`    makeDraft: (r) => new ${modelName}Client(r),`)
   L.push(`    fieldMeta: (${modelName}Client as any).fieldMeta ?? {},`)
   if (transportsLine) L.push(transportsLine)
-  L.push(`    submit: async ({ data, _event }) => {`)
+  L.push(`    submit: async ({ data, _event, _version }) => {`)
   L.push(`      try {`)
   L.push(`        const res: any = createdId.current == null`)
   L.push(`          ? await client.${clientKey}.create({ ${scopeSpread}data })`)
-  L.push(`          : await client.${clientKey}.update({ ${scopeSpread}id: createdId.current, data: _event ? { ...data, _event } : data })`)
+  L.push(`          : await client.${clientKey}.update({ ${scopeSpread}id: createdId.current, data: { ...data, ...(_event ? { _event } : {}), ...(_version != null ? { _version } : {}) } })`)
   L.push(`        if (createdId.current == null) {`)
   L.push(`          const rid = res && typeof res === 'object' ? ('record' in res ? res.record?.id : res.id) : null`)
   L.push(`          if (rid != null) createdId.current = rid`)
@@ -1141,7 +1203,7 @@ function emitFormHooks(
   L.push(`      } catch (e) { return _${lcFirst(modelName)}SubmitResult(e) }`)
   L.push(`    },`)
   L.push(`  })`)
-  L.push(`  return { status: 'ready', form: form as ${modelName}FormHandle }`)
+  L.push(`  return { status: 'ready', form: form as unknown as ${modelName}FormHandle }`)
   L.push(`}`)
   L.push('')
 }
@@ -1221,6 +1283,40 @@ function scopeType_fromFields(fields: string[]): string {
 }
 
 interface AssocImport { assocName: string; attrsType: string; isArray: boolean }
+
+/**
+ * The Attrs interface for a CONTROLLER-LESS child model, inlined into the
+ * consuming controller's gen file (columns only — enum/state fields hydrate
+ * as label unions, same as first-class Attrs emission). Fallback when the
+ * model can't be resolved: an alias to Record<string, any>.
+ */
+function renderInlineAttrs(attrsType: string, projectMeta: ProjectMeta): string[] {
+  const className = attrsType.replace(/Attrs$/, '')
+  const childModel = projectMeta.models.find(m => m.className === className)
+  const cols = childModel ? (projectMeta.schema.tables[childModel.tableName]?.columns ?? []) : []
+  if (!childModel || cols.length === 0) {
+    return [`/** ${className} has no controller of its own — untyped fallback. */`,
+      `export type ${attrsType} = Record<string, any>`]
+  }
+  const enumByProp = new Map<string, string>()
+  for (const e of childModel.enums) {
+    enumByProp.set(e.propertyName, Object.keys(e.values).map(k => `'${k}'`).join(' | '))
+  }
+  for (const st of childModel.states ?? []) {
+    enumByProp.set(st.propertyName, Object.keys(st.values).map(k => `'${k}'`).join(' | '))
+  }
+  const L: string[] = []
+  L.push(`/** ${className} has no controller of its own — its wire shape is inlined here. */`)
+  L.push(`export interface ${attrsType} {`)
+  for (const col of cols) {
+    L.push(`  ${col.name}${col.nullable ? '?' : ''}: ${columnToClientType(col, enumByProp)}`)
+  }
+  // Eager-loaded grandchildren may ride along (e.g. notes carry reactions) —
+  // an index signature keeps them reachable without lying about their shape
+  L.push(`  [assoc: string]: unknown`)
+  L.push(`}`)
+  return L
+}
 
 function resolveAssocImports(
   includes: Set<string>,
