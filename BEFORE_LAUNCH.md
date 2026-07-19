@@ -34,19 +34,85 @@ Today DB/validation errors surface as English strings (`"has already been taken"
 
 ## 🟠 4. Encryption at rest — field + file  (finance domain → do it before release)
 
-For a financial app, encrypting PII/secrets is often a compliance line, not a feature. And the *format* is a launch decision: adding encryption to columns/files that already hold plaintext later means a data-backfill + key ceremony — painful and risky post-launch. Scope it now, ship at least the MVP before release.
+> **Status: nothing implemented.** Scanned 2026-07-19 — no encrypt/decrypt/cipher/KMS code, no crypto deps, no `Attr.encrypted`, and the S3 layer doesn't set `ServerSideEncryption`. Crypto background + the tradeoffs live in [DESIGN-field-encryption.md](DESIGN-field-encryption.md); this section is the **build spec**.
 
-**A. Field-level encryption — `Attr.encrypted(...)`.** Three modes, because "encrypted but still searchable" is the real requirement:
-- **Non-deterministic (default, most secure):** random IV per value → same plaintext yields different ciphertext → **not** queryable. For fields you never search (tokens, secrets).
-- **Deterministic (`{ deterministic: true }`):** same plaintext → same ciphertext → supports **equality** queries (`where({ ssn })` matches on ciphertext). Leaks equality; use for fields you must look up exactly.
-- **Blind index (the advanced "we can still search" answer):** keep the real value non-deterministically encrypted, and emit a **separate keyed-HMAC column** that *is* queryable (CipherSweet-style). Gives exact-match (and, with tricks, prefix) search without deterministic leakage. This is the one worth showing off.
-- **Key management is the hard part, not the cipher:** per-attribute keys via **envelope encryption** (a data key encrypted by a KMS master key), plus a **rotation** story. Get the on-disk format right up front (versioned so keys can rotate).
+For a financial app this is usually a compliance line, not a feature. And the storage *format* is a launch decision: adding encryption to columns that already hold plaintext later means a backfill + key ceremony — painful post-launch.
 
-**B. File encryption on the S3/attachments layer — automatic.**
-- **Easy default (ship this): SSE-KMS.** One header on `PutObject` → server-side encryption with an auditable KMS key. Make it the storage layer's default so every upload is encrypted at rest with zero app code. Cheap, big compliance win.
-- **Stretch: client-side envelope encryption.** Encrypt bytes *before* upload with a data key (itself KMS-wrapped); store the wrapped key alongside. True end-to-end — S3 never sees plaintext — but it breaks range reads / direct presigned downloads (needs a decrypt proxy), so it's an opt-in advanced mode, not the default.
+### 4A. The API — a chainable `.encrypt()` on any Attr
 
-**MVP for launch:** deterministic + blind-index `Attr.encrypted` with KMS envelope keys, and **SSE-KMS on by default** for attachments. Client-side file envelope encryption can be a fast-follow.
+Encryption should be **one chainable modifier**, not a separate Attr kind:
+
+```ts
+@model('people')
+export class Person extends ApplicationRecord {
+  static ssn     = Attr.string().encrypt()                          // randomized — safest, NOT queryable
+  static email   = Attr.string().encrypt({ deterministic: true })   // where({ email }) works
+  static phone   = Attr.string().encrypt({ blindIndex: 'phoneBidx' })
+  static salary  = Attr.money('salaryCents').encrypt()              // composes with the money codec
+  static profile = Attr.json().encrypt()                            // composes with JSON too
+}
+```
+
+**Why this shape:** an `Attr` is already a `get`/`set` transform pair. `.encrypt()` is just a **decorator that wraps whatever codec is underneath** — so it composes with *every* Attr type for free, and the type/codec concern stays orthogonal to the at-rest concern. `Attr.money(...).encrypt()` still does dollars↔cents; it just stores ciphertext.
+
+```ts
+set: (v) => encrypt(innerSet(v))      // model value → codec → ciphertext
+get: (raw) => innerGet(decrypt(raw))  // ciphertext → codec → model value
+```
+
+### 4B. Why deterministic mode is nearly free
+
+`where()` already runs hash values through `Attr.set` (see `_applyHashWhere` in `relation.ts`). So for a deterministic field, the search term gets encrypted by the *same* codec and matches the stored ciphertext — **equality queries work through the existing pipeline with zero new query plumbing**:
+
+```ts
+await Person.where({ email: 'a@b.co' }).first()   // just works
+```
+
+`blindIndex` is the only mode needing new plumbing: `where()` must rewrite the predicate onto the sidecar HMAC column.
+
+### 4C. Implementation notes (one change point, not twenty)
+
+- Attach the chainable in **one** helper that every `Attr.*` factory returns through — don't edit 20 factories:
+  ```ts
+  function chainable(config) {
+    Object.defineProperty(config, 'encrypt', { enumerable: false, value: (opts = {}) => ({
+      ...config,
+      _encrypted: { mode: opts.deterministic ? 'deterministic' : 'randomized', blindIndex: opts.blindIndex },
+      set: (v) => encrypt((config.set ?? (x => x))(v), opts),
+      get: (raw) => (config.get ?? (x => x))(decrypt(raw)),
+    })})
+    return config
+  }
+  ```
+  Non-enumerable so it never leaks into `Object.keys`/serialization (same trick `installHelpers()` uses).
+- **Ciphertext is text.** An encrypted `Attr.integer()` must map to a `text`/`bytea` column. The codegen validator already checks columns — teach it to **fail the build** when an `_encrypted` attr points at a non-text column, and when `blindIndex` names a column that doesn't exist.
+- **Controller allowlists must reject randomized fields** in `filterable`/`sortable`, or you'll generate queries that silently return nothing.
+- AES-256-GCM (authenticated), versioned value format `v1:<keyId>:<iv>:<tag>:<ct>` so keys can rotate. Envelope encryption with a pluggable `KeyProvider` (`envKeyProvider` to ship, `kmsKeyProvider` designed in from day one).
+
+### 4D. ⚡ Quick win — do this one first, it's independent
+
+**Set `ServerSideEncryption` on the S3 `PutObjectCommand`** in `packages/core/src/storage/`. It's a few lines, requires **no key management on our side**, and gets every upload encrypted at rest today:
+
+```ts
+new sdk.PutObjectCommand({ ...existing, ServerSideEncryption: 'aws:kms' })  // or 'AES256'
+```
+
+Make it the storage layer's default (configurable). Cheap, immediate compliance win, zero coupling to 4A–4C.
+
+### 4E. Query-surface guards — the part that will bite you
+
+Encrypting a column removes most of the query surface, and **the failures are silent, not loud**. Full matrix in [DESIGN-field-encryption.md](DESIGN-field-encryption.md) §3; the must-dos:
+
+- **Three silent-wrongness traps on randomized fields** — nothing will ever tell you these are broken:
+  - `GROUP BY` returns **one group per row** (every ciphertext is unique).
+  - `COUNT(DISTINCT …)` returns the **row count**.
+  - A `UNIQUE` index **never fires** — duplicates are accepted forever.
+- **Reject at build time** (codegen validator): encrypted attr on a non-`text` column; `blindIndex` naming a missing column; an encrypted field appearing in a controller's `sortable`/`searchable`; a range filter (`gte`/`lte`) declared on an encrypted field.
+- **Throw at runtime** from `order()`, `seek()`, `search()`/`ftsSearch()`, `distinct()`, the aggregates, and operator-hash `where()` when handed an encrypted field — with a message naming the fix, e.g. *"Cannot ORDER BY encrypted field 'ssn' — ciphertext ordering is meaningless. Sort on a plaintext column, or store a sortable projection."*
+- **Controller allowlists**: `filterable` may allow **equality only** on deterministic/blind fields; `sortable` and `searchable` must reject every encrypted field outright.
+- **Free win while you're there:** for *deterministic* fields, `group()` has the `Attr.get` codec — decrypt the group keys before returning, so callers get `{ 'alice@x.com': 3 }` instead of `{ 'v1:k1:…': 3 }`. (Impossible for blind indexes — an HMAC is one-way.)
+
+**MVP for launch:** `.encrypt()` with randomized + deterministic modes and an env-var `KeyProvider`, validator enforcement of the text-column rule, the §4E guards, and SSE on by default for attachments. Blind index and client-side file envelope encryption can be fast-follows.
 
 ---
 

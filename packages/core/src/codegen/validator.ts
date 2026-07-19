@@ -357,7 +357,7 @@ function validateSti(model: ModelMeta, project: ProjectMeta, out: Diagnostic[]) 
   if (!hasDefaultScope && model.stiTypeValue == null) {
     out.push(warn(
       model.filePath,
-      `STI model "${model.className}": add \`static stiType = <discriminatorValue>\` to your class so active-drizzle automatically injects WHERE type = <value> on all queries and instantiates the correct subclass when loading from the parent table.`,
+      `STI model "${model.className}": add \`static stiType = <discriminatorValue>\` so queries auto-scope (WHERE type = <value>) — and keep @model('<base table>') on the subclass: stiType alone does NOT register it, and parent-table loads would silently instantiate the base class.`,
     ));
   }
 }

@@ -767,3 +767,32 @@ un-gitignored `.gen/`, missing `_client.ts`, missing framework packages —
 ✓/✗ with the exact fix per line, exit 1 on problems (CI-able). Plus: the
 "table not found" runtime error now teaches the boot map / bindDatabase /
 barrel-import checklist instead of just asking "did you call boot()?".
+
+
+## STI bug #6 closed: a missing @model on a subclass can no longer hide
+
+The failure was silence squared: an STI subclass with `static stiType`
+but no `@model` decorator never registers, so parent-table reads silently
+instantiate the BASE class for its rows — while writes, counts, and
+subclass-scoped queries all look correct. Worse, same-file subclasses
+were entirely invisible to codegen (only the first class per file was
+read). Three layers now:
+
+1. **Codegen ERROR** — the extractor scans EVERY class per model file; a
+   class with `stiType` and no `@model` throws a teaching error naming
+   the exact fix (`@model('<base table>')`).
+2. **Runtime dev backstop** — rows carrying a type value no registered
+   subclass claims warn once per (table, value), covering subclasses in
+   files outside the codegen glob.
+3. **Docs corrected** — LLM-GUIDE's STI rule now states BOTH declarations
+   are required (it previously taught the broken form), and the
+   validator's message no longer promises instantiation that only
+   @model delivers.
+
+Why not auto-registration (the reporter's preferred fix): JS has no
+subclass reflection, and the inherited-static-setter trick is defeated by
+`useDefineForClassFields: true` (class fields use Define semantics and
+bypass setters) — which is exactly the canonical tsconfig. Enforce +
+backstop is the honest mechanism. Bonus from the same report: the opaque
+`findMany of undefined` crash on a schema-export/table-name mismatch is
+now a teaching error naming the export to fix.

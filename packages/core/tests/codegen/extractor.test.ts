@@ -741,3 +741,39 @@ describe('teaching guard: cast/dynamic association options', () => {
       .toThrow(/PLAIN object literal[\s\S]*statically/)
   })
 })
+
+describe('bug #6 — stiType without @model is a codegen ERROR, never silence', () => {
+  it('an undecorated same-file subclass (previously INVISIBLE to codegen) throws the teaching error', () => {
+    const base = modelBuilder('Event', 'assets').build()
+    const project = createTestProject({
+      schema: schemas.assetsAndBusinesses,
+      models: {
+        'Event.model.ts': base + `
+
+export class ViewedEvent extends Event {
+  static stiType = 'ViewedEvent'
+}
+`,
+      },
+    })
+    expect(() => project.extractModel('Event.model.ts'))
+      .toThrow(/stiType[\s\S]*NO @model[\s\S]*silently return BASE-class/)
+  })
+
+  it('a DECORATED subclass passes', () => {
+    const base = modelBuilder('Event', 'assets').build()
+    const project = createTestProject({
+      schema: schemas.assetsAndBusinesses,
+      models: {
+        'Event.model.ts': base + `
+
+@model('assets')
+export class ViewedEvent extends Event {
+  static stiType = 'ViewedEvent'
+}
+`,
+      },
+    })
+    expect(() => project.extractModel('Event.model.ts')).not.toThrow()
+  })
+})

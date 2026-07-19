@@ -253,6 +253,27 @@ export function extractModel(project: Project, modelPath: string): ModelMeta {
   const classDecl = sourceFile.getClasses()[0];
   if (!classDecl) throw new Error(`No class found in ${modelPath}`);
 
+  // TEACHING GUARD (bug #6): an STI subclass with `static stiType` but NO
+  // @model decorator never registers — parent-table queries then SILENTLY
+  // instantiate the BASE class for its rows (writes/counts/scoping all look
+  // fine; only read-side downcast is wrong, and nothing warns). Scan EVERY
+  // class in the file — subclasses typically share the base's file and
+  // classes[1..n] were previously invisible here.
+  for (const cls of sourceFile.getClasses()) {
+    const declaresSti = cls.getStaticProperties().some(
+      p => Node.isPropertyDeclaration(p) && p.getName() === 'stiType',
+    );
+    if (declaresSti && !cls.getDecorator('model')) {
+      throw new Error(
+        `[active-drizzle] STI subclass '${cls.getName() ?? '<anonymous>'}' declares 'static stiType' ` +
+        `but has NO @model decorator. Without it the subclass never registers, and parent-table ` +
+        `queries silently return BASE-class instances for its rows (every overridden method resolves ` +
+        `to the base). Fix: decorate it with the SAME table as the base — ` +
+        `@model('<base table>') above the class.`,
+      );
+    }
+  }
+
   const className = classDecl.getName() ?? 'Unknown';
   const extendsClass = classDecl.getExtends()?.getExpression().getText() ?? 'ApplicationRecord';
   const isSti = extendsClass !== 'ApplicationRecord';

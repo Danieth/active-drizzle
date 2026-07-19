@@ -123,3 +123,31 @@ describe('registry by-table slot — base owns it regardless of import order', (
     expect((resolved as any).stiType).toBeUndefined()
   })
 })
+
+describe('bug #6 — unclaimed STI type values warn instead of silently basing', () => {
+  it('rows whose type no registered subclass claims trigger the teaching warn (once)', async () => {
+    const rows = [
+      { id: 1, type: 'TermLoan' },
+      { id: 2, type: 'GhostType' },     // no subclass registered for this
+      { id: 3, type: 'GhostType' },
+    ]
+    const db: any = {
+      select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(async () => rows) })) })),
+      transaction: vi.fn((cb: any) => cb(db)),
+    }
+    // load() path: _buildQuery uses select().from()… — emulate the minimal chain
+    boot(db, stiSchema)
+    const spy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const rel: any = StiRfp.all()
+      // bypass SQL assembly specifics: call the instantiation logic via load()
+      rel._buildQuery = async () => rows
+      const loaded: any[] = await rel.load()
+      expect(loaded[0].constructor.stiType).toBe('TermLoan')     // claimed → downcast
+      expect(loaded[1].constructor.stiType).toBeUndefined()      // unclaimed → base
+      const stiWarns = spy.mock.calls.filter(c => String(c[0]).includes('GhostType'))
+      expect(stiWarns).toHaveLength(1)                           // once per (table, value)
+      expect(String(stiWarns[0]![0])).toContain(`@model('sti_rfps')`)
+    } finally { spy.mockRestore() }
+  })
+})

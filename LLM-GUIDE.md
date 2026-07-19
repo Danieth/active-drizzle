@@ -148,9 +148,12 @@ export class Deal extends ApplicationRecord {
 RULES:
 - NEVER read `Klass.name` — `static name = Attr...` shadows it. Use
   `modelClassName(Klass)` if needed.
-- STI: subclass sets ONLY `static stiType = 'Label'`; parent statics are
-  inherited (state machines, associations, everything). Base class owns
-  the by-table registry slot automatically.
+- STI: a subclass needs BOTH `@model('<same table as base>')` AND
+  `static stiType = 'Label'` — @model REGISTERS it (without it,
+  parent-table queries silently instantiate the base class for its rows;
+  codegen now errors on this), stiType auto-scopes its queries. Parent
+  statics are inherited (state machines, associations, everything); the
+  base keeps the by-table registry slot automatically.
 - Import models through a barrel (`models/index.ts` re-exporting all) —
   ESM elides unused imports and unregistered models break associations.
 - habtm join tables: use a snake_case schema EXPORT (`deal_owners`) so

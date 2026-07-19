@@ -36,6 +36,9 @@ function _resolveColKey(Ctor: any, field: string): string {
  * are tuned around in-place chains, and the mixed rule is pinned by
  * tests/runtime/relation-chaining-semantics.test.ts.
  */
+/** Once-per-(table,type) dev warning for unclaimed STI type values (bug #6). */
+const _warnedUnclaimedStiTypes = new Set<string>()
+
 export class Relation<TModel extends ApplicationRecord = any, TRelations = Record<string, any>> {
   protected _ctor: any
   protected _tableName: string
@@ -390,6 +393,23 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     return rows.map((r: any) => {
       const typeVal = r[stiCol]
       const SubClass = (typeVal !== undefined && typeVal !== null ? subclassMap.get(typeVal) : undefined) ?? this._ctor
+      // Dev backstop for bug #6: a type value NO registered subclass claims
+      // usually means a subclass missing its @model decorator (or a file
+      // outside the codegen glob) — say so once instead of silently handing
+      // back base instances.
+      if (SubClass === this._ctor && typeVal != null && !subclassMap.has(typeVal)
+          && process.env['NODE_ENV'] !== 'production') {
+        const key = `${this._tableName}:${typeVal}`
+        if (!_warnedUnclaimedStiTypes.has(key)) {
+          _warnedUnclaimedStiTypes.add(key)
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[active-drizzle] table '${this._tableName}' has rows with ${stiCol}='${typeVal}' but no ` +
+            `registered model claims that type — they instantiate as the BASE class. If a subclass ` +
+            `declares stiType='${typeVal}', it also needs @model('${this._tableName}') to register.`,
+          )
+        }
+      }
       return new (SubClass as any)(r, false)
     })
   }
@@ -886,7 +906,16 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     if (rel._offset > 0)       config.offset  = rel._offset
     if (rel._order.length > 0) config.orderBy = rel._order
 
-    const rows: any[] = await (getExecutor(this._tableName).query as any)[rel._tableName].findMany(config)
+    const queryApi = (getExecutor(this._tableName).query as any)?.[rel._tableName]
+    if (!queryApi) {
+      throw new Error(
+        `active-drizzle: no relational query accessor for table '${rel._tableName}'. Drizzle keys ` +
+        `db.query by the schema EXPORT name — it must EQUAL the table name the framework uses. ` +
+        `Fix the schema export: \`export const ${rel._tableName} = pgTable('${rel._tableName}', …)\` ` +
+        `(a camelCase export over a snake_case table is the usual culprit).`,
+      )
+    }
+    const rows: any[] = await queryApi.findMany(config)
 
     return rows.map((row: any) => {
       // Single-field shortcut → plain value
