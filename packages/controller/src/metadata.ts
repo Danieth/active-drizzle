@@ -76,6 +76,18 @@ export interface IndexConfig {
    * `searchable` is a BadRequest, never a silent no-op.
    */
   searchable?: string[]
+  /**
+   * WEIGHTED full-text search (PG tsvector, computed on the fly — no
+   * migration; add a generated column later purely for speed):
+   *
+   *   search: { fields: { name: 'A', contactEmail: 'B' } }
+   *
+   * `?q=` upgrades from ilike to websearch parsing (quoted phrases,
+   * -negation, OR) with ts_rank relevance ordering; `sort: { field:
+   * 'relevance' }` is accepted while searching. `searchable` remains the
+   * simple-ilike fallback when `search` is absent.
+   */
+  search?: { fields: Record<string, 'A' | 'B' | 'C' | 'D'> }
   include?: IncludeSpec[]
   perPage?: number
   maxPerPage?: number

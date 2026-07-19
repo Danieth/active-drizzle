@@ -261,10 +261,19 @@ export async function defaultIndex(
   // The SQL is built by Relation.search — core's drizzle instance — so the
   // controller stays free of drizzle imports (mixed copies don't compose).
   const q = typeof params.q === 'string' ? params.q.trim() : ''
+  let searchedFts = false
   if (q) {
-    if (!idx.searchable?.length) throw new BadRequest(`This index does not support search (no 'searchable' config)`)
-    if (typeof rel.search !== 'function') throw new BadRequest(`Search requires a Relation with .search()`)
-    rel = rel.search(q, idx.searchable)
+    const fts = (idx as any).search
+    if (fts?.fields && typeof rel.ftsSearch === 'function') {
+      // Weighted websearch + rank — the badass path
+      rel = rel.ftsSearch(q, fts.fields)
+      searchedFts = true
+    } else if (idx.searchable?.length) {
+      if (typeof rel.search !== 'function') throw new BadRequest(`Search requires a Relation with .search()`)
+      rel = rel.search(q, idx.searchable)
+    } else {
+      throw new BadRequest(`This index does not support search (no 'search'/'searchable' config)`)
+    }
   }
 
   // 5. ids param (for combobox hydration — still respects scope)
@@ -272,12 +281,18 @@ export async function defaultIndex(
     rel = rel.where({ id: params.ids })
   }
 
-  // 6. Sort (validated against sortable list)
-  if (params.sort) {
+  // 6. Sort (validated against sortable list; 'relevance' allowed while searching)
+  if (params.sort?.field === 'relevance') {
+    if (!searchedFts) throw new BadRequest(`'relevance' sort requires an active full-text search`)
+    rel = rel.orderByRelevance()
+  } else if (params.sort) {
     const { field, dir = 'asc' } = params.sort
     if (!(idx.sortable ?? []).includes(field)) throw new BadRequest(`Cannot sort by '${field}'`)
     if (dir !== 'asc' && dir !== 'desc') throw new BadRequest(`Sort dir must be 'asc' or 'desc'`)
     rel = rel.order(field, dir)
+  } else if (searchedFts) {
+    // relevance is the natural default while full-text searching
+    rel = rel.orderByRelevance()
   } else if (idx.defaultSort) {
     rel = rel.order(idx.defaultSort.field, idx.defaultSort.dir ?? 'asc')
   }

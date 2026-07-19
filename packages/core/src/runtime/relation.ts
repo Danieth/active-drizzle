@@ -91,6 +91,50 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   }
 
   /**
+   * Weighted full-text search — websearch-style query parsing over a
+   * weighted on-the-fly tsvector (no generated column or migration needed;
+   * add one later as a pure performance upgrade):
+   *
+   *   Deal.all().ftsSearch('acme expansion', { name: 'A', contactEmail: 'B' })
+   *   → WHERE (setweight(to_tsvector(name),'A') || …) @@ websearch_to_tsquery('acme expansion')
+   *
+   * websearch semantics: quoted phrases, -negation, OR. Chain
+   * .orderByRelevance() for ts_rank ordering. Blank term/no fields = no-op.
+   */
+  public ftsSearch(term: string | null | undefined, fields: Record<string, 'A' | 'B' | 'C' | 'D'>): this {
+    const t = (term ?? '').trim()
+    const entries = Object.entries(fields)
+    if (!t || !entries.length) return this
+    const table = this.getTable()
+    let vec: SQL | null = null
+    for (const [f, w] of entries) {
+      const col = table[_resolveColKey(this._ctor, f)]
+      if (!col) throw new Error(`Column "${f}" not found on table "${this._tableName}"`)
+      const weight = ['A', 'B', 'C', 'D'].includes(w) ? w : 'D'
+      const piece = sql`setweight(to_tsvector('english', coalesce(${col}, '')), ${sql.raw(`'${weight}'`)})`
+      vec = vec ? sql`${vec} || ${piece}` : piece
+    }
+    // HYBRID match: full-text (websearch semantics) OR substring — a
+    // half-typed 'glo' still finds 'Globex' (type-ahead survives), while
+    // ts_rank orders real lexeme matches above substring-only ones
+    const pattern = '%' + t.replace(/[\\%_]/g, (m) => '\\' + m) + '%'
+    const likes = entries.map(([f]) => {
+      const col = table[_resolveColKey(this._ctor, f)]
+      return ilike(col, pattern)
+    })
+    this._where.push(or(sql`${vec!} @@ websearch_to_tsquery('english', ${t})`, ...likes)!)
+    ;(this as any)._ftsRank = sql`ts_rank(${vec!}, websearch_to_tsquery('english', ${t}))`
+    return this
+  }
+
+  /** Order by the last ftsSearch's ts_rank (highest relevance first). No-op without a search. */
+  public orderByRelevance(): this {
+    const rank = (this as any)._ftsRank as SQL | undefined
+    if (rank) this._order.push(desc(rank))
+    return this
+  }
+
+  /**
    * .limit(10)
    */
   public limit(amount: number): this {
@@ -881,6 +925,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     c._order    = [...this._order]
     c._includes = { ...this._includes }
     if ((this as any)._isNone) (c as any)._isNone = true
+    if ((this as any)._ftsRank) (c as any)._ftsRank = (this as any)._ftsRank
     // Association create-defaults survive chaining (deal.comments.order(...).create(...))
     if ((this as any)._createDefaults) (c as any)._createDefaults = { ...(this as any)._createDefaults }
     return c
