@@ -697,3 +697,75 @@ describe('Submit inside Form fires onSuccess', () => {
     expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(false)
   })
 })
+
+// ── belongsTo sugar: a 'ref' field aliases its FK column ─────────────────────
+
+describe('ref fields (belongsTo sugar)', () => {
+  beforeEach(() => {
+    setDefaultPresenters({
+      string: { edit: 'text', view: 'textView' },
+      ref: { edit: 'text', view: 'textView' },
+    })
+  })
+  const REF_META: Record<string, Record<string, any>> = {
+    ...FIELD_META,
+    ownerId: { kind: 'integer' },
+    owner: { kind: 'ref', fk: 'ownerId', label: 'Owner' },
+  }
+  function makeRefHandle(opts: {
+    abilities?: Record<string, 'edit' | 'view'> | null
+  } = {}) {
+    const session = new FormSession<any>({
+      draft: { id: 1, ownerId: 7 },
+      mode: 'edit',
+      abilities: opts.abilities === undefined ? { ownerId: 'edit' } : opts.abilities,
+      can: {},
+    })
+    return { handle: createFormHandle(session, { fieldMeta: REF_META }), session }
+  }
+
+  it('reads its value from the FK column', () => {
+    const { handle: deal } = makeRefHandle()
+    render(<deal.owner edit />)
+    expect((screen.getByRole('textbox') as HTMLInputElement).value).toBe('7')
+    expect(deal.owner.value).toBe(7)
+  })
+
+  it('writes commit to the FK column, not the association name', () => {
+    const { handle: deal, session } = makeRefHandle()
+    render(<deal.owner edit />)
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '9' } })
+    fireEvent.blur(screen.getByRole('textbox'))
+    expect(session.getValue('ownerId')).toBe('9')
+    expect((session.draft as any).owner).toBeUndefined()
+  })
+
+  it('obeys the FK entry of the abilities mask: view renders text', () => {
+    const { handle: deal } = makeRefHandle({ abilities: { ownerId: 'view' } })
+    render(<deal.owner edit />)
+    expect(screen.queryByRole('textbox')).toBeNull()
+    expect(screen.getByText('7')).toBeTruthy()
+  })
+
+  it('renders null when the FK is absent from the mask', () => {
+    const { handle: deal } = makeRefHandle({ abilities: { amount: 'edit' } })
+    const { container } = render(<deal.owner edit />)
+    expect(container.innerHTML).toBe('')
+  })
+
+  it('surfaces FK-keyed validation errors on the ref field', () => {
+    const session = new FormSession<any>({
+      draft: { id: 1, ownerId: 7 },
+      mode: 'edit',
+      abilities: { ownerId: 'edit' },
+      can: {},
+      validate: () => ({ ownerId: ['is not a teammate'] }),
+    })
+    const deal = createFormHandle(session, { fieldMeta: REF_META })
+    render(<deal.owner edit />)
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '9' } })
+    fireEvent.blur(screen.getByRole('textbox'))
+    expect(deal.owner.errors).toEqual(['is not a teammate'])
+    expect(screen.getByRole('note').textContent).toBe('is not a teammate')
+  })
+})

@@ -350,3 +350,69 @@ export class Loan extends ApplicationRecord {
     expect(out).toContain('threw client-side (treated as server-only)')
   })
 })
+
+// ── belongsTo sugar: ref fields ──────────────────────────────────────────────
+
+const dealsSchema = `
+import { pgTable, serial, integer, text } from 'drizzle-orm/pg-core'
+
+export const deals = pgTable('deals', {
+  id: serial('id').primaryKey(),
+  name: text('name'),
+  ownerId: integer('owner_id'),
+})
+`
+
+const dealModel = `
+import { ApplicationRecord, model, Attr, belongsTo } from 'active-drizzle'
+
+@model('deals')
+export class Deal extends ApplicationRecord {
+  static owner = belongsTo('users', { foreignKey: 'ownerId' })
+  static name = Attr.string({ label: 'Name' })
+}
+`
+
+function generateDeal(crudConfig: Record<string, any>): string {
+  const project = createTestProject({
+    schema: dealsSchema,
+    models: { 'Deal.model.ts': dealModel },
+  })
+  const projectMeta: ProjectMeta = {
+    schema: project.extractSchema(),
+    models: [project.extractModel('Deal.model.ts')],
+  }
+  const ctrl: CtrlMeta = {
+    filePath: '/src/Deal.ctrl.ts',
+    className: 'DealController',
+    basePath: '/deals',
+    scopes: [],
+    kind: 'crud',
+    modelClass: 'Deal',
+    mutations: [],
+    actions: [],
+    crudConfig,
+  } as CtrlMeta
+  const files = generateReactHooks({ controllers: [ctrl] } as CtrlProjectMeta, projectMeta, '/out')
+  return files.find(f => f.filePath.includes('deal.gen'))!.content
+}
+
+describe('belongsTo ref sugar emission', () => {
+  it('emits a ref handle member + fieldMeta aliasing the FK when the FK is projected', () => {
+    const out = generateDeal({
+      get: { expose: ['id', 'name', 'ownerId'], abilities: true },
+      update: { permit: ['name', 'ownerId'] },
+    })
+    expect(out).toContain(`owner: TypedFieldComponent<'ref'>`)
+    expect(out).toContain(`owner: { kind: 'ref', fk: 'ownerId', label: "Owner" }`)
+  })
+
+  it('emits nothing for the association when its FK is outside the projection', () => {
+    const out = generateDeal({
+      get: { expose: ['id', 'name'], abilities: true },
+      update: { permit: ['name'] },
+    })
+    expect(out).not.toContain(`TypedFieldComponent<'ref'>`)
+    expect(out).not.toContain(`kind: 'ref'`)
+  })
+})

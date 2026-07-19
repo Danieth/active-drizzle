@@ -247,10 +247,15 @@ export function createFormHandle<T extends Record<string, any>>(
     // subscribes to the session-wide channel. Plain fields subscribe only to
     // themselves, keeping keystrokes single-field re-renders.
     const staticMeta = fieldMeta[field] ?? {}
+    // belongsTo sugar: a 'ref' field is the FK column wearing the
+    // association's name — value, writes, abilities mask, and errors all
+    // alias to meta.fk (same trick as attachment `<name>AssetId` below)
+    const isRef = staticMeta.kind === 'ref' && typeof staticMeta.fk === 'string'
+    const dataField = isRef ? (staticMeta.fk as string) : field
     const dependsOnOthers = Boolean(
       staticMeta.presentIf || staticMeta.requiredIf || staticMeta.lockedIf || staticMeta.copy,
     )
-    const channel = dependsOnOthers ? '*' : field
+    const channel = dependsOnOthers ? '*' : dataField
 
     const Field: FC<FieldProps> = (props) => {
       useSyncExternalStore(
@@ -266,7 +271,7 @@ export function createFormHandle<T extends Record<string, any>>(
 
       // Visibility: server mask first, then presentIf over the draft (C6:
       // hiding never loses the value — it lives on the draft, not here)
-      if (!session.canView(field)) return null
+      if (!session.canView(dataField)) return null
       if (typeof meta.presentIf === 'function' && !meta.presentIf(session.draft)) return null
 
       const locked = typeof meta.lockedIf === 'function' && Boolean(meta.lockedIf(session.draft))
@@ -276,7 +281,7 @@ export function createFormHandle<T extends Record<string, any>>(
         meta,
         ...(props.edit !== undefined ? { edit: props.edit } : {}),
         ...(props.view !== undefined ? { view: props.view } : {}),
-        canEdit: session.canEdit(field),
+        canEdit: session.canEdit(dataField),
         locked,
       })
       if (!resolved) return null
@@ -286,7 +291,7 @@ export function createFormHandle<T extends Record<string, any>>(
       // `<name>AssetId(s)` column the controller actually permits — the
       // presenter deals in assets, the wire deals in ids, nobody wires it
       const isAttachment = meta.kind === 'attachmentOne' || meta.kind === 'attachmentMany'
-      const writeField = !isAttachment ? field
+      const writeField = !isAttachment ? dataField
         : meta.kind === 'attachmentOne' ? `${field}AssetId` : `${field}AssetIds`
 
       const commitMoment = resolved.def.commit ?? 'blur'
@@ -312,13 +317,13 @@ export function createFormHandle<T extends Record<string, any>>(
           if (cancelIntent) session.touch(writeField)
           else void session.commitField(writeField, commitMode)
         },
-        onCompositionStart: () => session.beginComposition(field),
+        onCompositionStart: () => session.beginComposition(dataField),
         onCompositionEnd: () => {
           // C11: IME composition commits once, at composition end
-          session.endComposition(field)
-          if (commitMoment === 'change') void session.commitField(field, commitMode)
+          session.endComposition(dataField)
+          if (commitMoment === 'change') void session.commitField(writeField, commitMode)
         },
-        disabled: session.getStatus() === 'saving' || session.fieldState(field) === 'saving',
+        disabled: session.getStatus() === 'saving' || session.fieldState(dataField) === 'saving',
       }
 
       const overrides: Record<string, any> = { ...(props.props ?? {}) }
@@ -329,23 +334,23 @@ export function createFormHandle<T extends Record<string, any>>(
       const Component = resolved.def.component
       return (
         <Component
-          value={session.getValue(field)}
+          value={session.getValue(dataField)}
           bind={bind}
           meta={meta}
           overrides={overrides}
           mode={resolved.mode}
           draft={session.draft}
-          errors={session.visibleErrors(field)}
-          state={session.fieldState(field) !== 'ready' ? session.fieldState(field) : session.getStatus()}
+          errors={session.visibleErrors(dataField)}
+          state={session.fieldState(dataField) !== 'ready' ? session.fieldState(dataField) : session.getStatus()}
         />
       )
     }
     Field.displayName = `Field(${field})`
 
     Object.defineProperties(Field, {
-      errors: { get: () => session.visibleErrors(field) },
+      errors: { get: () => session.visibleErrors(dataField) },
       meta: { get: () => resolveCopy(fieldMeta[field] ?? {}, session.draft) },
-      value: { get: () => session.getValue(field) },
+      value: { get: () => session.getValue(dataField) },
     })
     return Field as FieldComponent
   }

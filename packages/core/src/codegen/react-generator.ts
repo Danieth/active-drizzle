@@ -361,6 +361,19 @@ function generateControllerFile(
           { controllerKeys, sink: instantResources })
         if (entry) nestedEntries.push(`    ${entry},`)
       }
+      // belongsTo sugar: <deal.owner> is the FK field wearing the
+      // association's name. kind 'ref' meta carries the fk; the runtime
+      // aliases value/write/mask/errors to that column. WHICH directory the
+      // picker reads stays a call-site choice (props={{ from: Controller }})
+      // — a model has no canonical controller, so codegen names none.
+      const refEntries: string[] = []
+      for (const assoc of model.associations) {
+        if (assoc.kind !== 'belongsTo' || assoc.polymorphic) continue
+        const fk = assoc.foreignKey ?? `${assoc.propertyName}Id`
+        if (!stateProjection.has(fk)) continue
+        const label = capitalize(assoc.propertyName.replace(/([A-Z])/g, ' $1'))
+        refEntries.push(`    ${assoc.propertyName}: { kind: 'ref', fk: '${fk}', label: ${JSON.stringify(label)} },`)
+      }
       // Every field the typed handle declares gets a meta entry — a handle
       // field whose meta lookup comes up empty would promise presenters the
       // runtime can't resolve (id/ownerId/updatedAt etc. get their kind here)
@@ -376,7 +389,7 @@ function generateControllerFile(
         .filter(f => !covered.has(f) && colTypesForMeta.has(f))
         .sort()
         .map(f => `    ${f}: { kind: '${fieldKind(f, model, colTypesForMeta)}' },`)
-      const metaSource = renderFieldMeta(model, stateProjection, [...attachmentEntries, ...nestedEntries, ...bareColumnEntries])
+      const metaSource = renderFieldMeta(model, stateProjection, [...attachmentEntries, ...nestedEntries, ...refEntries, ...bareColumnEntries])
       if (metaSource) {
         L.push('')
         L.push(`  static fieldMeta = ${metaSource} as const`)
@@ -978,6 +991,13 @@ function emitFormHooks(
   }
   for (const a of attachmentFields) {
     L.push(`  ${a.name}: TypedFieldComponent<'${a.kind}'>`)
+  }
+  // belongsTo sugar members — <deal.owner> aliases the projected FK column
+  for (const assoc of model.associations) {
+    if (assoc.kind !== 'belongsTo' || assoc.polymorphic) continue
+    const fk = assoc.foreignKey ?? `${assoc.propertyName}Id`
+    if (!projection.has(fk) || fields.includes(assoc.propertyName)) continue
+    L.push(`  ${assoc.propertyName}: TypedFieldComponent<'ref'>`)
   }
   L.push(`}`)
   L.push('')
