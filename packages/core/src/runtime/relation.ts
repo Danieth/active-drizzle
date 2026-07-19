@@ -25,6 +25,17 @@ function _resolveColKey(Ctor: any, field: string): string {
  *   .where({ teamId: null })     → isNull(table.teamId)
  *   .where({ id: Asset.videos() })  → inArray(table.id, subquery)
  */
+/**
+ * ⚠ CHAINING SEMANTICS — read before adding a chainable:
+ * most chainables (where/order/limit/search/ftsSearch/...) MUTATE the
+ * relation in place and return `this`; group()/having() CLONE (a shared
+ * base must never accumulate GROUP BYs across chains — the facet engine
+ * fans one base into many). When one relation must feed INDEPENDENT
+ * chains, take an explicit `.clone()` first. Unifying everything on
+ * clone-per-call (Rails-style) is deliberately deferred: the hot paths
+ * are tuned around in-place chains, and the mixed rule is pinned by
+ * tests/runtime/relation-chaining-semantics.test.ts.
+ */
 export class Relation<TModel extends ApplicationRecord = any, TRelations = Record<string, any>> {
   protected _ctor: any
   protected _tableName: string

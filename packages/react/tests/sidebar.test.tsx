@@ -123,3 +123,31 @@ describe('scaffold rendering', () => {
     } finally { vi.useRealTimers() }
   })
 })
+
+describe('facet requesting — counts are asked for, never assumed', () => {
+  it('params() carries no facets until a count-consumer requests them', async () => {
+    const { IndexSession } = await import('../src/index.js')
+    const s = new IndexSession()
+    expect(s.params().facets).toBeUndefined()          // plain pages pay nothing
+    s.requestFacets(['stage'])
+    expect(s.params().facets).toEqual(['stage'])
+    s.requestFacets(['priority'])                       // second consumer merges
+    expect(s.params().facets).toEqual(['stage', 'priority'])
+    s.requestFacets(true)                               // true wins
+    expect(s.params().facets).toBe(true)
+    s.requestFacets(['stage'])                          // and stays won
+    expect(s.params().facets).toBe(true)
+  })
+
+  it('mounting the Sidebar auto-requests exactly its FACET groups', () => {
+    const S = makeSurface()
+    render(<S.Index><S.Sidebar /></S.Index>)
+    let captured: any
+    render(<S.Index><S.Sidebar>{(a: any) => { captured = a; return null }}</S.Sidebar></S.Index>)
+    // both mounts share nothing — assert via a fresh session's params through use()
+    let params: any
+    const Probe = () => { params = (S as any).use().session.params(); return null }
+    render(<S.Index><S.Sidebar /><Probe /></S.Index>)
+    expect(params.facets).toEqual(['stage'])            // facet kinds only, toggles excluded
+  })
+})

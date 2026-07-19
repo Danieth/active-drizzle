@@ -41,6 +41,7 @@ describe('buildContractProbes', () => {
       'chart dimension outside chartable is rejected',
       'aggregate measure outside measures is rejected',
       'metric measure outside measures is rejected',
+      'options projection outside expose is rejected',
       "non-permitted field 'stage' must not mass-assign",
       "mutation 'sendBack' without required params is rejected",
     ])
@@ -88,12 +89,21 @@ describe('runContractProbes against the real defaultIndex machinery', () => {
     expect(failures.length).toBe(probes.length)
   })
 
-  it('a strip probe fails only when the forged value ECHOES back', async () => {
+  it('a strip probe fails on a forged ECHO — and on clean-echo-but-PERSISTED', async () => {
     const probes = buildContractProbes(DuckController).filter(p => p.expect === 'strip')
     expect(probes).toHaveLength(1)
     const echoed = await runContractProbes(probes, async () => ({ record: { stage: '__ad_forged__' } }))
     expect(echoed).toHaveLength(1)
-    const stripped = await runContractProbes(probes, async () => ({ record: { stage: 'draft' } }))
-    expect(stripped).toEqual([])
+    expect(echoed[0]!.reason).toContain('ECHOED')
+
+    // lying server: strips the response but persists the write — the
+    // re-GET catches it
+    const liar = await runContractProbes(probes, async (proc) =>
+      proc === 'get' ? { record: { stage: '__ad_forged__' } } : { record: { stage: 'draft' } })
+    expect(liar).toHaveLength(1)
+    expect(liar[0]!.reason).toContain('PERSISTED')
+
+    const honest = await runContractProbes(probes, async () => ({ record: { stage: 'draft' } }))
+    expect(honest).toEqual([])
   })
 })

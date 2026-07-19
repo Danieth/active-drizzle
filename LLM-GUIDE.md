@@ -165,7 +165,10 @@ const EDITABLE = ['name', 'amount', 'notesAttributes', 'briefAttributes'] as con
     searchable: ['name', 'contactEmail'],   // ?q= ilike fallback
     search: { fields: { name: 'A', contactEmail: 'B' } },  // weighted FTS (websearch + ts_rank, hybrid substring)
     filterable: ['stage', 'priority', 'isHot'],            // tier-1 column filters (codec-normalized, allowlisted)
-    facets: true,                       // disjunctive counts ride every response → FilterPresenterProps.counts
+    facets: true,                       // CEILING for facet counts — computed only when a request asks
+    // (param facets: true|['stage']; Sidebar/Board auto-ask; requested ∩ allowed; ask w/o ceiling = 400)
+    // options param: { options: { value: 'id', label: 'name' } } → narrowed+sorted [{value,label}]
+    // picker feed under the expose ceiling (both fields must be exposed; id always ok; cap = perPage|50)
     chartable: ['stage'], measures: ['amount'],  // chart {x,y:'count'|'sum:F'|'avg:F'} + metric params (perPage:0 = agg-only)
     // search.adapter (the ES lane): external engine returns IDS ONLY in rank
     // order; hydration stays behind this door. search.doc = the ONE searchDoc

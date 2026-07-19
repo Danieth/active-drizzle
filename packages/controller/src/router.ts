@@ -170,6 +170,8 @@ export function buildRouter<TContext = Record<string, any>>(
         sort:    z.object({ field: z.string(), dir: z.enum(['asc', 'desc']) }).optional(),
         page:    z.number().int().min(0).optional(),
         perPage: z.number().int().nonnegative().optional(),   // 0 = aggregation-only call
+        facets:  z.union([z.boolean(), z.array(z.string())]).optional(),
+        options: z.object({ value: z.string(), label: z.string() }).optional(),
         // paramScopes: spread into top-level as optional string fields
         ...(config.index?.paramScopes ?? []).reduce((acc, ps) => {
           acc[ps] = z.string().optional()

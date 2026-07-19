@@ -88,6 +88,12 @@ export function buildContractProbes(
       procedure: 'index', input: { perPage: 0, metric: `sum:${FORGED}` }, expect: 'reject',
     })
   }
+  if (config.get?.expose?.length) {
+    probes.push({
+      name: 'options projection outside expose is rejected',
+      procedure: 'index', input: { options: { value: 'id', label: FORGED } }, expect: 'reject',
+    })
+  }
   if (!idx.searchable?.length && !idx.search) {
     probes.push({
       name: 'q on a non-searchable index is rejected',
@@ -147,11 +153,22 @@ export async function runContractProbes(
       if (probe.expect === 'reject') {
         failures.push({ probe, reason: 'expected a rejection, but the call succeeded' })
       } else if (probe.forgedField) {
-        const echoed = res && typeof res === 'object'
-          ? ((res as any).record?.[probe.forgedField] ?? (res as any)[probe.forgedField])
+        const pick = (body: any): unknown => body && typeof body === 'object'
+          ? ((body as any).record?.[probe.forgedField!] ?? (body as any)[probe.forgedField!])
           : undefined
-        if (echoed === probe.forgedValue) {
-          failures.push({ probe, reason: `forged value persisted on '${probe.forgedField}'` })
+        if (pick(res) === probe.forgedValue) {
+          failures.push({ probe, reason: `forged value ECHOED on '${probe.forgedField}'` })
+          continue
+        }
+        // The echo can lie — re-GET and check PERSISTENCE (a server that
+        // strips the response but writes the row must still fail)
+        if (probe.input['id'] != null) {
+          try {
+            const fresh = await call('get', { id: probe.input['id'] })
+            if (pick(fresh) === probe.forgedValue) {
+              failures.push({ probe, reason: `forged value PERSISTED on '${probe.forgedField}' (echo was clean)` })
+            }
+          } catch { /* no readable get — echo verdict stands */ }
         }
       }
     } catch {

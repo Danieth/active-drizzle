@@ -20,7 +20,7 @@
  * with `Surface.use()`. The raw hooks remain exported — components for
  * the 90%, hooks demoted to plumbing.
  */
-import React, { createContext, useContext, useMemo, useRef, useSyncExternalStore, type FC, type ReactNode } from 'react'
+import React, { createContext, useContext, useEffect, useMemo, useRef, useSyncExternalStore, type FC, type ReactNode } from 'react'
 import { parseControllerError } from './errors.js'
 
 // ── IndexSession — headless list state ───────────────────────────────────────
@@ -32,6 +32,9 @@ export interface IndexState {
   sort?: { field: string; dir: 'asc' | 'desc' } | undefined
   page: number
   perPage?: number | undefined
+  /** Facet-count ask — counts are OPT-IN (each is a GROUP BY server-side);
+   *  count-consuming views (Sidebar, Board) request what they render. */
+  facets?: boolean | string[] | undefined
 }
 
 export class IndexSession {
@@ -75,6 +78,16 @@ export class IndexSession {
     this.patch({ filters, page: 0 })
   }
   clearFilters(): void { this.patch({ filters: {}, q: undefined, page: 0 }) }
+  /** Ask the server for facet counts (merged across callers; `true` wins).
+   *  Views that RENDER counts call this — nobody else pays for them. */
+  requestFacets(spec: true | string[]): void {
+    const cur = this.state.facets
+    if (cur === true) return
+    if (spec === true) { this.patch({ facets: true }); return }
+    const merged = [...new Set([...(Array.isArray(cur) ? cur : []), ...spec])]
+    const same = Array.isArray(cur) && merged.length === cur.length
+    if (!same) this.patch({ facets: merged })
+  }
   setSort(field: string, dir: 'asc' | 'desc' = 'asc'): void { this.patch({ sort: { field, dir }, page: 0 }) }
   setPage(page: number): void { this.patch({ page: Math.max(0, page) }) }
 
@@ -88,6 +101,7 @@ export class IndexSession {
       ...(s.sort ? { sort: s.sort } : {}),
       page: s.page,
       ...(s.perPage ? { perPage: s.perPage } : {}),
+      ...(s.facets !== undefined ? { facets: s.facets } : {}),
     }
   }
 }
@@ -564,6 +578,13 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
   const useSidebarApi = (groupNames?: string[]): SidebarApi => {
     const { session, meta, query } = useCtx()
     const state = useSessionState(session)
+    // The sidebar RENDERS counts, so the sidebar ASKS for them — a page
+    // without a count-consumer never pays for the GROUP BYs
+    const facetGroupNames = (groupNames ?? Object.keys(meta.filters ?? {}))
+      .filter((n) => meta.filters?.[n]?.kind === 'facet')
+    useEffect(() => {
+      if (facetGroupNames.length) session.requestFacets(facetGroupNames)
+    }, [session, facetGroupNames.join(',')])
     const facets = (query.data as any)?.facets as Record<string, Record<string, number>> | undefined
     const names = groupNames ?? Object.keys(meta.filters ?? {})
     const groups: SidebarGroup[] = names.flatMap((name) => {
@@ -691,11 +712,15 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
   // states = columns, a drag IS a transition (advance via _event), guards
   // stay server-enforced; plain enum/facet fields group + PATCH instead.
   const Board: IndexSurface['Board'] = ({ groupBy, children, className }) => {
-    const { meta, query } = useCtx()
+    const { session, meta, query } = useCtx()
     const sm = cfg.stateMeta
     const field = groupBy ?? sm?.field
     if (!field) throw new Error('[active-drizzle] <Board> needs groupBy (this model declares no state machine)')
     const rows: any[] = query.data?.data ?? []
+    // Column totals come from facet counts — the board asks for ITS field
+    useEffect(() => {
+      if (meta.filters?.[field]) session.requestFacets([field])
+    }, [session, field])
     const isState = sm != null && field === sm.field
     const keys: string[] = isState ? sm!.states
       : (meta.filters?.[field]?.options as string[] | undefined) ?? [...new Set(rows.map((r) => String(r[field])))]

@@ -231,6 +231,8 @@ export interface IndexResult {
   chart?: Array<{ x: string; y: number }>
   /** Scalar aggregation (metric param). */
   metric?: number | string | null
+  /** Picker feed (options param) — narrowed + sorted [{ value, label }]. */
+  options?: Array<{ value: any; label: any }>
   /** Present ONLY when the page is empty: why. 'no-records' = the door
    *  scope is empty; 'no-matches' = records exist but filters/search
    *  excluded them all. Costs one extra COUNT, only on empty pages. */
@@ -251,6 +253,21 @@ export interface IndexParams {
   chart?: { x: string; y?: string }
   /** Scalar metric request: 'count' | 'sum:F' | 'avg:F' (F ∈ index.measures). */
   metric?: string
+  /**
+   * Facet-count REQUEST — counts are never computed unless asked for
+   * (each facet field costs a GROUP BY in PG; an ES-backed view gets them
+   * ~free and should ask always). `true` = every field the config allows;
+   * a list narrows it. The config's `index.facets` stays the CEILING:
+   * requested ∩ allowed, never more.
+   */
+  facets?: boolean | string[]
+  /**
+   * Picker/options feed: `{ value: 'id', label: 'name' }` → the narrowed,
+   * sorted result set projected to [{ value, label }] pairs (array, not a
+   * hash — numeric object keys lose their order in JS). Both fields must
+   * be within the expose ceiling. Combine with q/filters/perPage.
+   */
+  options?: { value: string; label: string }
 }
 
 // ── Index ─────────────────────────────────────────────────────────────────────
@@ -454,16 +471,49 @@ export async function defaultIndex(
     metric = measureValue(mField, raw)
   }
 
-  // 6.6 Facet counts (disjunctive: each facet field re-runs the narrowing
-  // with its OWN filter excluded). Configured server-side; one grouped
-  // count per facet field, same pass, same door scope.
+  // 6.55 Options feed — the picker projection: the SAME narrowed, sorted
+  // relation, reduced to [{ value, label }]. Both fields sit under the
+  // expose ceiling (view permission IS the projection permission).
+  let options: Array<{ value: any; label: any }> | undefined
+  if (params.options) {
+    const { value: valueField, label: labelField } = params.options
+    const ceiling = config.get?.expose
+    for (const f of [valueField, labelField]) {
+      if (typeof f !== 'string' || !f) throw new BadRequest(`options needs { value, label } field names`)
+      if (ceiling?.length && f !== 'id' && !ceiling.includes(f)) {
+        throw new BadRequest(`Cannot project '${f}' into options (outside expose)`)
+      }
+    }
+    const cap = Math.min(params.perPage && params.perPage > 0 ? params.perPage : 50, idx.maxPerPage ?? 100)
+    let optRel = applyNarrowing(scopedRel)
+    // Rank order while searching (a picker's whole point), declared default otherwise
+    if (searchedFts && typeof optRel.orderByRelevance === 'function') optRel = optRel.orderByRelevance()
+    else if (idx.defaultSort) optRel = optRel.order(idx.defaultSort.field, idx.defaultSort.dir ?? 'asc')
+    const rows = await optRel.limit(cap).load()
+    options = rows.map((r: any) => ({ value: r[valueField], label: r[labelField] }))
+  }
+
+  // 6.6 Facet counts — OPT-IN per request (each field is a GROUP BY; a
+  // plain index call must never pay for counts nobody renders). The
+  // config is the CEILING, the param is the ask: requested ∩ allowed.
+  // Disjunctive: each facet field re-runs the narrowing with its OWN
+  // filter excluded, so options never zero themselves out.
   let facets: Record<string, Record<string, number>> | undefined
-  const facetFields = idx.facets === true ? filterableFields
+  const allowedFacets: string[] = idx.facets === true ? filterableFields
     : Array.isArray(idx.facets) ? idx.facets : []
-  if (facetFields.length) {
+  const requestedFacets: string[] = params.facets === true ? allowedFacets
+    : Array.isArray(params.facets) ? params.facets : []
+  const facetsAsked = params.facets === true || (Array.isArray(params.facets) && params.facets.length > 0)
+  if (facetsAsked && !allowedFacets.length) {
+    // an explicit ask against a non-offering index is an error, never a silent no-op
+    throw new BadRequest(`This index does not offer facet counts (no 'facets' config)`)
+  }
+  if (requestedFacets.length) {
     facets = {}
-    for (const f of facetFields) {
-      if (!filterableFields.includes(f)) throw new BadRequest(`facets field '${f}' must be filterable`)
+    for (const f of requestedFacets) {
+      if (!allowedFacets.includes(f) || !filterableFields.includes(f)) {
+        throw new BadRequest(`Cannot count facets for '${f}'`)
+      }
       const grouped = await applyNarrowing(scopedRel, f).group(f).count()
       facets[f] = Object.fromEntries(Object.entries(grouped ?? {}).map(([k, v]) => [k, Number(v)]))
     }
@@ -521,6 +571,7 @@ export async function defaultIndex(
     ...(facets !== undefined ? { facets } : {}),
     ...(chart !== undefined ? { chart } : {}),
     ...(metric !== undefined ? { metric } : {}),
+    ...(options !== undefined ? { options } : {}),
     ...(emptyReason !== undefined ? { emptyReason } : {}),
   }
 }

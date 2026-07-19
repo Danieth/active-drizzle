@@ -566,11 +566,25 @@ inline field (`elsewhere`) → floater (`<Changes>`) → save-time dialog
 
 ## The derived-frontend batch (overnight round — all built, all verified)
 
-**Facet counts** — `index: { facets: true }` and every index response
-carries `facets: { stage: { draft: 12, … } }`, computed DISJUNCTIVELY
-(each field's own filter excluded, so options never zero out) with label
-keys. They flow into `FilterPresenterProps.counts` — chips show live
-numbers with zero client code.
+**Facet counts — opt-in on the wire, ceiling in the config.** Counts are
+never computed unless a request ASKS (`facets: true | ['stage']` param):
+each facet field costs a GROUP BY in PG, and a plain index call must never
+pay for numbers nobody renders. `index: { facets: true }` in the config is
+the CEILING (requested ∩ allowed; an ask against a non-offering index is a
+400, never a silent no-op). Count-consuming views ask automatically — the
+Sidebar requests its facet groups on mount, the Board requests its groupBy
+field — so "use sidebar, bam" still holds while everything else stays
+free. Counts are DISJUNCTIVE (own filter excluded) with label keys, and an
+ES-backed adapter view can simply always ask — there they're ~free.
+
+**`options` — the picker feed.** One more index read shape:
+`{ options: { value: 'id', label: 'name' } }` returns the narrowed,
+SORTED result set (relevance while searching, defaultSort otherwise)
+projected to `[{ value, label }]` — an array, not a hash, because numeric
+object keys lose their order in JS. Both fields must sit under the expose
+ceiling (view permission IS projection permission; `id` always passes).
+Capped at `perPage` (default 50, bounded by maxPerPage). Combine with
+q/filters: a combobox is one call, zero custom endpoints.
 
 **Chart / Metric** — `chartable: ['stage']` + `measures: ['amount']`
 allowlist two aggregation params: `chart: { x, y: 'count'|'sum:F'|'avg:F' }`
@@ -605,7 +619,12 @@ by the declared fields.
 
 **Live signals (the WS plug, plugged)** — `connectEventSource(qc,
 coherenceEdges, '/live')` and every server push fans the same coherence
-edges a local mutation does. SIGNAL-ONLY doctrine: `{ resource, op }`
+edges a local mutation does. **⚠ TENANCY: scope your live channel per
+door/tenant before production.** Even signal-only frames leak ACTIVITY
+metadata ("deals changed, now") — a multi-tenant app must partition the
+stream (per-org channels, auth on subscribe) exactly like any other door.
+The framework seam is tenancy-neutral on purpose; the wire is yours,
+and so is its blast radius. SIGNAL-ONLY doctrine: `{ resource, op }`
 frames, never payloads — refetches carry the truth through the normal
 doors and open forms absorb them via the three-way merge. Verified: a
 shell-side mutation moved a board card, re-drew the chart, and updated
