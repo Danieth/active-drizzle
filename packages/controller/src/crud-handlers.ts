@@ -294,9 +294,9 @@ export async function defaultCreate(
 ): Promise<any> {
   // Record-aware permit on create receives a defaults-draft instance
   const draft = typeof model === 'function' ? new (model as any)({}, true) : undefined
-  const permitted = await sanitizeNestedWrites(
+  const permitted = applyNestedAutoSet(await sanitizeNestedWrites(
     buildPermittedData(rawInput, config.create, ctx, model, ctrl, draft), model,
-  )
+  ), config.create, ctx, ctrl)
   // Scope overrides are applied AFTER permit — they cannot be excluded or overridden
   const record = await model.create({ ...permitted, ...scopeOverrides })
   // ApplicationRecord.create returns the instance even if save failed.
@@ -343,9 +343,9 @@ export async function defaultUpdate(
   // `_event` rides the PATCH but is a state-machine instruction, not a field
   const { _event, ...fields } = rawInput ?? {}
 
-  const permitted = await sanitizeNestedWrites(
+  const permitted = applyNestedAutoSet(await sanitizeNestedWrites(
     buildPermittedData(fields, config.update, ctx, model, ctrl, record), model,
-  )
+  ), config.update, ctx, ctrl)
   for (const [k, v] of Object.entries(permitted)) {
     (record as any)[k] = v
   }
@@ -525,6 +525,50 @@ export async function sanitizeNestedWrites(
     out[key] = sanitizeRows(out[key], meta?.fkField ?? null, meta?.childModel ?? null)
   }
   return out
+}
+
+/**
+ * nestedAutoSet — top-level autoSet's nested sibling, closing the forged-fk
+ * gap on STAGED nested writes (the instant path already autoSets through the
+ * child's own controller):
+ *
+ *   update: { nestedAutoSet: { 'notes.reactions': { userId: (ctx) => ctx.userId } } }
+ *
+ * Paths are association names, dot-separated for depth. Semantics per row:
+ *   - CREATE rows (no id): the field is FORCED from context — client value
+ *     ignored, never trusted
+ *   - UPDATE rows (id present): the field is STRIPPED — immutable through the
+ *     nested path. (Forcing it on update would let touching any existing row
+ *     re-parent it onto the current context — worse than the forgery.)
+ */
+export function applyNestedAutoSet(
+  permitted: Record<string, any>,
+  writeConfig: { nestedAutoSet?: Record<string, Record<string, (ctx: any, ctrl?: any) => any>> } | undefined,
+  ctx: any,
+  ctrl?: any,
+): Record<string, any> {
+  const config = writeConfig?.nestedAutoSet
+  if (!config) return permitted
+  for (const [path, fields] of Object.entries(config)) {
+    const segs = path.split('.')
+    const walk = (rows: any[], depth: number): void => {
+      for (const row of rows) {
+        if (!row || typeof row !== 'object') continue
+        if (depth === segs.length - 1) {
+          for (const [f, fn] of Object.entries(fields)) {
+            if (row.id == null) row[f] = fn(ctx, ctrl)
+            else delete row[f]
+          }
+        } else {
+          const next = row[`${segs[depth + 1]}Attributes`]
+          if (Array.isArray(next)) walk(next, depth + 1)
+        }
+      }
+    }
+    const top = permitted[`${segs[0]}Attributes`]
+    if (Array.isArray(top)) walk(top, 0)
+  }
+  return permitted
 }
 
 function buildPermittedData(

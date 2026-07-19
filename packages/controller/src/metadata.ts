@@ -83,6 +83,17 @@ export interface WriteConfig {
    * }
    */
   autoSet?: Record<string, (ctx: any, ctrl?: any) => any>
+  /**
+   * autoSet for NESTED rows — keys are association-name paths (dots for
+   * depth). Fields are FORCED from context on nested create rows and
+   * STRIPPED (immutable) on nested update rows:
+   *
+   * @example
+   * nestedAutoSet: {
+   *   'notes.reactions': { userId: (ctx) => ctx.userId },
+   * }
+   */
+  nestedAutoSet?: Record<string, Record<string, (ctx: any, ctrl?: any) => any>>
 }
 
 /** Read-side config for @crud get (and singleton get). */
