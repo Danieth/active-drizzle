@@ -1420,13 +1420,6 @@ function emitFormHooks(
   // <Deals.Index><Deals.Search/><Deals.Filters/><Deals.Items>{d => ...}
   // The head is a component: no visible hooks. Filters/search/sort render
   // from the DECLARED index config; the server allowlists everything.
-  if (ctrl.scopes.length !== 0) {
-    // Make the limitation LOUD instead of silent — scoped surfaces are a
-    // known gap (the head component would need scope params threaded)
-    L.push(`// NOTE: no index surface emitted — @scope'd controllers don't get compound`)
-    L.push(`// surface components yet (use the generated hooks + your own layout).`)
-    L.push('')
-  }
   if (ctrl.scopes.length === 0) {
     const idx = ctrl.crudConfig?.index ?? {}
     const filterMetaParts: string[] = []

@@ -619,12 +619,8 @@ by the declared fields.
 
 **Live signals (the WS plug, plugged)** — `connectEventSource(qc,
 coherenceEdges, '/live')` and every server push fans the same coherence
-edges a local mutation does. **⚠ TENANCY: scope your live channel per
-door/tenant before production.** Even signal-only frames leak ACTIVITY
-metadata ("deals changed, now") — a multi-tenant app must partition the
-stream (per-org channels, auth on subscribe) exactly like any other door.
-The framework seam is tenancy-neutral on purpose; the wire is yours,
-and so is its blast radius. SIGNAL-ONLY doctrine: `{ resource, op }`
+edges a local mutation does. The wire is app code — multi-tenant apps
+partition it (per-org channels) the same way they scope every door. SIGNAL-ONLY doctrine: `{ resource, op }`
 frames, never payloads — refetches carry the truth through the normal
 doors and open forms absorb them via the three-way merge. Verified: a
 shell-side mutation moved a board card, re-drew the chart, and updated
