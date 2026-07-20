@@ -176,3 +176,26 @@ describe('<Can> + skeletons', () => {
     expect(list.container.querySelector('[data-ad-skeleton="list"]')!.children).toHaveLength(3)
   })
 })
+
+describe('bug #7 — rows persist through a refetch; isFetching signals it', () => {
+  it('use() exposes isFetching, and placeholder-served rows keep the page from collapsing', () => {
+    const S = createIndexSurface({
+      meta: {},
+      // simulate a filter-change refetch: previous data served as
+      // placeholder (keepPreviousData semantics), isFetching true
+      useIndexQuery: () => ({
+        data: { data: [{ id: 1, name: 'Acme' }], pagination: null },
+        isLoading: false, isError: false, isFetching: true,
+      }),
+      makeRowHandle: () => ({}),
+    })
+    let api: any
+    const Probe = () => { api = (S as any).use(); return null }
+    render(<S.Index><Probe /><S.Empty /></S.Index>)
+    expect(api.rows).toHaveLength(1)           // previous rows still mounted
+    expect(api.isFetching).toBe(true)          // …and the refresh is signalable
+    expect(api.isLoading).toBe(false)
+    // Empty must NOT flash "no results" while placeholder rows show
+    expect(document.querySelector('[data-ad-empty]')).toBeNull()
+  })
+})

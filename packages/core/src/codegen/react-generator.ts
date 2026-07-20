@@ -283,7 +283,7 @@ function generateControllerFile(
     .map(a => ({ name: a.propertyName, handleType: a.kind === 'hasOne' ? 'OneFieldHandle' : 'ArrayFieldHandle' }))
 
   const rqImports: string[] = []
-  if (needsQuery) rqImports.push('useQuery', 'useInfiniteQuery')
+  if (needsQuery) rqImports.push('useQuery', 'useInfiniteQuery', 'keepPreviousData')
   if (needsMutation) rqImports.push('useMutation')
   // Coherence fan-out needs the query client wherever mutations exist
   if (envelopeEnabled || (needsMutation && model)) rqImports.push('useQueryClient')
@@ -876,6 +876,7 @@ function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string, tableName: stri
     L.push(`    index: (params?: ${modelName}SearchState) => useQuery({`)
     L.push(`      queryKey: ${keysRef}!.list(scopes, params),`)
     L.push(`      queryFn:  () => client.${clientKey}.index({ ${scopeSpread}...params }),`)
+    L.push(`      placeholderData: keepPreviousData,   // search/filter changes keep rows mounted`)
     L.push(`    }),`)
     L.push(`    /** Infinite-scroll list. */`)
     L.push(`    infiniteIndex: (params?: Omit<${modelName}SearchState, 'page'>) => useInfiniteQuery({`)
@@ -1485,6 +1486,9 @@ function emitFormHooks(
     L.push(`  useIndexQuery: (params) => { _adQc = useQueryClient(); return useQuery({`)
     L.push(`    queryKey: ${keysName}.list({} as Record<string, never>, params as any),`)
     L.push(`    queryFn: () => client.${clientKey}.index(params as any),`)
+    L.push(`    // a filter change = a NEW query key; without this the previous`)
+    L.push(`    // rows unmount and the page collapses to zero height (bug #7)`)
+    L.push(`    placeholderData: keepPreviousData,`)
     L.push(`  }) },`)
     if (actionMuts.length > 0) {
       L.push(`  makeRowHandle: (row) => createFormHandle(`)

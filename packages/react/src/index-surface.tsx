@@ -250,7 +250,7 @@ function warnScaffold(name: string): void {
 export interface IndexSurfaceConfig {
   meta: IndexMeta
   /** Injected by codegen: the controller's index query hook, fed the wire params. */
-  useIndexQuery: (params: Record<string, any>) => { data: any; isLoading: boolean; isError: boolean }
+  useIndexQuery: (params: Record<string, any>) => { data: any; isLoading: boolean; isError: boolean; isFetching?: boolean }
   /** Row → typed handle (view-mode form handle per row). */
   makeRowHandle: (row: Record<string, any>) => any
   /** Injected by codegen for Surface.One: the generated edit-form hook. */
@@ -279,7 +279,7 @@ export interface IndexSurfaceConfig {
 interface IndexCtx {
   session: IndexSession
   meta: IndexMeta
-  query: { data: any; isLoading: boolean; isError: boolean }
+  query: { data: any; isLoading: boolean; isError: boolean; isFetching?: boolean }
 }
 
 export interface IndexSurface {
@@ -327,7 +327,7 @@ export interface IndexSurface {
   FormSkeleton: FC<{ className?: string }>
   ListSkeleton: FC<{ rows?: number; className?: string }>
   /** Context accessor for custom widgets: session + live query + meta. */
-  use: () => { session: IndexSession; state: IndexState; meta: IndexMeta; rows: any[]; pagination: any; isLoading: boolean }
+  use: () => { session: IndexSession; state: IndexState; meta: IndexMeta; rows: any[]; pagination: any; isLoading: boolean; isFetching: boolean }
   /** Query components from cfg.queries (aggregation @actions), keyed PascalCase. */
   [query: string]: any
 }
@@ -566,6 +566,10 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
       rows: query.data?.data ?? [],
       pagination: query.data?.pagination ?? null,
       isLoading: query.isLoading,
+      // true during a filter/search refetch while PREVIOUS rows stay
+      // mounted (placeholderData) — the "refreshing" affordance signal;
+      // without it the jitter fix would trade a jump for silent staleness
+      isFetching: Boolean(query.isFetching),
     }
   }
 
