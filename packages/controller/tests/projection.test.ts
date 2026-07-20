@@ -31,7 +31,7 @@ const FORM = {
 
 describe('normalizeProjection', () => {
   it('editable is IMPLICITLY viewable — declared once, never repeated', () => {
-    const n = normalizeProjection({ form: FORM })
+    const n = normalizeProjection({ access: FORM })
     // 'name'/'amount' appear only in editable, yet they are visible
     expect([...(n.fields as Set<string>)].sort()).toEqual(['amount', 'name', 'stage'])
     expect([...n.edit].sort()).toEqual(['amount', 'name'])
@@ -42,10 +42,10 @@ describe('normalizeProjection', () => {
   })
 
   it('viewable-only and editable-only nodes are both legal', () => {
-    const viewOnly = normalizeProjection({ form: { viewable: ['a', 'b'] } })
+    const viewOnly = normalizeProjection({ access: { viewable: ['a', 'b'] } })
     expect([...(viewOnly.fields as Set<string>)].sort()).toEqual(['a', 'b'])
     expect([...viewOnly.edit]).toEqual([])
-    const editOnly = normalizeProjection({ form: { editable: ['a'] } })
+    const editOnly = normalizeProjection({ access: { editable: ['a'] } })
     expect([...(editOnly.fields as Set<string>)]).toEqual(['a'])
     expect([...editOnly.edit]).toEqual(['a'])
   })
@@ -64,16 +64,16 @@ describe('normalizeProjection', () => {
   })
 
   it('a node with neither array throws a teaching error naming the shape', () => {
-    expect(() => normalizeProjection({ form: {} }))
+    expect(() => normalizeProjection({ access: {} }))
       .toThrow(/editable and\/or viewable arrays/)
-    expect(() => normalizeProjection({ form: { viewable: ['a'], include: { notes: {} } } }))
+    expect(() => normalizeProjection({ access: { viewable: ['a'], include: { notes: {} } } }))
       .toThrow(/'notes'[\s\S]*editable and\/or viewable/)
   })
 })
 
-describe('@crud desugar — form: populates every legacy reader', () => {
+describe('@crud desugar — access: populates every legacy reader', () => {
   @controller('/loans')
-  @crud(class Loan {} as any, { form: FORM as any })
+  @crud(class Loan {} as any, { access: FORM as any })
   class LoanController {}
 
   it('expose/permit/include derived; node stashed; abilities on', () => {
@@ -88,7 +88,7 @@ describe('@crud desugar — form: populates every legacy reader', () => {
 })
 
 describe('sliceByProjection — the eternal problem, read half', () => {
-  const node = normalizeProjection({ form: FORM })
+  const node = normalizeProjection({ access: FORM })
   const RECORD = {
     id: 1, name: 'Acme loan', amount: '500.00', stage: 'draft',
     secretMargin: 0.44,                                    // root secret
@@ -129,7 +129,7 @@ describe('sliceByProjection — the eternal problem, read half', () => {
 describe('end-to-end: the envelope serves the sliced graph', () => {
   it('a form-declared door envelope carries sliced children at every depth', () => {
     @controller('/loans2')
-    @crud(class Loan2 {} as any, { form: FORM as any })
+    @crud(class Loan2 {} as any, { access: FORM as any })
     class Loan2Controller {}
     const cfg: any = getCrudMeta(Loan2Controller)!.config
 

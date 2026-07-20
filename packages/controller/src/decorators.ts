@@ -56,13 +56,14 @@ export function crud<TModel extends new (...args: any[]) => any>(
   config: CrudConfig = {},
 ) {
   return function (target: any) {
-    // Projection-tree desugar (DESIGN-projections P1): a `form:` node is
-    // the ONE declaration; expose/permit/include are derived from it so
-    // every existing reader keeps working. The normalized node rides the
-    // config for the read-slicer (and P2/P3 later).
+    // Access-ceiling desugar (DESIGN-projections): `access:` is the ONE
+    // declaration of what this door may show/change; expose/permit/include
+    // are derived from it so every existing reader keeps working. The
+    // normalized ceiling rides the config for the read-slicer — and for
+    // SHAPES later, which resolve subsets against it.
     const node = normalizeProjection(config)
     let cfg: any = config
-    if ((config as any).form) {
+    if ((config as any).access) {
       const fields = node.fields === '*' ? [] : [...node.fields]
       cfg = {
         ...config,

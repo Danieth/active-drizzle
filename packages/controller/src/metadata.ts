@@ -201,19 +201,24 @@ export interface GetConfig {
 
 export interface CrudConfig {
   /**
-   * THE projection tree (DESIGN-projections.md) — slice + editability +
-   * includes as one recursive declaration. When present it desugars into
-   * expose/permit/include; explicit expose/permit/include beside it win
-   * per-key. Pair with the generated `satisfies XProjection` types so
-   * every field/association is typo-proof at the keystroke.
+   * THE ACCESS CEILING (DESIGN-projections.md) — what this door may ever
+   * show or change, and the whole graph it may reach, declared ONCE with
+   * recursive per-level access. `editable` is implicitly viewable; a
+   * field in neither list does not exist on this door.
    *
-   *   form: {
-   *     fields: { name: 'edit', stage: 'view' },
-   *     include: { notes: { fields: { body: 'edit' },
-   *                include: { sentiments: { fields: { label: 'view', score: 'edit' } } } } },
-   *   }
+   *   access: {
+   *     editable: ['name', 'amount'],
+   *     viewable: ['stage'],
+   *     include: { notes: { editable: ['body'], viewable: ['position'],
+   *                include: { sentiments: { editable: ['score'], viewable: ['label'] } } } },
+   *   } satisfies LoanProjection
+   *
+   * Desugars into expose/permit/include (explicit ones beside it win
+   * per-key). SHAPES — what a given route actually loads and sends — are
+   * a separate concern that only ever picks SUBSETS of this ceiling and
+   * never restates access.
    */
-  form?: import('./projection.js').ProjectionNode
+  access?: import('./projection.js').ProjectionNode
   index?: IndexConfig
   /**
    * Dynamically scope all CRUD queries using resolved controller state.

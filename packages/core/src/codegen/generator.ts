@@ -561,10 +561,10 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta, sr
   lines.push(`;(_${model.className} as any).Client = ${model.className}Client`);
   lines.push('');
 
-  // ── Projection type (DESIGN-projections P1) ────────────────────────────
+  // ── Ceiling type (DESIGN-projections) ──────────────────────────────────
   // Every field name + association key as literal types, RECURSIVELY —
-  // `form: { … } satisfies ${'{'}Model{'}'}Projection` makes a typo'd field or a
-  // nonexistent association a red squiggle at any depth of the tree.
+  // `access: { … } satisfies ${'{'}Model{'}'}Projection` makes a typo'd field or a
+  // nonexistent association a red squiggle at any depth of the ceiling.
   {
     const fieldNames = new Set<string>();
     for (const col of table?.columns ?? []) fieldNames.add(col.name);
@@ -587,7 +587,7 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta, sr
     }
     for (const imp of [...new Set(projImports)]) lines.push(imp);
     lines.push('');
-    lines.push(`/** Projection-tree config type — \`form: { editable: [...], viewable: [...], include: {...} } satisfies ${model.className}Projection\`; every field name and association key is typo-proof at any depth. */`);
+    lines.push(`/** Access-ceiling config type — \`access: { editable: [...], viewable: [...], include: {...} } satisfies ${model.className}Projection\`; every field name and association key is typo-proof at any depth. */`);
     lines.push(`export interface ${model.className}Projection {`);
     lines.push(`  /** Writable — implicitly viewable too. */`);
     lines.push(`  editable?: Array<${fieldUnion}>`);

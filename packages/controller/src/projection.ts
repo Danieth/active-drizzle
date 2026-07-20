@@ -1,10 +1,13 @@
 /**
- * The projection tree — DESIGN-projections.md P1 (read half).
+ * The ACCESS CEILING — DESIGN-projections.md (read half).
  *
- * ONE concept for what-is-visible / what-is-editable / what-comes-along,
- * recursively at every level of the record graph:
+ * The door's maximum: what may ever be seen, what may ever be changed,
+ * and the whole graph it may reach — recursively, declared ONCE on
+ * @crud. SHAPES (what a route actually loads/sends) are a separate
+ * concern layered on top; a shape only picks SUBSETS of this ceiling and
+ * never restates access, so editability can never drift per shape.
  *
- *   form: {
+ *   access: {
  *     editable: ['name', 'amount'],          // implicitly viewable
  *     viewable: ['stage'],
  *     include: { notes: { editable: ['body'], viewable: ['position'],
@@ -12,7 +15,7 @@
  *   }
  *
  * Integration strategy (why the mega refactor isn't a big bang):
- *   - `@crud` DESUGARS `form:` into expose/permit/include at decoration
+ *   - `@crud` DESUGARS `access:` into expose/permit/include at decoration
  *     time, so every existing reader (envelope, sanitize, index, search
  *     ceilings, codegen) keeps working with zero changes.
  *   - The normalized node rides the config; the ONLY new runtime is
@@ -26,9 +29,9 @@
 export type Access = 'edit' | 'view'
 
 /**
- * A projection node, DRY form: two arrays and a rule — anything editable
- * is implicitly viewable. A field in neither list does not exist in this
- * projection. Recursive through include.
+ * A ceiling node: two arrays and a rule — anything editable is implicitly
+ * viewable. A field in neither list does not exist on this door.
+ * Recursive through include, so nested levels carry their own access.
  */
 export interface ProjectionNode {
   /** Fields the client may WRITE (implicitly viewable). */
@@ -39,12 +42,12 @@ export interface ProjectionNode {
   include?: Record<string, ProjectionNode>
 }
 
-/** Runtime-normalized node. fields === '*' means legacy whole-row. */
+/** Runtime-normalized ceiling node. fields === '*' means legacy whole-row. */
 export interface NormalizedNode {
   fields: Set<string> | '*'
   edit: Set<string>
   include: Record<string, NormalizedNode>
-  /** True when declared via `form:` — slicing only activates then;
+  /** True when declared via `access:` — slicing only activates then;
    *  desugared legacy configs stay byte-identical (their index/get
    *  include sets may legitimately differ). */
   explicit?: boolean
@@ -92,11 +95,11 @@ function fromIncludeSpecs(specs: any[]): Record<string, NormalizedNode> {
 }
 
 /**
- * Normalize whatever the config declares into ONE node.
- * `form:` wins; otherwise expose/permit/include desugar losslessly.
+ * Normalize whatever the config declares into ONE ceiling node.
+ * `access:` wins; otherwise expose/permit/include desugar losslessly.
  */
 export function normalizeProjection(config: any): NormalizedNode {
-  if (config?.form) return fromExplicit(config.form as ProjectionNode, '')
+  if (config?.access) return fromExplicit(config.access as ProjectionNode, '')
   const expose: string[] | undefined = config?.get?.expose
   const permitRaw = config?.update?.permit
   const permit = Array.isArray(permitRaw) ? permitRaw : []   // permit FNS stay with the envelope machinery
