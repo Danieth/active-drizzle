@@ -587,9 +587,12 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta, sr
     }
     for (const imp of [...new Set(projImports)]) lines.push(imp);
     lines.push('');
-    lines.push(`/** Projection-tree config type — use \`form: { … } satisfies ${model.className}Projection\` on the controller for keystroke-level typo-proofing at every depth. */`);
+    lines.push(`/** Projection-tree config type — \`form: { editable: [...], viewable: [...], include: {...} } satisfies ${model.className}Projection\`; every field name and association key is typo-proof at any depth. */`);
     lines.push(`export interface ${model.className}Projection {`);
-    lines.push(`  fields: Partial<Record<${fieldUnion}, 'edit' | 'view'>>`);
+    lines.push(`  /** Writable — implicitly viewable too. */`);
+    lines.push(`  editable?: Array<${fieldUnion}>`);
+    lines.push(`  /** Read-only. */`);
+    lines.push(`  viewable?: Array<${fieldUnion}>`);
     if (assocEntries.length) {
       lines.push(`  include?: { ${assocEntries.join('; ')} }`);
     } else {

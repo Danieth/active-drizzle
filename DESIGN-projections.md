@@ -21,49 +21,57 @@ included children as all-or-nothing rows. GraphQL solves only #1+#3
 only #2 (writes, via nested permit). Nobody unifies all four with types
 and UI masks — we can, because we own every layer.
 
-## The one concept
+## The one concept — two arrays and a rule
 
 ```ts
-type Access = 'edit' | 'view'
-
 interface ProjectionNode {
-  /** Slice + editability in ONE map. Absent field = does not exist here. */
-  fields: Record<string, Access>
-  /** Recursive: each included association is itself a sliced node. */
+  /** Writable — IMPLICITLY viewable (the rule; never repeat a name). */
+  editable?: string[]
+  /** Read-only. */
+  viewable?: string[]
+  /** Recursive: each included association is itself a node. */
   include?: Record<string, ProjectionNode>
-  /** Optional record/ctx-aware NARROWING (may only downgrade/remove). */
-  narrow?: (ctx, record) => Partial<Record<string, Access | null>>
 }
 ```
 
-A controller declares one **canonical form node** (the envelope + the
-write surface) and optionally named **read views** (reductions):
+A field in neither array does not exist in this projection. One
+declaration per door — the SECURITY layer, "what this door allows":
 
 ```ts
 @crud(Loan, {
   form: {
-    fields: { name: 'edit', amount: 'edit', stage: 'view' },
+    editable: ['name', 'amount'],
+    viewable: ['stage'],
     include: {
       notes: {
-        fields: { body: 'edit', position: 'view' },
+        editable: ['body'],
+        viewable: ['position'],
         include: {
-          sentiments: { fields: { label: 'view', score: 'edit' } },   // Daniel's slice:
-        },                                                            // see 2 fields, edit 1
+          sentiments: { editable: ['score'], viewable: ['label'] },   // see 2, edit 1
+        },
       },
     },
-  },
-  views: {
-    card: { fields: { name: 'view', amount: 'view' } },   // read-only reductions
-  },
-  index: { /* unchanged; its row shape is just another view */ },
+  } satisfies LoanProjection,
 })
 ```
 
-**What it subsumes** (these become sugar that desugars into the tree):
-`expose` = keys of `fields`; `permit` = keys marked `'edit'`; `include` =
-the include tree (legacy form = node with all fields, plus a codegen
-nudge toward slicing); nested write rules = `'edit'` marks inside child
-nodes; per-record permit fns = `narrow`.
+Why arrays over a per-field access map: the map repeats every field name
+against a literal, reads as noise at depth, and cannot express
+"editable implies viewable" — the rule has to be re-typed per field.
+Arrays state each name ONCE, and TS even offers did-you-mean on array
+elements (verified) where map keys only got "not assignable".
+
+**What it subsumes** (sugar that desugars into the tree): `expose` =
+editable ∪ viewable; `permit` = editable; `include` = the include tree
+(legacy include = whole-row node); nested write rules = `editable`
+inside child nodes. Per-record permit FUNCTIONS stay as they are — the
+tree is the static ceiling, functions narrow within it.
+
+**NAMED VIEWS ARE NOT PART OF THIS.** A later, entirely separate
+concept (`@projection('$card') { fields, includes }` selecting a SUBSET
+of the door's tree — never new fields, never new editability). Deferred
+until a real consumer hits the union wall; the tree ships alone and is
+complete without it.
 
 ## Type safety — the part that must be EXPLICIT
 
@@ -73,7 +81,8 @@ Two belts, both required:
    `@gen/models`:
    ```ts
    export interface LoanProjection {
-     fields: Partial<Record<'name' | 'amount' | 'stage' | …, Access>>
+     editable?: Array<'name' | 'amount' | 'stage' | …>
+     viewable?: Array<'name' | 'amount' | 'stage' | …>
      include?: { notes?: NoteProjection; company?: CompanyProjection }
    }
    ```
@@ -134,7 +143,7 @@ Compat rule: `expose`/`permit`/`include` DESUGAR into the form node —
 every existing app keeps working untouched; new syntax opts into
 narrowness.
 
-- **P1 — types + read slices** — **BUILT** (2026-07-20): ProjectionNode/
+- **P1 — types + read slices** — **BUILT** (2026-07-20, DRY syntax): ProjectionNode/
   normalizeProjection/sliceByProjection in the controller package; @crud
   desugars `form:` into expose/permit/include at decoration time (all
   legacy readers untouched; legacy configs normalize non-explicit and the
@@ -150,8 +159,11 @@ narrowness.
   sessions consume their node; recursive write sanitize. Runtime:
   sanitizer + react session/handle plumbing (seats already exist).
   Medium-large.
-- **P3 — named views + artifacts**: `?view=` param, per-view cache
-  families + generated hooks/handles. Codegen-heavy, runtime-light.
+- **P3 — named views (`@projection`) + artifacts**: DEFERRED, not
+  scheduled. A subset-selector over the door's tree (`?view=` param,
+  per-view cache families, generated hooks/handles). Only when a
+  consumer actually hits the union wall — the tree is complete without
+  it.
 - Each phase ships alone; nothing breaks between phases.
 
 ## Refused, permanently

@@ -5,9 +5,10 @@
  * recursively at every level of the record graph:
  *
  *   form: {
- *     fields: { name: 'edit', stage: 'view' },
- *     include: { notes: { fields: { body: 'edit', position: 'view' },
- *                         include: { sentiments: { fields: { label: 'view', score: 'edit' } } } } },
+ *     editable: ['name', 'amount'],          // implicitly viewable
+ *     viewable: ['stage'],
+ *     include: { notes: { editable: ['body'], viewable: ['position'],
+ *                include: { sentiments: { editable: ['score'], viewable: ['label'] } } } },
  *   }
  *
  * Integration strategy (why the mega refactor isn't a big bang):
@@ -24,10 +25,16 @@
 
 export type Access = 'edit' | 'view'
 
+/**
+ * A projection node, DRY form: two arrays and a rule — anything editable
+ * is implicitly viewable. A field in neither list does not exist in this
+ * projection. Recursive through include.
+ */
 export interface ProjectionNode {
-  /** Slice + editability in ONE map. A field absent from the map does
-   *  not exist in this projection. */
-  fields: Record<string, Access>
+  /** Fields the client may WRITE (implicitly viewable). */
+  editable?: string[]
+  /** Fields the client may only READ. */
+  viewable?: string[]
   /** Recursive: each included association is itself a sliced node. */
   include?: Record<string, ProjectionNode>
 }
@@ -47,23 +54,17 @@ export interface NormalizedNode {
 export const PROJECTION_NODE = Symbol('ad:projection')
 
 function fromExplicit(node: ProjectionNode, path: string): NormalizedNode {
-  if (!node || typeof node !== 'object' || !node.fields || typeof node.fields !== 'object') {
+  const at = path || '<root>'
+  if (!node || typeof node !== 'object'
+      || (!Array.isArray(node.editable) && !Array.isArray(node.viewable))) {
     throw new Error(
-      `[active-drizzle] projection node at '${path || '<root>'}' needs a fields map — ` +
-      `{ fields: { name: 'edit' | 'view', … }, include?: { assoc: <node> } }`,
+      `[active-drizzle] projection node at '${at}' needs editable and/or viewable arrays — ` +
+      `{ editable?: ['a'], viewable?: ['b'], include?: { assoc: <node> } } (editable is implicitly viewable)`,
     )
   }
-  const fields = new Set<string>()
-  const edit = new Set<string>()
-  for (const [f, access] of Object.entries(node.fields)) {
-    if (access !== 'edit' && access !== 'view') {
-      throw new Error(
-        `[active-drizzle] projection field '${path}${path ? '.' : ''}${f}' has access '${String(access)}' — use 'edit' or 'view'`,
-      )
-    }
-    fields.add(f)
-    if (access === 'edit') edit.add(f)
-  }
+  const edit = new Set<string>(node.editable ?? [])
+  // THE rule: editable ⊆ viewable, by construction — declared once, never repeated
+  const fields = new Set<string>([...(node.viewable ?? []), ...edit])
   const include: Record<string, NormalizedNode> = {}
   for (const [name, child] of Object.entries(node.include ?? {})) {
     include[name] = fromExplicit(child, path ? `${path}.${name}` : name)

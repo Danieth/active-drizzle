@@ -13,27 +13,41 @@ import { controller, crud } from '../src/decorators.js'
 import { getCrudMeta } from '../src/metadata.js'
 import { buildRecordEnvelope } from '../src/crud-handlers.js'
 
+// The DRY declaration: two arrays + the rule (editable is implicitly
+// viewable), recursive through include.
 const FORM = {
-  fields: { name: 'edit', amount: 'edit', stage: 'view' },
+  editable: ['name', 'amount'],
+  viewable: ['stage'],
   include: {
     notes: {
-      fields: { body: 'edit', position: 'view' },
+      editable: ['body'],
+      viewable: ['position'],
       include: {
-        sentiments: { fields: { label: 'view', score: 'edit' } },
+        sentiments: { editable: ['score'], viewable: ['label'] },
       },
     },
   },
 } as const
 
 describe('normalizeProjection', () => {
-  it('explicit form → sliced nodes, edit sets, explicit flag', () => {
+  it('editable is IMPLICITLY viewable — declared once, never repeated', () => {
     const n = normalizeProjection({ form: FORM })
+    // 'name'/'amount' appear only in editable, yet they are visible
     expect([...(n.fields as Set<string>)].sort()).toEqual(['amount', 'name', 'stage'])
     expect([...n.edit].sort()).toEqual(['amount', 'name'])
     expect(n.explicit).toBe(true)
     const sentiments = n.include['notes']!.include['sentiments']!
     expect([...(sentiments.fields as Set<string>)].sort()).toEqual(['label', 'score'])
     expect([...sentiments.edit]).toEqual(['score'])
+  })
+
+  it('viewable-only and editable-only nodes are both legal', () => {
+    const viewOnly = normalizeProjection({ form: { viewable: ['a', 'b'] } })
+    expect([...(viewOnly.fields as Set<string>)].sort()).toEqual(['a', 'b'])
+    expect([...viewOnly.edit]).toEqual([])
+    const editOnly = normalizeProjection({ form: { editable: ['a'] } })
+    expect([...(editOnly.fields as Set<string>)]).toEqual(['a'])
+    expect([...editOnly.edit]).toEqual(['a'])
   })
 
   it('legacy expose/permit/include desugars losslessly (non-explicit, * children)', () => {
@@ -49,11 +63,11 @@ describe('normalizeProjection', () => {
     expect(n.include['brief']!.fields).toBe('*')
   })
 
-  it('bad access values and field-less nodes throw teaching errors', () => {
-    expect(() => normalizeProjection({ form: { fields: { name: 'writable' } } }))
-      .toThrow(/'edit' or 'view'/)
-    expect(() => normalizeProjection({ form: { fields: { a: 'view' }, include: { notes: {} } } }))
-      .toThrow(/needs a fields map/)
+  it('a node with neither array throws a teaching error naming the shape', () => {
+    expect(() => normalizeProjection({ form: {} }))
+      .toThrow(/editable and\/or viewable arrays/)
+    expect(() => normalizeProjection({ form: { viewable: ['a'], include: { notes: {} } } }))
+      .toThrow(/'notes'[\s\S]*editable and\/or viewable/)
   })
 })
 
