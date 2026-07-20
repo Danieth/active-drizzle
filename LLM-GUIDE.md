@@ -101,6 +101,31 @@ Files you edit: `server/db/schema.ts`, `server/models/*.model.ts`,
 Files you NEVER edit: everything in `.gen/` (rebuilt on save; gitignored).
 `_client.ts` (controllers dir) is user-owned wiring — created once, yours.
 
+## 0.6 PROJECTION IDENTITY (the anti-GraphQL law)
+
+**One door = one shape = one cache identity.** A controller's GET always
+returns the same silhouette — `get.include` is DECLARED on the door,
+never requested by the client. No per-request relation expansion, ever:
+client-varied shapes are the partial-record trap (fragmented caches or an
+Apollo-grade normalized store). Corollaries:
+- A form structurally cannot touch a relation its door doesn't serve —
+  handle members are GENERATED from the door's declarations; needing a
+  new relation = declare it on the controller (envelope, cache, types,
+  and form members update atomically).
+- The SAME model through TWO doors = two projections, both correct,
+  NEVER blended: a picker (target model's door) contributes an ID and
+  only an id; nested-form VALUES always come from the owning door's
+  envelope. Foreign projections contribute identity, never fields.
+- A door too heavy for a light consumer → make ANOTHER door (projection
+  controllers are cheap; projections only reduce). Doors are picked,
+  fields are not.
+- hasOne: "create new child" = nested attributes through the OWNER's
+  door; "attach existing" = a write to the CHILD (its fk) through
+  whichever door serves it, picker-fed via the `options` param. Two
+  writes, two doors — don't blur them into one widget.
+- Coherence across doors is automatic: edges are MODEL-keyed, so a write
+  through either door invalidates every family that serves the model.
+
 ## 1. Model DSL
 
 ```ts
