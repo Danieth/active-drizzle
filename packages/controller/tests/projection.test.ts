@@ -153,3 +153,162 @@ describe('end-to-end: the envelope serves the sliced graph', () => {
     expect(env.abilities).toMatchObject({ name: 'edit', amount: 'edit', stage: 'view' })
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────────
+// The parts that would HURT if they silently broke: the ceiling is a
+// permission boundary, and legacy doors must stay byte-identical.
+// ─────────────────────────────────────────────────────────────────────────
+
+import { vi } from 'vitest'
+import { defaultUpdate } from '../src/crud-handlers.js'
+
+describe('SECURITY — viewable is NOT editable', () => {
+  @controller('/sec')
+  @crud(class Sec {} as any, { access: FORM as any })
+  class SecController {}
+  const cfg: any = getCrudMeta(SecController)!.config
+
+  it('a viewable-only field never reaches the write permits', () => {
+    // 'stage' is declared viewable, never editable — it must be readable
+    // and un-writable through BOTH write paths
+    expect(cfg.get.expose).toContain('stage')
+    expect(cfg.update.permit).not.toContain('stage')
+    expect(cfg.create.permit).not.toContain('stage')
+  })
+
+  it('defaultUpdate STRIPS a viewable-only field and reports it', async () => {
+    const record: any = {
+      id: 1, name: 'before', stage: 'draft',
+      save: vi.fn().mockResolvedValue(true), errors: {},
+      toJSON({ only }: { only: string[] }) {
+        const o: any = {}
+        for (const k of only) if (k in this) o[k] = (this as any)[k]
+        return o
+      },
+    }
+    const relation: any = { where: () => ({ first: async () => record }) }
+
+    await defaultUpdate(
+      relation, { name: 'Sec' } as any, cfg, 1,
+      { name: 'after', stage: 'won' },          // 'stage' is a forged write
+      {}, { state: {} },
+    )
+
+    expect(record.name).toBe('after')            // editable → written
+    expect(record.stage).toBe('draft')           // viewable-only → STRIPPED
+  })
+})
+
+describe('the NESTED-WRITE boundary (documented, not assumed)', () => {
+  // Nested `editable` currently means "in the read slice". It does NOT yet
+  // grant nested WRITE permission — that is the edit half (P3). Encoding
+  // the boundary here so nobody mistakes the declaration for enforcement,
+  // and so P3 has an exact test to flip.
+  //
+  // NOTE: the naive "fix" (auto-permitting `<assoc>Attributes`) would be a
+  // SECURITY REGRESSION until P3 lands — it would open the whole child row
+  // (authorSsn included), because per-field nested enforcement is P3's job.
+  @controller('/nested')
+  @crud(class N {} as any, { access: FORM as any })
+  class NController {}
+  const cfg: any = getCrudMeta(NController)!.config
+
+  it('nested editable does NOT auto-permit <assoc>Attributes (P3 flips this)', () => {
+    expect(cfg.update.permit).toEqual(expect.arrayContaining(['name', 'amount']))
+    expect(cfg.update.permit).not.toContain('notesAttributes')
+  })
+
+  it('…but nested fields ARE read-sliced today (the read half works)', () => {
+    const node = normalizeProjection({ access: FORM })
+    const out = sliceByProjection(
+      { id: 1, notes: [{ id: 7, body: 'b', position: 0, authorSsn: 'SECRET' }] },
+      node,
+    )
+    expect(out.notes[0]).toEqual({ id: 7, body: 'b', position: 0 })
+  })
+})
+
+describe('desugar precedence — explicit keys beside access: win per-key', () => {
+  it('hand-written expose/permit/include are NOT overwritten by the ceiling', () => {
+    @controller('/prec')
+    @crud(class P {} as any, {
+      access: FORM as any,
+      get: { expose: ['name'], include: ['brief'] } as any,
+      update: { permit: ['name'] } as any,
+    })
+    class PController {}
+    const cfg: any = getCrudMeta(PController)!.config
+    expect(cfg.get.expose).toEqual(['name'])          // explicit wins
+    expect(cfg.get.include).toEqual(['brief'])        // explicit wins
+    expect(cfg.update.permit).toEqual(['name'])       // explicit wins
+    expect(cfg.create.permit.sort()).toEqual(['amount', 'name'])  // absent → derived
+  })
+})
+
+describe('COMPAT — a legacy door is byte-identical (slicer is a no-op)', () => {
+  it('legacy expose/include keeps WHOLE child rows, secrets and all', () => {
+    @controller('/legacy')
+    @crud(class L {} as any, {
+      get: { expose: ['id', 'name'], include: ['notes'], abilities: true },
+      update: { permit: ['name'] },
+    } as any)
+    class LController {}
+    const cfg: any = getCrudMeta(LController)!.config
+
+    const record: any = {
+      id: 1, name: 'n', secretMargin: 9,
+      notes: [{ id: 7, body: 'b', authorSsn: 'STILL-HERE' }],
+      toJSON({ only }: { only: string[] }) {
+        const o: any = { }
+        for (const k of only) if (k in this) o[k] = (this as any)[k]
+        if ('notes' in this) o.notes = (this as any).notes
+        return o
+      },
+    }
+    const env = buildRecordEnvelope(record, { name: 'L' } as any, cfg, {}, {})
+    // The legacy contract: expose gates the ROOT, children come whole.
+    // (That is exactly what `access:` exists to fix — but old doors must
+    // not change behavior underneath a running app.)
+    expect(env.record.notes[0].authorSsn).toBe('STILL-HERE')
+    expect(env.record.secretMargin).toBeUndefined()   // root ceiling still applies
+  })
+})
+
+describe('slicer robustness', () => {
+  const node = normalizeProjection({ access: FORM })
+
+  it('a custom primary key survives even when undeclared', () => {
+    const out = sliceByProjection({ uuid: 'abc', name: 'n', secret: 1 }, node, 'uuid')
+    expect(out).toEqual({ uuid: 'abc', name: 'n' })
+  })
+
+  it('declared-but-absent fields are NOT invented as undefined keys', () => {
+    const out = sliceByProjection({ id: 1, name: 'n' }, node)
+    expect(Object.keys(out).sort()).toEqual(['id', 'name'])
+    expect('amount' in out).toBe(false)
+  })
+
+  it('slices an ARRAY at the root (the index shape)', () => {
+    const rows = [
+      { id: 1, name: 'a', secretMargin: 1 },
+      { id: 2, name: 'b', secretMargin: 2 },
+    ]
+    expect(sliceByProjection(rows, node)).toEqual([{ id: 1, name: 'a' }, { id: 2, name: 'b' }])
+  })
+
+  it('a ceiling child absent from the data does not appear or crash', () => {
+    const out = sliceByProjection({ id: 1, name: 'n' }, node)
+    expect('notes' in out).toBe(false)
+  })
+
+  it('primitives and null pass through untouched', () => {
+    expect(sliceByProjection(null, node)).toBeNull()
+    expect(sliceByProjection(42, node)).toBe(42)
+  })
+
+  it('a malformed node names its FULL path in the teaching error', () => {
+    expect(() => normalizeProjection({
+      access: { viewable: ['a'], include: { notes: { viewable: ['b'], include: { sentiments: {} } } } },
+    })).toThrow(/'notes\.sentiments'/)
+  })
+})

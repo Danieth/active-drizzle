@@ -153,9 +153,11 @@ narrowness.
   changes is WHO declares what: `form:` becomes the ceiling at @crud's
   top level (editable/viewable/include), and slicing is driven by a
   SHAPE subset resolved against it.
-- **P2 — shapes**: `fields`/`include` subsets on get/index + the
-  `@projection` decorator; per-shape route, generated hook/handle, cache
-  family; refusal of access vocabulary inside a shape (types + regen).
+- **P2 — shapes: PARKED, do not build** (Daniel, 2026-07-20: "let's just
+  not do shapes unless we have to"). `index`/`get` already differ in
+  include today and that has been sufficient. Build ONLY when a real
+  consumer needs a third shape on one door — and the ceiling is designed
+  so it stays additive whenever that day comes.
 - **P3 — the edit half**: tree-shaped abilities on the wire (from the
   CEILING), child sessions consuming their node, recursive write
   sanitize. Unchanged in substance from before; it reads the ceiling,
