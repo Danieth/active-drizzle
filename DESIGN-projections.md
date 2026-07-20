@@ -21,57 +21,59 @@ included children as all-or-nothing rows. GraphQL solves only #1+#3
 only #2 (writes, via nested permit). Nobody unifies all four with types
 and UI masks — we can, because we own every layer.
 
-## The one concept — two arrays and a rule
+## The one concept — CEILING vs SHAPES (corrected 2026-07-20)
+
+P1 fused two concerns into one `form:` tree: what may be edited/viewed
+(SECURITY) and what gets loaded/sent (SHAPE). That fusion is why a second
+shape looked like a mega-refactor — every shape would re-declare access
+at every level. They are separate, and only one of them is recursive
+about access:
+
+**`@crud` = THE CEILING.** Access + the whole graph, declared ONCE.
+`editable` implies viewable; a field in neither array does not exist on
+this door; nested levels carry their own access.
 
 ```ts
-interface ProjectionNode {
-  /** Writable — IMPLICITLY viewable (the rule; never repeat a name). */
-  editable?: string[]
-  /** Read-only. */
-  viewable?: string[]
-  /** Recursive: each included association is itself a node. */
-  include?: Record<string, ProjectionNode>
-}
-```
-
-A field in neither array does not exist in this projection. One
-declaration per door — the SECURITY layer, "what this door allows":
-
-```ts
-@crud(Loan, {
-  form: {
-    editable: ['name', 'amount'],
-    viewable: ['stage'],
-    include: {
-      notes: {
-        editable: ['body'],
-        viewable: ['position'],
-        include: {
-          sentiments: { editable: ['score'], viewable: ['label'] },   // see 2, edit 1
-        },
-      },
-    },
-  } satisfies LoanProjection,
+@crud(Deal, {
+  editable: ['name', 'amount', 'contactEmail'],
+  viewable: ['stage', 'updatedAt'],
+  include: {
+    notes:   { editable: ['body'], viewable: ['position'],
+               include: { sentiments: { editable: ['score'], viewable: ['label'] } } },
+    company: { viewable: ['name'] },
+  },
+  index: { fields: ['name', 'stage'], include: { company: ['name'] }, sortable: [...] },
+  get:   { /* omitted = the whole ceiling */ },
 })
 ```
 
-Why arrays over a per-field access map: the map repeats every field name
-against a literal, reads as noise at depth, and cannot express
-"editable implies viewable" — the rule has to be re-typed per field.
-Arrays state each name ONCE, and TS even offers did-you-mean on array
-elements (verified) where map keys only got "not assignable".
+**Shapes = SUBSETS of the ceiling, never access.** `index` and `get` were
+always the two built-in shapes (own routes, own cache families); named
+ones are the same thing with a name:
 
-**What it subsumes** (sugar that desugars into the tree): `expose` =
-editable ∪ viewable; `permit` = editable; `include` = the include tree
-(legacy include = whole-row node); nested write rules = `editable`
-inside child nodes. Per-record permit FUNCTIONS stay as they are — the
-tree is the static ceiling, functions narrow within it.
+```ts
+@projection('card', { fields: ['name', 'amount'] })
+@projection('feed', { fields: ['name'], include: { notes: ['body'] } })
+```
 
-**NAMED VIEWS ARE NOT PART OF THIS.** A later, entirely separate
-concept (`@projection('$card') { fields, includes }` selecting a SUBSET
-of the door's tree — never new fields, never new editability). Deferred
-until a real consumer hits the union wall; the tree ships alone and is
-complete without it.
+Rules that make this safe and cheap:
+- A shape may only REDUCE the ceiling (unknown field/assoc, or one the
+  ceiling omits → compile error via generated types + regen error).
+- A shape NEVER says editable/viewable. Editability is inherited from the
+  ceiling, so it can never drift per-shape. `fields: [...]` +
+  `include: { assoc: [...] | <subset> }` is the entire vocabulary.
+- Each shape gets its OWN route and its own generated hook/handle
+  (`useDealCard`), and its own cache family. Model-keyed coherence
+  invalidates every shape of a model together — unchanged.
+- **All writes go to ONE place**: the ceiling's write surface. Shapes are
+  read concerns; there is exactly one form/validation/permit path per
+  door regardless of how many shapes exist.
+
+**What it subsumes:** `expose` = viewable ∪ editable; `permit` =
+editable; `include` = the ceiling's include tree; nested write rules =
+`editable` inside child ceiling nodes; `get.include`/`index.include` =
+shape subsets. Per-record permit FUNCTIONS still narrow within the
+ceiling at runtime.
 
 ## Type safety — the part that must be EXPLICIT
 
@@ -143,28 +145,21 @@ Compat rule: `expose`/`permit`/`include` DESUGAR into the form node —
 every existing app keeps working untouched; new syntax opts into
 narrowness.
 
-- **P1 — types + read slices** — **BUILT** (2026-07-20, DRY syntax): ProjectionNode/
-  normalizeProjection/sliceByProjection in the controller package; @crud
-  desugars `form:` into expose/permit/include at decoration time (all
-  legacy readers untouched; legacy configs normalize non-explicit and the
-  slicer is a strict no-op — 245 controller tests unchanged); recursive
-  read-slice active at all three serialization sites for explicit trees
-  (root secret + child secret + grandchild secret all sliced — tested
-  end-to-end through a real envelope); codegen emits recursive
-  `XProjection` types into @gen/models (probed: typo'd field /
-  nonexistent assoc / bad access = 3/3 compile errors, valid tree clean).
-  Remaining P1.5: regen-time validator tree-walk (second belt behind
-  `satisfies`) — needs the deep AST config parse.
-- **P2 — the edit half**: tree-shaped abilities on the wire; child
-  sessions consume their node; recursive write sanitize. Runtime:
-  sanitizer + react session/handle plumbing (seats already exist).
-  Medium-large.
-- **P3 — named views (`@projection`) + artifacts**: DEFERRED, not
-  scheduled. A subset-selector over the door's tree (`?view=` param,
-  per-view cache families, generated hooks/handles). Only when a
-  consumer actually hits the union wall — the tree is complete without
-  it.
-- Each phase ships alone; nothing breaks between phases.
+- **P1 — BUILT, needs RESHAPING** (2026-07-20): ProjectionNode /
+  normalizeProjection / sliceByProjection / @crud desugar / recursive
+  read-slice at all three serialization sites / generated XProjection
+  types all exist and WORK — but they were built around the fused
+  `form:` tree. The machinery is shape-mechanics and survives; what
+  changes is WHO declares what: `form:` becomes the ceiling at @crud's
+  top level (editable/viewable/include), and slicing is driven by a
+  SHAPE subset resolved against it.
+- **P2 — shapes**: `fields`/`include` subsets on get/index + the
+  `@projection` decorator; per-shape route, generated hook/handle, cache
+  family; refusal of access vocabulary inside a shape (types + regen).
+- **P3 — the edit half**: tree-shaped abilities on the wire (from the
+  CEILING), child sessions consuming their node, recursive write
+  sanitize. Unchanged in substance from before; it reads the ceiling,
+  not the shape.
 
 ## Refused, permanently
 
