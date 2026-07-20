@@ -101,42 +101,14 @@ Files you edit: `server/db/schema.ts`, `server/models/*.model.ts`,
 Files you NEVER edit: everything in `.gen/` (rebuilt on save; gitignored).
 `_client.ts` (controllers dir) is user-owned wiring — created once, yours.
 
-## 0.6 PROJECTION IDENTITY (the anti-GraphQL law, amended for scale)
+## 0.6 Projections
 
-**Shapes are DECLARED on the door and finite; the client SELECTS one by
-name — it never composes one by structure.** Every door already has two
-named shapes (index, get; `options` is a third). When one canonical GET
-shape starts accreting the union of its consumers' needs (the
-god-serializer disease — unions grow monotonically and can never safely
-shrink), the answer is NAMED VIEWS on the same door, not a fatter shape
-and not more doors:
-  `views: { card: { expose: [...], include: [] }, … }` → `?view=card`
-— allowlisted (undeclared view = 400), reduce-only (⊆ the door's
-expose/include, codegen-validated), each (door, view) a fixed shape with
-its own cache family, all invalidated together (edges are model-keyed).
-DESIGN status: build on first union-wall collision, not before.
-Structural client requests (field lists / include trees on the wire)
-stay REFUSED — partial-record trap, client-driven query cost, CDN
-killer. The FORM shape stays singular: the envelope view IS the
-canonical get (abilities/permit/version congruence); views are
-read-only. Other corollaries:
-- A form structurally cannot touch a relation its door doesn't serve —
-  handle members are GENERATED from the door's declarations; needing a
-  new relation = declare it on the controller (envelope, cache, types,
-  and form members update atomically).
-- The SAME model through TWO doors = two projections, both correct,
-  NEVER blended: a picker (target model's door) contributes an ID and
-  only an id; nested-form VALUES always come from the owning door's
-  envelope. Foreign projections contribute identity, never fields.
-- A door too heavy for a light consumer → make ANOTHER door (projection
-  controllers are cheap; projections only reduce). Doors are picked,
-  fields are not.
-- hasOne: "create new child" = nested attributes through the OWNER's
-  door; "attach existing" = a write to the CHILD (its fk) through
-  whichever door serves it, picker-fed via the `options` param. Two
-  writes, two doors — don't blur them into one widget.
-- Coherence across doors is automatic: edges are MODEL-keyed, so a write
-  through either door invalidates every family that serves the model.
+One reference: **DESIGN-projections.md** (the projection tree — fields/
+editability/includes sliced recursively at every level, typed via
+generated `XProjection` types, named views selected by `?view=`).
+Current shipped behavior: `expose`/`permit`/`include` at the top level;
+included children serialize whole. Structural client shape requests are
+refused, always.
 
 ## 1. Model DSL
 
