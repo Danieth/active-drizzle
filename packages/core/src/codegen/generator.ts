@@ -561,6 +561,43 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta, sr
   lines.push(`;(_${model.className} as any).Client = ${model.className}Client`);
   lines.push('');
 
+  // ── Projection type (DESIGN-projections P1) ────────────────────────────
+  // Every field name + association key as literal types, RECURSIVELY —
+  // `form: { … } satisfies ${'{'}Model{'}'}Projection` makes a typo'd field or a
+  // nonexistent association a red squiggle at any depth of the tree.
+  {
+    const fieldNames = new Set<string>();
+    for (const col of table?.columns ?? []) fieldNames.add(col.name);
+    for (const f of Object.keys(model.fieldMeta ?? {})) fieldNames.add(f);
+    for (const e of model.enums ?? []) fieldNames.add(e.propertyName);
+    for (const s of model.states ?? []) fieldNames.add(s.propertyName);
+    const fieldUnion = [...fieldNames].sort().map(f => `'${f}'`).join(' | ') || 'never';
+    const assocEntries: string[] = [];
+    const projImports: string[] = [];
+    for (const assoc of model.associations) {
+      const targetClass = resolveAssocClass(assoc, project);
+      if (!targetClass) continue;
+      const assocModel = project.models.find(mm => mm.className === targetClass);
+      if (!assocModel) continue;
+      assocEntries.push(`${assoc.propertyName}?: ${targetClass}Projection`);
+      if (targetClass !== model.className) {
+        const base = assocModel.filePath.split('/').pop()!.replace('.model.ts', '.model.gen');
+        projImports.push(`import type { ${targetClass}Projection } from './${base}.js'`);
+      }
+    }
+    for (const imp of [...new Set(projImports)]) lines.push(imp);
+    lines.push('');
+    lines.push(`/** Projection-tree config type — use \`form: { … } satisfies ${model.className}Projection\` on the controller for keystroke-level typo-proofing at every depth. */`);
+    lines.push(`export interface ${model.className}Projection {`);
+    lines.push(`  fields: Partial<Record<${fieldUnion}, 'edit' | 'view'>>`);
+    if (assocEntries.length) {
+      lines.push(`  include?: { ${assocEntries.join('; ')} }`);
+    } else {
+      lines.push(`  include?: Record<string, never>`);
+    }
+    lines.push(`}`);
+  }
+
   return lines.join('\n');
 }
 

@@ -3,6 +3,7 @@
  * @mutation, @action, @before, @after.
  */
 import pluralize from 'pluralize'
+import { normalizeProjection, nodeToIncludeSpecs, PROJECTION_NODE } from './projection.js'
 import {
   CONTROLLER_META, CRUD_META, SINGLETON_META, SCOPE_META,
   MUTATION_META, ACTION_META, BEFORE_META, AFTER_META, RESCUE_META, ATTACHABLE_META,
@@ -55,7 +56,28 @@ export function crud<TModel extends new (...args: any[]) => any>(
   config: CrudConfig = {},
 ) {
   return function (target: any) {
-    target[CRUD_META] = { model, config }
+    // Projection-tree desugar (DESIGN-projections P1): a `form:` node is
+    // the ONE declaration; expose/permit/include are derived from it so
+    // every existing reader keeps working. The normalized node rides the
+    // config for the read-slicer (and P2/P3 later).
+    const node = normalizeProjection(config)
+    let cfg: any = config
+    if ((config as any).form) {
+      const fields = node.fields === '*' ? [] : [...node.fields]
+      cfg = {
+        ...config,
+        get: {
+          abilities: true,
+          ...(config.get ?? {}),
+          expose: (config.get as any)?.expose ?? fields,
+          include: (config.get as any)?.include ?? nodeToIncludeSpecs(node),
+        },
+        update: { ...(config.update ?? {}), permit: (config.update as any)?.permit ?? [...node.edit] },
+        create: { ...(config.create ?? {}), permit: (config.create as any)?.permit ?? [...node.edit] },
+      }
+    }
+    ;(cfg as any)[PROJECTION_NODE] = node
+    target[CRUD_META] = { model, config: cfg }
   }
 }
 

@@ -49,6 +49,10 @@ export type {
 
 // Router
 export { buildRouter, mergeRouters, type BuildResult, type RouteRecord } from './router.js'
+export {
+  normalizeProjection, sliceByProjection, nodeToIncludeSpecs, PROJECTION_NODE,
+  type ProjectionNode, type NormalizedNode, type Access,
+} from './projection.js'
 export { buildContractProbes, runContractProbes, type ContractProbe, type ContractProbeFailure } from './contract-probes.js'
 
 // Handlers (useful for custom overrides)

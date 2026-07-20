@@ -190,5 +190,13 @@ class AssetClient {
 
 // Attach so that new Asset.Client(payload) works at runtime
 ;(_Asset as any).Client = AssetClient
-"
+
+import type { BusinessProjection } from './Business.model.gen.js'
+import type { CampaignProjection } from './Campaign.model.gen.js'
+
+/** Projection-tree config type — use \`form: { … } satisfies AssetProjection\` on the controller for keystroke-level typo-proofing at every depth. */
+export interface AssetProjection {
+  fields: Partial<Record<'assetType' | 'businessId' | 'createdAt' | 'id' | 'title' | 'updatedAt', 'edit' | 'view'>>
+  include?: { business?: BusinessProjection; campaigns?: CampaignProjection }
+}"
 `;

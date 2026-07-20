@@ -134,10 +134,18 @@ Compat rule: `expose`/`permit`/`include` DESUGAR into the form node —
 every existing app keeps working untouched; new syntax opts into
 narrowness.
 
-- **P1 — types + read slices** (the eternal problem's read half):
-  generated `XProjection` types + codegen validation (kills silent
-  typos); recursive slice serialization; envelope carries sliced
-  children. Runtime: serializer + envelope builder. Medium.
+- **P1 — types + read slices** — **BUILT** (2026-07-20): ProjectionNode/
+  normalizeProjection/sliceByProjection in the controller package; @crud
+  desugars `form:` into expose/permit/include at decoration time (all
+  legacy readers untouched; legacy configs normalize non-explicit and the
+  slicer is a strict no-op — 245 controller tests unchanged); recursive
+  read-slice active at all three serialization sites for explicit trees
+  (root secret + child secret + grandchild secret all sliced — tested
+  end-to-end through a real envelope); codegen emits recursive
+  `XProjection` types into @gen/models (probed: typo'd field /
+  nonexistent assoc / bad access = 3/3 compile errors, valid tree clean).
+  Remaining P1.5: regen-time validator tree-walk (second belt behind
+  `satisfies`) — needs the deep AST config parse.
 - **P2 — the edit half**: tree-shaped abilities on the wire; child
   sessions consume their node; recursive write sanitize. Runtime:
   sanitizer + react session/handle plumbing (seats already exist).

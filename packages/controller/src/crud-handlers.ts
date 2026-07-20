@@ -5,6 +5,16 @@
  */
 import { BadRequest, Conflict, NotFound, ValidationError, toValidationError } from './errors.js'
 import { getMutations, getScopes } from './metadata.js'
+import { PROJECTION_NODE, sliceByProjection, type NormalizedNode } from './projection.js'
+
+/** The read-slicer: active ONLY for explicit `form:` trees (legacy
+ *  configs pass through untouched). Applied AFTER serialization — a
+ *  pure data walk that cuts included children to their node's slice. */
+function applyProjectionSlice(data: any, config: any, pk = 'id'): any {
+  const node: NormalizedNode | undefined = config?.[PROJECTION_NODE]
+  if (!node?.explicit) return data
+  return sliceByProjection(data, node, pk)
+}
 import type { CrudConfig, IndexConfig, MutationEntry } from './metadata.js'
 
 // ── Forms envelope (expose / abilities / can) ─────────────────────────────────
@@ -226,9 +236,12 @@ export function buildRecordEnvelope(
   // The primary key always serializes — an envelope without `id` is a record
   // the client can never PATCH back (mirrors codegen, which always projects id)
   const pk = typeof model?.primaryKey === 'string' ? model.primaryKey : 'id'
-  const serialized = typeof record.toJSON === 'function'
-    ? record.toJSON({ only: [...new Set([pk, ...expose, ...topLevelIncludeNames(includes)])] })
-    : record
+  const serialized = applyProjectionSlice(
+    typeof record.toJSON === 'function'
+      ? record.toJSON({ only: [...new Set([pk, ...expose, ...topLevelIncludeNames(includes)])] })
+      : record,
+    config, pk,
+  )
 
   const envelope: RecordEnvelope = {
     record: serialized,
@@ -629,7 +642,10 @@ export async function defaultIndex(
     ? data.map((r: any) => {
         if (typeof r.toJSON !== 'function') return r
         const pk = typeof model?.primaryKey === 'string' ? model.primaryKey : 'id'
-        return r.toJSON({ only: [...new Set([pk, ...expose, ...topLevelIncludeNames(idx.include ?? [])])] })
+        return applyProjectionSlice(
+          r.toJSON({ only: [...new Set([pk, ...expose, ...topLevelIncludeNames(idx.include ?? [])])] }),
+          config, pk,
+        )
       })
     : data
 
@@ -669,7 +685,8 @@ export async function defaultGet(
 
   if (usesEnvelope(config)) return buildRecordEnvelope(record, model, config, ctx, ctrl)
   if (config.get?.expose?.length && typeof record.toJSON === 'function') {
-    return record.toJSON({ only: [...config.get.expose, ...topLevelIncludeNames(includes)] })
+    return applyProjectionSlice(
+      record.toJSON({ only: [...config.get.expose, ...topLevelIncludeNames(includes)] }), config)
   }
   return record
 }
