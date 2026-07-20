@@ -117,6 +117,16 @@ compile error, not an undefined read.
   named shape with its own family; model-keyed coherence invalidates all
   of them together. Clients select views BY NAME; structural shape
   requests stay refused forever.
+- **Coherence/channels multiplication (Daniel's worry, resolved):**
+  INVALIDATION does not multiply — edges are model-keyed and prefix-
+  invalidate every (door, view) family in one call, shape-count-blind.
+  Only channels EMISSION multiplies (per (model, controller, view) blob)
+  and the silence rule tames it at node level: a frame is
+  `changedFields ∩ node.fields`, so a view whose slice carries none of
+  the changed fields emits NOTHING. Narrow projections make the live
+  system QUIETER: a field no view carries produces total silence where
+  today it produces refetch traffic. Identical slices across views
+  dedupe to one serialization (the get/index economy note, generalized).
 
 ## The refactor, sized honestly (NOT a big bang)
 
