@@ -10,7 +10,7 @@
  *   <MyMoneyInput {...fx.dirty} />       // every story = real props, real bind
  */
 import { FormSession, type ServerEnvelope } from './form-session.js'
-import { buildFieldBind, type BuildFieldBindOptions } from './form-handle.js'
+import { buildFieldBind, resolveCopy, type BuildFieldBindOptions } from './form-handle.js'
 import type { PresenterProps } from './presenters.js'
 
 export interface CreateTestSessionOptions {
@@ -48,18 +48,21 @@ export function buildTestProps(
   fieldMeta: Record<string, Record<string, any>>,
   field: string,
   bindOpts: Partial<BuildFieldBindOptions> = {},
+  /** Force a state the session can't be ARRANGED into headlessly (waiting
+   *  comes from a render-time pendingIf, not session state). */
+  stateOverride?: PresenterProps['state'],
 ): PresenterProps {
   const incoming = session.getIncomingFor(field)
   return {
     value: session.getValue(field),
     bind: buildFieldBind(session, { field, ...bindOpts }),
-    meta: fieldMeta[field] ?? {},
+    meta: resolveCopy(fieldMeta[field] ?? {}, session.draft),
     ctx: session.getFrontendCtx(),
     overrides: {},
     mode: session.canEdit(field) ? 'edit' : 'view',
     draft: session.draft,
     errors: session.visibleErrors(field),
-    state: session.fieldState(field) !== 'ready' ? session.fieldState(field) : session.getStatus(),
+    state: stateOverride ?? (session.fieldState(field) !== 'ready' ? session.fieldState(field) : session.getStatus()),
     dirty: session.fieldDirty(field),
     ...(incoming !== undefined ? { elsewhere: incoming } : {}),
   }
@@ -77,10 +80,14 @@ export function fieldStateFixtures(
   field: string,
   values: Record<string, any> = {},
 ): Record<FieldStateName, { session: FormSession<any>; props: PresenterProps }> {
-  const make = (arrange: (s: FormSession<any>) => void, bindOpts: Partial<BuildFieldBindOptions> = {}) => {
+  const make = (
+    arrange: (s: FormSession<any>) => void,
+    bindOpts: Partial<BuildFieldBindOptions> = {},
+    stateOverride?: PresenterProps['state'],
+  ) => {
     const session = createTestSession(fieldMeta, { values })
     arrange(session)
-    return { session, props: buildTestProps(session, fieldMeta, field, bindOpts) }
+    return { session, props: buildTestProps(session, fieldMeta, field, bindOpts, stateOverride) }
   }
   const dirtyValue = values[field] != null ? `${values[field]}!` : 'edited'
   return {
@@ -93,7 +100,7 @@ export function fieldStateFixtures(
       ;(s as any)._primeFieldState(field, 'error')
     }),
     pending: make(s => (s as any)._primeFieldState(field, 'pending')),
-    waiting: make(() => {}, { disabled: true }),   // pendingIf semantics: bind disables; story sets state below
+    waiting: make(() => {}, { disabled: true }, 'waiting'),   // pendingIf semantics: bind disabled + state 'waiting'
     conflict: make(s => (s as any)._primeStatus('conflict')),
     elsewhere: make(s => {
       s.setValue(field, dirtyValue)

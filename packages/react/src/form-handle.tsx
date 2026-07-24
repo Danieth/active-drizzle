@@ -227,7 +227,7 @@ function inertBind(field: string): PresenterBind {
 }
 
 /** Resolve per-discriminant copy: meta.copy = { by, [LABEL]: overrides }. */
-function resolveCopy(meta: Record<string, any>, draft: any): Record<string, any> {
+export function resolveCopy(meta: Record<string, any>, draft: any): Record<string, any> {
   const copy = meta?.copy
   if (!copy?.by) return meta
   const disc = draft?.[copy.by]
@@ -283,7 +283,7 @@ export function useFieldProps(
   return {
     value: session.getValue(field),
     bind,
-    meta,
+    meta: { ...meta, ...(opts.overrides ?? {}) },
     ctx: { ...useClientPresenterCtx(), ...session.getFrontendCtx() },
     overrides: opts.overrides ?? {},
     mode: opts.mode ?? (session.canEdit(field) ? 'edit' : 'view'),
@@ -739,7 +739,7 @@ export function createFormHandle<T extends Record<string, any>>(
         <Component
           value={session.getValue(dataField)}
           bind={bind}
-          meta={meta}
+          meta={{ ...meta, ...overrides }}
           ctx={{ ...clientCtx, ...session.getFrontendCtx() }}
           overrides={overrides}
           mode={resolved.mode}

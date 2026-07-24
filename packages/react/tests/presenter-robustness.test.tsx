@@ -190,3 +190,34 @@ describe('#5 a typo teaches — with did-you-mean', () => {
     expect(handle.anything.value).toBeUndefined()          // no chip, no error
   })
 })
+
+describe('audit bug fixes (presenter DX)', () => {
+  it("call-site label reaches meta.label — a presenter reading ONLY meta just works", () => {
+    let got: any
+    registerPresenter('metaProbe', { kind: '*', component: (p: any) => { got = p; return null } })
+    setDefaultPresenters({ string: { edit: 'metaProbe' } })
+    const { handle } = makeHandle()
+    render(<handle.name edit label="Call-site label" />)
+    expect(got.meta.label).toBe('Call-site label')       // merged — the doc is now true
+    expect(got.overrides.label).toBe('Call-site label')  // raw overrides still distinguishable
+  })
+
+  it("the waiting fixture actually reads state 'waiting' with a disabled bind", async () => {
+    const { fieldStateFixtures } = await import('../src/testing.js')
+    const fx = fieldStateFixtures({ name: { kind: 'string', label: 'Name' } }, 'name')
+    expect(fx.waiting.props.state).toBe('waiting')
+    expect(fx.waiting.props.bind.disabled).toBe(true)
+  })
+
+  it("registering a discrete-kind presenter without commit:'change' warns; with it, silent", () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      registerPresenter('sw', { kind: 'boolean', component: () => null })
+      expect(warn.mock.calls.some(c => String(c[0]).includes('NEVER SAVES'))).toBe(true)
+      warn.mockClear()
+      registerPresenter('sw2', { kind: 'boolean', commit: 'change', component: () => null })
+      registerPresenter('txt', { kind: 'string', component: () => null })
+      expect(warn).not.toHaveBeenCalled()
+    } finally { warn.mockRestore() }
+  })
+})

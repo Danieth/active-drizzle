@@ -44,9 +44,13 @@ export interface PresenterBind {
 export interface PresenterProps<V = any> {
   value: V
   bind: PresenterBind
-  /** Field meta from the backend Attr — label/help/info/copy-resolved/kind/your keys. */
+  /** Field meta from the backend Attr, CALL-SITE-MERGED: `<loan.amount
+   *  label="X"/>` arrives as meta.label — read meta and overrides just
+   *  work. (Resolution — kind, presenter names — always uses the pure
+   *  Attr meta; a call site can't spoof those.) */
   meta: Record<string, any>
-  /** Call-site overrides win over meta (label, help, arbitrary props). */
+  /** The raw call-site overrides, pre-merge — for the rare presenter that
+   *  must distinguish "Attr said" from "call site said". */
   overrides: Record<string, any>
   mode: 'edit' | 'view'
   /** The ENTIRE projected draft — safe by construction (unexposed fields don't exist). */
@@ -151,7 +155,22 @@ const KIND_FALLBACKS: Record<string, string> = {
   uuid: 'string',
 }
 
+/** Kinds whose inputs commit discretely — a toggle/select never blurs. */
+const DISCRETE_KINDS = new Set(['boolean', 'enum', 'state'])
+
 export function registerPresenter(name: string, def: PresenterDef): void {
+  // The silent-never-saves trap: a discrete presenter left on the default
+  // 'blur' commit only saves when the input blurs — which a toggle may
+  // never do. Teach at REGISTRATION, not after a user's flip vanishes.
+  const kinds = Array.isArray(def.kind) ? def.kind : [def.kind]
+  if (def.commit !== 'change' && kinds.some(k => DISCRETE_KINDS.has(k))) {
+    console.warn(
+      `[active-drizzle] presenter "${name}" serves discrete kind(s) ` +
+      `${kinds.filter(k => DISCRETE_KINDS.has(k)).join(', ')} without commit: 'change' — ` +
+      `under autosave, a toggle that never blurs NEVER SAVES. Add commit: 'change' ` +
+      `(or ignore this if the presenter genuinely commits on blur).`,
+    )
+  }
   registry.set(name, def)
 }
 
