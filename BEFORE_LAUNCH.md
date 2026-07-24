@@ -34,7 +34,7 @@ Today DB/validation errors surface as English strings (`"has already been taken"
 
 ## 🟠 4. Encryption at rest — field + file  (finance domain → do it before release)
 
-> **Status: nothing implemented.** Scanned 2026-07-19 — no encrypt/decrypt/cipher/KMS code, no crypto deps, no `Attr.encrypted`, and the S3 layer doesn't set `ServerSideEncryption`. Crypto background + the tradeoffs live in [DESIGN-field-encryption.md](DESIGN-field-encryption.md); this section is the **build spec**.
+> **Status (updated 2026-07-23): core BUILT.** Chainable `.encrypt()` on any Attr (AES-256-GCM), guards + redaction, 69 tests — see [DESIGN-field-encryption.md](DESIGN-field-encryption.md) for what's done vs. remaining (propagation to codegen/controller/React; S3 `ServerSideEncryption` still unset). The extractor now unwraps chained modifiers (`resolveAttrCall`), so meta on `Attr.string({label}).encrypt()` extracts correctly — regression-tested in field-meta.test.ts.
 
 For a financial app this is usually a compliance line, not a feature. And the storage *format* is a launch decision: adding encryption to columns that already hold plaintext later means a backfill + key ceremony — painful post-launch.
 

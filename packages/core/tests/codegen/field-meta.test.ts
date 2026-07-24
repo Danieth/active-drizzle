@@ -221,3 +221,38 @@ describe('generators: fieldMeta on Clients', () => {
     expect(content).not.toContain('presentIf')                  // purpose ∉ projection → omitted
   })
 })
+
+// ── Chained modifiers (.encrypt()) — the extraction survives the chain ───────
+
+describe('extractor: chained Attrs (Attr.string({…}).encrypt())', () => {
+  const encryptedModel = `
+import { ApplicationRecord, model, Attr } from 'active-drizzle'
+
+@model('loans')
+export class Loan extends ApplicationRecord {
+  static purpose = Attr.string({
+    label: 'Loan Purpose',
+    help: 'Why the funds are needed.',
+    presenters: { view: 'textView', edit: 'textInput' },
+    default: 'GENERAL',
+  }).encrypt()
+}
+`
+  it('kind is the INNER factory, and the config meta is not lost', () => {
+    // Before resolveAttrCall, the kind for this documented pattern was the
+    // garbage string "string({…}).encrypt" and label/help/presenters
+    // silently vanished — an encrypted field lost its entire presentation.
+    const meta = projectFor(encryptedModel).extractModel('Loan.model.ts')
+    const purpose = meta.fieldMeta.purpose!
+    expect(purpose).toBeDefined()
+    expect(purpose.kind).toBe('string')
+    expect(purpose.label).toBe('Loan Purpose')
+    expect(purpose.help).toMatch(/funds are needed/)
+    expect(purpose.presenters).toEqual({ view: 'textView', edit: 'textInput' })
+  })
+
+  it('defaults ride the chain too', () => {
+    const meta = projectFor(encryptedModel).extractModel('Loan.model.ts')
+    expect((meta as any).propertyDefaults?.purpose).toBe(`'GENERAL'`)
+  })
+})

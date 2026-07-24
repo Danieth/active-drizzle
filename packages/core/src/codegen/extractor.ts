@@ -602,15 +602,43 @@ const META_KEYS = new Set(['label', 'help', 'info', 'copy', 'presenters', 'prese
  * (static data only — functions or identifier references are extraction
  * errors the validator turns into build failures).
  */
+/**
+ * Resolves a static-property initializer to its underlying `Attr.<kind>(…)`
+ * call, UNWRAPPING chained modifiers — `Attr.string({label}).encrypt()`
+ * resolves to the inner `Attr.string({label})` call, so the kind is
+ * 'string' (not the garbage 'string({label}).encrypt') and the config
+ * object is the one that actually carries the meta. Without this, every
+ * chained Attr silently lost its label/help/presenters at extraction.
+ */
+function resolveAttrCall(init: Node): { call: CallExpression; fnName: string } | null {
+  if (!Node.isCallExpression(init)) return null;
+  let call: CallExpression = init;
+  for (let depth = 0; depth < 8; depth++) {
+    const expr = call.getExpression();
+    const text = expr.getText();
+    if (/^Attr\.[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)?$/.test(text)) {
+      return { call, fnName: text };
+    }
+    // Chained modifier: the callee is `<innerCall>.modifier` — descend
+    if (Node.isPropertyAccessExpression(expr)) {
+      const inner = expr.getExpression();
+      if (Node.isCallExpression(inner)) { call = inner; continue }
+    }
+    return null;
+  }
+  return null;
+}
+
 function extractFieldMeta(classDecl: ClassDeclaration): Record<string, FieldMetaEntry> {
   const result: Record<string, FieldMetaEntry> = {};
 
   for (const prop of classDecl.getStaticProperties()) {
     if (!Node.isPropertyDeclaration(prop)) continue;
-    const init = prop.getInitializer();
-    if (!init || !Node.isCallExpression(init)) continue;
-    const fnName = init.getExpression().getText();
-    if (!fnName.startsWith('Attr.')) continue;
+    const rawInit = prop.getInitializer();
+    if (!rawInit) continue;
+    const resolved = resolveAttrCall(rawInit);
+    if (!resolved) continue;
+    const { call: init, fnName } = resolved;
 
     const propertyName = prop.getName();
     const entry: FieldMetaEntry = {
@@ -993,10 +1021,11 @@ function extractPropertyDefaults(classDecl: ClassDeclaration): Record<string, st
   const result: Record<string, string> = {};
   for (const prop of classDecl.getStaticProperties()) {
     if (!Node.isPropertyDeclaration(prop)) continue;
-    const init = prop.getInitializer();
-    if (!init || !Node.isCallExpression(init)) continue;
-    const fnName = init.getExpression().getText();
-    if (!fnName.startsWith('Attr.')) continue;
+    const rawInit = prop.getInitializer();
+    if (!rawInit) continue;
+    const resolved = resolveAttrCall(rawInit);
+    if (!resolved) continue;
+    const init = resolved.call;
 
     // Search all object literal args for a `default` key
     for (const arg of init.getArguments()) {
@@ -1021,10 +1050,11 @@ function extractAttrSetReturnTypes(classDecl: ClassDeclaration): Record<string, 
 
   for (const prop of classDecl.getStaticProperties()) {
     if (!Node.isPropertyDeclaration(prop)) continue;
-    const init = prop.getInitializer();
-    if (!init || !Node.isCallExpression(init)) continue;
-    const fnName = init.getExpression().getText();
-    if (!fnName.startsWith('Attr.')) continue;
+    const rawInit = prop.getInitializer();
+    if (!rawInit) continue;
+    const resolved = resolveAttrCall(rawInit);
+    if (!resolved) continue;
+    const init = resolved.call;
 
     for (const arg of init.getArguments()) {
       if (!Node.isObjectLiteralExpression(arg)) continue;
