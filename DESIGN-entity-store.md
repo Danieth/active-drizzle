@@ -65,3 +65,25 @@ external API, or a queue merges identically.
    with pending patches from `useMutationState` (the optimistic slice —
    zero declarations: diffs, transition targets, simulated bodies).
 3. WS frames = `merge()` calls (the store is the channel sink).
+
+## LAW: serialization fidelity (Daniel, 2026-07-24)
+
+Controllers can NEVER custom-serialize an EXISTING model field. The
+model's Attr codecs are the ONE representation of every field, on every
+door, always — this is what makes slice-merging sound (cross-door
+`amount` is `amount`). Custom action payloads are their own shapes and
+never normalize into the store (I1). Enforcement: no field-transform
+seam exists or will be built; FIXES-NEEDED #12 (included children
+bypassing child codecs) is a VIOLATION of this law and its fix is
+mandatory, not optional.
+
+## Per-record status (bare minimum, built)
+
+`useEntityStatus(model, pk)` → `{ pending, tick, entry }`:
+- `pending` — a write is in flight (store.markPending, counted/stacking,
+  released only AFTER the echo merges: read-your-writes ordering)
+- `tick` — bumps on every APPLIED merge (stale drops never flash);
+  effect-on-tick = the row highlight
+FormSession keeps its own reality (draft/baseline) and FEEDS the store
+(pending during flight, echo on settle/rehydrate) — wiring lands with
+slice 1 via a `entity: { model, pk }` session option.

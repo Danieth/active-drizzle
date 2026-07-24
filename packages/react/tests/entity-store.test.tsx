@@ -12,7 +12,7 @@
 import React from 'react'
 import { describe, it, expect, vi } from 'vitest'
 import { render, act } from '@testing-library/react'
-import { EntityStore, composeEntity, useEntity } from '../src/entity-store.js'
+import { EntityStore, composeEntity, useEntity, useEntityStatus } from '../src/entity-store.js'
 
 // Seeded LCG — deterministic adversary, reproducible failures.
 function rng(seed: number) {
@@ -188,5 +188,45 @@ describe('property suite (seeded adversary)', () => {
     expect(store.get('Deal', 'keep-2')).toBeDefined()
     expect(store.size).toBeLessThanOrEqual(12)                      // capacity + pinned overflow only
     release()
+  })
+})
+
+describe('bare-minimum status: pending + tick (Daniel 2026-07-24)', () => {
+  it('markPending counts, stacks, releases idempotently, and notifies', () => {
+    const s = new EntityStore()
+    s.merge('Deal', 5, { name: 'a' })
+    const seen = vi.fn()
+    s.subscribe('Deal', 5, seen)
+    const r1 = s.markPending('Deal', 5)
+    const r2 = s.markPending('Deal', 5)
+    expect(s.isPending('Deal', 5)).toBe(true)
+    r1(); r1()                                     // double-release is safe
+    expect(s.isPending('Deal', 5)).toBe(true)      // second flight still up
+    r2()
+    expect(s.isPending('Deal', 5)).toBe(false)
+    expect(seen.mock.calls.length).toBeGreaterThanOrEqual(3)
+  })
+
+  it('tick bumps ONLY on applied merges — stale drops do not flash', () => {
+    const s = new EntityStore()
+    s.merge('Deal', 5, { name: 'a' }, { version: 2 })
+    expect(s.get('Deal', 5)!.tick).toBe(1)
+    s.merge('Deal', 5, { name: 'stale' }, { version: 1 })
+    expect(s.get('Deal', 5)!.tick).toBe(1)          // no lie, no flash
+    s.merge('Deal', 5, { name: 'b' }, { version: 3 })
+    expect(s.get('Deal', 5)!.tick).toBe(2)
+  })
+
+  it('useEntityStatus re-renders on a pending flip (rev-based snapshot)', () => {
+    const s = new EntityStore()
+    s.merge('Deal', 5, { name: 'a' })
+    const seen: any[] = []
+    function Probe() { const st = useEntityStatus('Deal', 5, s); seen.push(st.pending); return null }
+    render(<Probe />)
+    let release!: () => void
+    act(() => { release = s.markPending('Deal', 5) })
+    act(() => { release() })
+    expect(seen).toContain(true)
+    expect(seen[seen.length - 1]).toBe(false)
   })
 })

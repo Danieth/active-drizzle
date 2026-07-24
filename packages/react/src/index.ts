@@ -139,3 +139,4 @@ export {
   type EntityEntry,
   type EntityPk,
 } from './entity-store.js'
+export { useEntityStatus } from './entity-store.js'
