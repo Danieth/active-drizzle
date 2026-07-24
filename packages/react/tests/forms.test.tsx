@@ -374,19 +374,33 @@ describe('C15 — auth death mid-form', () => {
 
 // ── Presenter registry guardrails ────────────────────────────────────────────
 
-describe('registry errors are loud', () => {
-  it('missing default edit presenter names the fix', () => {
-    clearPresenters()
-    registerPresenter('textView', { kind: '*', component: TextView })
-    setDefaultPresenters({ string: { view: 'textView' } })
-    const { handle: loan } = makeHandle()
-    expect(() => render(<loan.amount edit />)).toThrow(/No edit presenter for "amount"/)
+describe('registry errors are loud — AND contained (the field boundary)', () => {
+  // Wiring errors no longer take down the render tree: the per-field
+  // boundary converts them into an inline teaching chip (console.error'd),
+  // and every OTHER field keeps working.
+  it('missing default edit presenter names the fix, inline', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      clearPresenters()
+      registerPresenter('textView', { kind: '*', component: TextView })
+      setDefaultPresenters({ string: { view: 'textView' } })
+      const { handle: loan } = makeHandle()
+      const { container } = render(<loan.amount edit />)
+      const chip = container.querySelector('[data-ad-field-error="amount"]')!
+      expect(chip).toBeTruthy()
+      expect(chip.textContent).toMatch(/No edit presenter for "amount"/)
+    } finally { err.mockRestore() }
   })
 
-  it('requires-gate dev backstop fires when meta is missing', () => {
-    registerPresenter('thickInfo', { kind: '*', requires: ['info'], component: TextInput })
-    const { handle: loan } = makeHandle()
-    expect(() => render(<loan.amount edit="thickInfo" />)).toThrow(/requires meta 'info'/)
+  it('requires-gate dev backstop fires when meta is missing, inline', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      registerPresenter('thickInfo', { kind: '*', requires: ['info'], component: TextInput })
+      const { handle: loan } = makeHandle()
+      const { container } = render(<loan.amount edit="thickInfo" />)
+      expect(container.querySelector('[data-ad-field-error="amount"]')!.textContent)
+        .toMatch(/requires meta 'info'/)
+    } finally { err.mockRestore() }
   })
 })
 

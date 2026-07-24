@@ -7,7 +7,7 @@ import { normalizeProjection, nodeToIncludeSpecs, PROJECTION_NODE } from './proj
 import {
   CONTROLLER_META, CRUD_META, SINGLETON_META, SCOPE_META,
   MUTATION_META, ACTION_META, BEFORE_META, AFTER_META, RESCUE_META, ATTACHABLE_META,
-  type CrudConfig, type SingletonConfig, type ScopeEntry,
+  type CrudConfig, type SingletonConfig, type ScopeEntry, type ModelFieldNames,
   type MutationEntry, type ActionEntry, type HookEntry, type RescueEntry,
   type AttachableConfig,
   inferScopeResource,
@@ -50,10 +50,15 @@ export function scope(field: string) {
 /**
  * Attaches a model + config to the controller class, enabling default
  * CRUD handlers (index/get/create/update/destroy).
+ *
+ * Field-naming config keys (sortable, searchable, expose, permit, …) are
+ * typed against the MODEL'S generated instance type: `sortable: ['naem']`
+ * is a red squiggle the moment codegen has run. Untyped models degrade to
+ * plain strings — nothing to opt into, nothing breaks before first regen.
  */
 export function crud<TModel extends new (...args: any[]) => any>(
   model: TModel,
-  config: CrudConfig = {},
+  config: CrudConfig<ModelFieldNames<TModel>> = {},
 ) {
   return function (target: any) {
     // Access-ceiling desugar (DESIGN-projections): `access:` is the ONE

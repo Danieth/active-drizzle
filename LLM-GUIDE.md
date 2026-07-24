@@ -438,6 +438,31 @@ const row = recordOf(await SomeController.get({ id }))  // unwraps envelope OR b
 import { onClientError } from '@active-drizzle/react'   // error telemetry seam
 ```
 
+## 6.5 The vice: what the types refuse for you
+
+Config keys that name model fields are typed against the model's GENERATED
+instance type — a typo is a red squiggle at the keystroke, not a runtime
+surprise. Constrained: `sortable`, `searchable`, `filterable`, `facets`,
+`chartable`, `measures`, `defaultSort.field`, `search.fields` keys,
+`expose`, `permit` (arrays AND function returns, plus `<assoc>Attributes`
+nested-write keys), `restrict`, `autoSet` keys, and the whole `access:`
+ceiling (`satisfies XProjection`, recursive). NOT constrained: `filters`
+keys (named product concepts, not columns). habtm `<singular>Ids` sets are
+typed instance members (emitted by codegen), so they pass allowlists.
+Untyped models (`as any`, pre-first-regen) degrade to plain strings.
+Compile-time proof lives in `packages/controller/tests/typing.test-d.ts`
+(`npm run test:types`).
+
+Presenter-side robustness (all automatic):
+- every Field renders inside its own boundary: a throwing/miswired
+  presenter becomes an inline `[data-ad-field-error]` teaching chip on THAT
+  field; the rest of the form keeps working
+- view renders receive an INERT bind — a view presenter cannot write
+- `buildFieldBind` refuses writes the ability mask marks 'view' (warn)
+- attachment fields judge edit/visibility on the WRITE column (`<x>AssetId`)
+- a typo'd handle member (`handle.naem`) renders a did-you-mean chip
+  (`[data-ad-unknown-field]`) instead of a misleading presenter error
+
 ## 7. Operational rules
 
 - Run tests from INSIDE each package dir (`cd packages/core && npx vitest run`).

@@ -1037,7 +1037,7 @@ function buildPermittedData(
   writeConfig: {
     permit?: string[] | ((ctx: any, ctrl: any, record?: any) => string[])
     restrict?: string[]
-    autoSet?: Record<string, (ctx: any, ctrl?: any) => any>
+    autoSet?: Partial<Record<string, (ctx: any, ctrl?: any) => any>>
   } | undefined,
   ctx: any,
   model: any,
@@ -1066,7 +1066,7 @@ function buildPermittedData(
 
   if (autoSet && ctx) {
     for (const [k, fn] of Object.entries(autoSet)) {
-      out[k] = fn(ctx, ctrl)
+      if (fn) out[k] = fn(ctx, ctrl)
     }
   }
 

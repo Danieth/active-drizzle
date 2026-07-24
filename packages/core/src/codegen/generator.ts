@@ -99,6 +99,13 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta, srcPr
   for (const assoc of model.associations) {
     const assocLine = generateAssociationType(assoc, model, project);
     if (assocLine) lines.push(`    ${assocLine}`);
+    // The Rails-style habtm ids set is a REAL instance member (hydrated on
+    // read, REPLACES the join-row set on assign) — typing it here is what
+    // lets expose/permit allowlists accept it and gives `deal.coOwnerIds`
+    // autocomplete instead of `any`.
+    if (assoc.kind === 'habtm') {
+      lines.push(`    ${habtmIdsKey(assoc.propertyName)}: Array<number | string>`);
+    }
   }
 
   for (const enumDef of model.enums) {
@@ -241,6 +248,9 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta, srcPr
     // module can't import, so cross-model references go through globals.
     if (assoc.kind === 'hasMany' || assoc.kind === 'habtm') {
       lines.push(`      ${assoc.propertyName}: ${targetClass}Client[];`);
+      if (assoc.kind === 'habtm') {
+        lines.push(`      ${habtmIdsKey(assoc.propertyName)}?: Array<number | string>;`);
+      }
     } else {
       const nullable = assoc.kind === 'belongsTo' ? isBelongsToNullable(assoc, model, project) : true;
       lines.push(`      ${assoc.propertyName}: ${targetClass}Client${nullable ? ' | null' : ''};`);
@@ -571,6 +581,9 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta, sr
     for (const f of Object.keys(model.fieldMeta ?? {})) fieldNames.add(f);
     for (const e of model.enums ?? []) fieldNames.add(e.propertyName);
     for (const s of model.states ?? []) fieldNames.add(s.propertyName);
+    for (const a of model.associations) {
+      if (a.kind === 'habtm') fieldNames.add(habtmIdsKey(a.propertyName));
+    }
     const fieldUnion = [...fieldNames].sort().map(f => `'${f}'`).join(' | ') || 'never';
     const assocEntries: string[] = [];
     const projImports: string[] = [];
@@ -621,6 +634,19 @@ function dedupeBy<T>(items: T[], key: (item: T) => string): T[] {
 }
 
 /** Members of a model's `<X>Associations` interface (shared with _globals.gen.d.ts). */
+/**
+ * `owners` → `ownerIds`, using EXACTLY the runtime's rule
+ * (application-record `_singularize`) — the emitted key must match what
+ * save() looks for, so pluralize (with its irregular tables) is off-limits.
+ */
+function habtmIdsKey(prop: string): string {
+  const s = prop.endsWith('ies') ? prop.slice(0, -3) + 'y'
+    : prop.endsWith('ses') || prop.endsWith('xes') || prop.endsWith('zes') ? prop.slice(0, -2)
+    : prop.endsWith('s') && !prop.endsWith('ss') ? prop.slice(0, -1)
+    : prop;
+  return `${s}Ids`;
+}
+
 function renderAssociationMembers(model: ModelMeta, project: ProjectMeta): string[] {
   const lines: string[] = [];
   for (const assoc of model.associations) {

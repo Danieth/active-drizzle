@@ -170,6 +170,61 @@ export type FormHandle<T extends Record<string, any> = Record<string, any>> = {
   [K in keyof T & string]: FieldComponent
 } & FormHandleApi<T>
 
+/**
+ * One bad bulb must not black out the house. Every Field renders inside its
+ * own boundary: wiring mistakes (unregistered presenter, kind mismatch,
+ * missing required meta) and presenter render crashes surface as an inline
+ * teaching chip on THAT field — console.error'd for the terminal — while
+ * every other field keeps working. The chip carries the full fix text, so
+ * the error is MORE visible than a dev-overlay crash, not less.
+ */
+class FieldBoundary extends React.Component<
+  { field: string; children?: ReactNode },
+  { error: Error | null }
+> {
+  override state: { error: Error | null } = { error: null }
+  static getDerivedStateFromError(error: Error): { error: Error } {
+    return { error }
+  }
+  override componentDidCatch(error: Error): void {
+    console.error(`[active-drizzle] field "${this.props.field}" failed to render:`, error)
+  }
+  override render(): ReactNode {
+    if (this.state.error) {
+      return (
+        <span role="alert" data-ad-field-error={this.props.field}>
+          ⚠ {this.props.field}: {this.state.error.message}
+        </span>
+      )
+    }
+    return this.props.children
+  }
+}
+
+/**
+ * The bind a VIEW-rendered presenter receives: writes are refused with a
+ * teaching warn instead of silently corrupting the draft. Without this, a
+ * misbehaving view presenter could stage values the server will strip —
+ * leaving the form dirty-forever against a field nobody may edit.
+ */
+function inertBind(field: string): PresenterBind {
+  const refuse = (): void => {
+    console.warn(
+      `[active-drizzle] view-rendered field "${field}" received a write — refused. ` +
+      `Render it with \`edit\` (and ensure the server grants 'edit') to accept input.`,
+    )
+  }
+  return {
+    name: field,
+    onChange: refuse,
+    onCommit: refuse,
+    onBlur: () => {},
+    onCompositionStart: () => {},
+    onCompositionEnd: () => {},
+    disabled: true,
+  }
+}
+
 /** Resolve per-discriminant copy: meta.copy = { by, [LABEL]: overrides }. */
 function resolveCopy(meta: Record<string, any>, draft: any): Record<string, any> {
   const copy = meta?.copy
@@ -210,6 +265,13 @@ export function useFieldProps(
   }
   const fieldMeta: Record<string, any> =
     ((session.draft as any)?.constructor?.fieldMeta as Record<string, any>) ?? {}
+  if (
+    Object.keys(fieldMeta).length > 0
+    && !(field in fieldMeta)
+    && !(session.draft != null && field in (session.draft as any))
+  ) {
+    console.warn(`[active-drizzle] useFieldProps: "${field}" is not a field on this session's draft or meta — check the name.`)
+  }
   const meta = resolveCopy(fieldMeta[field] ?? {}, session.draft)
   const bind = buildFieldBind(session, {
     field,
@@ -262,6 +324,17 @@ export function buildFieldBind(session: FormSession<any>, opts: BuildFieldBindOp
   return {
     name: field,
     onChange: (value: any) => {
+      // The mask is enforced at the PEN, not just the server: a write to a
+      // field this session may not edit is refused with a teaching warn.
+      // (The server would strip it anyway — but silently staging it would
+      // leave the draft diverged and the form dirty-forever.)
+      if (!session.canEdit(writeField)) {
+        console.warn(
+          `[active-drizzle] write to "${writeField}" refused — this session's abilities mark it ` +
+          `'${session.canView(writeField) ? 'view' : 'absent'}'. The server grants edit via permit/access.`,
+        )
+        return
+      }
       const written = !opts.attachment ? value
         : opts.attachment === 'many'
           ? (Array.isArray(value) ? value.map((v: any) => v?.id ?? v) : value)
@@ -569,7 +642,7 @@ export function createFormHandle<T extends Record<string, any>>(
       staticMeta.presentIf || staticMeta.requiredIf || staticMeta.lockedIf || staticMeta.copy,
     )
 
-    const Field: FC<FieldProps> = (props) => {
+    const FieldInner: FC<FieldProps> = (props) => {
       // pendingIf reads OTHER fields at render time → session-wide channel,
       // same rule as presentIf/lockedIf (dynamic per call site)
       const channel = dependsOnOthers || props.pendingIf ? '*' : dataField
@@ -602,9 +675,19 @@ export function createFormHandle<T extends Record<string, any>>(
       }
       if (props.pendingLabel !== undefined) meta = { ...meta, pendingLabel: props.pendingLabel }
 
+      // Attachment fields READ the loaded asset payload but WRITE the
+      // `<name>AssetId(s)` column the controller actually permits — the
+      // presenter deals in assets, the wire deals in ids, nobody wires it
+      const isAttachment = meta.kind === 'attachmentOne' || meta.kind === 'attachmentMany'
+      const writeField = !isAttachment ? dataField
+        : meta.kind === 'attachmentOne' ? `${field}AssetId` : `${field}AssetIds`
+
       // Visibility: server mask first, then presentIf over the draft (C6:
-      // hiding never loses the value — it lives on the draft, not here)
-      if (!session.canView(dataField)) return null
+      // hiding never loses the value — it lives on the draft, not here).
+      // Attachments alias like ref fields do: the envelope's abilities key
+      // the WRITE column (`logoAssetId`), the presenter wears the name —
+      // either key grants visibility.
+      if (!session.canView(dataField) && !(isAttachment && session.canView(writeField))) return null
       if (typeof meta.presentIf === 'function' && !meta.presentIf(session.draft)) return null
 
       const locked = typeof meta.lockedIf === 'function' && Boolean(meta.lockedIf(session.draft))
@@ -617,29 +700,28 @@ export function createFormHandle<T extends Record<string, any>>(
         meta,
         ...(props.edit !== undefined ? { edit: props.edit } : {}),
         ...(viewOverride !== undefined ? { view: viewOverride } : {}),
-        canEdit: session.canEdit(dataField),
+        // Editability is judged on the column the server actually permits —
+        // for attachments that is `<name>AssetId(s)`, never the display name
+        canEdit: session.canEdit(isAttachment ? writeField : dataField),
         locked,
       })
       if (!resolved) return null
       checkRequiredMeta(resolved.name, resolved.def, field, meta)
 
-      // Attachment fields READ the loaded asset payload but WRITE the
-      // `<name>AssetId(s)` column the controller actually permits — the
-      // presenter deals in assets, the wire deals in ids, nobody wires it
-      const isAttachment = meta.kind === 'attachmentOne' || meta.kind === 'attachmentMany'
-      const writeField = !isAttachment ? dataField
-        : meta.kind === 'attachmentOne' ? `${field}AssetId` : `${field}AssetIds`
-
       // One bind implementation for everyone — the same builder is exported
-      // (buildFieldBind) so custom compositions share this exact contract
-      const bind: PresenterBind = buildFieldBind(session, {
-        field: dataField,
-        writeField,
-        commit: resolved.def.commit ?? 'blur',
-        onCommit: commitViaContext,
-        ...(isAttachment ? { attachment: meta.kind === 'attachmentMany' ? 'many' as const : 'one' as const } : {}),
-        disabled: waiting,
-      })
+      // (buildFieldBind) so custom compositions share this exact contract.
+      // View renders get an INERT bind: a view presenter has no pen, so it
+      // cannot corrupt the draft no matter how it misbehaves.
+      const bind: PresenterBind = resolved.mode === 'edit'
+        ? buildFieldBind(session, {
+            field: dataField,
+            writeField,
+            commit: resolved.def.commit ?? 'blur',
+            onCommit: commitViaContext,
+            ...(isAttachment ? { attachment: meta.kind === 'attachmentMany' ? 'many' as const : 'one' as const } : {}),
+            disabled: waiting,
+          })
+        : inertBind(dataField)
 
       const overrides: Record<string, any> = { ...(props.props ?? {}) }
       if (props.label !== undefined) overrides.label = props.label
@@ -665,7 +747,14 @@ export function createFormHandle<T extends Record<string, any>>(
         />
       )
     }
-    Field.displayName = `Field(${field})`
+    FieldInner.displayName = `Field(${field})`
+
+    const Field: FC<FieldProps> = (props) => (
+      <FieldBoundary field={field}>
+        <FieldInner {...props} />
+      </FieldBoundary>
+    )
+    Field.displayName = `FieldGuard(${field})`
 
     Object.defineProperties(Field, {
       errors: { get: () => session.visibleErrors(dataField) },
@@ -678,6 +767,41 @@ export function createFormHandle<T extends Record<string, any>>(
       ability: { get: () => (session.canEdit(dataField) ? 'edit' : 'view') as 'edit' | 'view' },
     })
     return Field as FieldComponent
+  }
+
+  // A typo'd member (`handle.naem`) — loud, visible, and helpful at FIRST
+  // touch: console teaching error with did-you-mean, an inline chip when
+  // rendered, and safe defaults for programmatic reads (no crashes deep in
+  // someone's footer that counts dirty fields).
+  const makeUnknownFieldComponent = (prop: string): FieldComponent => {
+    const candidates = [
+      ...Object.keys(fieldMeta),
+      ...Object.keys((session.draft as any) ?? {}),
+    ]
+    const nearest = [...new Set(candidates)]
+      .map(c => ({ c, d: editDistance(prop.toLowerCase(), c.toLowerCase()) }))
+      .filter(x => x.d <= 2)
+      .sort((a, b) => a.d - b.d)
+      .slice(0, 3)
+      .map(x => x.c)
+    const hint = nearest.length
+      ? `Did you mean ${nearest.map(n => `"${n}"`).join(' or ')}?`
+      : `Declared fields: ${Object.keys(fieldMeta).slice(0, 8).join(', ')}${Object.keys(fieldMeta).length > 8 ? ', …' : ''}`
+    const message = `"${prop}" is not a field on this form. ${hint}`
+    console.error(`[active-drizzle] ${message}`)
+    const Unknown: FC<FieldProps> = () => (
+      <span role="alert" data-ad-unknown-field={prop}>⚠ {message}</span>
+    )
+    Unknown.displayName = `UnknownField(${prop})`
+    Object.defineProperties(Unknown, {
+      errors: { get: () => [] },
+      meta: { get: () => ({}) },
+      value: { get: () => undefined },
+      dirty: { get: () => false },
+      elsewhere: { get: () => undefined },
+      ability: { get: () => 'view' as const },
+    })
+    return Unknown as FieldComponent
   }
 
   const FormComponent: FC<{ children?: ReactNode; onSuccess?: () => void; autosave?: boolean | { debounceMs?: number }; className?: string }> = ({ children, onSuccess, autosave, className }) => {
@@ -1002,6 +1126,18 @@ export function createFormHandle<T extends Record<string, any>>(
         }
       }
       if (prop.startsWith('$') || prop.startsWith('_')) return undefined
+      // A member that is neither declared meta nor a draft key is a TYPO.
+      // Generated typed handles catch this at compile; untyped handles get
+      // the same protection at first touch — a did-you-mean chip instead of
+      // a misleading "no view presenter for naem". Only enforced when the
+      // handle HAS field meta (bare ad-hoc handles stay permissive).
+      const declared = prop in fieldMeta
+        || (session.draft != null && prop in (session.draft as any))
+      if (!declared && Object.keys(fieldMeta).length > 0) {
+        let unknown = cache.get(prop)
+        if (!unknown) { unknown = makeUnknownFieldComponent(prop); cache.set(prop, unknown) }
+        return unknown
+      }
       let field = cache.get(prop)
       if (!field) {
         field = fieldMeta[prop]?.kind === 'nested'
@@ -1014,4 +1150,18 @@ export function createFormHandle<T extends Record<string, any>>(
       return field
     },
   })
+}
+
+/** Tiny edit distance for did-you-mean (cap 2 — beyond that it's noise). */
+function editDistance(a: string, b: string, cap = 3): number {
+  if (Math.abs(a.length - b.length) > cap) return cap + 1
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i)
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i]
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j]! + 1, cur[j - 1]! + 1, prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1))
+    }
+    prev = cur
+  }
+  return prev[b.length]!
 }

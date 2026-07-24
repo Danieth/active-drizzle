@@ -36,19 +36,40 @@ export interface ScopeEntry {
   paramName: string            // e.g. 'teamId'  (used in oRPC input schema)
 }
 
+/**
+ * The red-squiggle machinery: every config key that names a MODEL FIELD is
+ * typed against the model's generated instance type, so `sortable: ['naem']`
+ * is a compile error at the keystroke — before regen, before runtime.
+ *
+ * Degrades gracefully: an untyped model (`as any`, or codegen not yet run)
+ * widens F to `string` and everything compiles like before. The moment the
+ * generated augmentations exist, the vice closes automatically — no opt-in,
+ * nothing to remember.
+ */
+type IsAny<T> = 0 extends 1 & T ? true : false
+type NonFunctionKeys<I> = Extract<
+  { [K in keyof I]-?: NonNullable<I[K]> extends (...args: any[]) => any ? never : K }[keyof I],
+  string
+>
+export type ModelFieldNames<TModel> =
+  IsAny<TModel> extends true ? string
+  : TModel extends abstract new (...args: any[]) => infer I
+    ? [NonFunctionKeys<I>] extends [never] ? string : NonFunctionKeys<I>
+    : string
+
 /** External search engine contract — see IndexConfig.search.adapter. */
 export interface SearchAdapter {
   /** Matching ids in rank order (cap at opts.limit). Ids ONLY. */
   search(term: string, ctx: any, opts: { limit: number }): Promise<Array<number | string>>
 }
 
-export interface IndexConfig {
+export interface IndexConfig<F extends string = string> {
   scopes?: string[]
   defaultScopes?: string[]
   paramScopes?: string[]
-  sortable?: string[]
-  defaultSort?: { field: string; dir: 'asc' | 'desc' }
-  filterable?: string[]
+  sortable?: F[]
+  defaultSort?: { field: F | 'relevance'; dir: 'asc' | 'desc' }
+  filterable?: F[]
   /**
    * Facet counts — the payoff of faceting. `true` counts every filterable
    * field; an array names a subset (must be ⊆ filterable). Each index
@@ -57,18 +78,18 @@ export interface IndexConfig {
    * filter excluded — so options never zero themselves out). Enum/state
    * group keys come back as labels via the aggregate engine.
    */
-  facets?: boolean | string[]
+  facets?: boolean | F[]
   /**
    * Chart dimension allowlist — fields the client may GROUP BY via the
    * `chart: { x, y }` index param (categorical v1: enum/state/boolean/fk).
    */
-  chartable?: string[]
+  chartable?: F[]
   /**
    * Measure allowlist — numeric fields the client may aggregate via
    * `chart.y: 'sum:amount' | 'avg:amount'` or `metric: 'sum:amount'`.
    * `count` is always allowed once `chartable`/`measures` is declared.
    */
-  measures?: string[]
+  measures?: F[]
   /**
    * NAMED filters — product concepts with server-side meaning (Rails-scope-
    * shaped, presentationally declared). The client only ever sees
@@ -101,7 +122,7 @@ export interface IndexConfig {
    * Like `filterable`, this is an allowlist: a `q` sent to an index without
    * `searchable` is a BadRequest, never a silent no-op.
    */
-  searchable?: string[]
+  searchable?: F[]
   /**
    * WEIGHTED full-text search (PG tsvector, computed on the fly — no
    * migration; add a generated column later purely for speed):
@@ -114,7 +135,7 @@ export interface IndexConfig {
    * simple-ilike fallback when `search` is absent.
    */
   search?: {
-    fields?: Record<string, 'A' | 'B' | 'C' | 'D'>
+    fields?: Partial<Record<F, 'A' | 'B' | 'C' | 'D'>>
     /**
      * External search engine plug (the "ES lane"), IDS-ONLY by doctrine:
      * the adapter returns matching ids in rank order and NOTHING else —
@@ -138,7 +159,16 @@ export interface IndexConfig {
   maxPerPage?: number
 }
 
-export interface WriteConfig {
+/**
+ * Permit vocabulary = model fields PLUS the nested-write wire keys
+ * (`notesAttributes` for the `notes` association). `${F}Attributes` is an
+ * over-approximation (any field name can wear the suffix) — the runtime
+ * rejects non-association Attributes keys; the type's job is killing typos
+ * (`notesAtributes`, `naemAttributes` both still die at the keystroke).
+ */
+export type PermitKeys<F extends string> = F | `${F}Attributes`
+
+export interface WriteConfig<F extends string = string> {
   /**
    * Allowed fields for mass assignment.
    * Can also be a function `(ctx, ctrl, record) => string[]` for role- AND
@@ -150,8 +180,8 @@ export interface WriteConfig {
    * permit: (_ctx, ctrl, loan) =>
    *   loan.isDraft() ? ['amount', 'termMonths'] : []
    */
-  permit?: string[] | ((ctx: any, ctrl: any, record?: any) => string[])
-  restrict?: string[]
+  permit?: PermitKeys<F>[] | ((ctx: any, ctrl: any, record?: any) => PermitKeys<F>[])
+  restrict?: PermitKeys<F>[]
   /**
    * Fields that are always set from context/state, bypassing user input.
    * The callback receives `(ctx, ctrl)` — use `ctrl.state` to access resolved entities.
@@ -162,7 +192,7 @@ export interface WriteConfig {
    *   createdById:    (ctx) => ctx.userId,
    * }
    */
-  autoSet?: Record<string, (ctx: any, ctrl?: any) => any>
+  autoSet?: Partial<Record<F, (ctx: any, ctrl?: any) => any>>
   /**
    * autoSet for NESTED rows — keys are association-name paths (dots for
    * depth). Fields are FORCED from context on nested create rows and
@@ -177,14 +207,14 @@ export interface WriteConfig {
 }
 
 /** Read-side config for @crud get (and singleton get). */
-export interface GetConfig {
+export interface GetConfig<F extends string = string> {
   include?: IncludeSpec[]
   /**
    * Serialization ceiling: ONLY these fields leave the server for this
    * controller. Omitting `expose` keeps today's behavior (all fields) but
    * also disables the abilities envelope — Forms require an explicit ceiling.
    */
-  expose?: string[]
+  expose?: F[]
   /**
    * When true, get/update/create respond with the Forms envelope instead of
    * the bare record:
@@ -199,7 +229,7 @@ export interface GetConfig {
   abilities?: boolean
 }
 
-export interface CrudConfig {
+export interface CrudConfig<F extends string = string> {
   /**
    * THE ACCESS CEILING (DESIGN-projections.md) — what this door may ever
    * show or change, and the whole graph it may reach, declared ONCE with
@@ -219,7 +249,7 @@ export interface CrudConfig {
    * never restates access.
    */
   access?: import('./projection.js').ProjectionNode
-  index?: IndexConfig
+  index?: IndexConfig<F>
   /**
    * Dynamically scope all CRUD queries using resolved controller state.
    * Called once after @before hooks run, applied to `this.relation`.
@@ -233,8 +263,8 @@ export interface CrudConfig {
    * })
    */
   scopeBy?: (ctrl: any) => Record<string, any>
-  create?: WriteConfig
-  update?: Omit<WriteConfig, 'autoSet'> & {
+  create?: WriteConfig<F>
+  update?: Omit<WriteConfig<F>, 'autoSet'> & {
     /**
      * Optimistic concurrency for updates. The envelope gains a `version`
      * token read from this field; the client echoes it as `_version` on
@@ -250,7 +280,7 @@ export interface CrudConfig {
      */
     optimisticLock?: boolean | string
   }
-  get?: GetConfig
+  get?: GetConfig<F>
 }
 
 export interface SingletonConfig {

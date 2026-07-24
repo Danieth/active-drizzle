@@ -487,7 +487,7 @@ export function buildRouter<TContext = Record<string, any>>(
           // Apply autoSet fields from @attachable config
           if (attachableMeta.autoSet) {
             for (const [k, fn] of Object.entries(attachableMeta.autoSet)) {
-              assetData[k] = fn(context, ctrl)
+              if (fn) assetData[k] = fn(context, ctrl)
             }
           }
 

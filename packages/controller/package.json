@@ -1,7 +1,7 @@
 {
   "name": "@active-drizzle/controller",
   "version": "0.1.13",
-  "description": "Rails-style controllers for active-drizzle — oRPC procedures + REST routes from model definitions",
+  "description": "Rails-style controllers for active-drizzle \u2014 oRPC procedures + REST routes from model definitions",
   "type": "module",
   "exports": {
     ".": {
@@ -29,7 +29,8 @@
     "dev": "tsup --watch",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:types": "tsc --noEmit --strict --target es2022 --module nodenext --moduleResolution nodenext --experimentalDecorators tests/typing.test-d.ts"
   },
   "author": "Daniel Ackerman <danieth@github>",
   "license": "MIT",
