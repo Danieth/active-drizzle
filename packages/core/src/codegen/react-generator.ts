@@ -307,7 +307,9 @@ function generateControllerFile(
   const isPlain = ctrl.kind === 'plain'
 
   // ── Imports ──────────────────────────────────────────────────────────────
-  const needsQuery    = hasGetActions(ctrl) || ctrl.kind === 'crud'
+  // singletons emit get() hooks too — omitting them here shipped a
+  // generated file calling useQuery without importing it (65 red lines)
+  const needsQuery    = hasGetActions(ctrl) || ctrl.kind === 'crud' || ctrl.kind === 'singleton'
   const needsMutation = hasMutationActions(ctrl) || ctrl.mutations.length > 0 || ctrl.kind === 'crud' || ctrl.kind === 'singleton' || ctrl.attachable
 
   // Forms envelope → typed handle + wired useEditForm/useNewForm
