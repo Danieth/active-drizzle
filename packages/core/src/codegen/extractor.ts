@@ -176,6 +176,10 @@ const DRIZZLE_TYPE_MAP: Record<string, ColumnType> = {
   // Geometry (standard Postgres types)
   point: 'point', line: 'line', lseg: 'lseg', box: 'box',
   path: 'path', polygon: 'polygon', circle: 'circle',
+  // Ranges (customType fns named after the pg type)
+  int4range: 'int4range', int8range: 'int8range', numrange: 'numrange',
+  tsrange: 'tsrange', tstzrange: 'tstzrange', daterange: 'daterange',
+  nummultirange: 'nummultirange',
   // Extension types — drizzle-orm/pg-core exports these when extension drivers are loaded
   geometry: 'geometry',  // PostGIS
   vector: 'vector',      // pgvector

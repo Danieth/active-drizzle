@@ -756,7 +756,57 @@ function capitalize(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-function columnToTsType(col: ColumnMeta): string {
+/**
+ * THE column → emitted-TS-type map — EXHAUSTIVE by construction:
+ * `satisfies Record<…>` makes a new ColumnType member a compile error HERE
+ * until it is deliberately mapped (the silent `?? 'unknown'` fallthrough
+ * that mistyped ranges for weeks is unrepresentable now). 'unknown' values
+ * are DELIBERATE and allowlisted by the precision ratchet test — adding a
+ * new one fails the suite.
+ */
+export const COLUMN_TS_TYPE = {
+  // Integers
+  integer: 'number',   smallint: 'number',
+  serial:  'number',   smallserial: 'number',
+  bigint:  'string',   bigserial:   'string',   // exceed JS safe-integer range
+  // Floats / decimals
+  real: 'number',  doublePrecision: 'number',
+  decimal: 'string', numeric: 'string',          // full-precision; use Attr.decimal()
+  // Strings
+  text: 'string', varchar: 'string', char: 'string', citext: 'string', uuid: 'string',
+  // Boolean
+  boolean: 'boolean',
+  // Date / time — pg driver returns Date for timestamps, string for date/time
+  date: 'string', timestamp: 'Date', timestamptz: 'Date',
+  time: 'string', interval: 'string',
+  // JSON — arbitrary by nature; Attr.json narrows at the model layer
+  json: 'unknown', jsonb: 'unknown',
+  // Binary
+  bytea: 'Buffer',
+  // Network
+  inet: 'string', cidr: 'string', macaddr: 'string', macaddr8: 'string',
+  // Full-text search
+  tsvector: 'string', tsquery: 'string',
+  // Bit strings
+  bit: 'string', varbit: 'string',
+  // Misc
+  xml: 'string', money: 'string', oid: 'number',
+  // Geometry — base type; wrap with Attr.new() for structured access
+  point: '{ x: number; y: number }',
+  line: 'string', lseg: 'string', box: 'string',
+  path: 'string', polygon: 'string', circle: 'string',
+  geometry: 'unknown',   // PostGIS — shape depends on the geometry type arg
+  vector:   'number[]',  // pgvector
+  // Ranges — RAW driver repr is a string ('[1,10)'); Attr.range() parses
+  int4range: 'string', int8range: 'string', numrange: 'string',
+  tsrange: 'string', tstzrange: 'string', daterange: 'string',
+  nummultirange: 'string',
+  // Fallbacks
+  unknown: 'unknown',
+  array: 'unknown[]',
+} satisfies Record<Exclude<import('./types.js').ColumnType, 'pgEnum'>, string>
+
+export function columnToTsType(col: ColumnMeta): string {
   let base: string;
 
   // Native Postgres enum — emit the string literal union directly
@@ -765,44 +815,16 @@ function columnToTsType(col: ColumnMeta): string {
       ? col.pgEnumValues.map(v => `'${v}'`).join(' | ')
       : 'string';
   } else {
-    const map: Record<string, string> = {
-      // Integers
-      integer: 'number',   smallint: 'number',
-      serial:  'number',   smallserial: 'number',
-      bigint:  'string',   bigserial:   'string',   // exceed JS safe-integer range
-      // Floats / decimals
-      real: 'number',  doublePrecision: 'number',
-      decimal: 'string', numeric: 'string',          // full-precision; use Attr.decimal()
-      // Strings
-      text: 'string', varchar: 'string', char: 'string', citext: 'string', uuid: 'string',
-      // Boolean
-      boolean: 'boolean',
-      // Date / time — pg driver returns Date for timestamps, string for date/time
-      date: 'string', timestamp: 'Date', timestamptz: 'Date',
-      time: 'string', interval: 'string',
-      // JSON
-      json: 'unknown', jsonb: 'unknown',
-      // Binary
-      bytea: 'Buffer',
-      // Network
-      inet: 'string', cidr: 'string', macaddr: 'string', macaddr8: 'string',
-      // Full-text search
-      tsvector: 'string', tsquery: 'string',
-      // Bit strings
-      bit: 'string', varbit: 'string',
-      // Misc
-      xml: 'string', money: 'string', oid: 'number',
-      // Geometry — base type; wrap with Attr.new() for structured access
-      point: '{ x: number; y: number }',
-      line: 'string', lseg: 'string', box: 'string',
-      path: 'string', polygon: 'string', circle: 'string',
-      geometry: 'unknown',   // PostGIS — shape depends on the geometry type arg
-      vector:   'number[]',  // pgvector
-      // Fallbacks
-      unknown: 'unknown',
-      array: 'unknown[]',
-    };
-    base = map[col.type] ?? 'unknown';
+    base = (COLUMN_TS_TYPE as Record<string, string>)[col.type];
+    if (base === undefined) {
+      // A type outside the union reached codegen — silent 'unknown' here is
+      // how the range mistyping survived for weeks. Never again: teach.
+      throw new Error(
+        `column '${col.name}' has unrecognized type '${col.type}' — add it to ColumnType + ` +
+        `COLUMN_TS_TYPE (packages/core/src/codegen), or wrap the column with Attr.new() ` +
+        `to declare its shape. Silent 'unknown' typing is not an option anymore.`,
+      );
+    }
   }
 
   if (col.isArray) base = `(${base})[]`;

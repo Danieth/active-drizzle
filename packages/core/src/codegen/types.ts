@@ -34,6 +34,9 @@ export type ColumnType =
   | 'point' | 'line' | 'lseg' | 'box' | 'path' | 'polygon' | 'circle' | 'geometry'
   // pgvector extension
   | 'vector'
+  // Ranges — raw driver representation is a STRING ('[1,10)');
+  // Attr.range()/dateRange() parse to PgRange at the model layer
+  | 'int4range' | 'int8range' | 'numrange' | 'tsrange' | 'tstzrange' | 'daterange' | 'nummultirange'
   // Native Postgres enum (pgEnum column)
   | 'pgEnum'
   // Fallbacks
