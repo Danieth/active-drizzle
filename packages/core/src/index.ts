@@ -17,3 +17,4 @@ export { generatePresenterManifest, verifyPresenterManifest, type PresenterManif
 export { validateChromeCoverage, REQUIRED_CHROME } from './codegen/presenter-context-generator.js'
 export { runPresenterPipeline, type PresenterPipelineResult } from './codegen/presenter-pipeline.js'
 export { scaffoldModelForms, scanFormManifest, validateFormManifest, resolveLadder, generateFormsIndex, bulbFieldsOf, type FormManifest } from './codegen/presenter-forms.js'
+export { generateUsingDoc } from './codegen/using-doc.js'

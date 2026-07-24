@@ -923,7 +923,9 @@ function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string, tableName: stri
   const qcClose = tableName ? ` }` : ''
 
   if (ctrl.kind === 'crud' && modelName) {
-    L.push(`    /** Paginated list. Pass search state from use${modelName}Search(). */`)
+    L.push(`    /** Paginated list. RETURNS { data: rows, pagination, facets?, ctx? } — NOT bare rows`)
+    L.push(`     *  (read \\\`query.data?.data ?? []\\\`). Params: ${modelName}SearchState`)
+    L.push(`     *  (filters/q/sort/page — nest filters: { filters: { stage: 'won' } }). */`)
     L.push(`    index: (params?: ${modelName}SearchState) => useQuery({`)
     L.push(`      queryKey: ${keysRef}!.list(scopes, params),`)
     L.push(`      queryFn:  () => client.${clientKey}.index({ ${scopeSpread}...params }),`)

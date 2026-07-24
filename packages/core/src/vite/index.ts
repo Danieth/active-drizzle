@@ -441,6 +441,11 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
 
     const routesContent  = generateRoutesFile(ctrlMeta, routesFilePath)
     const routesDocContent = generateRoutesDoc(ctrlMeta)
+    // USING.gen.md — the per-app usage guide (one source, projected at
+    // prose): hooks-factory pattern, wire shapes, wire vocabulary — the
+    // conventions a file-reading LLM can't discover from types alone
+    const { generateUsingDoc } = await import('../codegen/using-doc.js')
+    writeIfChanged(join(outDir, 'USING.gen.md'), generateUsingDoc(ctrlMeta, null))
 
     // _routes.gen.ts is executable (runtime) → reload-worthy; the .md is docs.
     const routesChanged = writeIfChanged(routesFilePath, routesContent)
