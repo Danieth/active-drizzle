@@ -11,3 +11,4 @@ export {
   type TrailsConfig, type TrailsConfigFile, type ChannelsConfig,
 } from './config.js'
 export { processAsset, type ProcessResult } from './tasks/asset-process-task.js'
+export { scaffoldPresenterTree, collectKindsInUse, type ScaffoldResult, type KindUsage } from './codegen/presenter-scaffold.js'

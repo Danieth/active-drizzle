@@ -87,7 +87,9 @@ export default definePresenterContext({ density: () => … }, {
 })
 ```
 Layers stack down the tree; each declares what it CONSUMES; the bulb
-receives the REMAINDER. The REQUIRED set (`label`, `errors`, `dirty`,
+receives the REMAINDER. ORDER (Daniel's rule): a file's context keys
+establish BEFORE its own layout — provider outside, layout inside, so a
+layout may read its own folder's ctx. The REQUIRED set (`label`, `errors`, `dirty`,
 `state`, `elsewhere`) must be covered on EVERY path: consumed by an
 enclosing layout, or declared handled by the bulb
 (`handles: ['state']` in its registration). A responsibility handled

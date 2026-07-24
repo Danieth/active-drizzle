@@ -35,3 +35,9 @@ Every feature passes this filter or dies. Corollaries earned this far:
   Teaching errors target MISTAKES (typos, silent no-ops, swallowed
   errors) — never the permissiveness itself. No boot warnings for
   ungoverned doors, ever.
+- SCOPE, permanent (Daniel, 2026-07-25): mail, i18n, streaming, auth,
+  jobs — NEVER framework territory. ROUTING — ours (typed route manifest
+  derived from the doors). The client does whatever it wants — client
+  freedom is the accepted complexity, answered with laws not lock-in.
+- Context ORDER: within one context.ts, keys establish BEFORE that same
+  file's layout — a folder's layout may read its own folder's ctx.
