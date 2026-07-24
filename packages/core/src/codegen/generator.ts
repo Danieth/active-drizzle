@@ -815,8 +815,8 @@ export function columnToTsType(col: ColumnMeta): string {
       ? col.pgEnumValues.map(v => `'${v}'`).join(' | ')
       : 'string';
   } else {
-    base = (COLUMN_TS_TYPE as Record<string, string>)[col.type];
-    if (base === undefined) {
+    const mapped = (COLUMN_TS_TYPE as Record<string, string>)[col.type];
+    if (mapped === undefined) {
       // A type outside the union reached codegen — silent 'unknown' here is
       // how the range mistyping survived for weeks. Never again: teach.
       throw new Error(
@@ -825,6 +825,7 @@ export function columnToTsType(col: ColumnMeta): string {
         `to declare its shape. Silent 'unknown' typing is not an option anymore.`,
       );
     }
+    base = mapped;
   }
 
   if (col.isArray) base = `(${base})[]`;

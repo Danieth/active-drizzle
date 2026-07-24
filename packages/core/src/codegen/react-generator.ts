@@ -523,7 +523,7 @@ import type { FC, ReactNode } from 'react'`)
     const nestedAttrKinds = new Map(
       model.associations
         .filter(a => a.acceptsNested)
-        .map(a => [`${a.propertyName}Attributes`, a.kind] as const),
+        .map(a => [`${a.propertyName}Attributes` as string, a.kind as string] as [string, string]),
     )
     const nestedAttrNames = new Set(nestedAttrKinds.keys())
     const regularWritable = writableFields.filter(f => !attachmentNames.has(f) && !nestedAttrNames.has(f))
