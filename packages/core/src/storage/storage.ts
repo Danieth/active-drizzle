@@ -208,7 +208,8 @@ export class StorageInstance {
   generateKey(filename: string): string {
     const sanitized = filename
       .replace(/[^a-zA-Z0-9._-]/g, '_')
-      .replace(/_{2,}/g, '_')
+      .replace(/\.{2,}/g, '_')     // '..' can't traverse S3 keys, but a future
+      .replace(/_{2,}/g, '_')      // disk driver must never re-discover this
       .substring(0, 255)
     return `uploads/${randomUUID()}/${sanitized}`
   }
