@@ -131,3 +131,11 @@ export {
   useClientPresenterCtx,
   type PresenterContextMap,
 } from './presenter-context.js'
+export {
+  EntityStore,
+  entityStore,
+  composeEntity,
+  useEntity,
+  type EntityEntry,
+  type EntityPk,
+} from './entity-store.js'
