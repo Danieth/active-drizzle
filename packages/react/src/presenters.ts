@@ -63,6 +63,14 @@ export interface PresenterProps<V = any> {
    * or session-level adoptIncoming. Absent = nothing moved under you.
    */
   elsewhere?: { value: any; at: string | number | null }
+  /**
+   * @frontendContext — server-computed, request-level facts from the door
+   * (userType, plan, …), the same bag in EVERY presenter of the app.
+   * Never fetched, never prop-drilled: computed once per request beside
+   * abilities and delivered on the envelope. Always an object (empty on
+   * ungoverned sessions) so `ctx.userType` never explodes.
+   */
+  ctx: Record<string, unknown>
 }
 
 export interface PresenterDef {

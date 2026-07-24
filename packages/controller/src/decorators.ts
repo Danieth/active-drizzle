@@ -7,6 +7,7 @@ import { normalizeProjection, nodeToIncludeSpecs, PROJECTION_NODE } from './proj
 import {
   CONTROLLER_META, CRUD_META, SINGLETON_META, SCOPE_META,
   MUTATION_META, ACTION_META, BEFORE_META, AFTER_META, RESCUE_META, ATTACHABLE_META,
+  FRONTEND_CONTEXT_META, type FrontendContextMap,
   type CrudConfig, type SingletonConfig, type ScopeEntry, type ModelFieldNames,
   type MutationEntry, type ActionEntry, type HookEntry, type RescueEntry,
   type AttachableConfig,
@@ -116,6 +117,39 @@ export function singleton<TModel extends new (...args: any[]) => any>(
 export function attachable(config?: AttachableConfig) {
   return function (target: any) {
     target[ATTACHABLE_META] = config ?? {}
+  }
+}
+
+// ── @frontendContext ──────────────────────────────────────────────────────────
+
+/**
+ * Server-computed context for PRESENTERS — the fourth passenger on the
+ * envelope, beside abilities/can/version. Each function runs ONCE per
+ * request (after @before hooks, so ctrl.state is loaded) and its value
+ * rides every envelope and index response this door serves. On the
+ * client it appears as `props.ctx.<key>` in every presenter — typed,
+ * never fetched, never prop-drilled.
+ *
+ * Values must be JSON-serializable (they ride the wire). Keys never
+ * shadow: a concern and a controller declaring the same key is a
+ * teaching error at route build, not a silent override.
+ *
+ * @example
+ * @frontendContext({
+ *   userType: (ctx, ctrl) => ctrl.state.user.isAdmin() ? 'admin' : 'member',
+ *   plan:     (_ctx, ctrl) => ctrl.state.org.plan,
+ * })
+ */
+export function frontendContext(map: FrontendContextMap) {
+  return function (target: any) {
+    if (Object.prototype.hasOwnProperty.call(target, FRONTEND_CONTEXT_META)) {
+      const existing = Object.keys(target[FRONTEND_CONTEXT_META]).join(', ')
+      throw new Error(
+        `@frontendContext appears twice on ${target.name} (existing keys: ${existing}). ` +
+        `Declare all keys in ONE decorator — a single object, a single source of truth.`,
+      )
+    }
+    target[FRONTEND_CONTEXT_META] = map
   }
 }
 

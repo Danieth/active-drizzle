@@ -4,7 +4,7 @@
  * Controllers that define their own methods override these automatically.
  */
 import { BadRequest, Conflict, NotFound, ValidationError, toValidationError } from './errors.js'
-import { getMutations, getScopes } from './metadata.js'
+import { getMutations, getScopes, collectFrontendContext } from './metadata.js'
 import { PROJECTION_NODE, sliceByProjection, type NormalizedNode } from './projection.js'
 
 /** The read-slicer: active ONLY for explicit `form:` trees (legacy
@@ -31,6 +31,36 @@ export interface RecordEnvelope {
   issues?: Array<{ field: string; code: string }>
   /** Optimistic-lock token (update.optimisticLock) — echo as `_version` on PATCH. */
   version?: string
+  /** @frontendContext — server-computed presenter context (userType, plan, …).
+   *  Request-level, JSON-plain, delivered to every presenter as props.ctx. */
+  ctx?: Record<string, unknown>
+}
+
+/**
+ * Runs the door's merged @frontendContext map ONCE for this request.
+ * Returns undefined when the door declares none (the envelope stays lean).
+ * A throwing entry fails LOUD with the key and controller named — context
+ * functions are app code, and a broken fact is a bug, not a blank.
+ */
+export function computeFrontendContext(ctrl: any, ctx: any): Record<string, unknown> | undefined {
+  const cls = ctrl?.constructor
+  if (!cls) return undefined
+  const map = collectFrontendContext(cls)
+  const keys = Object.keys(map)
+  if (keys.length === 0) return undefined
+  const out: Record<string, unknown> = {}
+  for (const key of keys) {
+    try {
+      out[key] = map[key]!(ctx, ctrl)
+    } catch (e: any) {
+      throw new Error(
+        `@frontendContext '${key}' on ${cls.name} threw: ${e?.message ?? e}. ` +
+        `Context functions run after @before hooks — if this reads ctrl.state, ` +
+        `make sure the hook that loads it runs for EVERY action of this door.`,
+      )
+    }
+  }
+  return out
 }
 
 /**
@@ -261,6 +291,9 @@ export function buildRecordEnvelope(
     can,
     ...(Object.keys(why).length ? { why } : {}),
   }
+  // @frontendContext — the fourth passenger, computed once per request
+  const feCtx = computeFrontendContext(ctrl, ctx)
+  if (feCtx) envelope.ctx = feCtx
   // Optimistic lock: the version token rides every envelope so the client
   // can echo it back on PATCH
   const lock = lockField(config)
@@ -300,6 +333,8 @@ export interface IndexResult {
    *  scope is empty; 'no-matches' = records exist but filters/search
    *  excluded them all. Costs one extra COUNT, only on empty pages. */
   emptyReason?: 'no-records' | 'no-matches'
+  /** @frontendContext — server-computed presenter context (request-level). */
+  ctx?: Record<string, unknown>
 }
 
 export interface IndexParams {
@@ -675,6 +710,9 @@ export async function defaultIndex(
     ...(metric !== undefined ? { metric } : {}),
     ...(options !== undefined ? { options } : {}),
     ...(emptyReason !== undefined ? { emptyReason } : {}),
+    // @frontendContext: request-level (computed once per RESPONSE, never
+    // per row) — index consumers get the same ctx bag envelopes carry
+    ...(() => { const c = computeFrontendContext(ctrl, ctx); return c ? { ctx: c } : {} })(),
   }
 }
 

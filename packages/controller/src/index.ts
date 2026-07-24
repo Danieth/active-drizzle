@@ -26,6 +26,7 @@ export {
   after,
   rescue,
   attachable,
+  frontendContext,
   inferControllerPath,
   type HookConfig,
   type ActionConfig,
@@ -45,6 +46,7 @@ export type {
   HookEntry,
   RescueEntry,
   AttachableConfig,
+  FrontendContextMap,
 } from './metadata.js'
 
 // Router

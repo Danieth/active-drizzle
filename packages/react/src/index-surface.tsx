@@ -327,7 +327,7 @@ export interface IndexSurface {
   FormSkeleton: FC<{ className?: string }>
   ListSkeleton: FC<{ rows?: number; className?: string }>
   /** Context accessor for custom widgets: session + live query + meta. */
-  use: () => { session: IndexSession; state: IndexState; meta: IndexMeta; rows: any[]; pagination: any; isLoading: boolean; isFetching: boolean }
+  use: () => { session: IndexSession; state: IndexState; meta: IndexMeta; rows: any[]; pagination: any; ctx: Record<string, unknown>; isLoading: boolean; isFetching: boolean }
   /** Query components from cfg.queries (aggregation @actions), keyed PascalCase. */
   [query: string]: any
 }
@@ -565,6 +565,8 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
       meta,
       rows: query.data?.data ?? [],
       pagination: query.data?.pagination ?? null,
+      // @frontendContext — request-level, same bag the envelopes carry
+      ctx: (query.data as any)?.ctx ?? {},
       isLoading: query.isLoading,
       // true during a filter/search refetch while PREVIOUS rows stay
       // mounted (placeholderData) — the "refreshing" affordance signal;

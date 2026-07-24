@@ -28,6 +28,8 @@ export interface ServerEnvelope {
   issues?: Array<{ field: string; code: string }>
   /** Optimistic-lock token — echoed back as `_version` on every submit. */
   version?: string
+  /** @frontendContext — server-computed presenter context (request-level). */
+  ctx?: Record<string, unknown>
 }
 
 export type SubmitResult =
@@ -107,6 +109,9 @@ export interface FormSessionOptions<T extends Record<string, any>> {
   can?: Record<string, boolean> | null
   /** Optimistic-lock token from the initial envelope (edit forms). */
   version?: string | null
+  /** @frontendContext from the envelope — server-computed presenter context
+   *  (userType, plan, …). Delivered to every presenter as props.ctx. */
+  ctx?: Record<string, unknown> | null
   /**
    * Client validation over the draft. Defaults to calling `draft.validate()`
    * when the generated Client provides one.
@@ -155,6 +160,8 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   private withheldVersion: string | null = null
   /** The server's CURRENT envelope from a 409 — fuel for resolveConflict(). */
   private conflictEnvelope: ServerEnvelope | null = null
+  /** @frontendContext bag — refreshed by every envelope (rehydrate). */
+  private frontendCtx: Record<string, unknown> = {}
 
   /** Baseline for the submit diff — reset on load and on successful submit. */
   private baseline: Record<string, any>
@@ -187,6 +194,7 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     this.whyMap = (opts as any).why ?? {}
     this.canGoverned = opts.can != null
     this.version = opts.version ?? null
+    this.frontendCtx = opts.ctx ?? {}
     this.validateFn = opts.validate
       ?? ((d: T) => (typeof (d as any).validate === 'function' ? (d as any).validate() : {}))
     if (opts.submit) this.submitFn = opts.submit
@@ -309,6 +317,12 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     this.baseline = this.snapshotDraft()
     this.serverErrors = {}
     this.notifyAll()
+  }
+
+  /** The @frontendContext bag — server-computed presenter context. Empty
+   *  object on ungoverned sessions (never null: presenters destructure it). */
+  getFrontendCtx(): Record<string, unknown> {
+    return this.frontendCtx
   }
 
   // ── Permissions ───────────────────────────────────────────────────────────
@@ -979,6 +993,10 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
       const known = Number(this.version)
       if (Number.isFinite(incoming) && Number.isFinite(known) && incoming < known) return false
     }
+
+    // @frontendContext refreshes with every envelope — server-computed facts
+    // (userType, plan) track the server, not the initial page load
+    if (envelope.ctx) { this.frontendCtx = envelope.ctx; this.notifyAll() }
 
     let conflict = false
     const adopted: string[] = []

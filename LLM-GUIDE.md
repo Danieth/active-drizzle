@@ -463,6 +463,28 @@ Presenter-side robustness (all automatic):
 - a typo'd handle member (`handle.naem`) renders a did-you-mean chip
   (`[data-ad-unknown-field]`) instead of a misleading presenter error
 
+## 6.6 @frontendContext — server facts in every presenter
+
+Anything you'd normally fetch-in-the-component or prop-drill (user type,
+plan, org settings): compute it ONCE on the door, read it as `props.ctx.*`
+in ANY presenter. Never fetched, never threaded.
+
+```ts
+@frontendContext({
+  userType: (_ctx, ctrl) => ctrl.state.user.isAdmin() ? 'admin' : 'member',
+  plan:     (_ctx, ctrl) => ctrl.state.org.plan,
+})
+class DealController { … }
+```
+
+Rules: runs once per request AFTER @before hooks (ctrl.state is loaded);
+values must be JSON-plain (they ride the envelope beside abilities, and
+index responses too — request-level, never per-row); a concern/base class
+contributes keys and the child ADDS its own; the SAME key declared twice
+is a route-build teaching error — context keys never shadow. Client:
+`props.ctx` in every presenter (always an object), `session.getFrontendCtx()`,
+`Surface.use().ctx`; rehydrate refreshes it on every envelope.
+
 ## 7. Operational rules
 
 - Run tests from INSIDE each package dir (`cd packages/core && npx vitest run`).

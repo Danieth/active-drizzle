@@ -35,6 +35,9 @@ export function useForm<T extends Record<string, any>>(opts: UseFormOptions<T>):
       ...sessionOpts,
       abilities: envelope?.abilities ?? null,
       can: envelope?.can ?? null,
+      // @frontendContext rides the same envelope — version comes through
+      // sessionOpts, ctx needs the same explicit lift
+      ctx: envelope?.ctx ?? null,
     })
     ref.current = createFormHandle(session, fieldMeta ? { fieldMeta } : {})
   }

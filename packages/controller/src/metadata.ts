@@ -16,6 +16,7 @@ export const BEFORE_META      = Symbol('ad:before')
 export const AFTER_META       = Symbol('ad:after')
 export const RESCUE_META      = Symbol('ad:rescue')
 export const ATTACHABLE_META  = Symbol('ad:attachable')
+export const FRONTEND_CONTEXT_META = Symbol('ad:frontendContext')
 
 // ── Shape definitions ─────────────────────────────────────────────────────────
 
@@ -431,6 +432,43 @@ export function collectBeforeHooks(cls: any, actionName: string): HookEntry[] {
 
 export function collectAfterHooks(cls: any, actionName: string): HookEntry[] {
   return collectHooks(cls, AFTER_META, actionName)
+}
+
+/** One @frontendContext declaration: key → per-request compute function. */
+export type FrontendContextMap = Record<string, (ctx: any, ctrl: any) => unknown>
+
+/**
+ * Collects the merged @frontendContext map for a controller, walking the
+ * prototype chain (a concern/base class contributes its keys; the child
+ * ADDS its own). A key declared twice — child shadowing parent, or two
+ * decorators on one class — BLOWS UP with a teaching error: context keys
+ * are facts, and two definitions of a fact is a bug, never a preference.
+ */
+export function collectFrontendContext(cls: any): FrontendContextMap {
+  const layers: Array<{ owner: string; map: FrontendContextMap }> = []
+  let proto = cls
+  while (proto && proto !== Function.prototype) {
+    if (Object.prototype.hasOwnProperty.call(proto, FRONTEND_CONTEXT_META)) {
+      layers.unshift({ owner: proto.name ?? '(anonymous)', map: proto[FRONTEND_CONTEXT_META] })
+    }
+    proto = Object.getPrototypeOf(proto)
+  }
+  const merged: FrontendContextMap = {}
+  const ownerOf: Record<string, string> = {}
+  for (const { owner, map } of layers) {
+    for (const [key, fn] of Object.entries(map)) {
+      if (key in merged) {
+        throw new Error(
+          `@frontendContext key '${key}' is declared by BOTH ${ownerOf[key]} and ${owner}. ` +
+          `Context keys never shadow — rename one, or delete the duplicate ` +
+          `(the whole point is that ctx.${key} means ONE thing everywhere).`,
+        )
+      }
+      merged[key] = fn
+      ownerOf[key] = owner
+    }
+  }
+  return merged
 }
 
 function collectHooks(cls: any, sym: symbol, actionName: string): HookEntry[] {

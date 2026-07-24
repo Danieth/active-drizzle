@@ -76,6 +76,7 @@ export function useGeneratedForm<T extends Record<string, any>>(
       abilities: (envelope as any).abilities ?? null,
       can: (envelope as any).can ?? null,
       version: (envelope as any).version ?? null,
+      ctx: (envelope as any).ctx ?? null,
       ...(opts.submit ? { submit: opts.submit } : {}),
       ...(opts.validate ? { validate: opts.validate } : {}),
     })

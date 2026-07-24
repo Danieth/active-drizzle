@@ -283,6 +283,7 @@ export function useFieldProps(
     value: session.getValue(field),
     bind,
     meta,
+    ctx: session.getFrontendCtx(),
     overrides: opts.overrides ?? {},
     mode: opts.mode ?? (session.canEdit(field) ? 'edit' : 'view'),
     draft: session.draft,
@@ -735,6 +736,7 @@ export function createFormHandle<T extends Record<string, any>>(
           value={session.getValue(dataField)}
           bind={bind}
           meta={meta}
+          ctx={session.getFrontendCtx()}
           overrides={overrides}
           mode={resolved.mode}
           draft={session.draft}

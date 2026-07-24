@@ -54,6 +54,7 @@ export function buildTestProps(
     value: session.getValue(field),
     bind: buildFieldBind(session, { field, ...bindOpts }),
     meta: fieldMeta[field] ?? {},
+    ctx: session.getFrontendCtx(),
     overrides: {},
     mode: session.canEdit(field) ? 'edit' : 'view',
     draft: session.draft,
