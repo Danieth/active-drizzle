@@ -15,7 +15,7 @@ import React, { createContext, useContext, useEffect, useState, useSyncExternalS
 import { FormSession, type SessionStatus } from './form-session.js'
 import { parseControllerError } from './errors.js'
 import { NestedArrayManager, NestedOneManager, type NestedChild } from './nested.js'
-import { resolvePresenter, checkRequiredMeta, type PresenterBind, type PresenterProps } from './presenters.js'
+import { resolvePresenter, checkRequiredMeta, resolveLayout, type PresenterBind, type PresenterProps } from './presenters.js'
 import { useClientPresenterCtx } from './presenter-context.js'
 
 /**
@@ -733,25 +733,29 @@ export function createFormHandle<T extends Record<string, any>>(
       if (props.help !== undefined) overrides.help = props.help
       if (props.className !== undefined) overrides.className = props.className
 
-      const Component = resolved.def.component
+      const Component = resolved.def.component as React.ComponentType<PresenterProps>
+      const Layout = resolveLayout(resolved.def)
       const incoming = session.getIncomingFor(dataField)
-      return (
-        <Component
-          value={session.getValue(dataField)}
-          bind={bind}
-          meta={{ ...meta, ...overrides }}
-          ctx={{ ...clientCtx, ...session.getFrontendCtx() }}
-          overrides={overrides}
-          mode={resolved.mode}
-          draft={session.draft}
-          errors={session.visibleErrors(dataField)}
-          state={waiting ? 'waiting'
-            : session.fieldState(dataField) !== 'ready' ? session.fieldState(dataField)
-            : session.getStatus()}
-          dirty={session.fieldDirty(dataField)}
-          {...(incoming !== undefined ? { elsewhere: incoming } : {})}
-        />
-      )
+      const presenterProps: PresenterProps = {
+        value: session.getValue(dataField),
+        bind,
+        meta: { ...meta, ...overrides },
+        ctx: { ...clientCtx, ...session.getFrontendCtx() },
+        overrides,
+        mode: resolved.mode,
+        draft: session.draft,
+        errors: session.visibleErrors(dataField),
+        state: waiting ? 'waiting'
+          : session.fieldState(dataField) !== 'ready' ? session.fieldState(dataField)
+          : session.getStatus(),
+        dirty: session.fieldDirty(dataField),
+        ...(incoming !== undefined ? { elsewhere: incoming } : {}),
+      }
+      const bulb = <Component {...presenterProps} />
+      // The LAYOUT renders the chrome (label/errors/dirty/state/elsewhere)
+      // around the bulb — with a default layout registered, the bulb is
+      // just value + bind and the chrome is written ONCE, by the app
+      return Layout ? <Layout {...presenterProps}>{bulb}</Layout> : bulb
     }
     FieldInner.displayName = `Field(${field})`
 

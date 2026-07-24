@@ -20,3 +20,7 @@ Every feature passes this filter or dies. Corollaries earned this far:
   never guessed); values may be optimistic because they are DECLARED.
 - Signals live at the grain of the thing that renders them: presenters
   are fields, so narration (dirty/state/elsewhere/tick) is per-field.
+- Formatting is APP vocabulary: the framework never ships format/parse
+  for values (no Intl, no repr codecs) — the app dries that up itself.
+- Chrome is written ONCE, by the app, as a LAYOUT: bulbs are value+bind;
+  the layout renders label/errors/dirty/state around them.

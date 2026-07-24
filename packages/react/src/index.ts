@@ -140,3 +140,12 @@ export {
   type EntityPk,
 } from './entity-store.js'
 export { useEntityStatus } from './entity-store.js'
+export {
+  registerPresenterLayout,
+  resolveLayout,
+  type PresenterLayout,
+  type PresenterPropsFor,
+  type KindValue,
+  type AdKindShapes,
+  type BuiltinKindShapes,
+} from './presenters.js'

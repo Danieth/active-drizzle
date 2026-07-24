@@ -41,6 +41,43 @@ export interface PresenterBind {
   disabled: boolean
 }
 
+/**
+ * Kind → value/meta types. The FRAMEWORK types its own kinds (below);
+ * apps augment AdKindShapes for custom kinds (defineAttrKind will emit
+ * this). `registerPresenter` then checks the component against its
+ * kind's value type — a money bulb typed for string is a red squiggle.
+ */
+export interface BuiltinKindShapes {
+  string: { value: string | null }
+  text: { value: string | null }
+  email: { value: string | null }
+  url: { value: string | null }
+  uuid: { value: string | null }
+  money: { value: number | null }
+  percent: { value: number | null }
+  bps: { value: number | null }
+  multiple: { value: number | null }
+  integer: { value: number | null }
+  int: { value: number | null }
+  decimal: { value: number | string | null }
+  boolean: { value: boolean | null }
+  date: { value: string | null }
+  enum: { value: string | null }
+  state: { value: string | null }
+  json: { value: unknown }
+}
+
+/** App-augmented kind shapes (custom kinds) — wins over builtins. */
+export interface AdKindShapes {}
+
+export type KindValue<K extends string> =
+  K extends keyof AdKindShapes ? (AdKindShapes[K] extends { value: infer V } ? V : any)
+  : K extends keyof BuiltinKindShapes ? BuiltinKindShapes[K]['value']
+  : any
+
+/** The props a presenter for kind K receives — value TYPED by the kind. */
+export type PresenterPropsFor<K extends string> = PresenterProps<KindValue<K>>
+
 export interface PresenterProps<V = any> {
   value: V
   bind: PresenterBind
@@ -95,14 +132,18 @@ export type FrontendCtx = keyof AdFrontendCtx extends never
   ? Record<string, unknown>
   : AdFrontendCtx & Record<string, unknown>
 
-export interface PresenterDef {
+export interface PresenterDef<K extends string = string> {
   /** Attr kind(s) this presenter accepts — wrong pairing is a dev-time error. */
-  kind: string | string[]
+  kind: K | K[]
   /** Meta keys this presenter refuses to render without. */
   requires?: string[]
   /** Natural commit moment. Discrete inputs: 'change'. Continuous: 'blur' (default). */
   commit?: 'change' | 'blur'
-  component: ComponentType<PresenterProps>
+  /** Chrome wrapper by name ('false' = bare). Defaults to the app's
+   *  default layout when one is registered — the bulb renders value+bind,
+   *  the LAYOUT renders label/errors/dirty/saving/elsewhere chrome. */
+  layout?: string | false
+  component: ComponentType<PresenterPropsFor<K>>
 }
 
 /**
@@ -158,7 +199,34 @@ const KIND_FALLBACKS: Record<string, string> = {
 /** Kinds whose inputs commit discretely — a toggle/select never blurs. */
 const DISCRETE_KINDS = new Set(['boolean', 'enum', 'state'])
 
-export function registerPresenter(name: string, def: PresenterDef): void {
+/**
+ * A LAYOUT is app-defined chrome (sockets, not bulbs — and not chrome
+ * either): it receives the FULL PresenterProps plus the rendered bulb as
+ * children, and renders label/errors/dirty/saving/elsewhere around it.
+ * With a default layout registered, the 90% bulb is just value + bind.
+ */
+export type PresenterLayout = ComponentType<PresenterProps & { children?: import('react').ReactNode }>
+const layoutRegistry = new Map<string, PresenterLayout>()
+let defaultLayoutName: string | null = null
+
+export function registerPresenterLayout(name: string, component: PresenterLayout, opts: { default?: boolean } = {}): void {
+  layoutRegistry.set(name, component)
+  if (opts.default) defaultLayoutName = name
+}
+
+/** Resolve the layout for a def: explicit name → app default → none. */
+export function resolveLayout(def: PresenterDef): PresenterLayout | null {
+  if (def.layout === false) return null
+  const name = def.layout ?? defaultLayoutName
+  if (!name) return null
+  const layout = layoutRegistry.get(name)
+  if (!layout) {
+    throw new Error(`Presenter layout "${name}" is not registered — registerPresenterLayout('${name}', …)`)
+  }
+  return layout
+}
+
+export function registerPresenter<K extends string>(name: string, def: PresenterDef<K>): void {
   // The silent-never-saves trap: a discrete presenter left on the default
   // 'blur' commit only saves when the input blurs — which a toggle may
   // never do. Teach at REGISTRATION, not after a user's flip vanishes.
@@ -171,7 +239,7 @@ export function registerPresenter(name: string, def: PresenterDef): void {
       `(or ignore this if the presenter genuinely commits on blur).`,
     )
   }
-  registry.set(name, def)
+  registry.set(name, def as PresenterDef)
 }
 
 /** App-registered per-kind defaults. AD itself registers NONE. */
@@ -187,6 +255,8 @@ export function getPresenter(name: string): PresenterDef | undefined {
 export function clearPresenters(): void {
   registry.clear()
   kindDefaults = {}
+  layoutRegistry.clear()
+  defaultLayoutName = null
 }
 
 export interface ResolvedPresenter {
