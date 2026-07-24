@@ -15,7 +15,8 @@ import React, { createContext, useContext, useEffect, useState, useSyncExternalS
 import { FormSession, type SessionStatus } from './form-session.js'
 import { parseControllerError } from './errors.js'
 import { NestedArrayManager, NestedOneManager, type NestedChild } from './nested.js'
-import { resolvePresenter, checkRequiredMeta, resolveLayout, type PresenterBind, type PresenterProps } from './presenters.js'
+import { resolvePresenter, checkRequiredMeta, type PresenterBind, type PresenterProps } from './presenters.js'
+import { usePresenterLayoutStack, wrapInLayoutStack } from './presenter-context.js'
 import { useClientPresenterCtx } from './presenter-context.js'
 
 /**
@@ -657,6 +658,7 @@ export function createFormHandle<T extends Record<string, any>>(
       // Client-lane presenter context (folder context.ts files) — merged
       // UNDER the server lane; regen guarantees the lanes never collide
       const clientCtx = useClientPresenterCtx()
+      const layoutStack = usePresenterLayoutStack()
       // Route a commit by context: autoflush stages + schedules the whole-
       // diff flush; stage just stages; no Form → per-field autosave PATCH
       const commitViaContext = (f: string): void => {
@@ -734,7 +736,6 @@ export function createFormHandle<T extends Record<string, any>>(
       if (props.className !== undefined) overrides.className = props.className
 
       const Component = resolved.def.component as React.ComponentType<PresenterProps>
-      const Layout = resolveLayout(resolved.def)
       const incoming = session.getIncomingFor(dataField)
       const presenterProps: PresenterProps = {
         value: session.getValue(dataField),
@@ -752,10 +753,10 @@ export function createFormHandle<T extends Record<string, any>>(
         ...(incoming !== undefined ? { elsewhere: incoming } : {}),
       }
       const bulb = <Component {...presenterProps} />
-      // The LAYOUT renders the chrome (label/errors/dirty/state/elsewhere)
-      // around the bulb — with a default layout registered, the bulb is
-      // just value + bind and the chrome is written ONCE, by the app
-      return Layout ? <Layout {...presenterProps}>{bulb}</Layout> : bulb
+      // LAYOUTS ARE CONTEXT: the folder-declared layout stack (outermost
+      // first) wraps every bulb — chrome written once, at the altitude the
+      // app chose; LAW 3's regen walk guarantees full coverage, no doubles
+      return <>{wrapInLayoutStack(layoutStack, presenterProps, bulb)}</>
     }
     FieldInner.displayName = `Field(${field})`
 

@@ -1,14 +1,16 @@
 /**
- * The LAYOUT socket + typed kind values (Daniel's two directives):
- * chrome written ONCE by the app; a money bulb typed for the wrong value
- * is a red squiggle at registration.
+ * LAYOUTS ARE CONTEXT (LAW 3, DESIGN-presenter-tree §3): a folder's
+ * context.ts declares its layout + consumed responsibilities; the stack
+ * wraps every bulb beside/below; keys establish BEFORE the file's own
+ * layout (Daniel's ordering rule). Plus typed kind values.
  */
 import React from 'react'
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach } from 'vitest'
 import { render } from '@testing-library/react'
 import {
   FormSession, createFormHandle,
-  registerPresenter, registerPresenterLayout, setDefaultPresenters, clearPresenters,
+  registerPresenter, setDefaultPresenters, clearPresenters,
+  definePresenterContext, PresenterContextProvider,
   type PresenterPropsFor,
 } from '../src/index.js'
 
@@ -25,48 +27,72 @@ function makeHandle() {
   return handle
 }
 
-describe('the layout socket — chrome written once', () => {
-  it('a DEFAULT layout wraps every bulb: label + dirty chrome around a value+bind input', () => {
-    registerPresenterLayout('field', (p) => (
-      <label data-ad-layout="">
-        <span>{p.meta.label}</span>
-        {p.dirty && <em data-chrome="dirty">unsaved</em>}
-        {p.children}
-        {p.errors.length > 0 && <span role="alert">{p.errors.join(', ')}</span>}
-      </label>
-    ), { default: true })
+describe('layouts are context — the stack wraps every bulb below', () => {
+  it('a context-declared layout renders chrome around the bulb; ctx keys visible to it', () => {
     registerPresenter('textInput', { kind: 'string', component: Bare })
     setDefaultPresenters({ string: { edit: 'textInput' } })
-    const { container } = render(React.createElement(makeHandle().name, { edit: true }))
+    let layoutSawCtx: any
+    const appCtx = definePresenterContext(
+      { density: () => 'compact' },
+      {
+        layout: (p: any) => {
+          layoutSawCtx = p.ctx.density        // ordering rule: keys BEFORE own layout
+          return (
+            <label data-ad-layout="">
+              <span>{p.meta.label}</span>
+              {p.dirty && <em data-chrome="dirty">unsaved</em>}
+              {p.children}
+            </label>
+          )
+        },
+        consumes: ['label', 'dirty'],
+      },
+    )
+    const handle = makeHandle()
+    const { container } = render(
+      <PresenterContextProvider map={appCtx}>
+        {React.createElement(handle.name, { edit: true })}
+      </PresenterContextProvider>,
+    )
     expect(container.querySelector('[data-ad-layout]')).toBeTruthy()
-    expect(container.textContent).toContain('Name')                    // chrome rendered the label
+    expect(container.textContent).toContain('Name')
     expect(container.querySelector('[data-chrome="dirty"]')).toBeTruthy()
-    expect(container.querySelector('input[aria-label="name"]')).toBeTruthy()  // bulb inside
+    expect(container.querySelector('input[aria-label="name"]')).toBeTruthy()
+    expect(layoutSawCtx).toBe('compact')                 // the layout read its OWN folder's ctx
   })
 
-  it("layout: false opts a bulb OUT; explicit layout name wins; missing layout teaches", () => {
-    registerPresenterLayout('field', (p) => <div data-ad-layout="">{p.children}</div>, { default: true })
-    registerPresenter('bare', { kind: 'string', layout: false, component: Bare })
-    setDefaultPresenters({ string: { edit: 'bare' } })
-    const { container } = render(React.createElement(makeHandle().name, { edit: true }))
-    expect(container.querySelector('[data-ad-layout]')).toBeNull()
+  it('layouts STACK: outer area wraps inner area wraps the bulb', () => {
+    registerPresenter('textInput', { kind: 'string', component: Bare })
+    setDefaultPresenters({ string: { edit: 'textInput' } })
+    const mk = (name: string) => definePresenterContext({}, {
+      layout: (p: any) => <div data-layer={name}>{p.children}</div>,
+      consumes: [],
+    })
+    const handle = makeHandle()
+    const { container } = render(
+      <PresenterContextProvider map={mk('app')}>
+        <PresenterContextProvider map={mk('deal-area')}>
+          {React.createElement(handle.name, { edit: true })}
+        </PresenterContextProvider>
+      </PresenterContextProvider>,
+    )
+    const outer = container.querySelector('[data-layer="app"]')!
+    expect(outer.querySelector('[data-layer="deal-area"]')).toBeTruthy()   // nesting order holds
+    expect(outer.querySelector('input')).toBeTruthy()
+  })
 
-    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
-    try {
-      clearPresenters()
-      registerPresenter('lost', { kind: 'string', layout: 'nope', component: Bare })
-      setDefaultPresenters({ string: { edit: 'lost' } })
-      const { container: c2 } = render(React.createElement(makeHandle().name, { edit: true }))
-      expect(c2.querySelector('[data-ad-field-error]')!.textContent).toMatch(/layout "nope" is not registered/)
-    } finally { err.mockRestore() }
+  it('no layout declared anywhere → bulb renders bare (nothing to opt out of)', () => {
+    registerPresenter('textInput', { kind: 'string', component: Bare })
+    setDefaultPresenters({ string: { edit: 'textInput' } })
+    const handle = makeHandle()
+    const { container } = render(React.createElement(handle.name, { edit: true }))
+    expect(container.querySelector('[data-ad-layout]')).toBeNull()
+    expect(container.querySelector('input[aria-label="name"]')).toBeTruthy()
   })
 })
 
 describe('typed kind values (compile-time — asserted structurally)', () => {
   it('PresenterPropsFor gives builtin kinds their value types', () => {
-    // These are type-level facts; the runtime assertion is that correctly
-    // typed registrations compile AND run. The red-squiggle proof lives
-    // in the type test below (build fails if the typing regresses).
     const MoneyBulb = (p: PresenterPropsFor<'money'>) => {
       const v: number | null = p.value                    // typed number — not any
       return <span>{v ?? 0}</span>

@@ -75,3 +75,63 @@ describe('the generated registry', () => {
     expect(scans[0]!.components).toEqual(['MoneyInput', 'MoneyCompact', 'MoneyText'])
   })
 })
+
+// ── Slices 3+4: LAW 3 coverage + the boot manifest ──────────────────────────
+
+import { validateChromeCoverage, REQUIRED_CHROME } from '../../src/codegen/presenter-context-generator.js'
+import { generatePresenterManifest, verifyPresenterManifest } from '../../src/codegen/presenter-registry.js'
+
+const ctx = (area: string, consumes: string[], keys: string[] = []): any =>
+  ({ filePath: `/p/${area || 'root'}/context.ts`, area, keys, consumes, hasLayout: consumes.length > 0 })
+
+describe('LAW 3 — chrome coverage walk', () => {
+  it('root layout consuming the full required set covers every kind', () => {
+    expect(() => validateChromeCoverage(
+      [ctx('', [...REQUIRED_CHROME])],
+      [{ kind: 'money' }, { kind: 'boolean' }],
+    )).not.toThrow()
+  })
+
+  it("a responsibility handled NOWHERE explodes with the spec's teaching error", () => {
+    expect(() => validateChromeCoverage(
+      [ctx('', ['label', 'errors', 'state', 'elsewhere'])],   // dirty missing
+      [{ kind: 'money' }],
+    )).toThrow(/attr\/money[\s\S]*'dirty'[\s\S]*consume it in a layout[\s\S]*handles = \['dirty'\]/)
+  })
+
+  it('bulb-level handles fills the gap; kind-area consumes does too', () => {
+    expect(() => validateChromeCoverage(
+      [ctx('', ['label', 'errors', 'state', 'elsewhere'])],
+      [{ kind: 'money', handles: ['dirty'] }],
+    )).not.toThrow()
+    expect(() => validateChromeCoverage(
+      [ctx('', ['label', 'errors', 'state', 'elsewhere']), ctx('attr/money', ['dirty'])],
+      [{ kind: 'money' }],
+    )).not.toThrow()
+  })
+
+  it('DOUBLE-CLAIM on one path explodes naming both files', () => {
+    expect(() => validateChromeCoverage(
+      [ctx('', [...REQUIRED_CHROME]), ctx('models/Deal', ['errors'])],
+      [],
+    )).toThrow(/'errors' is consumed by BOTH[\s\S]*root\/context\.ts[\s\S]*models\/Deal\/context\.ts/)
+  })
+})
+
+describe('slice 4 — the boot manifest', () => {
+  const usages = [{ kind: 'money', usedBy: [{ model: 'Deal', field: 'amount' }] }]
+
+  it('round-trips: regen writes it, boot verifies it, all green', () => {
+    const scans: any = [{ kind: 'money', filePath: '/x', components: ['MoneyInput', 'MoneyText'] }]
+    const m = generatePresenterManifest(usages, scans, [ctx('', ['label'])])
+    expect(m.kinds.money!.presenters).toEqual(['moneyInput', 'moneyText'])
+    expect(m.kinds.money!.usedBy).toEqual(['Deal.amount'])
+    expect(() => verifyPresenterManifest(m, ['money'])).not.toThrow()
+  })
+
+  it('a NEW kind added after regen fails boot with the fix command', () => {
+    const m = generatePresenterManifest(usages, [{ kind: 'money', filePath: '/x', components: ['MoneyInput'] }] as any, [])
+    expect(() => verifyPresenterManifest(m, ['money', 'timezone']))
+      .toThrow(/STALE or incomplete[\s\S]*timezone[\s\S]*regen[\s\S]*LAW 1/)
+  })
+})

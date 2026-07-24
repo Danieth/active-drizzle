@@ -28,7 +28,13 @@ export interface PresenterContextFile {
   /** Area = folder path relative to the presenters root ('' = root). */
   area: string
   keys: string[]
+  /** Chrome responsibilities this file's LAYOUT consumes (LAW 3). */
+  consumes: string[]
+  hasLayout: boolean
 }
+
+/** LAW 3's required set — every path must handle each of these once. */
+export const REQUIRED_CHROME = ['label', 'errors', 'dirty', 'state', 'elsewhere'] as const
 
 export function scanPresenterContexts(
   project: Project,
@@ -63,8 +69,26 @@ export function scanPresenterContexts(
         keys.push(prop.getName())
       }
     }
+    // Second arg: { layout, consumes } — LAW 3's declaration
+    let consumes: string[] = []
+    let hasLayout = false
+    if (expr && Node.isCallExpression(expr)) {
+      const optsArg = expr.getArguments()[1]
+      if (optsArg && Node.isObjectLiteralExpression(optsArg)) {
+        for (const prop of optsArg.getProperties()) {
+          if (!Node.isPropertyAssignment(prop)) continue
+          if (prop.getName() === 'layout') hasLayout = true
+          if (prop.getName() === 'consumes') {
+            const arr = prop.getInitializer()
+            if (arr && Node.isArrayLiteralExpression(arr)) {
+              consumes = arr.getElements().map(e => e.getText().replace(/['"`]/g, ''))
+            }
+          }
+        }
+      }
+    }
     const area = relative(presentersDir, dirname(filePath)).replace(/\\/g, '/')
-    out.push({ filePath, area: area === '.' ? '' : area, keys })
+    out.push({ filePath, area: area === '.' ? '' : area, keys, consumes, hasLayout })
   }
   return out
 }
@@ -168,4 +192,54 @@ export function generatePresenterContext(
   const files = scanPresenterContexts(project, presentersDir, contextPaths)
   validatePresenterContexts(files, serverKeys)
   return generatePresenterContextFile(files, outFilePath)
+}
+
+
+/**
+ * LAW 3 — chrome coverage (DESIGN-presenter-tree §3): every REQUIRED
+ * responsibility is handled EXACTLY ONCE on every path. Two walks:
+ *   1. DOUBLE-CLAIM: an ancestor and a descendant both consuming the same
+ *      responsibility = two error lists rendered — error naming both files.
+ *   2. COVERAGE per kind folder: required ⊆ root.consumes ∪ the kind
+ *      area's consumes ∪ the bulb module's `handles` export — a
+ *      responsibility handled NOWHERE is the teaching error from the spec.
+ */
+export function validateChromeCoverage(
+  files: PresenterContextFile[],
+  kinds: Array<{ kind: string; handles?: string[] }>,
+): void {
+  // 1. double-claims along ancestor chains
+  for (const f of files) {
+    for (const a of files) {
+      if (a === f) continue
+      const isAncestor = a.area === '' ? f.area !== '' : f.area.startsWith(a.area + '/')
+      if (!isAncestor) continue
+      for (const r of f.consumes) {
+        if (a.consumes.includes(r)) {
+          throw new Error(
+            `chrome responsibility '${r}' is consumed by BOTH ${a.filePath} and ${f.filePath} ` +
+            `on the same path — two layers rendering the same chrome (two error lists, two labels). ` +
+            `Exactly one layer owns each responsibility; remove one 'consumes' entry.`,
+          )
+        }
+      }
+    }
+  }
+
+  // 2. coverage per kind folder
+  const root = files.find(f => f.area === '')
+  const rootConsumes = new Set(root?.consumes ?? [])
+  for (const k of kinds) {
+    const kindArea = files.find(f => f.area === `attr/${k.kind}`)
+    const covered = new Set([...rootConsumes, ...(kindArea?.consumes ?? []), ...(k.handles ?? [])])
+    const missing = REQUIRED_CHROME.filter(r => !covered.has(r))
+    if (missing.length > 0) {
+      throw new Error(
+        `under presenters/attr/${k.kind}/, nothing handles ${missing.map(m => `'${m}'`).join(', ')} — ` +
+        `consume ${missing.length > 1 ? 'them' : 'it'} in a layout (presenters/context.ts: ` +
+        `definePresenterContext({…}, { layout, consumes: [${missing.map(m => `'${m}'`).join(', ')}] })) ` +
+        `or declare \`export const handles = [${missing.map(m => `'${m}'`).join(', ')}]\` in the bulb module.`,
+      )
+    }
+  }
 }

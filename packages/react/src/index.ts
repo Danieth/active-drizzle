@@ -129,7 +129,13 @@ export {
   definePresenterContext,
   PresenterContextProvider,
   useClientPresenterCtx,
+  usePresenterLayoutStack,
+  wrapInLayoutStack,
+  CHROME_RESPONSIBILITIES,
+  PRESENTER_CONTEXT_OPTS,
   type PresenterContextMap,
+  type PresenterContextOpts,
+  type ChromeResponsibility,
 } from './presenter-context.js'
 export {
   EntityStore,
@@ -141,8 +147,6 @@ export {
 } from './entity-store.js'
 export { useEntityStatus } from './entity-store.js'
 export {
-  registerPresenterLayout,
-  resolveLayout,
   type PresenterLayout,
   type PresenterPropsFor,
   type KindValue,

@@ -139,10 +139,10 @@ export interface PresenterDef<K extends string = string> {
   requires?: string[]
   /** Natural commit moment. Discrete inputs: 'change'. Continuous: 'blur' (default). */
   commit?: 'change' | 'blur'
-  /** Chrome wrapper by name ('false' = bare). Defaults to the app's
-   *  default layout when one is registered — the bulb renders value+bind,
-   *  the LAYOUT renders label/errors/dirty/saving/elsewhere chrome. */
-  layout?: string | false
+  /** Chrome responsibilities THIS BULB handles itself (LAW 3): a bare
+   *  bulb under no consuming layout must handle the full required set —
+   *  regen walks coverage and errors on gaps and double-claims. */
+  handles?: import('./presenter-context.js').ChromeResponsibility[]
   component: ComponentType<PresenterPropsFor<K>>
 }
 
@@ -200,31 +200,13 @@ const KIND_FALLBACKS: Record<string, string> = {
 const DISCRETE_KINDS = new Set(['boolean', 'enum', 'state'])
 
 /**
- * A LAYOUT is app-defined chrome (sockets, not bulbs — and not chrome
- * either): it receives the FULL PresenterProps plus the rendered bulb as
- * children, and renders label/errors/dirty/saving/elsewhere around it.
- * With a default layout registered, the 90% bulb is just value + bind.
+ * LAYOUTS ARE CONTEXT (GOLDEN-RULE.md; DESIGN-presenter-tree §3): a
+ * folder's context.ts declares its layout + consumed responsibilities;
+ * the stack wraps every presenter beside/below. The transitional
+ * registration API (registerPresenterLayout) was deleted per the spec —
+ * see presenter-context.tsx for the stacking machinery.
  */
 export type PresenterLayout = ComponentType<PresenterProps & { children?: import('react').ReactNode }>
-const layoutRegistry = new Map<string, PresenterLayout>()
-let defaultLayoutName: string | null = null
-
-export function registerPresenterLayout(name: string, component: PresenterLayout, opts: { default?: boolean } = {}): void {
-  layoutRegistry.set(name, component)
-  if (opts.default) defaultLayoutName = name
-}
-
-/** Resolve the layout for a def: explicit name → app default → none. */
-export function resolveLayout(def: PresenterDef): PresenterLayout | null {
-  if (def.layout === false) return null
-  const name = def.layout ?? defaultLayoutName
-  if (!name) return null
-  const layout = layoutRegistry.get(name)
-  if (!layout) {
-    throw new Error(`Presenter layout "${name}" is not registered — registerPresenterLayout('${name}', …)`)
-  }
-  return layout
-}
 
 export function registerPresenter<K extends string>(name: string, def: PresenterDef<K>): void {
   // The silent-never-saves trap: a discrete presenter left on the default
@@ -255,8 +237,6 @@ export function getPresenter(name: string): PresenterDef | undefined {
 export function clearPresenters(): void {
   registry.clear()
   kindDefaults = {}
-  layoutRegistry.clear()
-  defaultLayoutName = null
 }
 
 export interface ResolvedPresenter {

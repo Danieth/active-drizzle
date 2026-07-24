@@ -33,6 +33,8 @@ export interface KindModuleScan {
   components: string[]
   /** Explicit `defaults` export override, when present. */
   defaults?: { edit?: string; view?: string }
+  /** LAW 3: chrome responsibilities this module's bulbs handle themselves. */
+  handles?: string[]
 }
 
 export function scanKindModules(project: Project, files: Array<{ kind: string; filePath: string }>): KindModuleScan[] {
@@ -41,8 +43,19 @@ export function scanKindModules(project: Project, files: Array<{ kind: string; f
     const sf = project.getSourceFile(filePath) ?? project.addSourceFileAtPath(filePath)
     const components: string[] = []
     let defaults: { edit?: string; view?: string } | undefined
+    let handles: string[] | undefined
     for (const [name, decls] of sf.getExportedDeclarations()) {
       if (name === 'default') continue
+      if (name === 'handles') {
+        const d = decls[0]
+        if (d && Node.isVariableDeclaration(d)) {
+          const init = d.getInitializer()
+          if (init && Node.isArrayLiteralExpression(init)) {
+            handles = init.getElements().map(e => e.getText().replace(/['"`]/g, ''))
+          }
+        }
+        continue
+      }
       if (name === 'defaults') {
         const d = decls[0]
         if (d && Node.isVariableDeclaration(d)) {
@@ -66,7 +79,7 @@ export function scanKindModules(project: Project, files: Array<{ kind: string; f
       // functions and const arrow components both qualify
       if (Node.isFunctionDeclaration(d) || Node.isVariableDeclaration(d)) components.push(name)
     }
-    out.push({ kind, filePath, components, ...(defaults ? { defaults } : {}) })
+    out.push({ kind, filePath, components, ...(defaults ? { defaults } : {}), ...(handles ? { handles } : {}) })
   }
   return out
 }
@@ -160,4 +173,61 @@ export function generatePresenterRegistryFromDir(
   const total = scans.reduce((n, s) => n + s.components.length, 0)
   const report = `registry   ✓ ${total} presenter${total === 1 ? '' : 's'} across ${scans.length} kind${scans.length === 1 ? '' : 's'} — zero hand-registration`
   return { content, outFilePath, report }
+}
+
+// ── Slice 4: the boot-verification manifest ─────────────────────────────────
+
+export interface PresenterManifest {
+  /** kind → registered presenter names + the Attrs that demand it. */
+  kinds: Record<string, { presenters: string[]; usedBy: string[] }>
+  /** Chrome ledger per area (root '' included) — the LAW 3 record. */
+  chrome: Record<string, string[]>
+  ctxKeys: Record<string, string[]>
+}
+
+/** Regen writes this; boot re-verifies from it — no scanning at runtime. */
+export function generatePresenterManifest(
+  usages: Array<{ kind: string; usedBy: Array<{ model: string; field: string }> }>,
+  scans: KindModuleScan[],
+  contextFiles: Array<{ area: string; keys: string[]; consumes: string[] }>,
+): PresenterManifest {
+  const kinds: PresenterManifest['kinds'] = {}
+  for (const u of usages) {
+    const scan = scans.find(s => s.kind === u.kind)
+    kinds[u.kind] = {
+      presenters: (scan?.components ?? []).map(lcFirst),
+      usedBy: u.usedBy.map(x => `${x.model}.${x.field}`),
+    }
+  }
+  const chrome: Record<string, string[]> = {}
+  const ctxKeys: Record<string, string[]> = {}
+  for (const f of contextFiles) {
+    chrome[f.area] = f.consumes
+    ctxKeys[f.area] = f.keys
+  }
+  return { kinds, chrome, ctxKeys }
+}
+
+/**
+ * The BOOT check (server and client): the manifest must still cover the
+ * kinds the live model set uses. Catches the running-without-regen /
+ * deleted-after-regen window regen-time checks can't see. Fast — no
+ * filesystem, no scanning; throws with the command that fixes it.
+ */
+export function verifyPresenterManifest(manifest: PresenterManifest, liveKinds: string[]): void {
+  const missing = liveKinds.filter(k => {
+    const entry = manifest.kinds[k]
+    return !entry || entry.presenters.length === 0
+  })
+  if (missing.length > 0) {
+    const who = missing.map(k => {
+      const entry = manifest.kinds[k]
+      return entry?.usedBy?.length ? `${k} (${entry.usedBy[0]})` : k
+    })
+    throw new Error(
+      `presenter manifest is STALE or incomplete: kind${missing.length > 1 ? 's' : ''} ` +
+      `${who.join(', ')} ha${missing.length > 1 ? 've' : 's'} no registered presenter. ` +
+      `Run \`npm run regen\` (or \`trails presenters\`) — LAW 1: every Attr has a presenter, ALWAYS.`,
+    )
+  }
 }
