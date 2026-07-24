@@ -15,9 +15,11 @@ import {
 import { inferControllerPath } from './decorators.js'
 import {
   defaultIndex, defaultGet, defaultCreate, defaultUpdate, defaultDestroy,
-  singletonFindOrCreate, enforceMutationRules,
+  singletonFindOrCreate, enforceMutationRules, sanitizeMutationPayload,
+  buildGovernedWriteData, applyAutoAttach,
 } from './crud-handlers.js'
 import { BadRequest, Conflict, HttpError, NotFound, ValidationError, toValidationError, serializeError } from './errors.js'
+import { assertAssetTouchable, generateUploadToken, UPLOAD_TOKEN_KEY } from './attach-guard.js'
 
 // ── Route record (for REST adapter + CLI) ─────────────────────────────────────
 
@@ -268,8 +270,23 @@ export function buildRouter<TContext = Record<string, any>>(
     for (const mut of mutations) {
       const kebab = toKebab(mut.method)
       if (mut.bulk) {
+        // A guard needs records to judge — records:false skips loading, so
+        // the combination is undecidable, and silently not enforcing a
+        // declared rule is exactly the bug class this framework exists to
+        // kill. Teach at ROUTE BUILD (boot), not at first attack.
+        if (mut.records === false && mut.if) {
+          throw new Error(
+            `@mutation ${ControllerClass.name}.${mut.method}: \`if:\` cannot be enforced with ` +
+            `\`records: false\` (there are no records to judge). Drop \`records: false\`, or ` +
+            `move the rule into the method body (e.g. a guarded updateAll where-clause).`,
+          )
+        }
         router[mut.method] = builder.input(
-          z.object({ ...scopeSchema, ids: z.array(z.number().int().positive()) }).passthrough()
+          z.object({
+            ...scopeSchema,
+            ids: z.array(z.number().int().positive()),
+            data: z.record(z.string(), z.any()).optional(),
+          }).passthrough()
         ).handler(async ({ input, context }) => {
           const rel = buildScopedRelation(model, input as any)
           return dispatch(ControllerClass, context as TContext, input as any, rel, mut.method,
@@ -277,14 +294,26 @@ export function buildRouter<TContext = Record<string, any>>(
               const ids = (input as any).ids
               // Apply id filter to ctrl.relation so method can use this.relation.updateAll()
               ctrl.relation = ctrl.relation.where({ id: ids })
+              // params allowlist + required run ONCE (record-independent);
+              // the if-guard runs per record below — same rules as non-bulk
+              const payload = sanitizeMutationPayload(mut, (input as any).data)
               // If records: false, pass ids directly for efficient updateAll() usage.
               // Otherwise, load all records (backward compat).
               if (mut.records === false) {
-                return ctrl[mut.method](ids)
-              } else {
-                const records = await ctrl.relation.load()
-                return ctrl[mut.method](records)
+                return payload !== undefined ? ctrl[mut.method](ids, payload) : ctrl[mut.method](ids)
               }
+              const records = await ctrl.relation.load()
+              if (mut.if) {
+                const blocked = records.filter((r: any) => !mut.if!(r, context, ctrl))
+                if (blocked.length > 0) {
+                  // All-or-nothing, loudly: partial silent application is
+                  // how a bulk archive "works" while skipping half the rows
+                  throw new ValidationError({
+                    base: [`${mut.method} is not available for ${blocked.length} of ${records.length} selected record(s)`],
+                  })
+                }
+              }
+              return payload !== undefined ? ctrl[mut.method](records, payload) : ctrl[mut.method](records)
             },
             undefined,
             config.scopeBy,
@@ -360,9 +389,18 @@ export function buildRouter<TContext = Record<string, any>>(
           const findBy = config.findBy(context, ctrl)
           const record = await singletonModel.findBy(findBy)
           if (!record) throw new NotFound(singletonModel.name)
-          const permitted = buildUpdatePermit((input as any).data, config.update, context, ctrl)
+          // THE governed pipeline — the same permit/nested-sanitize/autoSet
+          // path as CRUD update. (This handler previously ran its own weaker
+          // permit filter: no nested sanitization, no nestedAutoSet, permit
+          // functions never saw the record.)
+          const permitted = await buildGovernedWriteData(
+            (input as any).data, config.update, context, singletonModel, ctrl, record,
+          )
           for (const [k, v] of Object.entries(permitted)) (record as any)[k] = v
           if (!(await record.save())) throw toValidationError(record.errors)
+          const permitRaw = (config.update as any)?.permit
+          const resolvedPermit = typeof permitRaw === 'function' ? permitRaw(context, ctrl, record) : permitRaw
+          await applyAutoAttach(record, singletonModel, (input as any).data, resolvedPermit)
           return record
         })
     })
@@ -475,13 +513,32 @@ export function buildRouter<TContext = Record<string, any>>(
           const storage = core.getStorage()
           const key = storage.generateKey(filename)
 
+          // The ownership stamp (attach-guard.ts): which model family this
+          // asset belongs to, the door's resolved scope values (@scope URL
+          // params AND scopeBy output), and a possession token the presigning
+          // client — and only it — gets back. confirm/attach verify all three.
+          const scopeStamp: Record<string, unknown> = {}
+          for (const s of scopes) {
+            const v = (input as any)[s.paramName]
+            if (v !== undefined) scopeStamp[s.field] = v
+          }
+          if (typeof crud?.config?.scopeBy === 'function') {
+            Object.assign(scopeStamp, crud.config.scopeBy(ctrl))
+          }
+          const uploadToken = generateUploadToken()
+
           const assetData: Record<string, any> = {
             key,
             filename,
             contentType,
             status: 'pending',
             access,
-            metadata: { attachmentName: name },
+            metadata: {
+              attachmentName: name,
+              model: modelClassName,
+              scope: scopeStamp,
+              [UPLOAD_TOKEN_KEY]: uploadToken,
+            },
           }
 
           // Apply autoSet fields from @attachable config
@@ -499,6 +556,9 @@ export function buildRouter<TContext = Record<string, any>>(
           return {
             asset: asset.toJSON(),
             uploadUrl,
+            // The ONE time the token leaves the server — every later
+            // serialization redacts it (Asset.toJSON)
+            uploadToken,
             constraints: {
               accepts: entry.accepts,
               maxSize: maxSize ?? storage.defaultMaxSize,
@@ -514,15 +574,27 @@ export function buildRouter<TContext = Record<string, any>>(
       z.object({
         ...scopeSchema,
         assetId: z.number().int().positive(),
+        uploadToken: z.string().min(1).optional(),
       }).passthrough()
     ).handler(async ({ input, context }) => {
       const rel = crudModel ? buildScopedRelation(crudModel, input as any) : null
 
       return dispatch(ControllerClass, context as TContext, input as any, rel as any, 'confirm',
-        async (_ctrl) => {
+        async (ctrl) => {
           const core = await import('@active-drizzle/core' as string) as any
 
-          const asset = await core.Asset.find((input as any).assetId)
+          const asset = await core.Asset.where({ id: (input as any).assetId }).first()
+          if (!asset) throw new NotFound('Asset')
+          // Ownership: model stamp + possession token + scope stamp — an id
+          // belonging to another tenant (or nobody) is a 404, never an oracle
+          const scopeByValues = typeof crud?.config?.scopeBy === 'function' ? crud.config.scopeBy(ctrl) : {}
+          const fieldByParam = new Map(scopes.map(s => [s.field, s.paramName]))
+          assertAssetTouchable(asset, {
+            model: crudModel?.name ?? '',
+            uploadToken: (input as any).uploadToken,
+            anchor: (key) => (scopeByValues as any)[key]
+              ?? (input as any)[fieldByParam.get(key) ?? key],
+          })
           if (asset.status !== 'pending') throw new BadRequest('Asset is not in pending state')
 
           const attachmentName = (asset.metadata as any)?.attachmentName
@@ -561,6 +633,7 @@ export function buildRouter<TContext = Record<string, any>>(
         assetId: z.number().int().positive(),
         name: z.string().min(1),
         attachableId: z.number().int().positive(),
+        uploadToken: z.string().min(1).optional(),
       }).passthrough()
     ).handler(async ({ input, context }) => {
       if (!crudModel) throw new BadRequest('attach requires a CRUD controller with a model')
@@ -571,6 +644,19 @@ export function buildRouter<TContext = Record<string, any>>(
           const { assetId, name: attachName, attachableId } = input as any
           const record = await ctrl.relation.where({ id: attachableId }).first()
           if (!record) throw new NotFound(crudModel.name)
+
+          // Ownership: the RECORD is the anchor — it came through the door,
+          // so its own scope columns are the authorized tenancy. The asset's
+          // stamp must match them, and the client must hold the token.
+          const core = await import('@active-drizzle/core' as string) as any
+          const asset = await core.Asset.where({ id: assetId }).first()
+          if (!asset) throw new NotFound('Asset')
+          assertAssetTouchable(asset, {
+            model: crudModel.name,
+            uploadToken: (input as any).uploadToken,
+            anchor: (key) => (record as any)[key],
+            requireReady: true,
+          })
 
           await record.attach(attachName, assetId)
           return { success: true }
@@ -634,19 +720,3 @@ function httpToOrpc(e: HttpError): ORPCError<string, unknown> {
   return new ORPCError(code, { status: e.status, message: e.message, data })
 }
 
-function buildUpdatePermit(
-  data: Record<string, any>,
-  updateConfig?: { permit?: string[] | ((ctx: any, ctrl: any) => string[]); restrict?: string[] },
-  ctx?: any,
-  ctrl?: any,
-): Record<string, any> {
-  const { permit, restrict } = updateConfig ?? {}
-  const resolvedPermit = typeof permit === 'function' ? permit(ctx, ctrl) : permit
-  if (resolvedPermit) {
-    return Object.fromEntries(Object.entries(data).filter(([k]) => resolvedPermit.includes(k)))
-  }
-  const out = { ...data }
-  for (const k of ['id', 'createdAt', 'updatedAt', 'created_at', 'updated_at']) delete out[k]
-  if (restrict) for (const k of restrict) delete out[k]
-  return out
-}

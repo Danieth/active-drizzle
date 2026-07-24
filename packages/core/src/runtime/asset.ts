@@ -96,6 +96,14 @@ export class Asset extends ApplicationRecord {
     if (this.access === 'public') {
       json.url = getStorage().publicUrl(this.key)
     }
+    // The presign possession token leaves the server EXACTLY once (top-level
+    // on the presign response). Every serialization after — confirm echoes,
+    // attachment payloads, includes — redacts it, or holding any asset's
+    // JSON would be holding its attach rights.
+    if (json.metadata && typeof json.metadata === 'object' && 'uploadToken' in (json.metadata as any)) {
+      const { uploadToken: _redacted, ...rest } = json.metadata as Record<string, unknown>
+      json.metadata = rest
+    }
     return json
   }
 }

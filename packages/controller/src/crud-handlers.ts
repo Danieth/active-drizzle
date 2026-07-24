@@ -51,6 +51,18 @@ export function enforceMutationRules(
   if (mut.if && !mut.if(record, ctx, ctrl)) {
     throw new ValidationError({ base: [`${mut.method} is not available for this record`] })
   }
+  return sanitizeMutationPayload(mut, data)
+}
+
+/**
+ * The record-independent half of the mutation rules — params allowlist +
+ * required — shared with the BULK path (which guards each loaded record
+ * separately and sanitizes the payload once).
+ */
+export function sanitizeMutationPayload(
+  mut: MutationEntry,
+  data: Record<string, any> | undefined,
+): Record<string, any> | undefined {
   let payload = data
   if (mut.params) {
     payload = {}
@@ -706,9 +718,7 @@ export async function defaultCreate(
 ): Promise<any> {
   // Record-aware permit on create receives a defaults-draft instance
   const draft = typeof model === 'function' ? new (model as any)({}, true) : undefined
-  const permitted = applyNestedAutoSet(await sanitizeNestedWrites(
-    buildPermittedData(rawInput, config.create, ctx, model, ctrl, draft), model,
-  ), config.create, ctx, ctrl)
+  const permitted = await buildGovernedWriteData(rawInput, config.create, ctx, model, ctrl, draft)
   // Scope overrides are applied AFTER permit — they cannot be excluded or overridden
   const record = await model.create({ ...permitted, ...scopeOverrides })
   // ApplicationRecord.create returns the instance even if save failed.
@@ -770,9 +780,7 @@ export async function defaultUpdate(
     }
   }
 
-  const permitted = applyNestedAutoSet(await sanitizeNestedWrites(
-    buildPermittedData(fields, config.update, ctx, model, ctrl, record), model,
-  ), config.update, ctx, ctrl)
+  const permitted = await buildGovernedWriteData(fields, config.update, ctx, model, ctrl, record)
   for (const [k, v] of Object.entries(permitted)) {
     (record as any)[k] = v
   }
@@ -1032,6 +1040,29 @@ export function applyNestedAutoSet(
   return permitted
 }
 
+/**
+ * THE governed write pipeline — permit (record-aware) → nested-write
+ * sanitize → nested autoSet forcing. Every write surface goes through this
+ * one function: create, update, AND singleton update. A second, weaker
+ * duplicate of this pipeline is how the singleton path silently lost
+ * nested sanitization once already — do not fork it again.
+ */
+export async function buildGovernedWriteData(
+  rawInput: Record<string, any>,
+  writeConfig: (Parameters<typeof buildPermittedData>[1] & Parameters<typeof applyNestedAutoSet>[1]) | undefined,
+  ctx: any,
+  model: any,
+  ctrl?: any,
+  record?: any,
+): Promise<Record<string, any>> {
+  return applyNestedAutoSet(await sanitizeNestedWrites(
+    buildPermittedData(rawInput, writeConfig, ctx, model, ctrl, record), model,
+  ), writeConfig, ctx, ctrl)
+}
+
+/** The auto-attach pass, exported for the singleton write surface. */
+export const applyAutoAttach = _autoAttach
+
 function buildPermittedData(
   input: Record<string, any>,
   writeConfig: {
@@ -1146,15 +1177,34 @@ async function _autoAttach(
 ): Promise<void> {
   const resolvedPermit = permit ?? []
   let attachmentEntries: any[] | null = null
+  let core: any
 
   try {
-    const core = await import('@active-drizzle/core' as string) as any
+    core = await import('@active-drizzle/core' as string) as any
     attachmentEntries = core.getAttachments(model.name)
   } catch {
     return
   }
 
   if (!attachmentEntries?.length) return
+
+  // Ownership (attach-guard.ts): a client-supplied asset id is only honored
+  // when the asset was presigned for THIS model family and its scope stamp
+  // matches the RECORD's own scope columns — the record came through the
+  // door, so its columns are the authorized tenancy. Without this, a
+  // permitted `logoAssetId` column is a cross-tenant IDOR: PATCH any
+  // tenant's asset id onto your record, then read it via your attachment.
+  const { assertAssetTouchable } = await import('./attach-guard.js')
+  const verify = async (assetId: any): Promise<void> => {
+    const asset = await core.Asset.where({ id: assetId }).first()
+    if (!asset) throw new NotFound('Asset')
+    assertAssetTouchable(asset, {
+      model: model.name,
+      anchor: (key) => record[key],
+      skipToken: true,        // the column write carries only ids — the
+      requireReady: true,     // model+scope stamp is the whole proof here
+    })
+  }
 
   for (const entry of attachmentEntries) {
     if (!resolvedPermit.includes(entry.name)) continue
@@ -1163,6 +1213,7 @@ async function _autoAttach(
       const inputKey = `${entry.name}AssetId`
       const assetId = rawInput[inputKey]
       if (assetId !== undefined && assetId !== null) {
+        await verify(assetId)
         await record.replace(entry.name, assetId)
       } else if (assetId === null) {
         await record.detach(entry.name)
@@ -1171,6 +1222,7 @@ async function _autoAttach(
       const inputKey = `${entry.name}AssetIds`
       const assetIds = rawInput[inputKey]
       if (Array.isArray(assetIds)) {
+        for (const id of assetIds) await verify(id)   // verify BEFORE any detach
         await record.detach(entry.name)
         for (const id of assetIds) {
           await record.attach(entry.name, id)

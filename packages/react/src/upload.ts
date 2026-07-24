@@ -46,9 +46,11 @@ export interface UploadEndpoints {
   presign: (input: { filename: string; contentType: string; name: string }) => Promise<{
     asset: AssetData
     uploadUrl: string
+    /** Possession proof (attach-guard): returned once, echoed on confirm. */
+    uploadToken?: string
     constraints: { accepts?: string; maxSize: number; access: string }
   }>
-  confirm: (input: { assetId: number }) => Promise<AssetData>
+  confirm: (input: { assetId: number; uploadToken?: string }) => Promise<AssetData>
 }
 
 // ── UseUpload ─────────────────────────────────────────────────────────────────
@@ -221,7 +223,12 @@ export function useUploadFactory(
 
     let confirmedAsset: AssetData
     try {
-      confirmedAsset = await endpoints.confirm({ assetId: presignResult.asset.id })
+      confirmedAsset = await endpoints.confirm({
+        assetId: presignResult.asset.id,
+        // The server verifies possession — without the token, someone else's
+        // pending assetId is a 404
+        ...(presignResult.uploadToken ? { uploadToken: presignResult.uploadToken } : {}),
+      })
     } catch (e: any) {
       if (!mountedRef.current) throw e
       const msg = e?.message ?? 'Confirm failed'
@@ -416,7 +423,12 @@ export function useMultiUploadFactory(
 
     let confirmedAsset: AssetData
     try {
-      confirmedAsset = await endpoints.confirm({ assetId: presignResult.asset.id })
+      confirmedAsset = await endpoints.confirm({
+        assetId: presignResult.asset.id,
+        // The server verifies possession — without the token, someone else's
+        // pending assetId is a 404
+        ...(presignResult.uploadToken ? { uploadToken: presignResult.uploadToken } : {}),
+      })
     } catch (e: any) {
       updateSlot(fileId, { status: 'error', error: e?.message ?? 'Confirm failed' })
       throw e
