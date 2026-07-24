@@ -96,8 +96,22 @@ if (command === 'doctor') {
   process.exit(failed ? 1 : 0)
 }
 
+// ── trails presenters — run the presenter pipeline (rides regen) ───────────
+// The pipeline itself lives in codegen (vite plugin option `presenters:`);
+// this command is the front door: it runs the app's regen, which scaffolds
+// missing bulbs/forms, verifies the three laws, and prints the report.
+if (command === 'presenters') {
+  const { spawnSync } = await import('node:child_process')
+  console.log('trails presenters — running regen (scaffold + verify + emit)\n')
+  const res = spawnSync('npm', ['run', 'regen'], { stdio: 'inherit', cwd: process.cwd() })
+  if (res.status !== 0) {
+    console.error('\n✗ regen failed — the errors above are TEACHING errors: each names its file and fix.')
+  }
+  process.exit(res.status ?? 1)
+}
+
 if (command !== 'new' || !name) {
-  console.log('Usage: trails new <app-name> [--link <monorepo>] | trails doctor')
+  console.log('Usage: trails new <app-name> [--link <monorepo>] | trails doctor | trails presenters')
   process.exit(command === 'new' ? 1 : 0)
 }
 

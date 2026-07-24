@@ -68,6 +68,15 @@ export type ActiveDrizzlePluginOptions = {
    * Set `false` for the legacy co-located layout.
    */
   genDir?: string | false
+  /**
+   * The presenter tree root (DESIGN-presenter-tree.md). When set, every
+   * regen runs the presenter PIPELINE: scaffold missing kind bulbs +
+   * model forms (generate-then-keep), verify the three laws (coverage,
+   * no-shadow, chrome), and emit the registry/context/forms/manifest
+   * into <presenters>/.gen. Example: presenters: 'presenters' (or the
+   * demo's 'src/presenters').
+   */
+  presenters?: string
 }
 
 /** Relative import specifier from one dir to another (posix, ./-prefixed). */
@@ -472,6 +481,23 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
         const changed = writeIfChanged(f.filePath, f.content)
         if (changed) hookCount++
       }
+    }
+
+    // ── The presenter pipeline (DESIGN-presenter-tree) ───────────────────
+    if (options.presenters && options.reactHooks) {
+      const presentersDir = resolve(root, options.presenters)
+      const { runPresenterPipeline } = await import('../codegen/presenter-pipeline.js')
+      const modelGlob2 = resolve(root, options.models)
+      const modelPaths2 = await glob(modelGlob2.replace(/\\/g, '/'))
+      const p4 = getOrCreateProject()
+      const models2 = modelPaths2.map(mp => {
+        const cached = modelCache.get(mp)
+        if (cached) return cached.meta
+        return extractModel(p4, mp)
+      })
+      const projectMeta2 = { schema: schemaCache?.meta ?? { tables: {}, filePath: '' }, models: models2 } as any
+      const { report } = runPresenterPipeline(p4, projectMeta2, ctrlMeta, presentersDir)
+      console.log(`\x1b[32m[active-drizzle] presenter tree\x1b[0m\n${report.split('\n').map(l => '  ' + l).join('\n')}`)
     }
 
     console.log(

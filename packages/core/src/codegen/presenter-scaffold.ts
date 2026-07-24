@@ -140,17 +140,36 @@ setDefaultPresenters({ ${JSON.stringify(kind)}: { edit: '${kind}Input', view: '$
 }
 
 const ROOT_CONTEXT_SCAFFOLD = `/**
- * APP-WIDE presenter context — the client lane of props.ctx, plus (soon)
- * the app layout declaration. Every folder below may hold its own
- * context.ts; the NO-SHADOW LAW applies: no nested folder may redeclare
- * a key from an ancestor, and no client key may collide with a server
- * @frontendContext key. Within THIS file, keys establish before the
- * layout — a layout may read its own folder's ctx.
+ * APP-WIDE presenter context — the client lane of props.ctx AND the app
+ * LAYOUT (chrome written once). Every folder below may hold its own
+ * context.ts; the NO-SHADOW LAW applies (no nested folder redeclares an
+ * ancestor key; no collision with server @frontendContext keys). Keys
+ * establish BEFORE this file's layout — the layout may read its own ctx.
+ *
+ * The layout below consumes the FULL required chrome set (LAW 3:
+ * label/errors/dirty/state/elsewhere — every responsibility handled
+ * somewhere, never twice). Restyle freely; if you split chrome across
+ * levels, move entries between 'consumes' lists — regen re-checks.
  */
-import { definePresenterContext } from '@active-drizzle/react'
+import React from 'react'
+import { definePresenterContext, type PresenterProps } from '@active-drizzle/react'
+
+function AppLayout({ meta, errors, dirty, state, elsewhere, children }: PresenterProps & { children?: React.ReactNode }) {
+  return (
+    <label style={{ display: 'block', marginBottom: 12 }}>
+      <span>{meta.label ?? ''}{dirty ? ' •' : ''}{state === 'saving' ? ' …' : state === 'saved' ? ' ✓' : ''}</span>
+      {children}
+      {elsewhere && <em> changed elsewhere → {String(elsewhere.value)}</em>}
+      {errors.length > 0 && <span role="alert" style={{ color: 'crimson' }}> {errors.join(', ')}</span>}
+    </label>
+  )
+}
 
 export default definePresenterContext({
   // density: () => useUiStore(s => s.density),   // hooks are legal here
+}, {
+  layout: AppLayout,
+  consumes: ['label', 'errors', 'dirty', 'state', 'elsewhere'],
 })
 `
 

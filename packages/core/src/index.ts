@@ -15,3 +15,5 @@ export { scaffoldPresenterTree, collectKindsInUse, type ScaffoldResult, type Kin
 export { scanKindModules, generatePresenterRegistry, generatePresenterRegistryFromDir, type KindModuleScan } from './codegen/presenter-registry.js'
 export { generatePresenterManifest, verifyPresenterManifest, type PresenterManifest } from './codegen/presenter-registry.js'
 export { validateChromeCoverage, REQUIRED_CHROME } from './codegen/presenter-context-generator.js'
+export { runPresenterPipeline, type PresenterPipelineResult } from './codegen/presenter-pipeline.js'
+export { scaffoldModelForms, scanFormManifest, validateFormManifest, resolveLadder, generateFormsIndex, bulbFieldsOf, type FormManifest } from './codegen/presenter-forms.js'
