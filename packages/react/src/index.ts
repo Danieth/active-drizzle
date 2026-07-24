@@ -42,6 +42,8 @@ export {
   resolvePresenter,
   type AdPresenterKinds,
   type PresenterNameFor,
+  type AdFrontendCtx,
+  type FrontendCtx,
   type PresenterProps,
   type PresenterDef,
   type PresenterBind,

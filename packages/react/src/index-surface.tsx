@@ -327,7 +327,7 @@ export interface IndexSurface {
   FormSkeleton: FC<{ className?: string }>
   ListSkeleton: FC<{ rows?: number; className?: string }>
   /** Context accessor for custom widgets: session + live query + meta. */
-  use: () => { session: IndexSession; state: IndexState; meta: IndexMeta; rows: any[]; pagination: any; ctx: Record<string, unknown>; isLoading: boolean; isFetching: boolean }
+  use: () => { session: IndexSession; state: IndexState; meta: IndexMeta; rows: any[]; pagination: any; ctx: import('./presenters.js').FrontendCtx; isLoading: boolean; isFetching: boolean }
   /** Query components from cfg.queries (aggregation @actions), keyed PascalCase. */
   [query: string]: any
 }

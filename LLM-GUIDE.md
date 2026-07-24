@@ -485,6 +485,15 @@ is a route-build teaching error — context keys never shadow. Client:
 `props.ctx` in every presenter (always an object), `session.getFrontendCtx()`,
 `Surface.use().ctx`; rehydrate refreshes it on every envelope.
 
+TYPED at regen, from your ACTUAL return types: codegen emits
+`_ctx.gen.ts` (AdFrontendCtx augmentation), so `ctx.userType` autocompletes
+as `'admin' | 'member' | undefined` — keys are optional because a door may
+not declare them; handle the undefined and the type stops complaining.
+Regen teaching errors: async context fn (load in @before instead),
+function-valued keys, Date (`.toISOString()`), class-instance returns
+(client can't see the type — return plain data), and the SAME key with
+TWO types across doors (declare it once in a concern both extend).
+
 ## 7. Operational rules
 
 - Run tests from INSIDE each package dir (`cd packages/core && npx vitest run`).

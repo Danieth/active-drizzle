@@ -179,6 +179,9 @@ function extractController(cls: ClassDeclaration, filePath: string): CtrlMeta | 
     })
   }
 
+  // @frontendContext (inherited concern keys included)
+  const frontendContext = extractCtrlFrontendContext(cls)
+
   // @attachable
   const attachableDec = decorators.find(d => d.getName() === 'attachable')
   const attachable = !!attachableDec
@@ -202,7 +205,97 @@ function extractController(cls: ClassDeclaration, filePath: string): CtrlMeta | 
     actions,
     ...(attachable ? { attachable } : {}),
     ...(attachments?.length ? { attachments } : {}),
+    ...(frontendContext.length ? { frontendContext } : {}),
   }
+}
+
+// ── @frontendContext extraction ───────────────────────────────────────────────
+
+/**
+ * Extracts @frontendContext keys with CHECKER-DERIVED return types, walking
+ * the base-class chain (a concern's keys are typed on every door that
+ * includes it). Bad choices die HERE, at regen, with the fix in the message:
+ * async functions, function-valued keys, and non-JSON-plain returns are all
+ * teaching errors — the ctx bag rides the wire, so it must be plain data.
+ */
+function extractCtrlFrontendContext(
+  cls: ClassDeclaration,
+): Array<{ key: string; type: string; owner: string }> {
+  const out: Array<{ key: string; type: string; owner: string }> = []
+  const chain: ClassDeclaration[] = []
+  let cur: ClassDeclaration | undefined = cls
+  while (cur) { chain.unshift(cur); cur = cur.getBaseClass() }
+
+  for (const c of chain) {
+    const dec = c.getDecorators().find(d => d.getName() === 'frontendContext')
+    if (!dec) continue
+    const arg = dec.getArguments()[0]
+    if (!arg || !Node.isObjectLiteralExpression(arg)) continue
+    const owner = c.getName() ?? '(anonymous)'
+    for (const prop of arg.getProperties()) {
+      let key: string | undefined
+      let fnNode: Node | undefined
+      if (Node.isPropertyAssignment(prop)) { key = prop.getName(); fnNode = prop.getInitializer() }
+      else if (Node.isMethodDeclaration(prop)) { key = prop.getName(); fnNode = prop }
+      if (!key || !fnNode) continue
+      out.push({ key, type: ctxReturnTypeText(key, owner, fnNode), owner })
+    }
+  }
+  return out
+}
+
+/** Wrappers/keywords legal in a JSON-plain ctx type. */
+const CTX_TYPE_ALLOWED_IDENTS = new Set([
+  'string', 'number', 'boolean', 'null', 'undefined', 'unknown', 'never',
+  'true', 'false', 'Array', 'ReadonlyArray', 'Record', 'Partial', 'Readonly', 'Pick', 'Omit',
+])
+
+function ctxReturnTypeText(key: string, owner: string, fnNode: Node): string {
+  const sig = fnNode.getType().getCallSignatures()[0]
+  if (!sig) {
+    throw new Error(
+      `@frontendContext '${key}' on ${owner} is not a function — every key is ` +
+      `\`(ctx, ctrl) => value\` (computed per request, so a stale constant can't ship).`,
+    )
+  }
+  // getText with the node as context keeps names unqualified where possible
+  let text = sig.getReturnType().getText(fnNode as any)
+
+  if (/^Promise\s*</.test(text)) {
+    throw new Error(
+      `@frontendContext '${key}' on ${owner} is ASYNC (returns ${text}). Context functions are ` +
+      `synchronous by design — load data in a @before hook, read ctrl.state here.`,
+    )
+  }
+  if (text.includes('=>')) {
+    throw new Error(
+      `@frontendContext '${key}' on ${owner} returns a FUNCTION (${text}). The ctx bag rides ` +
+      `the wire — return plain data; behavior belongs in the presenter.`,
+    )
+  }
+  if (/\bDate\b/.test(text)) {
+    throw new Error(
+      `@frontendContext '${key}' on ${owner} returns a Date — not JSON-plain. ` +
+      `Serialize it: \`.toISOString()\` (presenters format from the string).`,
+    )
+  }
+  if (text === 'any') return 'unknown'
+
+  // Strip import qualifiers, then quoted literals, then verify every
+  // remaining identifier (skipping object KEYS, which precede ':') is a
+  // plain-data keyword — a class/enum reference can't exist on the client
+  const stripped = text.replace(/import\("[^"]+"\)\./g, '')
+  const noStrings = stripped.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`/g, '""')
+  for (const m of noStrings.matchAll(/\b([A-Za-z_$][\w$]*)\b(?!\s*\??\s*:)/g)) {
+    if (!CTX_TYPE_ALLOWED_IDENTS.has(m[1]!)) {
+      throw new Error(
+        `@frontendContext '${key}' on ${owner} returns '${text}' — the client can't see the ` +
+        `type '${m[1]}'. Return JSON-plain data (string/number/boolean/null, arrays and ` +
+        `object literals of those); literal unions ('admin' | 'member') type themselves.`,
+      )
+    }
+  }
+  return stripped
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

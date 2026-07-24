@@ -320,9 +320,10 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   }
 
   /** The @frontendContext bag — server-computed presenter context. Empty
-   *  object on ungoverned sessions (never null: presenters destructure it). */
-  getFrontendCtx(): Record<string, unknown> {
-    return this.frontendCtx
+   *  object on ungoverned sessions (never null: presenters destructure it).
+   *  Typed by the generated AdFrontendCtx augmentation once codegen runs. */
+  getFrontendCtx(): import('./presenters.js').FrontendCtx {
+    return this.frontendCtx as import('./presenters.js').FrontendCtx
   }
 
   // ── Permissions ───────────────────────────────────────────────────────────

@@ -121,6 +121,11 @@ export interface CtrlMeta {
   /** Whether @attachable() is present */
   attachable?: boolean
 
+  /** @frontendContext keys with their CHECKER-DERIVED return types
+   *  (inherited concern keys included, parent-first). Feeds the generated
+   *  AdFrontendCtx augmentation — ctx.userType is typed at every call site. */
+  frontendContext?: Array<{ key: string; type: string; owner: string }>
+
   /** Attachment declarations from the model (hasOneAttachment / hasManyAttachments) */
   attachments?: CtrlAttachmentMeta[]
 }

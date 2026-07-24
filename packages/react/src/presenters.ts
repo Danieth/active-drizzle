@@ -69,9 +69,27 @@ export interface PresenterProps<V = any> {
    * Never fetched, never prop-drilled: computed once per request beside
    * abilities and delivered on the envelope. Always an object (empty on
    * ungoverned sessions) so `ctx.userType` never explodes.
+   *
+   * TYPED once codegen has run: the generated `_ctx.gen.ts` augments
+   * AdFrontendCtx from your actual @frontendContext return types, so
+   * `ctx.userType` autocompletes as `'admin' | 'member' | undefined` and a
+   * typo is a red squiggle in every presenter at once.
    */
-  ctx: Record<string, unknown>
+  ctx: FrontendCtx
 }
+
+/**
+ * The compile-time half of @frontendContext. Codegen augments this from
+ * the declared keys' REAL return types (`_ctx.gen.ts`); before the first
+ * regen it stays empty and ctx degrades to Record<string, unknown> —
+ * nothing to opt into, the vice closes on its own. Keys are optional
+ * because a presenter can render under a door that declares none of them.
+ */
+export interface AdFrontendCtx {}
+
+export type FrontendCtx = keyof AdFrontendCtx extends never
+  ? Record<string, unknown>
+  : AdFrontendCtx & Record<string, unknown>
 
 export interface PresenterDef {
   /** Attr kind(s) this presenter accepts — wrong pairing is a dev-time error. */

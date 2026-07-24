@@ -58,6 +58,57 @@ export function generateReactHooks(
 ): GeneratedReactFile[] {
   const files: GeneratedReactFile[] = []
 
+  // @frontendContext → ONE merged augmentation for the whole app. A
+  // presenter doesn't know which door rendered it, so ctx is typed as the
+  // union of every door's declarations, every key optional (a door that
+  // doesn't declare it ships nothing). The SAME key on two doors with
+  // DIFFERENT types is a teaching error: one fact, one type — declare it
+  // once in a concern both controllers extend.
+  {
+    const merged = new Map<string, { type: string; owners: string[] }>()
+    for (const ctrl of ctrlProject.controllers) {
+      for (const entry of ctrl.frontendContext ?? []) {
+        const existing = merged.get(entry.key)
+        if (!existing) {
+          merged.set(entry.key, { type: entry.type, owners: [entry.owner] })
+        } else if (existing.type !== entry.type) {
+          throw new Error(
+            `@frontendContext '${entry.key}' has TWO types across doors: ` +
+            `'${existing.type}' (${existing.owners.join(', ')}) vs '${entry.type}' (${entry.owner}). ` +
+            `One fact, one type — declare '${entry.key}' once in a concern class both controllers extend.`,
+          )
+        } else if (!existing.owners.includes(entry.owner)) {
+          existing.owners.push(entry.owner)
+        }
+      }
+    }
+    if (merged.size > 0) {
+      const L: string[] = [
+        `/**`,
+        ` * GENERATED — do not edit. @frontendContext types, merged across every door.`,
+        ` *`,
+        ` * This augmentation is why \`props.ctx.userType\` autocompletes and a typo`,
+        ` * red-squiggles in EVERY presenter: the type is derived from the actual`,
+        ` * return types of your @frontendContext functions at regen. Keys are`,
+        ` * optional because a presenter can render under a door that doesn't`,
+        ` * declare them — handle the undefined and the type stops complaining.`,
+        ` */`,
+        `declare module '@active-drizzle/react' {`,
+        `  interface AdFrontendCtx {`,
+      ]
+      for (const [key, { type, owners }] of [...merged.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+        L.push(`    /** From @frontendContext on ${owners.join(', ')}. */`)
+        L.push(`    ${key}?: ${type}`)
+      }
+      L.push(`  }`)
+      L.push(`}`)
+      L.push(``)
+      L.push(`export {}`)
+      L.push(``)
+      files.push({ filePath: join(outputDir, '_ctx.gen.ts'), content: L.join('\n') })
+    }
+  }
+
   // Client namespaces that actually exist — an instant nested write only
   // ships when the child resource has a controller to hit
   const controllerKeys = new Set(ctrlProject.controllers.map(toClientKey))
