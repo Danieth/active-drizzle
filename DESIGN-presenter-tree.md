@@ -25,6 +25,10 @@ presenters/
   models/<Model>/show.tsx ← index-row presentation (later phase)
   models/<Model>/context.ts
   controllers/<Ctrl>/…    ← per-door OVERRIDES (Rails view-resolution ladder)
+  controllers/<Ctrl>/<Nested>/…  ← NESTED doors mirror @scope nesting:
+                             /teams/:teamId/deals → controllers/Teams/Deals/
+                             (resolution walks OUTWARD: most-nested dir →
+                             parent door dir → models/<Model>/ → scaffold)
   .gen/                   ← the generated registry (never edited):
      _registry.gen.tsx    ← imports/registers EVERYTHING, area wrapping,
      _pctx.gen.tsx        ← context providers (already built)
@@ -157,3 +161,35 @@ that regen-time checks can't see.
 4. Boot manifest verification.
 5. `models/<Model>/{form,show}` + controller-override ladder + covers/
    omits manifests (its own slice; this spec reserves the folder shape).
+
+## 9. Refinements (Daniel, 2026-07-25)
+
+- **Variants are first-class**: a kind folder exports MANY named bulbs;
+  the scan registers all; AdPresenterKinds types every name. Area
+  context.ts may declare `defaults: { money: 'compact' }` — AREA-SCOPED
+  kind defaults: same field, full in a form, compact on a Board card,
+  zero call-site noise.
+- **Attr-level context** = the `meta:` bag (already flows Attr →
+  fieldMeta → props.meta), upgraded: typed per kind via
+  AdKindShapes['meta'].
+- **Forms make the leap NOW**: form.tsx/show.tsx + the controller
+  ladder (incl. nested dirs above) are IN this phase, ceiling-validated
+  with covers/omits. Slice 5 is promoted; the tree is the whole view
+  layer.
+- **Auto-generation is the key** (restated): every dir in the ladder is
+  scaffoldable on demand (`trails presenters --controller Teams/Deals`),
+  generated-then-kept, and the registry derives everything from
+  placement. Nothing is registered by hand, ever.
+
+## 10. The free superpowers (fall out of the machinery)
+
+1. **Living catalog** (`/_presenters` dev route): every bulb × every
+   state (dirty/saving/conflict/elsewhere/waiting) from REAL sessions
+   (the testing kit) — Storybook with zero config that CANNOT drift.
+2. **Render coverage in CI**: headless-mount every form of every model;
+   assert zero boundary chips — the whole UI provably renders.
+3. **Field inspector** (dev overlay): which bulb, which layout consumed
+   what, which area, which ctx keys — from the registry + manifest.
+
+The pitch: everyone else CATALOGS their UI and hopes; this framework
+DERIVES its UI and proves it. The schema proves the UI complete.
