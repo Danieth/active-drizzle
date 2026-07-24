@@ -230,3 +230,15 @@ describe('bare-minimum status: pending + tick (Daniel 2026-07-24)', () => {
     expect(seen[seen.length - 1]).toBe(false)
   })
 })
+
+describe('field-grain ticks (the presenter flash)', () => {
+  it('only CHANGED fields tick — same-value re-sends stay silent', () => {
+    const s = new EntityStore()
+    s.merge('Deal', 5, { name: 'a', amount: '10' }, { version: 1 })
+    s.merge('Deal', 5, { name: 'a', amount: '20' }, { version: 2 })
+    const e = s.get('Deal', 5)!
+    expect(e.fieldTicks.amount).toBe(1)          // moved → ticks
+    expect(e.fieldTicks.name).toBeUndefined()    // re-sent same value → silent
+    expect(e.tick).toBe(2)                        // record-level chrome still counts merges
+  })
+})
