@@ -15,6 +15,19 @@
  */
 import { FormSession } from './form-session.js'
 
+/** Best-effort field errors from a failed instant transport — 422 payloads
+ *  become field errors; everything else lands on base so it's VISIBLE. */
+function parseNestedError(error: unknown): Record<string, string[]> {
+  const anyErr = error as any
+  const fields = anyErr?.data?.errors ?? anyErr?.errors
+  if (fields && typeof fields === 'object') {
+    const out: Record<string, string[]> = {}
+    for (const [k, v] of Object.entries(fields)) out[k] = Array.isArray(v) ? v.map(String) : [String(v)]
+    if (Object.keys(out).length) return out
+  }
+  return { base: [anyErr?.message ? String(anyErr.message) : 'Save failed — see console for detail.'] }
+}
+
 /**
  * The child resource's own write endpoints, used for INSTANT nested writes
  * (when the parent row is already persisted). Wired by the generated hook
@@ -22,9 +35,9 @@ import { FormSession } from './form-session.js'
  * its new id) so the optimistic row can adopt it.
  */
 export interface NestedTransport {
-  create(data: Record<string, any>): Promise<{ ok: boolean; row?: Record<string, any> }>
-  update(id: any, data: Record<string, any>): Promise<{ ok: boolean; row?: Record<string, any> }>
-  destroy(id: any): Promise<{ ok: boolean }>
+  create(data: Record<string, any>): Promise<{ ok: boolean; row?: Record<string, any>; error?: unknown }>
+  update(id: any, data: Record<string, any>): Promise<{ ok: boolean; row?: Record<string, any>; error?: unknown }>
+  destroy(id: any): Promise<{ ok: boolean; error?: unknown }>
 }
 
 /** A view-only abilities mask covering every data field on a child draft. */
@@ -180,14 +193,21 @@ export class NestedArrayManager {
     const payload = { ...(child.session.draft as any) }
     delete payload.id
     if (this.foreignKey) payload[this.foreignKey] = this.parentId()
-    let res: { ok: boolean; row?: Record<string, any> }
-    try { res = await this.transport!.create(payload) } catch { res = { ok: false } }
+    let res: { ok: boolean; row?: Record<string, any>; error?: unknown }
+    try { res = await this.transport!.create(payload) } catch (e) { res = { ok: false, error: e } }
     if (res.ok && res.row?.id != null) {
       ;(child.session.draft as any).id = res.row.id
       child.isNew = false
       child.key = `id:${res.row.id}`
       child.session.resetBaseline()
     } else {
+      // A failed instant write must never be message-free: a 422, a 500,
+      // and a dropped socket used to all collapse into a silent removal —
+      // the developer had no thread to pull. Route what we know into the
+      // child's error channel before rolling back, and say so in the console.
+      const parsed = parseNestedError(res.error)
+      child.session.applyExternalErrors(parsed)
+      console.error(`[active-drizzle] instant nested create on '${this.name}' failed:`, res.error ?? '(no error detail)')
       const i = this.children.indexOf(child)
       if (i !== -1) this.children.splice(i, 1)   // rollback the optimistic add
     }

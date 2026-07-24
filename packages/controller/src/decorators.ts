@@ -153,6 +153,20 @@ export function frontendContext(map: FrontendContextMap) {
   }
 }
 
+
+/** A method decorator on a STATIC member receives the constructor itself —
+ *  the metadata would register on Function (globally!) and never attach to
+ *  the controller. Teach at decoration time. */
+function assertInstanceMember(decorator: string, target: any, key: string): void {
+  if (typeof target === 'function') {
+    throw new Error(
+      `@${decorator} on ${target.name}.${key}: ${decorator} decorates INSTANCE methods — ` +
+      `\`${key}\` is static. Drop the \`static\` keyword (controller actions run per-request ` +
+      `on an instance).`,
+    )
+  }
+}
+
 // ── @mutation ─────────────────────────────────────────────────────────────────
 
 /**
@@ -179,6 +193,7 @@ export function frontendContext(map: FrontendContextMap) {
 export function mutation(config?: Partial<Omit<MutationEntry, 'method'>> | null) {
   // supports both @mutation and @mutation({bulk: true})
   return function (_target: any, key: string, _descriptor: PropertyDescriptor) {
+    assertInstanceMember('mutation', _target, key)
     const ctor = _target.constructor
     const entry: MutationEntry = {
       method: key,
@@ -222,6 +237,7 @@ export function action(
   config?: ActionConfig,
 ) {
   return function (_target: any, key: string, _descriptor: PropertyDescriptor) {
+    assertInstanceMember('action', _target, key)
     const ctor = _target.constructor
     const entry: ActionEntry = {
       method: key,
@@ -258,6 +274,7 @@ export function after(config?: HookConfig) {
 
 function hookDecorator(sym: symbol, config?: HookConfig) {
   return function (_target: any, key: string, _descriptor: PropertyDescriptor) {
+    assertInstanceMember('before/@after', _target, key)
     const ctor = _target.constructor
     const entry: HookEntry = {
       method: key,
@@ -308,6 +325,7 @@ export function rescue(
   config?: RescueConfig,
 ) {
   return function (_target: any, key: string, _descriptor: PropertyDescriptor) {
+    assertInstanceMember('rescue', _target, key)
     const ctor = _target.constructor
     const entry: RescueEntry = {
       errorClass,

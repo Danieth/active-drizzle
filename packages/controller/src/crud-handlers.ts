@@ -207,7 +207,18 @@ function stateEventReason(model: any, record: any, event: string): string | null
       return `requires ${prop} '${fromList!.join("' or '")}' (currently '${current ?? '—'}')`
     }
     if (typeof tr.if === 'function') {
-      try { if (!tr.if(record)) return (tr.message as string) ?? 'conditions not met' } catch { return (tr.message as string) ?? 'conditions not met' }
+      try {
+        if (!tr.if(record)) return (tr.message as string) ?? 'conditions not met'
+      } catch (e: any) {
+        // A THROWING guard is a bug, not a decline — folding it into the
+        // normal verdict makes the button permanently grey with zero trace.
+        // The verdict stays safe (declined) but the bug gets a loud line.
+        console.error(
+          `[active-drizzle] state guard for '${String((tr as any).event ?? prop)}' THREW ` +
+          `(reported to the client as an ordinary decline): ${e?.message ?? e}`,
+        )
+        return (tr.message as string) ?? 'conditions not met'
+      }
     }
     return null
   }

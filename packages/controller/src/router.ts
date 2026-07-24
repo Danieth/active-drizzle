@@ -11,6 +11,7 @@ import { z } from 'zod'
 import {
   getCrudMeta, getSingletonMeta, getScopes, getMutations, getActions,
   getControllerMeta, getAttachableMeta,
+  BEFORE_META, AFTER_META, RESCUE_META,
 } from './metadata.js'
 import { inferControllerPath } from './decorators.js'
 import {
@@ -701,6 +702,38 @@ export function buildRouter<TContext = Record<string, any>>(
       )
     })
     routes.push({ method: 'POST', path: `${basePath}/attach`, procedure: 'attach', action: 'attach' })
+  }
+
+  // ── Teaching gate: hook only:/except: must name REAL actions ──────────────
+  // `@before({ only: ['lauch'] })` (typo of 'launch') silently never fires —
+  // an auth hook that no-ops on a typo is a security hole shaped like a
+  // spelling mistake. Validate every hook's action names against the routes
+  // this build just produced, at BOOT, with the fix in the message.
+  {
+    const actionNames = new Set(routes.map(r => r.action))
+    const check = (owner: string, kind: string, names: string[] | undefined) => {
+      for (const n of names ?? []) {
+        if (actionNames.has(n)) continue
+        const near = [...actionNames].find(a =>
+          a.toLowerCase() === n.toLowerCase() || Math.abs(a.length - n.length) <= 1 && (a.includes(n) || n.includes(a)))
+        throw new Error(
+          `${owner}: ${kind} names action '${n}', which does not exist on this controller` +
+          `${near ? ` — did you mean '${near}'?` : ''} (actions: ${[...actionNames].sort().join(', ')}). ` +
+          `A hook scoped to a nonexistent action SILENTLY never fires.`,
+        )
+      }
+    }
+    // OWN-class hooks only: an inherited concern hook may legitimately name
+    // actions that exist on OTHER controllers using it — reuse, not typo.
+    for (const sym of [BEFORE_META, AFTER_META, RESCUE_META]) {
+      if (Object.prototype.hasOwnProperty.call(ControllerClass, sym)) {
+        for (const h of (ControllerClass as any)[sym] as Array<{ method: string; only?: string[]; except?: string[] }>) {
+          const owner = `${ControllerClass.name}.${h.method}`
+          check(owner, 'only:', h.only)
+          check(owner, 'except:', h.except)
+        }
+      }
+    }
   }
 
   return { router, routes, basePath }

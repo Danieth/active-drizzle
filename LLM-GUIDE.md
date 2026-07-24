@@ -505,3 +505,19 @@ TWO types across doors (declare it once in a concern both extend).
   confirm; double-save to prove idempotence.
 - Delete stale `*.model.gen.d.ts` files if present (renamed to
   `*.model.types.gen.d.ts`; the old basename is tsc-shadowed and dead).
+
+## 8. Recent surfaces (2026-07-24) — one-liners, details in code/design docs
+
+- **Presenter layouts**: app-defined chrome wrapping every bulb —
+  `registerPresenterLayout(name, C, {default:true})`; bulbs become
+  value+bind. FUTURE canonical home is folder context.ts (GOLDEN-RULE.md).
+- **Typed presenter values**: `PresenterPropsFor<'money'>` types value by
+  kind (BuiltinKindShapes; AdKindShapes for custom kinds).
+- **@frontendContext**: server-computed props.ctx in every presenter
+  (§6.6); folder context.ts adds the client lane (no-shadow law).
+- **Entity store**: [model, pk] → record; RQ keeps membership
+  (DESIGN-entity-store.md — invariants, pending/tick, the serialization
+  fidelity LAW: controllers never reshape existing model fields).
+- **Teaching gates**: config-typo did-you-mean, hook only:/except:
+  validated at boot, decorators refuse static members, guard throws are
+  loud, instant nested failures carry their error.

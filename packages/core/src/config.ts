@@ -88,7 +88,43 @@ export function mergeConfig<T extends Record<string, any>>(base: T, over: Record
  * with the `environments` block itself stripped from the result. Pure —
  * file loading stays in loadConfig so this is trivially testable.
  */
+/** Sections the framework reads. App-defined sections are welcome (the
+ *  config is an open bag) — but a NEAR-MISS of a framework key is a typo,
+ *  and a typo'd `databse:` silently booting against defaults is the
+ *  highest-blast-radius silent failure a config can have. */
+const KNOWN_SECTIONS = ['server', 'database', 'channels', 'codegen', 'environments']
+
+function editDistance(a: string, b: string): number {
+  if (Math.abs(a.length - b.length) > 2) return 3
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i)
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i]
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j]! + 1, cur[j - 1]! + 1, prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1))
+    }
+    prev = cur
+  }
+  return prev[b.length]!
+}
+
+/** Teaching gate: an unknown top-level key that is 1–2 edits from a
+ *  framework section is a TYPO, not an app extension — throw with the fix. */
+export function assertNoConfigTypos(file: Record<string, unknown>): void {
+  for (const key of Object.keys(file)) {
+    if (KNOWN_SECTIONS.includes(key)) continue
+    const near = KNOWN_SECTIONS.find(k => editDistance(key.toLowerCase(), k) <= 2)
+    if (near) {
+      throw new Error(
+        `trails.config: unknown section '${key}' — did you mean '${near}'? ` +
+        `(A truly custom section is fine, but this one is ${key.length < 10 ? 'suspiciously' : ''} ` +
+        `close to a framework key, and a typo'd '${near}' silently boots against defaults.)`,
+      )
+    }
+  }
+}
+
 export function resolveConfig(file: TrailsConfigFile, env: string): TrailsConfig {
+  assertNoConfigTypos(file as Record<string, unknown>)
   const { environments, ...base } = file
   return Object.freeze(mergeConfig(base, environments?.[env]))
 }

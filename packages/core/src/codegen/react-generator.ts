@@ -1241,7 +1241,7 @@ function renderNestedMetaEntry(
   let validatePart = ''
   if (childShippable.length > 0) {
     const runs = childShippable.map(([p, code]) => `_run('${p}', (${code}), (d as any).${p})`).join('; ')
-    validatePart = `, validate: (d: any) => { const e: Record<string, string[]> = {}; const _push = (f: string, m: unknown) => { if (typeof m === 'string' && m.trim()) (e[f] ??= []).push(m.trim()) }; const _run = (f: string, v: any, val: any) => { const l = Array.isArray(v) ? v : [v]; for (const fn of l) { if (typeof fn !== 'function') continue; try { _push(f, fn(val, d, f)) } catch { /* server-only gate */ } } }; ${runs}; return e }`
+    validatePart = `, validate: (d: any) => { const e: Record<string, string[]> = {}; const _push = (f: string, m: unknown) => { if (typeof m === 'string' && m.trim()) (e[f] ??= []).push(m.trim()) }; const _run = (f: string, v: any, val: any) => { const l = Array.isArray(v) ? v : [v]; for (const fn of l) { if (typeof fn !== 'function') continue; try { _push(f, fn(val, d, f)) } catch (e) { if (process.env.NODE_ENV !== 'production') console.warn('[active-drizzle] client validator threw (treated as server-only):', e) } } }; ${runs}; return e }`
   }
   return `${assoc.propertyName}: { kind: '${singular ? 'nestedOne' : 'nested'}', allowDestroy: ${allowDestroy}${instantPart}${orderBy ? `, orderBy: '${orderBy}'` : ''}${validatePart}, fields: { ${parts.join(', ')} } }`
 }
@@ -1395,9 +1395,9 @@ function emitFormHooks(
     L.push(`const ${transportsName} = {`)
     for (const resource of instantResources) {
       L.push(`  ${resource}: {`)
-      L.push(`    create: (data: any) => client.${resource}.create({ data }).then((row: any) => { _adCohere('${resource}', 'create'); return { ok: true, row } }).catch(() => ({ ok: false })),`)
-      L.push(`    update: (id: any, data: any) => client.${resource}.update({ id, data }).then((row: any) => { _adCohere('${resource}', 'update'); return { ok: true, row } }).catch(() => ({ ok: false })),`)
-      L.push(`    destroy: (id: any) => client.${resource}.destroy({ id }).then(() => { _adCohere('${resource}', 'destroy'); return { ok: true } }).catch(() => ({ ok: false })),`)
+      L.push(`    create: (data: any) => client.${resource}.create({ data }).then((row: any) => { _adCohere('${resource}', 'create'); return { ok: true, row } }).catch((e: any) => ({ ok: false, error: e })),`)
+      L.push(`    update: (id: any, data: any) => client.${resource}.update({ id, data }).then((row: any) => { _adCohere('${resource}', 'update'); return { ok: true, row } }).catch((e: any) => ({ ok: false, error: e })),`)
+      L.push(`    destroy: (id: any) => client.${resource}.destroy({ id }).then(() => { _adCohere('${resource}', 'destroy'); return { ok: true } }).catch((e: any) => ({ ok: false, error: e })),`)
       L.push(`  },`)
     }
     L.push(`}`)

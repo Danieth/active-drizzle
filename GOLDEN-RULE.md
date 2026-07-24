@@ -30,3 +30,8 @@ Every feature passes this filter or dies. Corollaries earned this far:
   the REMAINDER; regen errors when a required responsibility is handled
   NOWHERE on a path. Per-presenter layout registration is transitional
   and dies in the tree phase.
+- PERMISSIVE BY DEFAULT is doctrine, not a gap (Daniel, 2026-07-24): all
+  editable, all viewable, until a ceiling/permit/expose says otherwise.
+  Teaching errors target MISTAKES (typos, silent no-ops, swallowed
+  errors) — never the permissiveness itself. No boot warnings for
+  ungoverned doors, ever.

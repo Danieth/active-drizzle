@@ -88,7 +88,7 @@ Two belts, both required:
      include?: { notes?: NoteProjection; company?: CompanyProjection }
    }
    ```
-   Controllers write `form: { … } satisfies LoanProjection` — a typo'd
+   Controllers write `access: { … } satisfies LoanProjection` — a typo'd
    field or a non-existent association is a RED SQUIGGLE at the
    keystroke, recursively, at every level. (Same bootstrap story as the
    model type augmentations: first codegen run creates the types, regen
@@ -141,7 +141,7 @@ compile error, not an undefined read.
 
 ## The refactor, sized honestly (NOT a big bang)
 
-Compat rule: `expose`/`permit`/`include` DESUGAR into the form node —
+Compat rule: `expose`/`permit`/`include` DESUGAR into the access node —
 every existing app keeps working untouched; new syntax opts into
 narrowness.
 
@@ -149,7 +149,7 @@ narrowness.
   normalizeProjection / sliceByProjection / @crud desugar / recursive
   read-slice at all three serialization sites / generated XProjection
   types all exist and WORK — but they were built around the fused
-  `form:` tree. The machinery is shape-mechanics and survives; what
+  `form:` tree (since renamed `access:`). The machinery is shape-mechanics and survives; what
   changes is WHO declares what: `form:` becomes the ceiling at @crud's
   top level (editable/viewable/include), and slicing is driven by a
   SHAPE subset resolved against it.
