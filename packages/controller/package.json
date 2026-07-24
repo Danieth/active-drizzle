@@ -36,7 +36,7 @@
   "license": "MIT",
   "peerDependencies": {
     "@active-drizzle/core": "*",
-    "@orpc/server": ">=0.0.1",
+    "@orpc/server": "^1.13.6",
     "zod": ">=3.0.0"
   },
   "devDependencies": {

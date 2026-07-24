@@ -1553,7 +1553,7 @@ function _combine(clauses: SQL[]): SQL {
  * Resolves the target model class for a given association marker + prop name.
  * Used by nested pluck to look up Attr configs on the target model.
  */
-function _lookupAssocTarget(marker: any, prop: string): any {
+export function _lookupAssocTarget(marker: any, prop: string): any {
   const reg = MODEL_REGISTRY as Record<string, any>
 
   // Explicit table name on the marker (e.g. habtm('products_tags'), hasMany('line_items'))

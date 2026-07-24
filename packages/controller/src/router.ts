@@ -284,23 +284,30 @@ export function buildRouter<TContext = Record<string, any>>(
         router[mut.method] = builder.input(
           z.object({
             ...scopeSchema,
-            ids: z.array(z.number().int().positive()),
+            // records:false mutations act on the WHOLE (scoped) set — ids
+            // are optional noise there (`markAllRead` shouldn't send ids: [])
+            ids: mut.records === false
+              ? z.array(z.number().int().positive()).optional()
+              : z.array(z.number().int().positive()),
             data: z.record(z.string(), z.any()).optional(),
           }).passthrough()
         ).handler(async ({ input, context }) => {
           const rel = buildScopedRelation(model, input as any)
           return dispatch(ControllerClass, context as TContext, input as any, rel, mut.method,
             async (ctrl) => {
-              const ids = (input as any).ids
-              // Apply id filter to ctrl.relation so method can use this.relation.updateAll()
-              ctrl.relation = ctrl.relation.where({ id: ids })
+              const ids = (input as any).ids as number[] | undefined
+              // Apply id filter to ctrl.relation so method can use
+              // this.relation.updateAll(). No ids (records:false whole-set
+              // mutations) → the relation stays door-scoped, unfiltered.
+              if (ids && ids.length > 0) ctrl.relation = ctrl.relation.where({ id: ids })
               // params allowlist + required run ONCE (record-independent);
               // the if-guard runs per record below — same rules as non-bulk
               const payload = sanitizeMutationPayload(mut, (input as any).data)
               // If records: false, pass ids directly for efficient updateAll() usage.
               // Otherwise, load all records (backward compat).
               if (mut.records === false) {
-                return payload !== undefined ? ctrl[mut.method](ids, payload) : ctrl[mut.method](ids)
+                const idArg = ids ?? []
+                return payload !== undefined ? ctrl[mut.method](idArg, payload) : ctrl[mut.method](idArg)
               }
               const records = await ctrl.relation.load()
               if (mut.if) {
@@ -331,8 +338,17 @@ export function buildRouter<TContext = Record<string, any>>(
           const record = await rel.where({ id: (input as any).id }).first()
           if (!record) throw new NotFound(model.name)
           return dispatch(ControllerClass, context as TContext, input as any, rel, mut.method,
-            (ctrl) => ctrl[mut.method](record,
-              enforceMutationRules(mut, record, (input as any).data, context, ctrl)),
+            async (ctrl) => {
+              // FIXES-NEEDED #8 (second half): the pre-load above only saw
+              // URL scopes — re-verify through the scopeBy-narrowed relation
+              const verified = config.scopeBy
+                ? await ctrl.relation.where({ id: (input as any).id }).first()
+                : record
+              if (!verified) throw new NotFound(model.name)
+              ctrl.record = verified
+              return ctrl[mut.method](verified,
+                enforceMutationRules(mut, verified, (input as any).data, context, ctrl))
+            },
             record,
             config.scopeBy,
           )
@@ -445,12 +461,26 @@ export function buildRouter<TContext = Record<string, any>>(
         z.object({ ...scopeSchema, id: z.number().int().positive(), data: z.record(z.string(), z.any()).optional() }).passthrough()
       ).handler(async ({ input, context }) => wrapErrors(async () => {
         const rel = buildScopedRelation(crudModel!, input as any)
+        // Pre-load primes this.record for @before hooks (URL scopes only —
+        // scopeBy needs ctrl.state, which doesn't exist yet)
         const record = await rel.where({ id: (input as any).id }).first()
         if (!record) throw new NotFound(crudModel!.name)
         return dispatch(
           ControllerClass, context as TContext, input as any, rel, act.method,
-          (ctrl) => ctrl[act.method](record, (input as any).data ?? input),
+          async (ctrl) => {
+            // FIXES-NEEDED #8: the record must be reachable through the
+            // FULLY narrowed relation — scopeBy included. Without this
+            // re-verify, a scopeBy-tenanted door leaks records cross-tenant
+            // through every @action({load:true}).
+            const verified = crud?.config?.scopeBy
+              ? await ctrl.relation.where({ id: (input as any).id }).first()
+              : record
+            if (!verified) throw new NotFound(crudModel!.name)
+            ctrl.record = verified
+            return ctrl[act.method](verified, (input as any).data ?? input)
+          },
           record,
+          crud?.config?.scopeBy,
         )
       }))
     } else {
@@ -458,8 +488,13 @@ export function buildRouter<TContext = Record<string, any>>(
         z.object({ ...scopeSchema, data: z.record(z.string(), z.any()).optional() }).passthrough()
       ).handler(async ({ input, context }) => {
         const rel = crudModel ? buildScopedRelation(crudModel, input as any) : null
+        // FIXES-NEEDED #8: scopeBy rides dispatch here too — this.relation
+        // inside a no-id action is fully narrowed, so aggregate actions
+        // (stats, leaderboards) can't sum across tenants
         return dispatch(ControllerClass, context as TContext, input as any, rel as any, act.method,
-          (ctrl) => ctrl[act.method]((input as any).data ?? input))
+          (ctrl) => ctrl[act.method]((input as any).data ?? input),
+          undefined,
+          crud?.config?.scopeBy)
       })
     }
     routes.push({ method: act.httpMethod, path, procedure: act.method, action: act.method })

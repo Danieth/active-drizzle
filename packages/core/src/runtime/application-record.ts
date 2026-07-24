@@ -1,6 +1,6 @@
 import util from 'util'
 import { eq, and, inArray, sql, getTableColumns } from 'drizzle-orm'
-import { Relation } from './relation.js'
+import { Relation, _lookupAssocTarget } from './relation.js'
 import { getExecutor, getSchema, MODEL_REGISTRY, transaction, transactionContext, afterCommitQueue, AbortChain, RecordNotFound } from './boot.js'
 import { modelClassName } from './class-name.js'
 import { runHooks, collectHooks } from './hooks.js'
@@ -138,6 +138,37 @@ export interface AttrConfig extends AttrPresentationalMeta {
  * hottest read path (every plain-column access) and from every save/validate.
  */
 const _staticEntriesCache = new WeakMap<object, Array<[string, any]>>()
+
+const _ASSOC_MARKER_TYPES = new Set(['hasMany', 'hasOne', 'belongsTo', 'habtm'])
+
+/**
+ * FIXES-NEEDED #12 / the serialization-fidelity LAW: children eager-loaded
+ * via includes() sit in _attributes as PLAIN rows — serializing them raw
+ * bypasses the child model's Attr codecs (money serialized as cents beside
+ * a parent in dollars). Hydrate through the child class so its codecs run,
+ * recursing into grandchildren the same way. Unknown associations fall
+ * back to the raw row (never throw during serialization).
+ */
+function _includedChildJSON(parentCtor: any, assocName: string, row: any): any {
+  try {
+    const marker = parentCtor?.[assocName]
+    if (!marker || typeof marker !== 'object' || !_ASSOC_MARKER_TYPES.has(marker._type)) return row
+    const Target = _lookupAssocTarget(marker, assocName)
+    if (!Target) return row
+    // Grandchildren: any key on the row that is ITSELF an association of
+    // the target hydrates recursively via toJSON({ include })
+    const nested: string[] = []
+    for (const [k, v] of Object.entries(row)) {
+      if (v && typeof v === 'object' && (Target as any)[k] && _ASSOC_MARKER_TYPES.has((Target as any)[k]?._type)) {
+        nested.push(k)
+      }
+    }
+    const inst = new (Target as any)(row, false)
+    return inst.toJSON(nested.length ? { include: nested } : undefined)
+  } catch {
+    return row
+  }
+}
 
 export function modelStaticEntries(ctor: any): Array<[string, any]> {
   if (!ctor) return []
@@ -797,12 +828,16 @@ export class ApplicationRecord {
       result = { ...all }
     }
     if (opts?.include) {
+      const ctor = this.constructor as any
       for (const assocName of opts.include) {
         const val = all[assocName]
         if (Array.isArray(val)) {
-          result[assocName] = val.map((r: any) => (typeof r?.toJSON === 'function' ? r.toJSON() : r))
+          result[assocName] = val.map((r: any) =>
+            typeof r?.toJSON === 'function' ? r.toJSON() : _includedChildJSON(ctor, assocName, r))
         } else if (val && typeof (val as any).toJSON === 'function') {
           result[assocName] = (val as any).toJSON()
+        } else if (val && typeof val === 'object') {
+          result[assocName] = _includedChildJSON(ctor, assocName, val)
         } else {
           result[assocName] = val ?? null
         }

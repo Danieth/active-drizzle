@@ -731,6 +731,9 @@ export async function defaultGet(
   if (includes.length) rel = rel.includes(...includes)
   const record = await rel.first()
   if (!record) throw new NotFound(model.name)
+  // FIXES-NEEDED #9: @after hooks on get read this.record (audit trails —
+  // "record who read this"); it was silently null forever
+  if (ctrl) ctrl.record = record
   await hydrateHabtmIds(record, model, config)
 
   if (usesEnvelope(config)) return buildRecordEnvelope(record, model, config, ctx, ctrl)

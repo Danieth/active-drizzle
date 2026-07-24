@@ -993,9 +993,13 @@ function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string, tableName: stri
     if (act.httpMethod === 'GET') {
       const hookName = toIndexName(act.method)
       if (act.load) {
-        // Record-level GET: takes id, uses detail cache key
+        // Record-level GET. FIXES-NEEDED #10: the key is the detail family
+        // key PLUS the action name — NOT the bare detail key, which is the
+        // edit-form's get query (same key + different queryFn = two
+        // consumers poisoning each other's cache). The suffix stays UNDER
+        // the family root, so coherence prefix-invalidation still reaches it.
         const qk = keysRef
-          ? `${keysRef}.detail(id ?? 0, scopes)`
+          ? `[...${keysRef}.detail(id ?? 0, scopes), '${act.method}']`
           : `['${lcFirst(ctrl.className)}', scopes, id, '${act.method}']`
         L.push(`    ${hookName}: (id: number | string | null | undefined) => useQuery({ queryKey: ${qk}, queryFn: () => client.${actionKey}({ ${scopeSpread}id }), enabled: id != null }),`)
       } else {
