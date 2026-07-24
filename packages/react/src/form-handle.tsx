@@ -16,6 +16,7 @@ import { FormSession, type SessionStatus } from './form-session.js'
 import { parseControllerError } from './errors.js'
 import { NestedArrayManager, NestedOneManager, type NestedChild } from './nested.js'
 import { resolvePresenter, checkRequiredMeta, type PresenterBind, type PresenterProps } from './presenters.js'
+import { useClientPresenterCtx } from './presenter-context.js'
 
 /**
  * Context decides what COMMIT does — the presenter never knows:
@@ -283,7 +284,7 @@ export function useFieldProps(
     value: session.getValue(field),
     bind,
     meta,
-    ctx: session.getFrontendCtx(),
+    ctx: { ...useClientPresenterCtx(), ...session.getFrontendCtx() },
     overrides: opts.overrides ?? {},
     mode: opts.mode ?? (session.canEdit(field) ? 'edit' : 'view'),
     draft: session.draft,
@@ -653,6 +654,9 @@ export function createFormHandle<T extends Record<string, any>>(
         () => session.fieldVersion(channel),
       )
       const formCtx = useContext(FormModeContext)
+      // Client-lane presenter context (folder context.ts files) — merged
+      // UNDER the server lane; regen guarantees the lanes never collide
+      const clientCtx = useClientPresenterCtx()
       // Route a commit by context: autoflush stages + schedules the whole-
       // diff flush; stage just stages; no Form → per-field autosave PATCH
       const commitViaContext = (f: string): void => {
@@ -736,7 +740,7 @@ export function createFormHandle<T extends Record<string, any>>(
           value={session.getValue(dataField)}
           bind={bind}
           meta={meta}
-          ctx={session.getFrontendCtx()}
+          ctx={{ ...clientCtx, ...session.getFrontendCtx() }}
           overrides={overrides}
           mode={resolved.mode}
           draft={session.draft}

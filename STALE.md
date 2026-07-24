@@ -8,6 +8,7 @@
 
 - **STALE** — contradicts current reality; the marker in the file says what to trust instead.
 - **LEGACY** — still works, but superseded; do not build on it.
+- **DORMANT** — unused by the current generation but has a plausible future role; decision deliberately open.
 - **DELETE-CANDIDATE** — pure debris; delete whenever convenient (nothing references it).
 - **PENDING** — not stale, but unfinished work parked in an odd place; tracked so it isn't mistaken for stale.
 - **WATCH** — accurate today, scheduled to become stale when a planned design ships.
@@ -17,7 +18,7 @@
 | # | Item | Status | Marked in place? | What to do eventually |
 |---|------|--------|------------------|----------------------|
 | 1 | `a.out` (repo root) | DELETE-CANDIDATE | n/a (binary) | Compiled Mach-O object file, **committed to git**. `git rm` it and add `a.out` to `.gitignore`. |
-| 2 | `packages/react/src/hooks.ts` | LEGACY | ✅ `@deprecated` banner | Phase-4 hook factories (`createModelHook`/`createSearchHook`). The current react-generator emits nothing against them; only `index.ts` re-exports them. Remove the exports in a minor-version bump once confirmed no app imports them. |
+| 2 | `packages/react/src/hooks.ts` | DORMANT (decision pending) | ✅ banner | Phase-4 hook factories (`createModelHook`/`createSearchHook`). The current react-generator emits nothing against them; only `index.ts` re-exports them. NOT deprecated — candidate future role as the lightweight read-only lane for presenter-side lookups (sessions are too heavy for "fetch options for a dropdown"). If revived: re-type against current generated meta and reconcile its `SearchState` with `IndexSession` so there's one list-state vocabulary. If presenters never need it, retire it then. |
 | 3 | `REMAINING.md` test-count line ("258 tests") | STALE | ✅ warning block | Old snapshot; suite is far larger (README cites 900+). Recount and refresh the test-file table, or drop the count entirely. |
 | 4 | `WEEKEND-2026-07-18.md` | STALE (historical) | ✅ archive banner | Sprint log, canonical only through 2026-07-19. Move to a `docs/history/` folder or leave archived — just never update it. |
 | 5 | `packages/controller/packages/controller/tests/concerns/` | DELETE-CANDIDATE | n/a (empty dirs) | Accidental nested directory tree, zero files, not in git (git doesn't track empty dirs). `rmdir -p` it. |

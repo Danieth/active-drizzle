@@ -125,3 +125,9 @@ export {
   type UseMultiUploadReturn,
   type UseMultiUploadOptions,
 } from './upload.js'
+export {
+  definePresenterContext,
+  PresenterContextProvider,
+  useClientPresenterCtx,
+  type PresenterContextMap,
+} from './presenter-context.js'
