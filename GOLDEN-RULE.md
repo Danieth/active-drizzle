@@ -24,3 +24,9 @@ Every feature passes this filter or dies. Corollaries earned this far:
   for values (no Intl, no repr codecs) — the app dries that up itself.
 - Chrome is written ONCE, by the app, as a LAYOUT: bulbs are value+bind;
   the layout renders label/errors/dirty/state around them.
+- LAYOUTS ARE CONTEXT (Daniel, 2026-07-24): chrome declares itself in
+  folder context.ts and wraps everything beside/below; each layer
+  CONSUMES named responsibilities (errors, dirty, …); the bulb receives
+  the REMAINDER; regen errors when a required responsibility is handled
+  NOWHERE on a path. Per-presenter layout registration is transitional
+  and dies in the tree phase.
