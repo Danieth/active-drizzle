@@ -12,3 +12,4 @@ export {
 } from './config.js'
 export { processAsset, type ProcessResult } from './tasks/asset-process-task.js'
 export { scaffoldPresenterTree, collectKindsInUse, type ScaffoldResult, type KindUsage } from './codegen/presenter-scaffold.js'
+export { scanKindModules, generatePresenterRegistry, generatePresenterRegistryFromDir, type KindModuleScan } from './codegen/presenter-registry.js'
