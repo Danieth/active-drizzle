@@ -307,6 +307,107 @@ path instead of at one boundary. `save()` does it right; every other path forks.
 
 ---
 
+## FOLDED IN — post-launch backlog (from NICE_TO_HAVE.md + STALE.md, 2026-08-26)
+
+The `NICE_TO_HAVE.md` and `STALE.md` trackers are DELETED; their still-live
+items land here (one fact, one place). Cross-refs mark what an earlier tier
+already owns — do not double-track.
+
+### Query algebra — advanced SQL still to surface (extends Tier 2 "Query algebra")
+Shipped + verified on real PG (2026-07-19): group/having, grouped aggregates,
+DISTINCT ON, window functions (`Fn.*`), keyset `seek`, set ops, `toSQL`.
+Still to surface as typed, chainable `Relation` methods (results hydrate to
+typed models/rows, never `any`; `.where(sql\`…\`)` stays the escape hatch):
+- [ ] 🟢 CTEs / `WITH … AS` (+ `AS MATERIALIZED` pinning; Drizzle `$with`).
+- [ ] 🟢 Recursive CTEs (`WITH RECURSIVE`) — trees/graphs (category trees, org
+      charts, threaded comments, descendants-of-X). Miserable to hand-roll.
+- [ ] 🟢 `LATERAL` joins — "top N per group" / "most recent N per group".
+- [ ] 🟢 Filtered aggregates — `COUNT(*) FILTER (WHERE …)` in one pass.
+- [ ] 🟢 JSONB querying (`->`,`->>`,`@>`, `jsonb_path_query`, `json_agg`,
+      `jsonb_build_object`) + array operators (`@>`,`&&`,`ANY`/`ALL`,`unnest`).
+- [ ] 🟢 `.explain()` (EXPLAIN ANALYZE) beside the shipped `.toSQL()`.
+- [ ] 🟢 `upsert` semantics decision (SQL is easy; the ActiveRecord stance is the
+      work — bypass hooks/validations like `updateAll`, document loudly, offer a
+      slower per-row path; `Attr set` transforms must apply to BOTH insert values
+      and the conflict-update set). Cross-ref: Tier 2 already lists `upsert`/ON CONFLICT.
+
+### Observability (new — the Rails "Bullet gem" shape; a pluggable sink)
+Plugs into the existing `reportError`/context seam (`core/runtime/error-reporting.ts`)
+as a matching `onQuery`/`onSlowQuery` sink — telemetry + errors share one model.
+- [ ] 🟢 Dev-time N+1 detector: "resolved `author` 50× across siblings in one
+      tick → add `.includes('author')`." The lazy N+1 is BY DESIGN — this teaches
+      the escape hatch at the moment it's needed. Off in production.
+- [ ] 🟢 Dev query logging (SQL + duration, tagged with model/operation).
+- [ ] 🟢 Slow-query warning past a configurable threshold.
+- [ ] 🟢 Optional OpenTelemetry spans around queries + `save()`/`transaction()`.
+
+### Error-handling enhancements (extends Tier 0 "Error taxonomy")
+- [ ] 🟢 Auto-retry `retryable` transactions — `translateDbError` already
+      classifies `40001`/`40P01` as `kind:'retryable'` but nothing acts on it;
+      `transaction()` should catch + retry with bounded backoff. Seam exists;
+      highest value-per-effort here.
+- [ ] 🟢 Promote the emergent `kind` into a documented taxonomy: user
+      (validation → shown, not reported) vs operational (DB down/conflict/
+      deadlock → friendly, maybe retry) vs programmer (bug → propagate in dev,
+      report in prod, generic message to user).
+- [ ] 🟢 Type the error context bag: `Record<string,unknown>` → `{ model,
+      operation:'insert'|'update'|'destroy', recordId?, sqlstate? }`.
+- [ ] 🟢 Document the hook error contract (before throws/returns false → abort;
+      after throws → reported, commit already happened; `afterCommit` isolated)
+      and "constraints are truth, validations are UX" (uniqueness TOCTOU → 23505).
+- Cross-ref: stable machine-readable `code:` on every error is Tier 0.
+
+### Ecosystem reach (new, post-launch)
+- [ ] 🟢 More framework adapters (Express / Next route-handlers / Remix /
+      Fastify) — the controller layer is already framework-agnostic; adapters
+      are thin. `hono` ships today.
+- [ ] 🟢 `generate:scaffold` end-to-end (model + Drizzle table stub + controller
+      + factory + a React form) — the one-command "wow" demo.
+- [ ] 🟢 Edge/serverless proof: run the suite on Workers/Neon-http/PGlite and
+      publish the matrix (also a trust item).
+
+### Adoption & docs (new, post-launch)
+- [ ] 🟢 Measure client bundle size with 50–100 models FIRST (likely fine, per-
+      model generated code is thin + tree-shakes); only if a measurement shows
+      growth, push common structure into one shared generated base type each
+      per-model file inherits from (`_globals.gen.d.ts` already sets the pattern).
+- [ ] 🟢 Rewrite the Prisma comparison "blur" into a crisp side-by-side table
+      (active-drizzle vs Prisma vs raw Drizzle vs TypeORM) + a concrete
+      Prisma→active-drizzle migration walkthrough. Best conversion tool there is.
+- Cross-ref: SSR/RSC find-out-and-document is Tier 1 "Onboarding truth".
+
+### Deferred / expensive (design deliberately; defer until needed)
+- [ ] 🟢 Read replicas AND full multi-database (`connected_to`): per-model/
+      per-request routing, sharding, DB-per-tenant. Reaches into `boot()`, the
+      executor seam, transactions, and every query path.
+
+### Doctrine (design stance, NOT a gap — record so it isn't re-opened)
+- Full audit / change-history is an APP concern: ship the `afterCommit` +
+  dirty-tracking seams that let an app build exactly the audit it needs
+  (retention, tamper-evidence, field-level diffs, regulatory export are all
+  app-specific); the `trackable` concern stays general-purpose (timestamps/
+  blame) and is NOT meant to grow into an opinionated audit table.
+
+### Housekeeping folded from STALE.md (live items only)
+- [ ] 🟢 `packages/react/src/hooks.ts` (DORMANT): Phase-4 hook factories
+      (`createModelHook`/`createSearchHook`) with ZERO references anywhere —
+      hand-wiring via them would BYPASS the coherence invalidation graph
+      (strictly worse). Drop the `index.ts` re-exports at the next minor bump,
+      then delete. Awaiting Daniel's call.
+- [ ] 🟢 `readme-to-add-to-repo.md` (PENDING, not stale): ~25 feature sections
+      written as features landed, not yet folded into `README.md` (e.g. the
+      hasOne nested-forms section is absent from README). Fold in, then delete
+      the staging file.
+- [ ] 🟢 LLM-GUIDE §5 signal-only SSE lane ("NEVER payloads") is a WATCH item:
+      accurate for shipped code today; when `DESIGN-ws-channels.md` payload
+      channels ship it must be rewritten THE SAME DAY or it misleads.
+- STALE.md items already RESOLVED (verified 2026-08-26, not carried): `a.out`
+  removed; `REMAINING.md` deleted (its stale test-count moot); `WEEKEND-2026-07-18.md`
+  gone; the accidental empty `packages/controller/packages/controller/tests/concerns/`
+  nested dir gone.
+
+---
+
 ## SEQUENCING (the burn-down)
 
 1. **Codec chokepoint** (Tier 0) — one boundary, then generated-real accessors

@@ -41,3 +41,4 @@ Thumbs.db
 *.local
 .claude/worktrees/
 .claude/launch.json
+a.out
