@@ -25,7 +25,7 @@
  * compose it explicitly instead of every validator failing on nil.
  */
 
-import type { AsyncAttrValidator, AttrValidator } from './validation-errors.js'
+import type { AsyncAttrValidator, AttrValidator, ValidationFailure } from './validation-errors.js'
 import { isValidTimezone } from './timezone.js'
 
 /** Options every validator accepts, mirroring Rails' common options. */
@@ -52,16 +52,26 @@ export function isBlank(value: unknown): boolean {
   return false
 }
 
+/** A coded failure — shorthand constructor keeping call sites terse. */
+function fail(code: string, message: string, meta?: Record<string, unknown>): ValidationFailure {
+  return meta ? { code, message, meta } : { code, message }
+}
+
 /**
- * Wraps a check with the shared option gates. When invoked without a record
- * (bare `fn(value)` call), the record-dependent gates (if/unless/on) are
- * skipped and the check still runs.
+ * Wraps a coded check with the shared option gates and builds BOTH lanes of
+ * the validator: the public `(value) => string | null` (what tests, the
+ * generated client validate(), and hand-written validators all speak) and a
+ * `.detailed` sibling returning the full { code, message, meta } failure.
+ * The code is born HERE, beside the default message; a `message:` override
+ * replaces the TEXT alone — the code survives custom copy and i18n.
+ * When invoked without a record (bare `fn(value)` call), the
+ * record-dependent gates (if/unless/on) are skipped and the check still runs.
  */
-function guard(
+function coded(
   opts: ValidatorOptions,
-  check: (value: any, record: any, key: string | undefined) => string | null,
+  check: (value: any, record: any, key: string | undefined) => ValidationFailure | null,
 ): AttrValidator {
-  return (value, record, key) => {
+  const detailed = (value: any, record?: any, key?: string): ValidationFailure | null => {
     if (record !== undefined && record !== null) {
       if (opts.if && !opts.if(record)) return null
       if (opts.unless && opts.unless(record)) return null
@@ -70,16 +80,22 @@ function guard(
     }
     if (opts.allowNull && (value === null || value === undefined)) return null
     if (opts.allowBlank && isBlank(value)) return null
-    return check(value, record, key)
+    const f = check(value, record, key)
+    if (!f) return null
+    return opts.message ? { ...f, message: opts.message } : f
   }
+  const fn = ((value: any, record?: any, key?: string) =>
+    detailed(value, record, key)?.message ?? null) as AttrValidator
+  ;(fn as AttrValidator & { detailed: typeof detailed }).detailed = detailed
+  return fn
 }
 
 /** Most validators skip nil — presence is the one that demands values. */
 function skipNil(
   opts: ValidatorOptions,
-  check: (value: any, record: any, key: string | undefined) => string | null,
+  check: (value: any, record: any, key: string | undefined) => ValidationFailure | null,
 ): AttrValidator {
-  return guard(opts, (value, record, key) =>
+  return coded(opts, (value, record, key) =>
     value === null || value === undefined ? null : check(value, record, key)
   )
 }
@@ -88,12 +104,12 @@ function skipNil(
 
 /** Value must be present: not null, '', whitespace, or []. */
 function presence(opts: ValidatorOptions = {}): AttrValidator {
-  return guard(opts, (v) => (isBlank(v) ? opts.message ?? "can't be blank" : null))
+  return coded(opts, (v) => (isBlank(v) ? fail('blank', "can't be blank") : null))
 }
 
 /** Value must be blank — the inverse of presence. */
 function absence(opts: ValidatorOptions = {}): AttrValidator {
-  return guard(opts, (v) => (isBlank(v) ? null : opts.message ?? 'must be blank'))
+  return coded(opts, (v) => (isBlank(v) ? null : fail('present', 'must be blank')))
 }
 
 export interface LengthOptions extends ValidatorOptions {
@@ -108,13 +124,13 @@ function length(opts: LengthOptions = {}): AttrValidator {
   return skipNil(opts, (v) => {
     const len = typeof v === 'string' || Array.isArray(v) ? v.length : String(v).length
     if (opts.is !== undefined && len !== opts.is) {
-      return opts.message ?? `is the wrong length (should be ${opts.is} characters)`
+      return fail('wrong_length', `is the wrong length (should be ${opts.is} characters)`, { count: opts.is })
     }
     if (opts.min !== undefined && len < opts.min) {
-      return opts.message ?? `is too short (minimum is ${opts.min} characters)`
+      return fail('too_short', `is too short (minimum is ${opts.min} characters)`, { count: opts.min })
     }
     if (opts.max !== undefined && len > opts.max) {
-      return opts.message ?? `is too long (maximum is ${opts.max} characters)`
+      return fail('too_long', `is too long (maximum is ${opts.max} characters)`, { count: opts.max })
     }
     return null
   })
@@ -138,30 +154,30 @@ export interface NumericalityOptions extends ValidatorOptions {
 function numericality(opts: NumericalityOptions = {}): AttrValidator {
   return skipNil(opts, (v) => {
     const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN
-    if (!Number.isFinite(n)) return opts.message ?? 'is not a number'
-    if (opts.onlyInteger && !Number.isInteger(n)) return opts.message ?? 'must be an integer'
+    if (!Number.isFinite(n)) return fail('not_a_number', 'is not a number')
+    if (opts.onlyInteger && !Number.isInteger(n)) return fail('not_an_integer', 'must be an integer')
     if (opts.greaterThan !== undefined && !(n > opts.greaterThan)) {
-      return opts.message ?? `must be greater than ${opts.greaterThan}`
+      return fail('greater_than', `must be greater than ${opts.greaterThan}`, { count: opts.greaterThan })
     }
     if (opts.greaterThanOrEqualTo !== undefined && !(n >= opts.greaterThanOrEqualTo)) {
-      return opts.message ?? `must be greater than or equal to ${opts.greaterThanOrEqualTo}`
+      return fail('greater_than_or_equal_to', `must be greater than or equal to ${opts.greaterThanOrEqualTo}`, { count: opts.greaterThanOrEqualTo })
     }
     if (opts.lessThan !== undefined && !(n < opts.lessThan)) {
-      return opts.message ?? `must be less than ${opts.lessThan}`
+      return fail('less_than', `must be less than ${opts.lessThan}`, { count: opts.lessThan })
     }
     if (opts.lessThanOrEqualTo !== undefined && !(n <= opts.lessThanOrEqualTo)) {
-      return opts.message ?? `must be less than or equal to ${opts.lessThanOrEqualTo}`
+      return fail('less_than_or_equal_to', `must be less than or equal to ${opts.lessThanOrEqualTo}`, { count: opts.lessThanOrEqualTo })
     }
     if (opts.equalTo !== undefined && n !== opts.equalTo) {
-      return opts.message ?? `must be equal to ${opts.equalTo}`
+      return fail('equal_to', `must be equal to ${opts.equalTo}`, { count: opts.equalTo })
     }
     if (opts.otherThan !== undefined && n === opts.otherThan) {
-      return opts.message ?? `must be other than ${opts.otherThan}`
+      return fail('other_than', `must be other than ${opts.otherThan}`, { count: opts.otherThan })
     }
-    if (opts.odd && Math.abs(n % 2) !== 1) return opts.message ?? 'must be odd'
-    if (opts.even && n % 2 !== 0) return opts.message ?? 'must be even'
+    if (opts.odd && Math.abs(n % 2) !== 1) return fail('odd', 'must be odd')
+    if (opts.even && n % 2 !== 0) return fail('even', 'must be even')
     if (opts.in && (n < opts.in[0] || n > opts.in[1])) {
-      return opts.message ?? `must be in ${opts.in[0]}..${opts.in[1]}`
+      return fail('inclusion', `must be in ${opts.in[0]}..${opts.in[1]}`, { in: [opts.in[0], opts.in[1]] })
     }
     return null
   })
@@ -181,11 +197,11 @@ function format(opts: FormatOptions = {}): AttrValidator {
     // Reset lastIndex so /g or /y flags can't make .test() stateful.
     if (opts.with) {
       opts.with.lastIndex = 0
-      if (!opts.with.test(s)) return opts.message ?? 'is invalid'
+      if (!opts.with.test(s)) return fail('invalid', 'is invalid')
     }
     if (opts.without) {
       opts.without.lastIndex = 0
-      if (opts.without.test(s)) return opts.message ?? 'is invalid'
+      if (opts.without.test(s)) return fail('invalid', 'is invalid')
     }
     return null
   })
@@ -199,7 +215,9 @@ export interface InclusionOptions extends ValidatorOptions {
 function inclusion(opts: InclusionOptions): AttrValidator {
   return skipNil(opts, (v, record) => {
     const list = typeof opts.in === 'function' ? opts.in(record) : opts.in
-    return list.includes(v) ? null : opts.message ?? 'is not included in the list'
+    if (list.includes(v)) return null
+    const meta = Array.isArray(opts.in) && opts.in.length <= 25 ? { in: [...opts.in] } : undefined
+    return fail('inclusion', 'is not included in the list', meta)
   })
 }
 
@@ -207,7 +225,7 @@ function inclusion(opts: InclusionOptions): AttrValidator {
 function exclusion(opts: InclusionOptions): AttrValidator {
   return skipNil(opts, (v, record) => {
     const list = typeof opts.in === 'function' ? opts.in(record) : opts.in
-    return list.includes(v) ? opts.message ?? 'is reserved' : null
+    return list.includes(v) ? fail('exclusion', 'is reserved') : null
   })
 }
 
@@ -222,7 +240,7 @@ function confirmation(opts: ValidatorOptions = {}): AttrValidator {
     if (!record || !key) return null
     const other = record[`${key}Confirmation`]
     if (other === undefined || other === null) return null
-    return Object.is(other, v) ? null : opts.message ?? `doesn't match ${key}`
+    return Object.is(other, v) ? null : fail('confirmation', `doesn't match ${key}`, { attribute: `${key}Confirmation` })
   })
 }
 
@@ -256,7 +274,13 @@ function comparison(opts: ComparisonOptions): AttrValidator {
       if (op === undefined) continue
       const bound = resolve(op, record)
       if (bound === null || bound === undefined) continue
-      if (!ok(v, bound)) return opts.message ?? `must be ${phrase} ${describe(bound)}`
+      if (!ok(v, bound)) {
+        const CODES = {
+          greaterThan: 'greater_than', greaterThanOrEqualTo: 'greater_than_or_equal_to',
+          lessThan: 'less_than', lessThanOrEqualTo: 'less_than_or_equal_to',
+        } as const
+        return fail(CODES[name], `must be ${phrase} ${describe(bound)}`, { count: describe(bound) })
+      }
     }
     return null
   })
@@ -270,7 +294,7 @@ export interface AcceptanceOptions extends ValidatorOptions {
 /** Checkbox acceptance (terms of service). Nil passes, per Rails. */
 function acceptance(opts: AcceptanceOptions = {}): AttrValidator {
   const accepted = opts.accept ?? [true, 'true', 1, '1', 'yes', 'on']
-  return skipNil(opts, (v) => (accepted.includes(v) ? null : opts.message ?? 'must be accepted'))
+  return skipNil(opts, (v) => (accepted.includes(v) ? null : fail('accepted', 'must be accepted')))
 }
 
 // ── fnando/validators-style extras ─────────────────────────────────────────
@@ -280,7 +304,7 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 function email(opts: ValidatorOptions = {}): AttrValidator {
   return skipNil(opts, (v) =>
-    typeof v === 'string' && EMAIL_RE.test(v.trim()) ? null : opts.message ?? 'is not a valid email'
+    typeof v === 'string' && EMAIL_RE.test(v.trim()) ? null : fail('invalid_email', 'is not a valid email')
   )
 }
 
@@ -292,14 +316,14 @@ export interface UrlOptions extends ValidatorOptions {
 function url(opts: UrlOptions = {}): AttrValidator {
   const protocols = opts.protocols ?? ['http', 'https']
   return skipNil(opts, (v) => {
-    if (typeof v !== 'string') return opts.message ?? 'is not a valid URL'
+    if (typeof v !== 'string') return fail('invalid_url', 'is not a valid URL')
     try {
       const u = new URL(v)
       return protocols.includes(u.protocol.replace(/:$/, ''))
         ? null
-        : opts.message ?? 'is not a valid URL'
+        : fail('invalid_url', 'is not a valid URL')
     } catch {
-      return opts.message ?? 'is not a valid URL'
+      return fail('invalid_url', 'is not a valid URL')
     }
   })
 }
@@ -308,14 +332,14 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 function uuid(opts: ValidatorOptions = {}): AttrValidator {
   return skipNil(opts, (v) =>
-    typeof v === 'string' && UUID_RE.test(v) ? null : opts.message ?? 'is not a valid UUID'
+    typeof v === 'string' && UUID_RE.test(v) ? null : fail('invalid_uuid', 'is not a valid UUID')
   )
 }
 
 /** IANA timezone id (canonical, alias, or offset — anything Intl accepts). */
 function timezone(opts: ValidatorOptions = {}): AttrValidator {
   return skipNil(opts, (v) =>
-    isValidTimezone(v) ? null : opts.message ?? 'is not a valid timezone'
+    isValidTimezone(v) ? null : fail('invalid_timezone', 'is not a valid timezone')
   )
 }
 
@@ -340,7 +364,7 @@ export interface UniquenessOptions extends ValidatorOptions {
  */
 function uniqueness(opts: UniquenessOptions = {}): AsyncAttrValidator {
   const scopes = opts.scope === undefined ? [] : Array.isArray(opts.scope) ? opts.scope : [opts.scope]
-  return async (value, record, key) => {
+  const detailed = async (value: any, record?: any, key?: string): Promise<ValidationFailure | null> => {
     if (isBlank(value) || !record || !key) return null
     if (record !== undefined && record !== null) {
       if (opts.if && !opts.if(record)) return null
@@ -355,8 +379,12 @@ function uniqueness(opts: UniquenessOptions = {}): AsyncAttrValidator {
     if (!existing) return null
     const ownId = record.id ?? record._attributes?.id
     if (ownId !== null && ownId !== undefined && existing.id === ownId) return null
-    return opts.message ?? 'has already been taken'
+    return fail('taken', opts.message ?? 'has already been taken')
   }
+  const fn = (async (value: any, record?: any, key?: string) =>
+    (await detailed(value, record, key))?.message ?? null) as AsyncAttrValidator
+  ;(fn as AsyncAttrValidator & { detailed: typeof detailed }).detailed = detailed
+  return fn
 }
 
 /**

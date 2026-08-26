@@ -99,17 +99,17 @@ describe('HttpError subclasses', () => {
 describe('serializeError()', () => {
   it('serializes a BadRequest to status+body format', () => {
     const result = serializeError(new BadRequest('nope'))
-    expect(result).toEqual({ status: 400, body: { error: 'nope' } })
+    expect(result).toEqual({ status: 400, body: { code: 'bad_request', error: 'nope' } })
   })
 
   it('serializes a ValidationError with errors object', () => {
     const result = serializeError(new ValidationError({ name: ['too short'] }))
-    expect(result).toEqual({ status: 422, body: { errors: { name: ['too short'] } } })
+    expect(result).toEqual({ status: 422, body: { code: 'validation_failed', errors: { name: ['too short'] } } })
   })
 
   it('serializes a NotFound', () => {
     const result = serializeError(new NotFound('Post'))
-    expect(result).toEqual({ status: 404, body: { error: 'Post not found' } })
+    expect(result).toEqual({ status: 404, body: { code: 'not_found', error: 'Post not found' } })
   })
 })
 

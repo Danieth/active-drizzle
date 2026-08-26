@@ -101,6 +101,8 @@ export function reportError(error: unknown, context: ErrorContext = {}): void {
 export interface TranslatedDbError {
   /** SQLSTATE code, e.g. '23505'. */
   code: string
+  /** Stable taxonomy code for the errors bag ('taken', 'blank', …). */
+  errorCode: string
   /** Coarse category — lets callers pick a response status. */
   kind: 'constraint' | 'bad_value' | 'retryable' | 'unavailable' | 'unknown'
   /** Column the error names, when the driver tells us. */
@@ -137,8 +139,9 @@ export function translateDbError(err: unknown): TranslatedDbError | null {
     (typeof e?.column === 'string' && e.column !== '' ? e.column : undefined) ??
     fieldFromDetail(e?.detail)
 
-  const t = (kind: TranslatedDbError['kind'], message: string, friendly?: string): TranslatedDbError => ({
+  const t = (kind: TranslatedDbError['kind'], message: string, friendly?: string, errorCode = 'invalid'): TranslatedDbError => ({
     code,
+    errorCode,
     kind,
     ...(field !== undefined ? { field } : {}),
     message,
@@ -146,17 +149,17 @@ export function translateDbError(err: unknown): TranslatedDbError | null {
   })
 
   switch (code) {
-    case '23502': return t('constraint', "can't be blank")
-    case '23505': return t('constraint', 'has already been taken')
-    case '23503': return t('constraint', 'refers to something that no longer exists')
-    case '23514': return t('constraint', 'is invalid')
-    case '22001': return t('bad_value', 'is too long')
-    case '22003': return t('bad_value', 'is out of range')
+    case '23502': return t('constraint', "can't be blank", undefined, 'blank')
+    case '23505': return t('constraint', 'has already been taken', undefined, 'taken')
+    case '23503': return t('constraint', 'refers to something that no longer exists', undefined, 'foreign_key')
+    case '23514': return t('constraint', 'is invalid', undefined, 'invalid')
+    case '22001': return t('bad_value', 'is too long', undefined, 'too_long')
+    case '22003': return t('bad_value', 'is out of range', undefined, 'inclusion')
     case '22007': // invalid datetime format
-    case '22P02': return t('bad_value', 'is invalid')
+    case '22P02': return t('bad_value', 'is invalid', undefined, 'invalid')
     case '40001': // serialization_failure
     case '40P01': // deadlock_detected
-      return t('retryable', 'conflicted with another change', 'The operation conflicted with another change. Please try again.')
+      return t('retryable', 'conflicted with another change', 'The operation conflicted with another change. Please try again.', 'stale')
   }
 
   // Connection / server-availability classes → "try again shortly"

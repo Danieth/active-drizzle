@@ -14,6 +14,16 @@ export interface ParsedControllerError {
    * @example { name: ["can't be blank"], status: ["is invalid"] }
    */
   fields?: Record<string, string[]>
+  /**
+   * Coded field-level details (same keys as `fields`, same order): each entry
+   * carries the STABLE machine code ('blank' | 'too_long' | 'taken' | …) plus
+   * the message and i18n-ready meta. Branch on `code`, never on message text.
+   *
+   * @example { email: [{ code: 'taken', message: 'has already been taken' }] }
+   */
+  details?: Record<string, Array<{ code: string; message: string; meta?: Record<string, unknown> }>>
+  /** The server's stable error identity ('validation_failed', 'stale_record', …). */
+  serverCode?: string
   /** 409 only: the server's CURRENT envelope (fresh record + version). */
   envelope?: Record<string, any>
   isValidation: boolean
@@ -62,12 +72,17 @@ export function parseControllerError(error: unknown): ParsedControllerError | nu
   // conflicts carry `data.envelope` (the server's current record + version)
   const rawData = e['data'] as Record<string, any> | undefined
   const fields: Record<string, string[]> | undefined = rawData?.['errors'] ?? undefined
+  const details: ParsedControllerError['details'] = rawData?.['details'] ?? undefined
+  const serverCode: string | undefined =
+    typeof rawData?.['code'] === 'string' ? rawData['code'] : undefined
   const envelope: Record<string, any> | undefined = rawData?.['envelope'] ?? undefined
 
   return {
     code,
     message,
     ...(fields !== undefined ? { fields } : {}),
+    ...(details !== undefined ? { details } : {}),
+    ...(serverCode !== undefined ? { serverCode } : {}),
     ...(envelope !== undefined ? { envelope } : {}),
     isValidation:  code === 'UNPROCESSABLE_ENTITY',
     isNotFound:    code === 'NOT_FOUND',
