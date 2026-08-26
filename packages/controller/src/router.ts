@@ -18,7 +18,7 @@ import { inferControllerPath } from './decorators.js'
 import {
   defaultIndex, defaultGet, defaultCreate, defaultUpdate, defaultDestroy,
   singletonFindOrCreate, enforceMutationRules, sanitizeMutationPayload,
-  buildGovernedWriteData, applyAutoAttach, effectiveUpdateConfig,
+  buildGovernedWriteData, applyAutoAttach, effectiveUpdateConfig, encryptedAttrNames,
   isStaleObjectError,
 } from './crud-handlers.js'
 import { BadRequest, Conflict, HttpError, NotFound, ValidationError, toValidationError, serializeError } from './errors.js'
@@ -167,6 +167,20 @@ export function buildRouter<TContext = Record<string, any>>(
 
   if (crud) {
     const { model, config } = crud
+
+    // THE ENCRYPTION CARVE-OUT (DESIGN-field-encryption §3.3): permissive-by-
+    // default is suspended the moment a column is .encrypt()'d. An ungoverned
+    // door serializes every column with encrypted fields already DECRYPTED by
+    // Attr.get — so absence of a read ceiling is a config error, not a default.
+    const encrypted = encryptedAttrNames(model)
+    if (encrypted.length > 0 && !config.get?.expose?.length) {
+      throw new Error(
+        `[active-drizzle] ${ControllerClass.name}: ${modelClassName(model)}.${encrypted[0]} is ` +
+        `encrypted, but this door declares no read ceiling. Permissive-by-default is suspended ` +
+        `for encrypted models — declare get: { expose: [...] } (list '${encrypted.join("', '")}' ` +
+        `ONLY if this door should really ship the decrypted plaintext).`,
+      )
+    }
 
     // Shared scope param schema
     const scopeSchema: Record<string, z.ZodTypeAny> = {}
@@ -382,6 +396,19 @@ export function buildRouter<TContext = Record<string, any>>(
   if (singleton) {
     const { model, config } = singleton
     const singletonModel: any = model
+    // Same carve-out as crud doors — but SingletonConfig has no read ceiling
+    // to declare yet, so an encrypted model simply cannot ship through a
+    // singleton door. Honest refusal beats silently serialized plaintext.
+    const singletonEncrypted = encryptedAttrNames(singletonModel)
+    if (singletonEncrypted.length > 0) {
+      throw new Error(
+        `[active-drizzle] ${ControllerClass.name}: ${modelClassName(singletonModel)}.` +
+        `${singletonEncrypted[0]} is encrypted, and singleton doors have no read ceiling ` +
+        `(SingletonConfig.get.expose does not exist yet) — every column would serialize with ` +
+        `encrypted fields already decrypted. Expose this model through a @crud door with ` +
+        `get: { expose: [...] }, or drop .encrypt() from it.`,
+      )
+    }
     const scopeSchema: Record<string, z.ZodTypeAny> = {}
     for (const s of scopes) scopeSchema[s.paramName] = z.number().int().positive()
 
@@ -685,7 +712,9 @@ export function buildRouter<TContext = Record<string, any>>(
           asset.byteSize = head.contentLength
           asset.checksum = head.etag ?? null
           asset.status = 'ready'
-          await asset.save()
+          // Same silent-false family as the presign gate: an unchecked save
+          // here returned 200 with an in-memory 'ready' that never persisted.
+          if (!(await asset.save())) throw toValidationError(asset.errors)
 
           return asset.toJSON()
         })
@@ -811,10 +840,11 @@ function httpToOrpc(e: HttpError): ORPCError<string, unknown> {
     422: 'UNPROCESSABLE_ENTITY',
   }
   const code = STATUS_TO_CODE[e.status] ?? 'INTERNAL_SERVER_ERROR'
-  const data = e instanceof ValidationError ? { errors: e.errors }
-    : e instanceof Conflict ? { envelope: e.envelope }
-    : undefined
+  // ONE wire body: serializeError defines it for every adapter — stable
+  // machine `code` on every error, `details` beside `errors` on 422,
+  // `envelope` on 409. Rebuilding it here would let the lanes drift.
+  const { body } = serializeError(e)
   // status explicitly — cross-package ORPCError copies don't all derive it from code
-  return new ORPCError(code, { status: e.status, message: e.message, data })
+  return new ORPCError(code, { status: e.status, message: e.message, data: body })
 }
 

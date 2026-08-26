@@ -80,7 +80,11 @@ export function enforceMutationRules(
   ctrl: any,
 ): Record<string, any> | undefined {
   if (mut.if && !mut.if(record, ctx, ctrl)) {
-    throw new ValidationError({ base: [`${mut.method} is not available for this record`] })
+    const msg = `${mut.method} is not available for this record`
+    throw new ValidationError(
+      { base: [msg] },
+      { base: [{ code: 'unavailable', message: msg }] },
+    )
   }
   return sanitizeMutationPayload(mut, data)
 }
@@ -107,7 +111,12 @@ export function sanitizeMutationPayload(
       const v = payload?.[k]
       if (v == null || (typeof v === 'string' && v.trim() === '')) errors[k] = ['is required']
     }
-    if (Object.keys(errors).length > 0) throw new ValidationError(errors)
+    if (Object.keys(errors).length > 0) {
+      throw new ValidationError(
+        errors,
+        Object.fromEntries(Object.keys(errors).map(k => [k, [{ code: 'blank', message: 'is required' }]])),
+      )
+    }
   }
   return payload
 }
@@ -148,7 +157,7 @@ export function isStaleObjectError(e: unknown): boolean {
  * blind to the state machine / nested associations its parent declares.
  * Walks to Function.prototype; first hit wins so subclasses shadow.
  */
-function staticEntries(model: any): Array<[string, any]> {
+export function staticEntries(model: any): Array<[string, any]> {
   const out: Array<[string, any]> = []
   const seen = new Set<string>()
   for (let c = model; c && c !== Function.prototype; c = Object.getPrototypeOf(c)) {
@@ -157,6 +166,15 @@ function staticEntries(model: any): Array<[string, any]> {
       seen.add(key)
       try { out.push([key, c[key]]) } catch { /* getter that throws — skip */ }
     }
+  }
+  return out
+}
+
+/** Attr names carrying a chainable .encrypt() marker (duck-typed, no core dep). */
+export function encryptedAttrNames(model: any): string[] {
+  const out: string[] = []
+  for (const [key, cfg] of staticEntries(model)) {
+    if (cfg && typeof cfg === 'object' && cfg._encrypted) out.push(key)
   }
   return out
 }
@@ -841,6 +859,22 @@ export async function defaultUpdate(
         : undefined)
     }
   }
+  // A NUMERIC lock column core will not CAS ('lockVersion' by convention, or
+  // the model's declared lockingColumn) never advances now that the
+  // controller pre-bump is gone — the _version pre-check token would stay
+  // frozen and the lock would be silently dead. Config bugs fail loud.
+  if (lock) {
+    const rawLockVal = (record as any)[lock] ?? (record as any)._attributes?.[lock]
+    if (typeof rawLockVal === 'number' && lock !== 'lockVersion' && (model as any).lockingColumn !== lock) {
+      throw new Error(
+        `[active-drizzle] update.optimisticLock names numeric column '${lock}', but core's ` +
+        `compare-and-swap only owns 'lockVersion' (convention) or the model's declared locking ` +
+        `column. Declare \`static lockingColumn = '${lock}'\` on ${modelClassName(model)} so ` +
+        `save() bumps and WHERE-guards it — without that the lock never advances and stale ` +
+        `writes silently win.`,
+      )
+    }
+  }
 
   const permitted = await buildGovernedWriteData(fields, effectiveUpdateConfig(config), ctx, model, ctrl, record)
   for (const [k, v] of Object.entries(permitted)) {
@@ -866,7 +900,11 @@ export async function defaultUpdate(
     }
     const fired = typeof (record as any)[_event] === 'function' ? (record as any)[_event]() : false
     if (!fired) {
-      throw new ValidationError({ base: [`transition_blocked: cannot ${String(_event)} right now`] })
+      const msg = `transition_blocked: cannot ${String(_event)} right now`
+      throw new ValidationError(
+        { base: [msg] },
+        { base: [{ code: 'invalid_transition', message: msg, meta: { event: String(_event) } }] },
+      )
     }
   }
 
