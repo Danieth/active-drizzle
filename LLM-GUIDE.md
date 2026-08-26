@@ -439,6 +439,28 @@ const row = recordOf(await SomeController.get({ id }))  // unwraps envelope OR b
 import { onClientError } from '@active-drizzle/react'   // error telemetry seam
 ```
 
+## 6.4 Error codes (stable machine-readable; branch on codes, NEVER message text)
+
+Every serialized error carries a stable top-level `code`: `bad_request` /
+`unauthorized` / `forbidden` / `not_found` / `stale_record` (409, envelope
+rides along) / `validation_failed` (422). 422 bodies carry `details` beside
+the unchanged `errors` message map — per-field `{ code, message, meta? }`:
+`blank`, `too_short`/`too_long`/`wrong_length` (`meta.count`),
+`not_a_number`, `greater_than`/`less_than`/... (`meta.count`), `inclusion`
+(`meta.in`)/`exclusion`, `confirmation`, `accepted`, `invalid_email`/`url`/
+`uuid`/`timezone`, `taken` (uniqueness AND the 23505 backstop), `invalid`
+(hand-written validators returning bare strings). LAW: a `message:`
+override changes the TEXT only — the code never moves, so codes survive
+custom copy and i18n.
+
+```ts
+const err = parseControllerError(mutation.error)
+err?.details?.email?.some(d => d.code === 'taken')   // branch on the code
+errors.add('slug', 'is cursed', { code: 'cursed' })  // app codes: open set
+Validates.length({ max: 80 }).detailed('x'.repeat(99))
+// → { code: 'too_long', message: 'is too long (maximum is 80 characters)', meta: { count: 80 } }
+```
+
 ## 6.5 The vice: what the types refuse for you
 
 Config keys that name model fields are typed against the model's GENERATED
