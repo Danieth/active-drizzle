@@ -223,7 +223,10 @@ door's search/permit rules decide what appears in the dropdown.
 `hasMany('notes', { acceptsNested: true })` means a parent save carries its
 children (and grandchildren) in a **single PATCH** — Rails'
 `accepts_nested_attributes_for`, with types, including `allowDestroy` and
-ordered collections. The letterbox rule still applies: `notesAttributes` must
+ordered collections. `hasOne` opts in the same way, singular:
+`briefAttributes` is one object, not an array, and an id-less write when a
+child already exists **updates that row** — a second row can never appear.
+The letterbox rule still applies: `notesAttributes` must
 be in the door's `permit`, or the server strips every nested write — and
 codegen refuses to emit the nested form at all.
 
@@ -321,6 +324,12 @@ them is the root cause of essentially every confusing bug:
 npm install @active-drizzle/core @active-drizzle/controller @active-drizzle/react
 ```
 
+Or scaffold a working app in one command — see [Quick Start](#quick-start):
+
+```bash
+npx @active-drizzle/trails new myapp
+```
+
 ## The Three Files
 
 ### 1. Schema — your Drizzle table (you already have this)
@@ -399,7 +408,7 @@ You now have:
 ### Use it in React
 
 ```tsx
-import { CampaignController } from '../_generated'
+import { CampaignController } from '@gen/controllers'
 
 function CampaignsPage({ teamId }: { teamId: number }) {
   const ctrl = CampaignController.use({ teamId })
@@ -476,23 +485,26 @@ WARN   Campaign.model.ts — no bidirectional belongsTo found on Asset
 
 ### Models
 
-- **Chainable queries** — `.where()`, `.order()`, `.limit()`, `.includes()`, `.pluck()`, `.count()`
-- **Associations** — `belongsTo`, `hasMany`, `hasOne`, `habtm`, with `through:`, `dependent: 'destroy'`, `counterCache`, `autosave`, polymorphic `belongsTo`
+- **Chainable queries** — `.where()`, `.order()`, `.limit()`, `.includes()`, `.pluck()`, `.count()`, plus `.whereAny([...])` (one flat OR), `.orderByIds()`, `.groupByTime('createdAt', 'week')`; `where` hashes take `{ gte, lte, gt, lt, ne, nin, all }`, with bounds run through the Attr codecs
+- **Associations** — `belongsTo`, `hasMany`, `hasOne`, `habtm`, with `through:` (+ `source:` / `sourceForeignKey` to resolve the key off the through model), `dependent: 'destroy'`, `counterCache`, `autosave`, polymorphic `belongsTo` **and its inverse**: `hasMany('comments', { as: 'commentable' })` scopes by both columns (`commentableId` AND `commentableType`), so same-id parents of different types never leak into each other
+- **Association-scoped writes** — `deal.comments.create({ body })` / `.build()` stamp the owner's foreign key (and polymorphic type). `through`/`habtm` relations carry no defaults — create the join row through its own model, or sync habtm via `<singular>Ids`
+- **Concerns** — `@include(SoftDeletable, Sluggable({ from: 'title' }))`; built-ins (`SoftDeletable`, `Sluggable`, `Publishable`, `Trackable`) plus `defineModelConcern` for your own, all on the `@active-drizzle/core` main entry
 - **Attr transforms** — `Attr.enum()`, `Attr.state()`, `Attr.money()`, `Attr.percent()`, `Attr.range.*()` / `Attr.multirange()` (PG ranges), `Attr.array()`, `Attr.json<T>()`, `Attr.string()`, `Attr.boolean()`, `Attr.date()`, `Attr.new({ get, set })`
 - **State machines** — `Attr.state({ states, initial, transitions })` with guards and messages; integer or readable-text storage; synthesized `is<Label>()`, `can<Event>()`, `<event>()`, `advance()`
 - **Declarative validators** — the Rails `Validates.*` set attached where the field is declared; shippable validators also run in the browser
 - **Dirty tracking** — `isChanged()`, `changedFields()`, `fieldWas()`, `fieldChanged()`
 - **Lifecycle hooks** — `@beforeSave`, `@afterCommit`, `@beforeDestroy`, `@validate`, with `{ if: }` conditions
 - **Scopes** — `@scope static active() { ... }` → chainable, composable named queries
-- **STI** — `static stiType = 'TermLoan'` → auto-scoped queries, correct subclass instantiation, inherited statics through the prototype chain
+- **STI** — `static stiType = 'TermLoan'` → auto-scoped queries, correct subclass instantiation, inherited statics through the prototype chain. Every subclass needs its own `@model('<base table>')` — `stiType` without `@model` is a codegen error naming the fix, with a once-per-(table, value) dev warning as runtime backstop
 - **Transactions** — `ApplicationRecord.transaction(async () => { ... })` via `AsyncLocalStorage`
-- **Nested attributes** — `hasMany({ acceptsNested: true })` → create/update/destroy children in one save
+- **Nested attributes** — `hasMany`/`hasOne` with `acceptsNested: true | { allowDestroy: true }` → create/update/destroy children in one save
 - **Custom primary keys** — composite keys, non-`id` columns
+- **Multi-database** — the framework owns binding, not connections: `bindDatabase('analytics', analyticsDb, { events })` routes per table (`getExecutor(table)`); `transaction()` takes `{ database }` and never captures queries against other databases. Cross-database associations/includes are unsupported by design
 
 ### Controllers
 
 - **`@crud`** — index, get, create, update, destroy from one decorator
-- **`@mutation`** — auto-loads record by `:id`, passes to method. `{ bulk: true, records: false }` for efficient mass updates; `optimistic` + typed `returns`
+- **`@mutation`** — auto-loads record by `:id`, passes to method. `{ bulk: true, records: false }` for efficient mass updates; `optimistic` + typed `returns`; `{ if, label, params, required, hint }` declare the full interaction contract (see [Mutation Buttons](#mutation-buttons))
 - **`@action`** — custom GET/POST endpoints; `{ load: true }` for member actions on the scoped relation
 - **`@before` / `@after`** — lifecycle hooks with `{ only: }`, `{ except: }`, `{ if: }` conditions
 - **`@rescue`** — Rails-style error handling. `RecordNotFound` → 404 automatically
@@ -501,7 +513,14 @@ WARN   Campaign.model.ts — no bidirectional belongsTo found on Asset
 - **`expose` / `abilities`** — the read ceiling + the per-field wristband the client renders from
 - **`autoSet` / `nestedAutoSet`** — stamp fields from context on create; nested child rows can't forge them
 - **Dynamic `permit`** — `(ctx, ctrl, record) => string[]` for role- and record-aware field access
-- **Optimistic locking** — version token in the envelope; stale writes 409 with the fresh envelope
+- **Optimistic locking** — `update: { optimisticLock: true }` versions on `updatedAt` (the model must touch it on save); a numeric field name (`'lockVersion'`) auto-increments server-side instead. Every envelope carries an opaque `version`, the generated form echoes `_version` on every submit, a mismatch is a **409** carrying the server's current envelope (recovery needs no extra round-trip), and a PATCH without `_version` skips the check — pre-lock clients keep working
+- **Index allowlists** — `index: { searchable, filterable, sortable, filters, facets, chartable, measures }`: everything the wire may narrow or aggregate by is declared server-side; an undeclared param is a 400, never a silent no-op. Named `filters` keep product semantics on the server via `apply: (rel) => …`; `$or` is the one cross-field combinator (depth-1, allowlisted branches, codec-run values, max 10 branches, no nesting) and the whole group ANDs onto the door-scoped relation — narrowing only
+- **Facet counts** — computed only when a request asks (`facets: true | ['stage']` param); the config is the ceiling (requested ∩ allowed; asking a non-offering index is a 400). Counts are disjunctive (own filter excluded) with label keys
+- **Aggregates over the wire** — `chartable` + `measures` allowlist `chart: { x, y: 'count'|'sum:F'|'avg:F' }` (+ `bucket:` time units via `groupByTime`) and `metric: 'sum:F'`; `perPage: 0` for aggregation-only calls
+- **Picker feed** — `options: { value: 'id', label: 'name' }` returns the narrowed, sorted result projected to `[{ value, label }]` (an array — numeric object keys lose order), capped at `perPage`; both fields must sit under the expose ceiling
+- **Search lanes** — `search: { adapter, doc }`: an external engine answers `?q=` with **ids in rank order and nothing else**; hydration returns through the door-scoped relation (a compromised engine cannot leak a field or a record the door wouldn't serve), order kept via `orderByIds`. Falls back adapter → PG FTS → ilike. `doc` is the one searchDoc transform — your afterCommit shipper and reindex script both call `buildSearchDoc`, so they can never drift
+- **`emptyReason`** — empty index responses say why (`no-records` vs `no-matches`, one extra COUNT only when empty) so the client renders the right CTA
+- **Contract probes** — `buildContractProbes(DealController)` derives the forge-every-field security suite from the same metadata that enforces it (undeclared filters, `$or` forging/nesting/cap, forged sort/chart/metric, non-permitted mass-assignment, missing required mutation params); `runContractProbes(probes, call)` runs it through any transport
 - **Multi-tenant** — `this.state` with typed inheritance. Resolve org once, use everywhere
 
 ### React Integration
@@ -509,10 +528,239 @@ WARN   Campaign.model.ts — no bidirectional belongsTo found on Asset
 - **Generated hooks** — `ctrl.index()`, `ctrl.get(id)`, `ctrl.mutateCreate()`, `ctrl.mutateLaunch()`
 - **Generated form handles** — every field is a component (`<deal.name edit />`); the same JSX renders edit or view per the server's abilities
 - **Headless presenters** — `registerPresenter` / `setDefaultPresenters`; resolution by field kind derived from Attrs and refined by validators; the framework ships the socket, your app ships the kit
-- **Nested collections** — `<deal.notes>{note => …}</deal.notes>` + `<deal.notes.Add />`; one PATCH saves the tree
+- **Nested collections** — `<deal.notes>{note => …}</deal.notes>` + `<deal.notes.Add />`, singular `<deal.brief>` + `<deal.brief.Build />`; one PATCH saves the tree (see [Nested Forms](#nested-forms))
 - **Door-scoped pickers** — `props={{ from: UserController }}`; the controller's rules decide what's pickable
 - **Error parsing** — 422 responses map to per-field errors; base errors surface via `<form.BaseErrors />`
 - **Client model** — typed instances with predicates, dirty tracking, validation on the frontend
+- **`recordOf()`** — unwrap a `get()` response door-agnostically: a door with `abilities: true` answers the envelope `{ record, abilities, can }`, one without answers the bare row — `recordOf(await Door.get({ id }))` works for both
+- **Declarative gates** — `<deal.Can edit="amount">`, `<deal.Can action="markWon" not fallback={…}>`, plus `useAbilities` — gates over the same mask the server enforces; never hardcode `if (admin)` again
+- **Read parity** — field members expose `.dirty` / `.elsewhere` / `.ability` beside `.value` / `.errors` / `.meta`
+- **The escape hatch** — `buildFieldBind(session, opts)` is the exact bind generated fields wire (IME guards, commit staging, disable rules), and `useFieldProps(form, field)` assembles full live `PresenterProps` as a hook — novel compositions build against the real contract, never an imitation
+- **Testing kit** — `createTestSession`, `buildTestProps`, `fieldStateFixtures` from `@active-drizzle/react/testing`: every presenter state (ready/dirty/saving/saved/error/pending/conflict/elsewhere/view) as a real session arranged into that state
+
+### Nested Forms
+
+`acceptsNested` opens the write surface; the door still governs it —
+`notesAttributes` / `briefAttributes` must be in `permit`, or the server
+strips every nested write and codegen refuses to emit the form.
+
+```tsx
+<deal.notes>{(note) => <note.body edit />}</deal.notes>
+<deal.notes.Add>+ add note</deal.notes.Add>
+
+<deal.brief>
+  {(brief) => (
+    <>
+      <brief.summary edit />
+      <brief.Remove>remove brief</brief.Remove>
+    </>
+  )}
+</deal.brief>
+<deal.brief.Build>+ add brief</deal.brief.Build>
+```
+
+- **The wire.** `hasMany` sends an array of rows; `hasOne` sends a single
+  object: `{ summary }` creates, `{ id, summary }` updates
+  (ownership-gated), `{ id, _destroy: true }` destroys (`allowDestroy`
+  only). **Shape is arity** — an array sent for a hasOne, or a bare object
+  for a hasMany, is a protocol violation and drops whole, fail-closed.
+- **The singular invariant.** An id-less write when a child already exists
+  updates that row (Rails' `update_only`, always on) — a second row can
+  never appear, which makes autosave/double-save idempotent by construction.
+- **Security.** A forged or foreign child id 422s before touching anything;
+  the parent fk, timestamps, and STI `type` strip server-side; `nestedAutoSet`
+  paths walk through singular nodes.
+- **Programmatic surface.** `deal.brief.form` (child handle or null),
+  `.exists`, `.build(defaults?)`, `.remove()`, `.use()`. Child validation
+  gates the parent submit; server errors route as `brief.summary`. Singular
+  children always stage into the parent save (no instant mode).
+- **Create-from-picker is a recipe, not a feature.** The picker's `from`
+  door already has `create`: a modal calls
+  `UserController.with({}).mutateCreate({ data })`, invalidates the picker's
+  queries, and `bind.onChange(created.id)` selects the new row. If this user
+  can't create users, the door 403s — the modal just surfaces it. Works the
+  same for habtm multi-pickers (`bind.onChange([...ids, created.id])`).
+
+### Mutation Buttons
+
+A controller mutation declares its whole interaction contract, and the form
+handle grows a PascalCase member for it:
+
+```ts
+@mutation({ if: (deal) => deal.isSubmitted(), label: 'Mark won' })
+async markWon(deal: Deal) { await deal.advance('win'); return this.envelope(deal) }
+
+@mutation({ params: ['reason'], required: ['reason'], label: 'Send back',
+            if: (deal) => deal.isSubmitted(), hint: 'Only submitted deals can be sent back' })
+async sendBack(deal: Deal, data: { reason: string }) { /* … */ }
+```
+
+```tsx
+<deal.MarkWon />                            {/* paramless → verdict-aware button */}
+<deal.SendBack />                           {/* params → implicit mini-form (scaffolding) */}
+<deal.SendBack fields={{ reason: 'dup' }}>Reject as dup</deal.SendBack>
+<deal.SendBack>{({ run, allowed, pending, errors }) => /* … */ null}</deal.SendBack>
+```
+
+- **`if` is a guard, not a hint.** Its verdict rides the envelope's `can`
+  map (the button greys itself per record) AND dispatch re-evaluates it — a
+  forged POST gets `422 "markWon is not available"`.
+- **`params` is a permit ceiling for the payload.** Undeclared keys strip
+  before the method runs; missing `required` params 422 with per-field
+  issues that land on the mini-form inputs.
+- **Return `this.envelope(record)`** and the button folds fresh fields +
+  verdicts straight into the live session — buttons re-grey the instant the
+  stage flips, no refetch.
+- **False verdicts ship a `why`.** State machines derive it from their own
+  declaration ("requires stage 'submitted' (currently 'draft')", the
+  transition's `message`); `@mutation` guards supply it via `hint:` (string
+  or per-record function). Client side: `session.whyNot(action)`,
+  `<deal.Can action>` function children get `{ allowed, why }`, buttons get
+  `title`. Reasons are declared or derived — never inferred from permit
+  lambdas.
+- **Coherence and events included.** Every action fires the edge fan-out
+  (index, aggregation headers, open forms refetch) and emits
+  `{ type: 'action', action, ok }` on the global bus. Row handles get the
+  same members inside `<Deals.Items>`; ungoverned rows default to allow and
+  let the server gate.
+
+### The Index Surface
+
+The head is a component — no hooks in sight:
+
+```tsx
+<Deals.Index>
+  <Deals.Search />                  {/* from index.searchable */}
+  <Deals.Filters />                 {/* tier-1: enum → facet chips, boolean → toggle */}
+  <Deals.Items>{(deal) => <deal.name view />}</Deals.Items>
+  <Deals.Pagination />
+</Deals.Index>
+<Deals.One id={5}>{(form) => <form.Form>…</form.Form>}</Deals.One>
+```
+
+Everything is declared server-side, allowlisted, codec-normalized, and
+narrowing-only. Tier-2 named filters keep product semantics on the server:
+
+```ts
+index: {
+  searchable: ['name'],
+  filterable: ['stage', 'priority', 'isFeatured'],
+  facets: true,
+  filters: { bigDeals: { label: 'Big deals', kind: 'toggle',
+    apply: (rel) => rel.where({ amount: { gte: 20_000 } }) } },
+}
+```
+
+Drive named filters from any widget via
+`Deals.use().session.setFilter('bigDeals', true)` — change what "big" means
+in the controller, no client redeploy. Individual placement:
+`<Deals.Filters.stage />`. The raw hooks stay exported underneath.
+
+- **`<Deals.Sidebar />`** — faceted search in one tag: groups from the
+  declared filters, options zero-filled from the enum/state labels (an
+  option matching nothing shows 0, dimmed, never vanishes), disjunctive
+  counts that respond to every *other* active filter plus the live search,
+  multi-select toggles (arrays → IN), `clearAll`. Engine-agnostic:
+  whichever lane answered `q` — adapter, PG FTS, or ilike — the counts
+  follow, because facets re-run the same narrowing pipeline. Headless via
+  `SidebarApi`; counts require `index: { facets: … }` on the controller.
+  `groups={[…]}` picks and orders; `presenters={{ … }}` or registered
+  kind defaults take over any group's body.
+- **`<Deals.Board>`** — the `Attr.state` machine as a kanban, data-only:
+  states are columns (facet counts attached), `move(row, to)` resolves the
+  declared transition and PATCHes `_event` (guards stay server-enforced),
+  `canMove` exposes the transition graph for drag affordances. `groupBy`
+  any facet field for a plain grouped board (moves PATCH the value).
+- **`<Deals.Table>`** — the grid contract: columns from field meta
+  (name/kind/label + sortable flags), rows, `setSort`, and the
+  coherence-wired `mutateRow` for inline edits. Virtualization is
+  deliberately yours.
+- **`<Deals.Chart x="stage" y="sum:amount">{points => …}`** — paints your
+  bars from `[{ x, y }]`; no chart lib shipped. `x="createdAt" bucket="week"`
+  for time series (`date_trunc`, unit allowlisted, buckets sorted
+  ascending). Filter-aware inside `<Deals.Index>`, standalone outside.
+- **`<Deals.Stats>{(s) => …}`** — a GET `@action` as a first-class surface
+  member: headless, works outside `<Deals.Index>`, cached under the deals
+  family root so the numbers recompute whenever any deal mutation lands.
+- **`<Deals.Empty>` / `<Deals.Error>`** — empty pages know why
+  (`emptyReason` → the right CTA); errors arrive parsed
+  (forbidden/not-found/unauthenticated/…). `<Deals.FormSkeleton />` /
+  `<Deals.ListSkeleton />` are shaped by the declared fields.
+- **Filter presenters** — the socket, not the bulb:
+  `registerFilterPresenter` + `setDefaultFilterPresenters` (kind defaults
+  for the whole app), per-site
+  `<Deals.Filters.stage presenter="segmented" />` (kind-gated), or the
+  registry-free render-prop
+  `<Deals.Filter name="stage">{({ meta, value, set, clear }) => …}</Deals.Filter>`.
+  `FilterPresenterProps = { name, meta, value, set, clear, session, counts? }`
+  is the list-state analogue of `PresenterProps`. Until you register
+  presenters, built-in scaffolding renders — unstyled, marked
+  `data-ad-scaffold`, announced once in the console. Demo furniture, not
+  the product.
+
+### Live Forms
+
+Mutate a record from any surface; every other surface — including live,
+half-edited forms — gets fresh without losing a keystroke:
+
+- **Coherence fan-out** — every generated mutation fans out through one
+  `applyEntityChange` call against the generated edge table
+  (`_coherence.gen.ts`), so a proposal mutation that touches its loan
+  invalidates the doors that embed *loans* too. `connectEventSource(qc,
+  coherenceEdges, '/live')` plugs a server push wire into the same entry
+  point. Signal-only doctrine: `{ resource, op }` frames, never payloads —
+  refetches carry the truth through the normal doors. The wire itself is
+  app code, so multi-tenant apps partition it (per-org channels) the same
+  way they scope every door.
+- **`rehydrate()`** — refetches three-way-merge into live forms: clean
+  fields adopt, dirty fields survive, true conflicts withhold the version
+  token so the next save 409s into the conflict flow. Nested children merge
+  by id.
+- **Conflicts** — on a 409 the session parks in `'conflict'`: the draft is
+  untouched (no keystroke is ever dropped by a race), autosave pauses,
+  `<deal.SaveStatus />` shows "Changed elsewhere". Two exits via
+  `deal.$resolveConflict('reload' | 'overwrite')`: reload folds the 409's
+  envelope into the draft (server wins); overwrite adopts the fresh token
+  and resubmits your still-dirty diff — always an explicit user action, the
+  framework never overwrites on its own. `<deal.Conflict>{resolve => …}`
+  renders only during a 409; `deal.$conflict` exposes the fresh envelope
+  for field-by-field "theirs vs mine" UIs.
+- **`elsewhere`** — when the merge finds the server holding a *different*
+  value for a field you've edited, that divergence is data, not just a
+  future 409: presenters receive `elsewhere = { value, at }` (`at` from the
+  envelope's `updatedAt ?? version` — zero wire bytes; expose
+  `updatedByName`/`updatedBy` in your projection and affordances say who),
+  and `<deal.Changes>` render-props `{ changes, adoptAll, dismiss, fields }`
+  (default rendering: "Updated elsewhere: name, notes ✕"). Per-field
+  `adopt()` moves draft *and* baseline; adopting the last standing change
+  releases the withheld token — adopt-all fully settles. `dismiss()` is
+  presentation-only. One conflict system, three altitudes: inline field →
+  floater → save-time dialog. Headless: `getIncoming()` /
+  `getIncomingFor(f)` / `adoptIncoming(f)` / `adoptAllIncoming()` /
+  `dismissIncoming()`.
+- **Draft parking** — navigate away mid-edit and back: unsaved diffs park
+  (LRU/TTL, cleared on save) and restore through the same merge; a field
+  the server moved meanwhile conflicts honestly instead of silently.
+- **poll + pendingIf** — `useDealEditForm(id, { poll: { every: 3000, until:
+  d => d.reportStatus === 'ready' } })` plus `<deal.reportUrl view
+  pendingIf={d => d.reportStatus !== 'ready'} pendingLabel="Generating…" />`
+  for backend-job fields.
+- **Autosave narration** — a debounced flush pulses `saving → saved` on
+  exactly the fields it carried; mid-flight re-edits drop back to dirty;
+  failures clear the marks.
+- **The event bus** — one registration at startup plugs any toast or
+  telemetry system into every form in the app. Events are semantic (what
+  happened), never presentational (how to show it):
+
+```ts
+import { onFormEvents } from '@active-drizzle/react'
+onFormEvents((e) => {
+  if (e.type === 'rehydrated')     toast.info(`Updated elsewhere: ${e.fields?.join(', ')}`)
+  if (e.type === 'conflict')       toast.warn('This record changed elsewhere')
+  if (e.type === 'saved')          toast.success('Saved')
+  if (e.type === 'draft-restored') toast.info('Restored your unsaved edits')
+})
+```
 
 ### Build-Time Codegen
 
@@ -521,6 +769,10 @@ WARN   Campaign.model.ts — no bidirectional belongsTo found on Asset
 - **Runtime code** — `X.model.gen.ts` with the isomorphic `Model.Client` class for frontend hydration
 - **Ambient globals** — `_globals.gen.d.ts` so cross-model types resolve inside module augmentations
 - **oRPC router** — type-safe procedures with Zod validation schemas
+- **`.gen/` + the `@gen` alias** — all output lands in `.gen/models` + `.gen/controllers` (`genDir: false` restores co-location); the plugin injects a Vite alias so app imports are `import { Deals } from '@gen/controllers'` / `import { DealClient } from '@gen/models'` — no relative paths, and the tsconfig `paths` entry makes cmd-click jump into the generated file. Include `".gen/**/*"` explicitly in tsconfig (hidden directories don't ride wildcard includes); one `.gitignore` line covers it all. `_client.ts` — user-owned wiring — stays in the source tree
+- **Coherence edges** — `_coherence.gen.ts` composes the include graph with the write-effect graph (counterCache/touch/dependent/nested, transitively); every generated mutation fans out through one `applyEntityChange` call — WebSocket-ready by construction
+- **`tsc --noEmit`-clean** — a fresh project typechecks out of the box: declarations emit as `X.model.types.gen.d.ts` so the module augmentations actually apply (a `.d.ts` sharing its basename with a sibling `.ts` is silently excluded by tsc as presumed build output — invariant 7), controller-less nested children inline their wire shape, form handles type their nested members
+- **Teaching errors** — `stiType` without `@model` is a codegen error naming the exact fix; a schema-export/table-name mismatch names the export to fix; runtime "table not found" teaches the boot-map / `bindDatabase` / barrel-import checklist
 - **LLM docs** — `.active-drizzle/schema.md`: the whole data model in one AI-optimized file
 
 ## Architecture
@@ -543,17 +795,52 @@ WARN   Campaign.model.ts — no bidirectional belongsTo found on Asset
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-Three npm packages, each installable independently:
+Three runtime packages, each installable independently — plus the scaffolder:
 
 | Package | What it is |
 |---------|-----------|
 | `@active-drizzle/core` | Models, associations, hooks, dirty tracking, Attr, state machines, codegen, Vite plugin |
 | `@active-drizzle/controller` | `@crud`, `@mutation`, `@action`, `@before`/`@after`, `@rescue`, abilities, oRPC router, REST adapters |
 | `@active-drizzle/react` | React Query hook generation, form handles, presenter registry, `ClientModel`, error parsing |
+| `@active-drizzle/trails` | `trails new` — a working app in one command; `trails doctor` — checks for silent misconfigurations |
 
 ---
 
 ## Quick Start
+
+### One command
+
+```bash
+npx @active-drizzle/trails new myapp
+cd myapp && npm install && npm run dev
+```
+
+Sixteen files: PGlite (zero-setup Postgres), one schema table, one model
+(validations, scope, touch hook), one controller
+(expose/permit/search/facets/optimisticLock), `trails.config.ts`, the Vite
+codegen plugin wired, a client using the generated surface (`<Posts.Index>`,
+`<Posts.Sidebar>`, an autosave form with Conflict/Changes), and
+`npm run regen` for codegen without Vite.
+
+Every generated app also ships `tests/contract.test.ts` — the
+forge-every-field security suite derived from the controller's own config,
+running fully in-process (oRPC `call`, PGlite, no server). `npm test` exists
+on day one and can never fall behind the config, because it *is* the config.
+
+Generated apps are Postgres-first: set `DATABASE_URL` → node-postgres +
+`npm run db:push` (drizzle-kit owns the schema lifecycle). No `DATABASE_URL`
+→ a loud in-memory PGlite fallback keeps `npm run dev` zero-setup.
+
+`npx trails doctor` checks the misconfigurations that degrade *silently*:
+tsconfig missing the `@gen/*` paths or the `.gen/**/*` include (type
+augmentations silently dead), stale or un-gitignored `.gen/`, missing
+`_client.ts`, missing framework packages — ✓/✗ with the exact fix per line,
+exit 1 on problems (CI-able).
+
+See [GETTING-STARTED.md](GETTING-STARTED.md) for the full path from
+`trails new` through the three files to the `@gen` imports and the dev loop.
+
+### Manual setup
 
 ```bash
 npm install @active-drizzle/core drizzle-orm
@@ -584,6 +871,32 @@ export default defineConfig({
 ```
 
 > **[Full getting started guide →](https://danieth.github.io/active-drizzle/guide/getting-started)**
+
+### Configuration — `trails.config.ts`
+
+One JavaScript file: Rails' environment concept without Rails' file sprawl.
+Base config plus inline `environments` overrides, deep-merged by `NODE_ENV`
+at boot. Secrets are *referenced* from `process.env`, never stored — the
+file commits, the values deploy.
+
+```ts
+import { defineConfig } from '@active-drizzle/core'
+
+export default defineConfig({
+  server:   { port: 8787 },
+  channels: { bus: process.env.REDIS_URL ? 'redis' : 'memory',
+              redisUrl: process.env.REDIS_URL },   // set REDIS_URL → multi-process just works
+  environments: {
+    production: { channels: { revalidate: 'always' } },
+    test:       { server: { port: 0 } },
+  },
+})
+```
+
+Merge semantics: objects merge deep, arrays and scalars replace wholesale —
+an env that sets a list *means* that list. Missing file = everything
+defaults. `loadConfig()` at boot, `defineConfig` for types; app-defined
+sections ride along and merge the same way.
 
 ---
 
