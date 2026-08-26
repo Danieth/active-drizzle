@@ -39,7 +39,18 @@ export function honoAdapter<TContext = AnyContext>(
         const queryParams = route.method === 'GET' ? c.req.query() ?? {} : {}
         let body: Record<string, any> = {}
         if (route.method !== 'GET') {
-          try { body = await c.req.json() } catch { body = {} }
+          const raw = await c.req.text?.() ?? ''
+          if (raw !== '') {
+            // LAUNCH BLOCKER #2: malformed JSON used to become {} — the
+            // client then got "validation failed on empty input", a lie
+            // about their actual mistake. Broken JSON is ITS OWN 400.
+            try { body = JSON.parse(raw) } catch {
+              return Response.json(
+                { error: 'Request body is not valid JSON.' },
+                { status: 400 },
+              )
+            }
+          }
         }
         // Coerce numeric path params — but only CANONICAL numbers, i.e.
         // strings that survive a Number round-trip. This keeps zip codes
@@ -51,7 +62,21 @@ export function honoAdapter<TContext = AnyContext>(
           numericParams[k] =
             typeof v === 'string' && v !== '' && Number.isFinite(n) && String(n) === v ? n : v
         }
-        const input = { ...numericParams, ...body }
+        // LAUNCH BLOCKER #1: the URL wins. Body used to override path
+        // params, so PATCH /deals/5 with body {id: 99} silently retargeted
+        // deal 99 (same tenant, wrong resource). The path names the
+        // resource; the body carries the data — a body key colliding with
+        // a PATH param is refused loudly instead of silently ignored.
+        const pathKeys = new Set(Object.keys(pathParams))
+        for (const k of pathKeys) {
+          if (k in body && String(body[k]) !== String((pathParams as any)[k])) {
+            return Response.json(
+              { error: `Body '${k}' (${JSON.stringify(body[k])}) contradicts the URL's ${k} — the URL names the resource; remove '${k}' from the body.` },
+              { status: 400 },
+            )
+          }
+        }
+        const input = { ...body, ...numericParams }
         const procedure = resolveProcedure(router, route.procedure)
         const result = await callProcedure(procedure, input, context)
         return Response.json(result)

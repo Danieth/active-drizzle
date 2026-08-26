@@ -12,6 +12,10 @@ const fakeC = (over: { params?: any; query?: any; json?: any; jsonThrows?: boole
     param: () => over.params ?? {},
     query: () => over.query ?? {},
     json: async () => { if (over.jsonThrows) throw new Error('no body'); return over.json ?? {} },
+    text: async () => {
+      if (over.jsonThrows) return '{broken'
+      return over.json !== undefined ? JSON.stringify(over.json) : ''
+    },
   },
   var: { auth: { userId: 42 } },
 })
@@ -43,13 +47,33 @@ describe('honoAdapter', () => {
     expect(seen[0]).toEqual({ zip: '01234', hex: '0x10', big: '9007199254740993', nan: 'NaN', id: 7 })
   })
 
-  it('POST merges JSON body over params; body wins; unparseable body = {}', async () => {
+  it('THE URL WINS (launch blocker #1): a contradicting body id is a loud 400', async () => {
     const seen: any[] = []
     const h = adapt(async ({ input }: any) => { seen.push(input); return {} }, 'POST')
-    await h.handler(fakeC({ params: { id: '5' }, json: { id: 99, name: 'x' } }))
-    expect(seen[0]).toEqual({ id: 99, name: 'x' })             // body wins over path
-    await h.handler(fakeC({ params: { id: '5' }, jsonThrows: true }))
-    expect(seen[1]).toEqual({ id: 5 })                          // no body → params only
+    // body id contradicts the path id → refused, never silently retargeted
+    const res = await h.handler(fakeC({ params: { id: '5' }, json: { id: 99, name: 'x' } }))
+    expect(res.status).toBe(400)
+    expect(JSON.stringify(await res.json())).toMatch(/contradicts the URL/)
+    expect(seen).toHaveLength(0)                                // procedure never ran
+    // agreeing body id (client echoes) passes; path still authoritative
+    await h.handler(fakeC({ params: { id: '5' }, json: { id: 5, name: 'x' } }))
+    expect(seen[0]).toEqual({ id: 5, name: 'x' })
+    // non-colliding body keys merge under the params
+    await h.handler(fakeC({ params: { id: '5' }, json: { name: 'y' } }))
+    expect(seen[1]).toEqual({ id: 5, name: 'y' })
+  })
+
+  it('MALFORMED JSON is its own 400 (launch blocker #2), never empty-input validation lies', async () => {
+    const seen: any[] = []
+    const h = adapt(async ({ input }: any) => { seen.push(input); return {} }, 'POST')
+    const res = await h.handler(fakeC({ params: { id: '5' }, jsonThrows: true }))
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ error: 'Request body is not valid JSON.' })
+    expect(seen).toHaveLength(0)
+    // an EMPTY body (no payload at all) is still fine — params only
+    const h2 = adapt(async ({ input }: any) => { seen.push(input); return {} }, 'POST')
+    await h2.handler(fakeC({ params: { id: '5' } }))
+    expect(seen[0]).toEqual({ id: 5 })
   })
 
   it('HttpError → its status + serialized body (404, 422 with field errors)', async () => {
