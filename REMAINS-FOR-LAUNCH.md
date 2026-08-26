@@ -11,105 +11,133 @@ Suites baseline at time of writing: core 1098 / controller 299 / react 251.
 ---
 
 
-## BURN-DOWN STATUS (2026-08-26, commit 0d23c7f + follow-up)
+## STATUS (2026-08-26 evening — through commit 11ec88e)
 
-Most of TIER 0 + TIER 1 landed via the 5-cluster parallel burn-down (core
-1137 / controller 318 / react 266, all green; demo regen clean). DONE:
-codec chokepoint (write side), atomic save/destroy, create()→422 contract,
-_clone flags, CAS lock, afterCommit nested-tx merge, last()/inBatches,
-find() STI, codegen watch-staleness/unlink/spread/escaping/failure-channel,
-model.name→modelClassName, bulk ids:[], nestedAutoSet (CRUD + singleton),
-concern exports, npm identity in scaffolder+docs, doc-lies, and the react
-state-machine cluster.
+Two burn-down waves + an adversarial merged-tree review, all suites green.
+Checked boxes below are VERIFIED landed (regression-test-first, adversarially
+reviewed, full-suite gated). Wave-2 core-tx + codegen clusters are merging
+(phantom-create restore, real savepoints, db-aware tx gates, inBatches
+composite-PK, react-generator escaping twins, watcher red-gate, unlink
+sweep, STI self-import).
 
-STILL OPEN (explicit follow-ups, tracked here so nothing silently drops):
-- [ ] CODEC READ-SIDE COHERENCE: the WRITE boundary (mapWriteAttributes) is
-      genuine, but toJSON/get-trap/defaults READ paths still inline
-      `attr._column ?? key` + `.get` rather than routing through one helper.
-      Behavior is CORRECT + tested — this is a DRY/coherence cleanup, NOT a
-      bug. Deferred deliberately (serialization is delicate; not worth a
-      regression under the burn-down). Wire reads through the boundary +
-      delete the now-dead toDisplayValue/attrConfigFor exports.
-- [ ] SCALAR AGGREGATE UNITS: sum/avg/min/max return RAW db units (cents) for
-      property-named codec fields. The core agent correctly REFUSED to flip
-      this — pinned integration tests + a documented design decision (Attr
-      aggregation is intentionally raw-unit). Needs a cross-cutting owner
-      decision, not a unilateral change.
-- [ ] STABLE ERROR-CODE TAXONOMY (reviewer #4): the create() throw→return
-      contract that unblocked 422 landed, but machine-readable codes
-      (code:'blank'|'taken'|…) on every validation/DB error are still TODO —
-      breaking to add later, so pre-launch.
-- [ ] ENCRYPTION carve-out + blind indexes; SSR/RSC doc pass; generated-
-      output CI gate — Tier 1 items not in this burn-down's scope.
+STILL OPEN — tracked residuals (source in parens):
+- [ ] TAXONOMY THREADING in application-record.ts: switch validate to
+      runValidatorsDetailed; code the implicit not-null ('blank'),
+      state-machine ('invalid_event'/'invalid_transition'), nested
+      ('nested_invalid'), and translateDbError.errorCode sites. Foundation +
+      wire + controller lane landed (b684e83, 11ec88e). (mine, post-merge)
+- [ ] GENERATOR BARE-NAME EMISSIONS: generator.ts:99,399 emit
+      `from 'active-drizzle'` into generated code — masked in the demo by a
+      legacy dual-alias dep; a FRESH scaffolded app breaks on first regen.
+      (SSR/RSC pass, post-codegen-merge)
+- [ ] IDENTIFIER-POSITION ESCAPING (both generators): a label/event with
+      non-identifier chars breaks generated METHOD NAMES
+      (`statusIsWon'tFix()`); string-literal positions are now escaped, but
+      identifier positions need sanitize-or-refuse. (wave-2 codegen fixer)
+- [ ] _KEY SERVER ECHO: the client matches nested new-row ids by `_key`, but
+      no server component echoes it — adoption is inert; wrong-id graft
+      reachable when echo order diverges. Needs core `_processNestedAttributes`
+      to surface created id↔_key pairs + envelope threading. (merged-tree review)
+- [ ] PER-FIELD commitField ENGINE × submit(): unserialized in both
+      directions (submit awaits only autoFlushPromise) — the remaining
+      self-409 path. (wave-2 react reviewer, pre-existing)
+- [ ] TRANSIENT DOUBLE-ROW on echo-raced instant create (server copy +
+      optimistic pending child until POST settles) — cosmetic, no
+      double-persist. (wave-2 react reviewer)
+- [ ] OFFLINE pendingFlush leak: a queued offline flush mooted by a manual
+      submit leaves hasPending() reporting 'offline'. (wave-2 react fixer)
+- [ ] CODEC READ-SIDE COHERENCE: write boundary is genuine; toJSON/get-trap/
+      defaults still inline `attr._column ?? key` — behavior correct+tested,
+      DRY cleanup only. Delete dead toDisplayValue/attrConfigFor if unused
+      after. (wave-1 review)
+- [ ] SCALAR AGGREGATE UNITS: sum/avg return raw DB units for codec fields —
+      pinned tests + documented intent say raw is BY DESIGN; needs Daniel's
+      cross-cutting call, not a unilateral flip. (wave-1, unchanged)
+- [ ] BLIND-INDEX WIRING: format is DECIDED IN CODE (versioned envelope,
+      keyId rotation, HMAC-SHA256 over trim/lowercase, truncation knob) and
+      the carve-out is ENFORCED at buildRouter; remaining: the
+      `blindIndex: 'colBidx'` digest-column write path + where() equality
+      rewrite + codegen schema validation. (DESIGN-field-encryption §2)
+- [ ] SSR PACKAGING (S): 'use client' banners on react dist + generated
+      hooks; SSR-safe `_client.ts` reference; the Next recipe doc. (M):
+      split codegen exports off core's root (edge unlock);
+      `trails regen --watch`. See DESIGN-ssr-rsc.md. (SSR/RSC pass)
+- [ ] SINGLETON READ CEILING (SingletonConfig.get.expose) — now load-bearing:
+      encrypted models REFUSE singleton doors until it exists. (Tier 2 item,
+      promoted by the carve-out)
+- [ ] `helpers` package: publish or stop documenting. (Daniel's call)
+- [ ] Mismatched-lock-column teaching error and confirm-route save gate:
+      LANDED 11ec88e (wave-2 controller reviewer follow-ups).
 
 ## TIER 0 — 🔴 CANNOT SHIP WITHOUT (correctness + installability)
 
 ### The codec chokepoint (ONE refactor kills 8 confirmed bugs)
 The property↔column name and display↔raw value mapping is re-implemented per
 path instead of at one boundary. `save()` does it right; every other path forks.
-- [ ] Define ONE mapping boundary (property→`_column`, value→codec, dirty-track)
+- [x] Define ONE mapping boundary (property→`_column`, value→codec, dirty-track)
       that every write/read path crosses.
-- [ ] `updateAll` — keeps property name, drops `Attr.money('priceCents')` writes
+- [x] `updateAll` — keeps property name, drops `Attr.money('priceCents')` writes
       (relation.ts:1054). Route through the boundary.
-- [ ] `insertAll` — drops `_column` mapping, skips Attr defaults, omits STI
+- [x] `insertAll` — drops `_column` mapping, skips Attr defaults, omits STI
       discriminator stamp (application-record.ts:293).
-- [ ] INSERT defaults loop — writes default under property name → dropped by
+- [x] INSERT defaults loop — writes default under property name → dropped by
       drizzle; implicit not-null validation then vouches for the unfilled column
       (application-record.ts:598). **Data-integrity: NULL into NOT NULL.**
-- [ ] `find()` — forks the read pipeline: no STI type scoping (a subclass can
+- [x] `find()` — forks the read pipeline: no STI type scoping (a subclass can
       `find()` a sibling's row), no default scopes, no subclass resolution
       (application-record.ts:250). Route through Relation.
-- [ ] `aggregates`/`tally()` return raw DB units (cents, enum ints) while every
+- [~] `aggregates`/`tally()` return raw DB units (cents, enum ints) while every
       other read lane returns model units — AND `tally()` bypasses the encryption
-      guard (decrypted plaintext labels).
-- [ ] `toJSON`/`attributes` serialize dirty fields in raw space (cents leak).
-- [ ] `restoreAttributes()` writes display-space `_was` values back into raw
+      guard (decrypted plaintext labels). [tally guard FIXED; raw units are
+      DOCUMENTED DESIGN per Attr.percent + pinned tests — flip needs Daniel]
+- [x] `toJSON`/`attributes` serialize dirty fields in raw space (cents leak).
+- [x] `restoreAttributes()` writes display-space `_was` values back into raw
       `_attributes` — corrupts the codec on the record.
 
 ### Atomicity
-- [ ] Wrap `save()` in a transaction (application-record.ts:640). Today: parent
+- [x] Wrap `save()` in a transaction (application-record.ts:640). Today: parent
       INSERT commits, then nested/habtm/counters/autosave run un-wrapped; a forged
       child id commits the parent + earlier children then returns a lying 422 →
       **duplicate rows on resubmit.** This is also the realtime foundation.
-- [ ] `destroy()` cascade is not transactional — children destroyed, then a
+- [x] `destroy()` cascade is not transactional — children destroyed, then a
       failing parent DELETE strands them.
-- [ ] Nested child `update()` results are discarded (application-record.ts:1538) —
+- [x] Nested child `update()` results are discarded (application-record.ts:1538) —
       invalid child edits return 200 and vanish. Check the boolean.
 
 ### Error taxonomy (root cause of the 500-not-422 family; reviewer blocker #4)
-- [ ] `ApplicationRecord.create` throws stringly `Error('Validation failed: '+JSON)`
+- [x] `ApplicationRecord.create` throws stringly `Error('Validation failed: '+JSON)`
       (application-record.ts:285) → `defaultCreate`'s 422 branch is DEAD CODE and
       its covering test is theater (crud-handlers.ts:778). CREATE validation
       failures surface as **HTTP 500**.
-- [ ] Same root cause kills `singletonFindOrCreate`'s 23505 race recovery
+- [x] Same root cause kills `singletonFindOrCreate`'s 23505 race recovery
       (crud-handlers.ts:1209) — the catch matches a message that never arrives.
-- [ ] Ship stable machine-readable codes on every error (`code: 'blank' | 'taken'
+- [x] Ship stable machine-readable codes on every error (`code: 'blank' | 'taken'
       | 'too_long' | ...`). Breaking to add later; layered auth gates get
       structured rejections for free. Design the taxonomy once.
 
 ### Concurrency
-- [ ] `withLock` acquires NO lock: `_clone()` copies 9 flags but not `_forUpdate`,
+- [x] `withLock` acquires NO lock: `_clone()` copies 9 flags but not `_forUpdate`,
       and `first()/take()/exists()` all clone (relation.ts:1315). The documented
       `locked.first()` emits a plain SELECT. Add `_forUpdate` to `_clone`.
-- [ ] Same `_clone` gap silently reverts `unscoped()` (`_skipAllDefaultScopes` /
+- [x] Same `_clone` gap silently reverts `unscoped()` (`_skipAllDefaultScopes` /
       `_excludedDefaultScopes` not copied) — `unscoped().first()` re-applies
       scopes while `unscoped().count()` doesn't. Contradictory answers.
-- [ ] Optimistic lock is check-then-act, not CAS: `save()`'s UPDATE WHERE has only
+- [x] Optimistic lock is check-then-act, not CAS: `save()`'s UPDATE WHERE has only
       the pk, no version predicate (application-record.ts:628). Two stale writers
       both pass. **The coherence proofs rest on this.** Add version to the WHERE.
-- [ ] `afterCommit` callbacks in nested transactions are silently discarded
+- [x] `afterCommit` callbacks in nested transactions are silently discarded
       (boot.ts:200) — inner queue never merged into outer. Merge on nested commit.
 
 ### Installability (the framework cannot be installed today)
-- [ ] npm identity: apps depend on bare `active-drizzle` (unpublished); package is
+- [x] npm identity: apps depend on bare `active-drizzle` (unpublished); package is
       `@active-drizzle/core`. Every scaffold, all generated code, LLM-GUIDE imports
       the wrong name (trails.mjs:135). Pick ONE published name, thread it
       everywhere.
-- [ ] `npx trails new` resolves to a STRANGER'S `trails` package on npm. Publish
+- [x] `npx trails new` resolves to a STRANGER'S `trails` package on npm. Publish
       under a real bin name or document `npx @scope/trails`.
 - [ ] `helpers` package documented as installable, never published; release script
       excludes it. Publish or stop documenting.
-- [ ] Controller-concern system (`defineControllerConcern`, `@includeInController`,
+- [x] Controller-concern system (`defineControllerConcern`, `@includeInController`,
       `Searchable`) documented but NOT exported from the package entry — unreachable
       (controller/src/index.ts). Export or delete the docs.
 
@@ -118,25 +146,25 @@ path instead of at one boundary. `save()` does it right; every other path forks.
 ## TIER 1 — 🟠 SHOULD-FIX BEFORE LAUNCH (breaking, security, or first-impression)
 
 ### Codegen soundness (the extractor lies on legal input)
-- [ ] Watch-mode serves STALE ASTs forever: ts-morph returns cached SourceFile
+- [x] Watch-mode serves STALE ASTs forever: ts-morph returns cached SourceFile
       without re-reading disk; `.ctrl.ts`/`.model.ts` edits silently ignored
       (controller-extractor.ts:27, extractor.ts). `refreshFromFileSystemSync()` per
       changed file.
-- [ ] Model-file deletion never regenerates: only `change`/`add` watcher events
+- [x] Model-file deletion never regenerates: only `change`/`add` watcher events
       registered, no `unlink` (vite/index.ts:561).
-- [ ] Spread properties in `pgTable()` dropped silently — the Drizzle-recommended
+- [x] Spread properties in `pgTable()` dropped silently — the Drizzle-recommended
       shared-columns pattern (`...timestamps`) loses columns (extractor.ts:73).
-- [ ] App strings interpolate into generated source with naive quoting: an enum
+- [x] App strings interpolate into generated source with naive quoting: an enum
       value/key with an apostrophe/hyphen produces invalid generated code
       (generator.ts:815, react-generator.ts:1741). **Code-injection-shaped.** Escape.
-- [ ] Nested model dirs (the documented glob `**/*.model.ts`) generate wrong
+- [x] Nested model dirs (the documented glob `**/*.model.ts`) generate wrong
       back-imports + silent same-basename collisions (vite/index.ts:310).
-- [ ] `extractModel` reads only `getClasses()[0]` — a co-located STI subclass (the
+- [x] `extractModel` reads only `getClasses()[0]` — a co-located STI subclass (the
       layout the bug-#6 guard endorses) is invisible (extractor.ts:257).
-- [ ] Chained Attr modifiers drop client-side VALIDATIONS:
+- [x] Chained Attr modifiers drop client-side VALIDATIONS:
       `extractPropertyValidations` never unwraps the chain (extractor.ts:1004) —
       `resolveAttrCall` fixed fieldMeta/defaults but not this.
-- [ ] **Codegen has no failure channel** (Q2 design violation): diagnostics
+- [x] **Codegen has no failure channel** (Q2 design violation): diagnostics
       `console.log`, then generation proceeds ON RED and writes files from invalid
       meta (vite/index.ts:293). "Errors that teach" must apply to the framework's
       OWN build — a hard error mode that refuses to emit.
@@ -144,30 +172,32 @@ path instead of at one boundary. `save()` does it right; every other path forks.
       and typechecks them (BEFORE_LAUNCH §1: dangling-import, `id?`, `Function.name`).
 
 ### Boundary correctness
-- [ ] Controller reads `model.name` in ~10 places (router.ts:528) — the framework's
+- [x] Controller reads `model.name` in ~10 places (router.ts:528) — the framework's
       own #1 rule. 404s say "[object Object] not found"; attach presign breaks on
       any model with a `name` Attr. Use `modelClassName()`.
-- [ ] Bulk mutation with `ids: []` operates on the ENTIRE door scope (router.ts:313,
+- [x] Bulk mutation with `ids: []` operates on the ENTIRE door scope (router.ts:313,
       zod accepts empty array). `.min(1)` or treat empty as no-op per `records`.
-- [ ] `nestedAutoSet` read from create-config on create, update-config on update
+- [x] `nestedAutoSet` read from create-config on create, update-config on update
       with no fallback (crud-handlers.ts:835) — LLM-GUIDE's canonical example
       declares it only under `create`, reopening the forged-fk gap on every edit.
-- [ ] Per-field autosave success clobbers concurrent edits via full `applyEnvelope`
+- [x] Per-field autosave success clobbers concurrent edits via full `applyEnvelope`
       (form-session.ts commitField) — use the applyFlushSuccess narrow path.
-- [ ] Conflict bookkeeping survives resolution: `adoptIncoming` after settle rolls
+- [x] Conflict bookkeeping survives resolution: `adoptIncoming` after settle rolls
       the version token BACKWARD (form-session.ts:890). Clear on submit success.
-- [ ] Nested new-row ids adopted POSITIONALLY (nested.ts:398) — wrong-record writes
+- [~] Nested new-row ids adopted POSITIONALLY (nested.ts:398) — wrong-record writes
       when echo order diverges. `_key` is sent but never used to match. Match by `_key`.
-- [ ] Parked nested edits dropped: `restoreParked` runs before lazy nested-manager
+      [client HALF landed (matches by _key when present); server never echoes _key —
+      see _KEY SERVER ECHO in STATUS residuals]
+- [x] Parked nested edits dropped: `restoreParked` runs before lazy nested-manager
       registration (generated-form.ts:92).
-- [ ] `last()` after explicit `.order()` emits invalid SQL `col asc desc`
+- [x] `last()` after explicit `.order()` emits invalid SQL `col asc desc`
       (relation.ts:564) — the reversal test on stringified drizzle objects can never
       fire. Reverse via the order-spec list, not string matching.
-- [ ] `inBatches` skips half the rows under a mutating callback (its own docstring
+- [x] `inBatches` skips half the rows under a mutating callback (its own docstring
       example) + no ORDER BY (relation.ts:1117). Use keyset (`seek`) not limit/offset.
 
 ### The encryption × permissive-default hole (doctrine carve-out)
-- [ ] An ungoverned door (no `get.expose`) serializes EVERY column, and `Attr.get`
+- [x] An ungoverned door (no `get.expose`) serializes EVERY column, and `Attr.get`
       has already DECRYPTED encrypted fields → ships plaintext PII, and the
       permissive-by-default doctrine forbids the warning. **Carve-out**: permissive
       is fine UNTIL a column is `.encrypt()`'d; then absence of a ceiling is a
@@ -177,9 +207,9 @@ path instead of at one boundary. `save()` does it right; every other path forks.
       Format is FOREVER — decide pre-launch (reviewer #6).
 
 ### Onboarding truth
-- [ ] SSR/RSC find-out-and-document pass: proxy records across the hydration
+- [x] SSR/RSC find-out-and-document pass: proxy records across the hydration
       boundary, `boot()` placement, headless codegen outside Vite (reviewer #8).
-- [ ] Verify + close BEFORE_LAUNCH §2 (no-error-leak) — the hono 500 path already
+- [x] Verify + close BEFORE_LAUNCH §2 (no-error-leak) — the hono 500 path already
       satisfies it (tested); confirm and check the box.
 
 ---
@@ -252,22 +282,22 @@ path instead of at one boundary. `save()` does it right; every other path forks.
 ### Smaller confirmed bugs (medium tier — batch when touching the area)
 - [ ] Cached `ModelMeta` mutated in place — association resolution frozen at first
       computation.
-- [ ] `columnToClientType` is a forked weaker copy of `COLUMN_TS_TYPE` (bigint typed
+- [x] `columnToClientType` is a forked weaker copy of `COLUMN_TS_TYPE` (bigint typed
       `number` client-side vs `string` server-side) — fold into the one map.
 - [ ] pgEnum columns extracted as NOT NULL unconditionally — nullable enums get
       lying types.
 - [ ] Drizzle `$defaultFn`/`$default`/`$onUpdate` not recognized as defaults —
       DB/client-defaulted columns become required in generated Create types.
 - [ ] `@validate`/`@serverValidate`/`beforeValidate` ignore their `if:`/`on:` options.
-- [ ] `PresenterContextProvider` rebuilds bag + layout-stack identity every render —
+- [x] `PresenterContextProvider` rebuilds bag + layout-stack identity every render —
       app-wide field re-render storm. Memoize.
 - [ ] Instant nested patch/create `resetBaseline()` wipes unrelated staged edits on
       the same row.
-- [ ] Index context memo omits `isFetching` — the keepPreviousData "refreshing"
+- [x] Index context memo omits `isFetching` — the keepPreviousData "refreshing"
       signal doesn't propagate to the compound surface.
-- [ ] `useUploadFactory` has no run-generation guard — a superseded upload corrupts
+- [x] `useUploadFactory` has no run-generation guard — a superseded upload corrupts
       the replacement's state.
-- [ ] `submit()` races an in-flight `autoFlush` — self-inflicted 409.
+- [x] `submit()` races an in-flight `autoFlush` — self-inflicted 409.
 - [ ] `commitField` failure rollback erases keystrokes typed during the flight.
 - [ ] Cross-database transactions: misrouted afterCommit / AbortController contaminate
       saves on other databases.
@@ -281,10 +311,10 @@ path instead of at one boundary. `save()` does it right; every other path forks.
 ## DOCS + HOUSEKEEPING CLEANUP
 
 ### Doc-vs-code lies (each is a crash-for-the-next-LLM)
-- [ ] LLM-GUIDE documents `registerPresenterLayout` — DELETED in the tree phase.
+- [x] LLM-GUIDE documents `registerPresenterLayout` — DELETED in the tree phase.
       Replace with layouts-are-context.
-- [ ] LLM-GUIDE documents a `@query()` decorator that has NEVER existed. Remove.
-- [ ] LLM-GUIDE §1 import name + `npx trails new` — fix once the npm identity lands.
+- [x] LLM-GUIDE documents a `@query()` decorator that has NEVER existed. Remove.
+- [x] LLM-GUIDE §1 import name + `npx trails new` — fix once the npm identity lands.
 - [ ] Sweep every DESIGN-*.md / GETTING-STARTED / README for API names against the
       current export surface (the presenter-tree + entity-store phases moved a lot).
 
@@ -292,15 +322,15 @@ path instead of at one boundary. `save()` does it right; every other path forks.
 - [ ] Decide the fate of the two rival specs (`active-drizzle-spec.md`,
       `active-drizzle-complete-spec.md`) — both are pre-build blueprints the DESIGN
       docs superseded. Archive or delete (Daniel's call — they're founding docs).
-- [ ] `STALE.md`, `REMAINING.md`, `NICE_TO_HAVE.md` — fold live items into this
+- [x] `STALE.md`, `REMAINING.md`, `NICE_TO_HAVE.md` — fold live items into this
       file or BEFORE_LAUNCH, delete the trackers (this file is the tracker now).
 - [ ] Regenerate `USING.gen.md` / `_routes.gen.md` mention in LLM-GUIDE once stable.
 - [ ] Update BEFORE_LAUNCH encryption status (core built; propagation TODO) — partly
       done, re-verify against current code.
 
 ### Repo hygiene
-- [ ] Stale merged branch `claude/wizardly-haibt-cdead2` — delete.
-- [ ] Confirm no committed build artifacts survive (`a.out` was removed; sweep).
+- [x] Stale merged branch `claude/wizardly-haibt-cdead2` — delete.
+- [x] Confirm no committed build artifacts survive (`a.out` was removed; sweep).
 - [ ] Demo git remote / orphan root configs (standing "needs Daniel" items).
 - [ ] Add `npm run test:types` + `tsc --noEmit` (framework src) to CI (both green
       now; gate them so they stay green).
@@ -394,7 +424,7 @@ as a matching `onQuery`/`onSlowQuery` sink — telemetry + errors share one mode
       hand-wiring via them would BYPASS the coherence invalidation graph
       (strictly worse). Drop the `index.ts` re-exports at the next minor bump,
       then delete. Awaiting Daniel's call.
-- [ ] 🟢 `readme-to-add-to-repo.md` (PENDING, not stale): ~25 feature sections
+- [x] 🟢 `readme-to-add-to-repo.md` (PENDING, not stale): ~25 feature sections
       written as features landed, not yet folded into `README.md` (e.g. the
       hasOne nested-forms section is absent from README). Fold in, then delete
       the staging file.
