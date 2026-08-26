@@ -176,13 +176,30 @@ describe('ApplicationRecord.find() / findBy() / create()', () => {
     expect(post).toBeInstanceOf(Post)
   })
 
-  it('create() throws if validation fails', async () => {
+  // CONTRACT CHANGE (was: `create() throws if validation fails`). Rails' create
+  // returns the UNSAVED record on invalid input — it does NOT throw — so callers
+  // gate on `record.isNewRecord`. The controller's 422 branch depends on exactly
+  // this (crud-handlers.ts: `if (record.isNewRecord) throw toValidationError`);
+  // while create() threw, that branch was dead code and CREATE validation
+  // failures surfaced as HTTP 500. createBang() is the raise-on-invalid variant.
+  it('create() returns the UNSAVED instance on validation failure (no throw)', async () => {
     @model('posts')
     class Post extends ApplicationRecord {
       static title = Attr.string({ validate: v => v ? null : 'required' })
     }
 
-    await expect(Post.create({ title: '' })).rejects.toThrow(/Validation failed/)
+    const post = await Post.create({ title: '' })
+    expect(post.isNewRecord).toBe(true)                     // not persisted
+    expect(post.errors.on('title')).toContain('required')   // errors are populated
+  })
+
+  it('createBang() throws on validation failure', async () => {
+    @model('posts')
+    class Post extends ApplicationRecord {
+      static title = Attr.string({ validate: v => v ? null : 'required' })
+    }
+
+    await expect((Post as any).createBang({ title: '' })).rejects.toThrow(/Validation failed/)
   })
 })
 

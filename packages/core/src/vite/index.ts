@@ -23,7 +23,7 @@ import { Project, type CompilerOptions } from 'ts-morph'
 import { mkdirSync, writeFileSync, readFileSync, existsSync, statSync, realpathSync } from 'fs'
 import { dirname, join, resolve, relative } from 'path'
 import { glob } from 'glob'
-import { extractSchema, extractModel } from '../codegen/extractor.js'
+import { extractSchema, extractModels } from '../codegen/extractor.js'
 import { validate } from '../codegen/validator.js'
 import {
   generateModelTypes,
@@ -31,6 +31,8 @@ import {
   generateRegistry,
   generateGlobals,
   generateDocs,
+  groupModelsByOutputBase,
+  combineGeneratedModules,
   type GeneratedFile,
 } from '../codegen/generator.js'
 import type { ProjectMeta, ModelMeta, SchemaMeta, Diagnostic } from '../codegen/types.js'
@@ -77,6 +79,13 @@ export type ActiveDrizzlePluginOptions = {
    * demo's 'src/presenters').
    */
   presenters?: string
+  /**
+   * When any extraction/validation ERROR is present, refuse to emit generated
+   * files (default: true — errors that teach apply to the framework's OWN
+   * build). Set `false` to fall back to the legacy behavior of printing
+   * diagnostics and generating anyway from invalid meta. Warnings never block.
+   */
+  strict?: boolean
 }
 
 /** Relative import specifier from one dir to another (posix, ./-prefixed). */
@@ -93,7 +102,7 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
   // ── Per-plugin-instance state (survives hot-reloads, reset each build) ──────
   let project: Project | null = null
   let schemaCache: { path: string; mtime: number; meta: SchemaMeta } | null = null
-  const modelCache   = new Map<string, { mtime: number; meta: ModelMeta }>()
+  const modelCache   = new Map<string, { mtime: number; meta: ModelMeta[] }>()
   /** Per-model diagnostic cache — keyed by model filePath. */
   const diagCache    = new Map<string, Diagnostic[]>()
   /**
@@ -233,16 +242,18 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
       const mtime = statSync(mp).mtimeMs
       const cached = modelCache.get(mp)
       if (cached && cached.mtime === mtime) {
-        models.push(cached.meta)
+        models.push(...cached.meta)
         continue
       }
       changedFilePaths.add(mp)
       const sf = p.getSourceFile(mp)
       if (sf) sf.refreshFromFileSystemSync()
       else p.addSourceFileAtPath(mp)
-      const meta = extractModel(p, mp)
-      modelCache.set(mp, { mtime, meta })
-      models.push(meta)
+      // extractModels — a file may declare a base model PLUS a co-located STI
+      // subclass; every @model class is generated.
+      const metas = extractModels(p, mp)
+      modelCache.set(mp, { mtime, meta: metas })
+      models.push(...metas)
     }
 
     // Prune deleted model files
@@ -258,7 +269,11 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     }
 
     // ── Early exit — nothing relevant changed ────────────────────────────────
-    if (!schemaChanged && changedFilePaths.size === 0) return false
+    // A pure DELETION adds nothing to changedFilePaths but flips modelListChanged
+    // (a model was pruned); it MUST fall through so the registry/globals/barrel
+    // regenerate without the removed model. Without this, deleting a model file
+    // left it in the manifest forever.
+    if (!schemaChanged && changedFilePaths.size === 0 && !modelListChanged) return false
 
     resolveAssociations(models, schema.tables)
     const projectMeta: ProjectMeta = { schema, models }
@@ -292,6 +307,26 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
 
     printDiagnostics(allDiags, root)
 
+    // ── Failure channel (golden-rule: errors that teach apply to OUR OWN build) ─
+    // Diagnostics used to print and then generation PROCEEDED ON RED, writing
+    // `.gen` files from invalid meta — the exact "silent bad output" this
+    // framework forbids. Unless explicitly disabled (`strict: false`), a single
+    // extraction/validation ERROR REFUSES to emit: no file is written, and the
+    // throw is surfaced (dev: caught + retried by the self-healing scheduler;
+    // build: fails the build). Warnings never block.
+    const errorDiags = allDiags.filter(d => d.severity === 'error')
+    if (options.strict !== false && errorDiags.length > 0) {
+      const summary = errorDiags
+        .map(d => `  • ${relative(root, d.modelFile)}: ${d.message}${d.suggestion ? `\n      → ${d.suggestion}` : ''}`)
+        .join('\n')
+      throw new Error(
+        `[active-drizzle] Refusing to generate — ${errorDiags.length} extraction/validation ` +
+        `error${errorDiags.length === 1 ? '' : 's'} would produce INVALID code. Fix the ` +
+        `error${errorDiags.length === 1 ? '' : 's'} below, or set \`strict: false\` on the plugin ` +
+        `to emit anyway (not recommended — generated files will be wrong):\n${summary}`,
+      )
+    }
+
     // ── Generate ─────────────────────────────────────────────────────────────
     //
     // Per-model files are always regenerated (pure string concat, negligible cost).
@@ -310,15 +345,18 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     const srcPrefix = genRoot ? relImport(outDir, firstModelDir) : '.'
     mkdirSync(outDir, { recursive: true })
 
-    for (const model of models) {
-      const base = model.filePath.split('/').pop()!.replace('.model.ts', '.model.gen')
+    // Group by output basename — a base model and a co-located STI subclass
+    // share one source file and thus one `.model.gen` output; their modules are
+    // combined (imports de-duplicated) rather than one clobbering the other.
+    const modelGroups = groupModelsByOutputBase(models)
+    for (const [base, group] of modelGroups) {
       // .types.gen.d.ts — NOT `${base}.d.ts`: a d.ts sharing its basename
       // with the sibling .gen.ts is treated by tsc's include rules as that
       // file's build output and silently dropped from the program, which
       // killed every `declare module` augmentation under `tsc --noEmit`.
       const typesBase = base.replace(/\.model\.gen$/, '.model.types.gen')
-      files.push({ path: `${typesBase}.d.ts`, content: generateModelTypes(model, projectMeta, srcPrefix) })
-      files.push({ path: `${base}.ts`,   content: generateClientRuntime(model, projectMeta, srcPrefix) })
+      files.push({ path: `${typesBase}.d.ts`, content: combineGeneratedModules(group.map(m => generateModelTypes(m, projectMeta, srcPrefix))) })
+      files.push({ path: `${base}.ts`,   content: combineGeneratedModules(group.map(m => generateClientRuntime(m, projectMeta, srcPrefix))) })
     }
 
     if (globalsNeedRegen) {
@@ -327,8 +365,9 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
       files.push({ path: '_globals.gen.d.ts',      content: generateGlobals(projectMeta, outDir) })
       if (genRoot) {
         // models barrel → import { DealClient } from '@gen/models'
+        // One `export *` per output file (co-located models share one).
         const barrel = ['// AUTO-GENERATED — DO NOT EDIT', '',
-          ...models.map(m => `export * from './${m.filePath.split('/').pop()!.replace('.model.ts', '.model.gen')}'`), '']
+          ...[...modelGroups.keys()].map(base => `export * from './${base}'`), '']
         files.push({ path: 'index.ts', content: barrel.join('\n') })
       }
     }
@@ -457,13 +496,13 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
       const modelGlob = resolve(root, options.models)
       const modelPaths = await glob(modelGlob.replace(/\\/g, '/'))
       const p2 = getOrCreateProject()
-      const extractedModels = modelPaths.map(mp => {
+      const extractedModels = modelPaths.flatMap(mp => {
         const cached = modelCache.get(mp)
         if (cached) return cached.meta
         const sf = p2.getSourceFile(mp)
         if (sf) sf.refreshFromFileSystemSync()
         else p2.addSourceFileAtPath(mp)
-        return extractModel(p2, mp)
+        return extractModels(p2, mp)
       })
       // Reuse schemaCache if available
       const schemaPath = resolve(root, options.schema)
@@ -495,10 +534,10 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
       const modelGlob2 = resolve(root, options.models)
       const modelPaths2 = await glob(modelGlob2.replace(/\\/g, '/'))
       const p4 = getOrCreateProject()
-      const models2 = modelPaths2.map(mp => {
+      const models2 = modelPaths2.flatMap(mp => {
         const cached = modelCache.get(mp)
         if (cached) return cached.meta
-        return extractModel(p4, mp)
+        return extractModels(p4, mp)
       })
       const projectMeta2 = { schema: schemaCache?.meta ?? { tables: {}, filePath: '' }, models: models2 } as any
       const { report } = runPresenterPipeline(p4, projectMeta2, ctrlMeta, presentersDir)
@@ -560,6 +599,12 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
       }
       server.watcher.on('change', onChange)
       server.watcher.on('add', onChange)
+      // DELETION must regenerate too: without an 'unlink' listener a removed
+      // `.model.ts`/`.ctrl.ts` left its stale `.gen` files (and registry entry)
+      // behind forever. runCodegen/runControllerCodegen re-glob and prune the
+      // now-missing file, so routing the unlink through the same handler is
+      // enough — the pruning path already existed, it was just never triggered.
+      server.watcher.on('unlink', onChange)
     },
   }
 }

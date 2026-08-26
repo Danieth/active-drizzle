@@ -7,8 +7,9 @@
  * master trails.config.ts. `npm install && npm run dev` and you have a
  * live, searchable, faceted, permission-governed app.
  *
- * --link is for pre-release / monorepo development: the four framework
- * deps become file: paths into your local checkout.
+ * --link is for pre-release / monorepo development: the three framework
+ * deps (@active-drizzle/core, /controller, /react) become file: paths into
+ * your local checkout.
  */
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
@@ -87,7 +88,7 @@ if (command === 'doctor') {
   else warn('DATABASE_URL unset — dev falls back to IN-MEMORY PGlite (data resets on restart)')
 
   // framework packages
-  const missing = ['active-drizzle', '@active-drizzle/controller', '@active-drizzle/react']
+  const missing = ['@active-drizzle/core', '@active-drizzle/controller', '@active-drizzle/react']
     .filter(m => !ex(join(cwd, 'node_modules', m)))
   if (missing.length === 0) ok('framework packages installed')
   else bad(`missing packages: ${missing.join(', ')}`, 'npm install')
@@ -126,13 +127,11 @@ if (existsSync(dir)) {
 
 const AD_DEPS = linkPath
   ? {
-      'active-drizzle': `file:${join(linkPath, 'packages/core')}`,
       '@active-drizzle/core': `file:${join(linkPath, 'packages/core')}`,
       '@active-drizzle/controller': `file:${join(linkPath, 'packages/controller')}`,
       '@active-drizzle/react': `file:${join(linkPath, 'packages/react')}`,
     }
   : {
-      'active-drizzle': '^0.1.0',
       '@active-drizzle/core': '^0.1.0',
       '@active-drizzle/controller': '^0.1.0',
       '@active-drizzle/react': '^0.1.0',
@@ -187,7 +186,7 @@ const files = {
  * by NODE_ENV at boot. Secrets are REFERENCED from process.env, never
  * stored here (this file commits; the values deploy).
  */
-import { defineConfig } from 'active-drizzle'
+import { defineConfig } from '@active-drizzle/core'
 
 export default defineConfig({
   server: { port: 8787 },
@@ -263,12 +262,12 @@ export default defineConfig({
  *                        below.
  *
  * More databases? Bind extra tables to other instances:
- *   import { bindDatabase } from 'active-drizzle'
+ *   import { bindDatabase } from '@active-drizzle/core'
  *   bindDatabase('analytics', analyticsDb, { events: aSchema.events })
  * (Cross-database associations/includes are not supported — different
  * connections cannot join.)
  */
-import { loadConfig } from 'active-drizzle'
+import { loadConfig } from '@active-drizzle/core'
 import * as schema from './schema.ts'
 
 const config = await loadConfig()
@@ -325,7 +324,7 @@ export const posts = pgTable('posts', {
 })
 `,
 
-  'server/models/Post.model.ts': `import { ApplicationRecord, model, Attr, Validates, scope, beforeSave } from 'active-drizzle'
+  'server/models/Post.model.ts': `import { ApplicationRecord, model, Attr, Validates, scope, beforeSave } from '@active-drizzle/core'
 
 @model('posts')
 export class Post extends ApplicationRecord {
@@ -386,7 +385,7 @@ export class PostController extends ApplicationController {}
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
 import { RPCHandler } from '@orpc/server/fetch'
-import { boot, loadConfig } from 'active-drizzle'
+import { boot, loadConfig } from '@active-drizzle/core'
 import { buildRouter } from '@active-drizzle/controller'
 
 import * as schema from './db/schema.ts'
@@ -533,7 +532,7 @@ never edit them) and are imported through the \`@gen\` alias:
  */
 import { describe, it, expect } from 'vitest'
 import { call } from '@orpc/server'
-import { boot, bindDatabase } from 'active-drizzle'
+import { boot, bindDatabase } from '@active-drizzle/core'
 import { buildRouter, buildContractProbes, runContractProbes } from '@active-drizzle/controller'
 
 import * as schema from '../server/db/schema.ts'

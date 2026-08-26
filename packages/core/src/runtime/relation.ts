@@ -5,13 +5,68 @@ import { modelClassName } from './class-name.js'
 import { reportError } from './error-reporting.js'
 import type { ApplicationRecord } from './application-record.js'
 
+// ── THE CODEC-MAPPING BOUNDARY ────────────────────────────────────────────────
+//
+// ONE place that knows how a model's Attr configs bridge the two spaces every
+// read and write path must cross:
+//
+//   property name   ↔   DB column key     (Attr.for / Attr.money('col') → _column)
+//   display value   ↔   raw DB value      (Attr.get / Attr.set codec)
+//
+// The record Proxy's set-trap is the reference implementation; every OTHER path
+// (updateAll, insertAll, the INSERT defaults loop, where(), aggregates,
+// serialization) used to re-derive this mapping locally, and each fork was a
+// dropped-write or unit-mismatch bug. They now all funnel through here.
+
+/** The Attr config declared for a property, or undefined for a plain column. */
+export function attrConfigFor(Ctor: any, prop: string): any {
+  const a = Ctor?.[prop]
+  return a?._isAttr === true ? a : undefined
+}
+
 /**
- * Given a Attr property name (e.g. 'price') that may have an Attr.for column mapping
- * (e.g. '_column: priceInCents'), returns the actual DB column property name.
+ * Property name → the DB column key it reads/writes. Honors `Attr.for(col)` /
+ * `Attr.money('col')` (`_column`); a plain column maps to itself.
+ */
+export function columnKeyFor(Ctor: any, prop: string): string {
+  const a = Ctor?.[prop]
+  return a?._isAttr && a._column ? a._column : prop
+}
+
+/** Display/model value → raw DB value (Attr.set); passthrough for a plain column. */
+export function toRawValue(Ctor: any, prop: string, val: any): any {
+  const a = Ctor?.[prop]
+  return a?._isAttr && typeof a.set === 'function' ? a.set(val) : val
+}
+
+/** Raw DB value → display/model value (Attr.get); passthrough for a plain column. */
+export function toDisplayValue(Ctor: any, prop: string, raw: any): any {
+  const a = Ctor?.[prop]
+  return a?._isAttr && typeof a.get === 'function' ? a.get(raw) : raw
+}
+
+/**
+ * Maps a hash of writes from PROPERTY/display space into COLUMN/raw space — the
+ * exact shape drizzle's `.set()` / `.values()` need. This is the single funnel
+ * `updateAll`, `insertAll`, and the record INSERT payload all cross, so a
+ * `_column`-mapped Attr (money → priceCents) can never again land under its
+ * property name and be silently dropped by drizzle.
+ */
+export function mapWriteAttributes(Ctor: any, hash: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = {}
+  for (const [key, val] of Object.entries(hash)) {
+    out[columnKeyFor(Ctor, key)] = toRawValue(Ctor, key, val)
+  }
+  return out
+}
+
+/**
+ * Back-compat alias — property name (possibly `Attr.for`-mapped) → DB column
+ * key. Used throughout this file's query builder; it now delegates to the codec
+ * boundary so there is exactly one implementation of the mapping.
  */
 function _resolveColKey(Ctor: any, field: string): string {
-  const attr = Ctor[field] as any
-  return attr?._isAttr && attr._column ? attr._column : field
+  return columnKeyFor(Ctor, field)
 }
 
 /**
@@ -47,6 +102,13 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   protected _limit: number | undefined
   protected _offset: number = 0
   protected _order: SQL[] = []
+  /**
+   * Direction metadata parallel to `_order`, so `last()` can reverse an order
+   * by FLIPPING each spec instead of string-matching a compiled drizzle object
+   * (which produced the invalid `col asc desc`). A `null` entry marks a raw
+   * expression whose direction we can't structurally invert (kept as-is).
+   */
+  protected _orderSpecs: Array<{ col: any; dir: 'asc' | 'desc' } | null> = []
   protected _includes: Record<string, any> = {}
   protected _selectCols: string | undefined  // for toSubquery()
   
@@ -188,7 +250,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   /** Order by the last ftsSearch's ts_rank (highest relevance first). No-op without a search. */
   public orderByRelevance(): this {
     const rank = (this as any)._ftsRank as SQL | undefined
-    if (rank) this._order.push(desc(rank))
+    if (rank) { this._order.push(desc(rank)); this._orderSpecs.push(null) }
     return this
   }
 
@@ -219,8 +281,10 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
       const col = table[field]
       if (!col) throw new Error(`Column "${field}" not found on table "${this._tableName}"`)
       this._order.push(direction === 'desc' ? desc(col) : asc(col))
+      this._orderSpecs.push({ col, dir: direction })
     } else {
       this._order.push(field)
+      this._orderSpecs.push(null)   // raw expr — direction not structurally known
     }
     return this
   }
@@ -358,6 +422,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     const next = this._clone() as this
     const idCol = next._col('id')
     next._order.push(sql`array_position(ARRAY[${sql.join(ids.map(i => sql`${i}`), sql`, `)}]::bigint[], ${idCol})`)
+    next._orderSpecs.push(null)
     return next
   }
 
@@ -404,7 +469,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   public seek(fields: string[], opts: { after?: Record<string, any>; dir?: 'asc' | 'desc' } = {}): this {
     const dir  = opts.dir ?? 'asc'
     const cols = fields.map(f => this._col(f, 'keyset-paginate on'))
-    for (const c of cols) this._order.push((dir === 'desc' ? desc(c) : asc(c)) as SQL)
+    for (const c of cols) { this._order.push((dir === 'desc' ? desc(c) : asc(c)) as SQL); this._orderSpecs.push({ col: c, dir }) }
     if (opts.after) {
       const vals = fields.map(f => {
         const attr = (this._ctor as any)[f]
@@ -559,14 +624,31 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     // Reverse existing order, or add DESC on the PK
     if (cloned._order.length === 0) {
       const table = this.getTable()
-      if (table[pkCol]) cloned._order = [desc(table[pkCol])]
+      if (table[pkCol]) {
+        cloned._order = [desc(table[pkCol])]
+        cloned._orderSpecs = [{ col: table[pkCol], dir: 'desc' }]
+      }
     } else {
-      cloned._order = cloned._order.map((o: any) => {
-        // Swap asc ↔ desc by inspecting the SQL string — Drizzle puts 'asc'/'desc' at the end
-        const s = String(o)
-        if (s.includes(' desc')) return asc((o as any).column ?? o)
-        return desc((o as any).column ?? o)
+      // Reverse via the ORDER-SPEC list — flip each asc↔desc at the source.
+      // The old code stringified the compiled drizzle object and re-wrapped it,
+      // producing the invalid `col asc desc`; a raw expr with no recorded
+      // direction (spec null) can't be structurally inverted, so it passes
+      // through unchanged (best effort, never invalid SQL).
+      const revOrder: SQL[] = []
+      const revSpecs: Array<{ col: any; dir: 'asc' | 'desc' } | null> = []
+      cloned._order.forEach((o, i) => {
+        const spec = cloned._orderSpecs[i] ?? null
+        if (spec) {
+          const flipped: 'asc' | 'desc' = spec.dir === 'desc' ? 'asc' : 'desc'
+          revOrder.push((flipped === 'desc' ? desc(spec.col) : asc(spec.col)) as SQL)
+          revSpecs.push({ col: spec.col, dir: flipped })
+        } else {
+          revOrder.push(o)
+          revSpecs.push(null)
+        }
       })
+      cloned._order = revOrder
+      cloned._orderSpecs = revSpecs
     }
     if (n !== undefined) {
       cloned._limit = n
@@ -733,6 +815,12 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    */
   public async tally(field: string): Promise<Record<string, number>> {
     if ((this as any)._isNone) return {}
+    // tally GROUP BYs the raw column, then decrypts each group value into a
+    // label. On a randomized-encrypted column that means one group per row AND
+    // plaintext labels streamed back — the same silent-wrong the other lanes
+    // guard against. Reject it here (deterministic mode groups correctly, so
+    // it is allowed, matching group()).
+    this._guardEncrypted(field, 'GROUP BY', true)
     const rel = this._withDefaultScopes()
     const table  = rel.getTable()
     const colKey = _resolveColKey(rel._ctor, field)
@@ -850,8 +938,10 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   }
 
   /**
-   * Finds the first record matching `attrs`, or creates it.
-   * Raises if validation fails on create.
+   * Finds the first record matching `attrs`, or creates it. Follows create()'s
+   * contract: on a validation failure it returns the UNSAVED instance
+   * (isNewRecord === true, errors populated) rather than throwing — check
+   * `.isNewRecord` on the result.
    */
   public async findOrCreateBy(attrs: Record<string, any>): Promise<TModel> {
     const found = await this.where(attrs).first()
@@ -1050,10 +1140,11 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     const db = getExecutor(this._tableName)
     const table = rel.getTable()
     const Ctor = rel._ctor
-    const mapped: Record<string, any> = {}
-    for (const [key, val] of Object.entries(updates)) {
-      mapped[key] = Ctor[key]?._isAttr && Ctor[key].set ? Ctor[key].set(val) : val
-    }
+    // Cross the codec boundary: property→column AND value→raw, in one place.
+    // The old inline version kept the property name as the SET key, so an
+    // `Attr.money('priceCents')` write landed under `price` — a column that
+    // doesn't exist — and drizzle silently dropped it.
+    const mapped = mapWriteAttributes(Ctor, updates)
     let q: any = db.update(table).set(mapped)
     const whereExpr = rel._buildFinalWhere()
     if (whereExpr) q = q.where(whereExpr)
@@ -1114,16 +1205,37 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     batchSize: number,
     callback: (batch: this) => Promise<void>
   ): Promise<void> {
-    let offset = 0
+    const pk = (this._ctor as any).primaryKey ?? 'id'
+    const pkField = Array.isArray(pk) ? pk[0]! : pk
+    let after: any = undefined
+
     while (true) {
-      const batch = this._clone()
-      batch._limit = batchSize
-      batch._offset = offset
-      const rows = await batch.load()
+      // Load one chunk by KEYSET SEEK — ORDER BY pk ASC, pk > cursor — never
+      // OFFSET. A mutating callback (delete/re-scope) removes rows from the
+      // scope, which shifts every later offset window, so limit/offset paging
+      // silently skips half the rows (its own docstring example). It also had
+      // no ORDER BY, so even without mutation the batches were nondeterministic.
+      // Keyset is immune: the cursor is a value, not a count.
+      const cursor = this._clone() as this
+      cursor._order = []
+      cursor._orderSpecs = []
+      cursor.order(pkField)
+      if (after !== undefined) cursor.where({ [pkField]: { gt: after } })
+      cursor._limit = batchSize
+      const rows = await cursor.load()
       if (rows.length === 0) break
-      await callback(batch as this)
+
+      // Hand the callback a relation scoped to EXACTLY this chunk's rows, so
+      // batch.updateAll()/destroyAll() act on the loaded rows and nothing past
+      // them (UPDATE/DELETE ignore LIMIT, so a bare seek relation would hit
+      // every row after the cursor).
+      const ids = rows.map(r => (r as any)._attributes[pkField])
+      const batch = this._clone() as this
+      batch.where({ [pkField]: ids })
+      await callback(batch)
+
       if (rows.length < batchSize) break
-      offset += batchSize
+      after = (rows[rows.length - 1] as any)._attributes[pkField]
     }
   }
 
@@ -1318,11 +1430,19 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     c._limit    = this._limit
     c._offset   = this._offset
     c._order    = [...this._order]
+    c._orderSpecs = [...this._orderSpecs]
     c._includes = { ...this._includes }
     c._group    = [...this._group]
     c._having   = this._having
     c._distinct = this._distinct
     if (this._distinctOn) c._distinctOn = [...this._distinctOn]
+    // Locking + scoping flags MUST survive the clone. first()/take()/exists()
+    // all clone before executing, and _withDefaultScopes() clones too — dropping
+    // these here silently reverted withLock() (no FOR UPDATE) and unscoped()
+    // (default scopes re-applied), giving contradictory answers vs count().
+    c._skipAllDefaultScopes  = this._skipAllDefaultScopes
+    c._excludedDefaultScopes = new Set(this._excludedDefaultScopes)
+    if ((this as any)._forUpdate) (c as any)._forUpdate = (this as any)._forUpdate
     if ((this as any)._isNone) (c as any)._isNone = true
     if ((this as any)._ftsRank) (c as any)._ftsRank = (this as any)._ftsRank
     // Association create-defaults survive chaining (deal.comments.order(...).create(...))

@@ -407,8 +407,15 @@ describe('nested attributes security', () => {
 
   /** Parent INSERT returns id 10; find() resolves `childRow` (or nothing). */
   function securityDb(childRow: any) {
+    // find() routes through Relation → db.query[table].findMany. (The legacy
+    // select().from().where().limit() path is kept for any lane that still uses
+    // the core builder, e.g. FOR UPDATE.)
+    const findMany = vi.fn(async () => (childRow ? [childRow] : []))
     const db: any = {
-      query: {},
+      query: {
+        sec_items: { findMany },
+        des_items: { findMany },
+      },
       select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => ({
         limit: vi.fn(async () => (childRow ? [childRow] : [])),
       })) })) })),

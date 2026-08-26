@@ -113,6 +113,11 @@ vi.mock('@active-drizzle/core', () => ({
   },
   getAttachments: (model: string) =>
     model === 'Deal' ? [{ name: 'logo', kind: 'one' }] : [],
+  // The controller resolves a model's declared name through modelClassName()
+  // (the framework's #1 rule — a `name` Attr shadows `.name`). Mirror the real
+  // resolution here: a class/function → its `.name`, never the raw object.
+  modelClassName: (m: any) =>
+    typeof m === 'function' && typeof m.name === 'string' ? m.name : '',
 }))
 
 import { defaultUpdate } from '../src/crud-handlers.js'
@@ -128,7 +133,11 @@ describe('form PATCH logoAssetId — the third IDOR path, closed', () => {
     attach: vi.fn().mockResolvedValue(undefined),
   })
   const config: any = { update: { permit: ['name', 'logo', 'logoAssetId'] } }
-  const model: any = { name: 'Deal' }
+  // A real model is a class/function — modelClassName() resolves its name.
+  // (The prior `{ name: 'Deal' }` object only worked while the code read
+  // `model.name` directly, the very #1-rule violation now fixed.)
+  function Deal() {}
+  const model: any = Deal
 
   it("REFUSES another tenant's asset id (scope stamp ≠ record's own columns)", async () => {
     assets.set(77, {

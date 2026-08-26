@@ -34,16 +34,19 @@ export function generate(project: ProjectMeta): GeneratedFile[] {
 
   const files: GeneratedFile[] = [];
 
-  for (const model of project.models) {
-    const base = model.filePath.split('/').pop()!.replace('.model.ts', '.model.gen');
+  // Group models by their OUTPUT basename — a file may declare a base model and
+  // a co-located STI subclass, and both map to the same `X.model.gen` output.
+  // Their runtime/type modules are combined (imports de-duplicated) rather than
+  // one silently clobbering the other.
+  for (const [base, group] of groupModelsByOutputBase(project.models)) {
     // The declarations CANNOT share a basename with the runtime file:
     // `X.model.gen.d.ts` next to `X.model.gen.ts` is treated by tsc's
     // include-glob rules as that file's BUILD OUTPUT and silently excluded
     // from the program — so every `declare module` augmentation (instance
     // field types, statics, scopes) never applied under `tsc --noEmit`.
     const typesBase = base.replace(/\.model\.gen$/, '.model.types.gen');
-    files.push({ path: `${typesBase}.d.ts`, content: generateModelTypes(model, project) });
-    files.push({ path: `${base}.ts`, content: generateClientRuntime(model, project) });
+    files.push({ path: `${typesBase}.d.ts`, content: combineGeneratedModules(group.map(m => generateModelTypes(m, project))) });
+    files.push({ path: `${base}.ts`, content: combineGeneratedModules(group.map(m => generateClientRuntime(m, project))) });
   }
 
   files.push({
@@ -82,6 +85,11 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta, srcPr
   const lines: string[] = [];
   const recordName = `${model.className}Record`;
   const table = project.schema.tables[model.tableName];
+  // The source module a model lives in. Normally `<ClassName>.model`, but a
+  // co-located STI subclass shares its base's file — so derive the specifier
+  // from the FILE, not the class name, or the `declare module` / `import(...)`
+  // would point at a file that doesn't exist.
+  const srcModule = srcModuleName(model);
   // STI parent, when it's a model in this project (used to inherit types).
   const stiParentWithModel = model.stiParent && project.models.some(m => m.className === model.stiParent)
     ? model.stiParent
@@ -92,7 +100,7 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta, srcPr
   lines.push('');
 
   // ── Instance augmentation ─────────────────────────────────────────────
-  lines.push(`declare module '${srcPrefix}/${model.className}.model' {`);
+  lines.push(`declare module '${srcPrefix}/${srcModule}' {`);
   lines.push(`  interface ${model.className} {`);
   lines.push(`    readonly _associations: ${model.className}Associations;`);
 
@@ -125,14 +133,14 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta, srcPr
   // and per-event assign-only methods.
   for (const st of model.states) {
     const labels = Object.keys(st.values);
-    const labelUnion = labels.map(l => `'${l}'`).join(' | ') || 'never';
+    const labelUnion = labels.map(l => jsString(l)).join(' | ') || 'never';
     lines.push(`    ${st.propertyName}: ${labelUnion} | null`);
     for (const key of labels) {
       lines.push(`    is${capitalize(key)}(): boolean`);
       lines.push(`    to${capitalize(key)}(): ${recordName}`);
     }
     if (st.transitions.length > 0) {
-      const eventUnion = st.transitions.map(t => `'${t.event}'`).join(' | ');
+      const eventUnion = st.transitions.map(t => jsString(t.event)).join(' | ');
       lines.push(`    can(event: ${eventUnion}): boolean`);
       lines.push(`    advance(event: ${eventUnion}): Promise<boolean>`);
       for (const t of st.transitions) {
@@ -280,7 +288,7 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta, srcPr
   lines.push('');
 
   // ── Stand-alone exports ───────────────────────────────────────────────
-  lines.push(`export type ${recordName} = InstanceType<typeof import('./${model.className}.model').${model.className}>`);
+  lines.push(`export type ${recordName} = InstanceType<typeof import('./${srcModule}').${model.className}>`);
   lines.push('');
 
   lines.push(`// --- Advanced Type Sorcery ---`);
@@ -301,7 +309,7 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta, srcPr
       const enumDef = enumByProp.get(col.name);
       let baseType: string;
       if (enumDef) {
-        const labels = Object.keys(enumDef.values).map(k => `'${k}'`).join(' | ');
+        const labels = Object.keys(enumDef.values).map(k => jsString(k)).join(' | ');
         baseType = `${labels} | number`;
       } else {
         baseType = columnToTsType(col).replace(' | null', '');
@@ -325,7 +333,7 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta, srcPr
       const enumDef = enumByProp.get(col.name);
       let tsType: string;
       if (enumDef) {
-        const labels = Object.keys(enumDef.values).map(k => `'${k}'`).join(' | ');
+        const labels = Object.keys(enumDef.values).map(k => jsString(k)).join(' | ');
         tsType = col.nullable ? `${labels} | null` : labels;
       } else {
         tsType = columnToTsType(col);
@@ -384,7 +392,9 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta, sr
   );
 
   lines.push(`// AUTO-GENERATED — do not edit manually`);
-  lines.push(`import { ${model.className} as _${model.className} } from '${srcPrefix}/${model.className}.model.js'`);
+  // Import from the model's ACTUAL source file (a co-located STI subclass
+  // shares its base's file, so `<ClassName>.model.js` may not exist).
+  lines.push(`import { ${model.className} as _${model.className} } from '${srcPrefix}/${srcModuleName(model)}.js'`);
   if (needsValidates) {
     lines.push(`import { Validates } from 'active-drizzle'`);
   }
@@ -757,6 +767,27 @@ function capitalize(s: string): string {
 }
 
 /**
+ * Emits a single-quoted TS/JS string LITERAL with correct escaping. App
+ * strings — pgEnum values, defineEnum/Attr.state keys, filter labels — flow
+ * verbatim into generated source; an apostrophe (`it's`), a backslash, or a
+ * newline in one previously produced INVALID generated code (an injection-
+ * shaped hole). Route every app string that becomes a string literal through
+ * here. Values with no special chars round-trip identically to `'${v}'`, so
+ * existing snapshots stay byte-for-byte stable.
+ */
+export function jsString(s: string): string {
+  return "'" + s
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t')
+    .replace(/[\u2028]/g, '\\u2028')
+    .replace(/[\u2029]/g, '\\u2029')
+    + "'";
+}
+
+/**
  * THE column → emitted-TS-type map — EXHAUSTIVE by construction:
  * `satisfies Record<…>` makes a new ColumnType member a compile error HERE
  * until it is deliberately mapped (the silent `?? 'unknown'` fallthrough
@@ -806,13 +837,71 @@ export const COLUMN_TS_TYPE = {
   array: 'unknown[]',
 } satisfies Record<Exclude<import('./types.js').ColumnType, 'pgEnum'>, string>
 
+/**
+ * The module specifier for a model's source file, WITHOUT extension — e.g.
+ * `Asset.model` for `/…/Asset.model.ts`. Normally this equals
+ * `<ClassName>.model`, but a co-located STI subclass shares its base's file, so
+ * the specifier must come from the file path, not the class name.
+ */
+export function srcModuleName(model: ModelMeta): string {
+  const base = model.filePath.split('/').pop();
+  if (base && base.endsWith('.model.ts')) return base.slice(0, -'.ts'.length);
+  return `${model.className}.model`;
+}
+
+/**
+ * Groups models by the `.model.gen` output basename derived from their source
+ * file, preserving declaration order. Co-located models (base + STI subclass)
+ * land in the same group so they can be emitted into one file.
+ */
+export function groupModelsByOutputBase(models: ModelMeta[]): Map<string, ModelMeta[]> {
+  const groups = new Map<string, ModelMeta[]>();
+  for (const model of models) {
+    const base = model.filePath.split('/').pop()!.replace('.model.ts', '.model.gen');
+    const arr = groups.get(base);
+    if (arr) arr.push(model);
+    else groups.set(base, [model]);
+  }
+  return groups;
+}
+
+/**
+ * Concatenates the generated module strings for models that share one output
+ * file, de-duplicating identical top-level `import` lines and the single
+ * `// AUTO-GENERATED` header. Top-level imports are legal anywhere in an ES
+ * module (they hoist), so a de-duped import that trails a body still resolves.
+ * A single model passes through untouched (keeping byte-for-byte snapshots).
+ */
+export function combineGeneratedModules(parts: string[]): string {
+  if (parts.length === 1) return parts[0]!;
+  const seenImports = new Set<string>();
+  let headerEmitted = false;
+  const out: string[] = [];
+  for (const part of parts) {
+    for (const line of part.split('\n')) {
+      if (line.startsWith('import ')) {
+        if (seenImports.has(line)) continue;
+        seenImports.add(line);
+        out.push(line);
+      } else if (line.startsWith('// AUTO-GENERATED')) {
+        if (headerEmitted) continue;
+        headerEmitted = true;
+        out.push(line);
+      } else {
+        out.push(line);
+      }
+    }
+  }
+  return out.join('\n');
+}
+
 export function columnToTsType(col: ColumnMeta): string {
   let base: string;
 
   // Native Postgres enum — emit the string literal union directly
   if (col.type === 'pgEnum') {
     base = col.pgEnumValues && col.pgEnumValues.length > 0
-      ? col.pgEnumValues.map(v => `'${v}'`).join(' | ')
+      ? col.pgEnumValues.map(v => jsString(v)).join(' | ')
       : 'string';
   } else {
     const mapped = (COLUMN_TS_TYPE as Record<string, string>)[col.type];
@@ -902,10 +991,15 @@ export function generateRegistry(project: ProjectMeta, registryDir?: string): st
 
   lines.push('');
 
-  // Side-effect imports attach .Client to each model constructor
+  // Side-effect imports attach .Client to each model constructor. Co-located
+  // models (base + STI subclass) share one `.model.gen` file — import it once.
+  const seenSideEffect = new Set<string>();
   for (const model of project.models) {
     const basename = model.filePath.split('/').pop()!.replace('.ts', '');
-    lines.push(`import './${basename}.gen.js'`);
+    const spec = `./${basename}.gen.js`;
+    if (seenSideEffect.has(spec)) continue;
+    seenSideEffect.add(spec);
+    lines.push(`import '${spec}'`);
   }
 
   lines.push('');

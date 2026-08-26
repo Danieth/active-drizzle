@@ -338,6 +338,63 @@ describe('useUploadFactory — reset()', () => {
   })
 })
 
+// ── useUploadFactory — run-generation guard (superseded upload) ──────────────
+
+describe('useUploadFactory — superseded upload does not corrupt the replacement', () => {
+  it('a stale run resolving late never overwrites the newer run state', async () => {
+    // First presign hangs (run A stalls in presigning); second resolves.
+    let releaseA!: (v: any) => void
+    const presignA = new Promise<any>((res) => { releaseA = res })
+    const presign = vi.fn()
+      .mockImplementationOnce(() => presignA)
+      .mockImplementationOnce(() => Promise.resolve({
+        asset: makeAsset({ id: 2, status: 'pending' }),
+        uploadUrl: 'https://s3.example.com/upload?b',
+        constraints: { maxSize: 10 * 1024 * 1024, access: 'public' },
+      }))
+    const confirm = vi.fn().mockResolvedValue(makeAsset({ id: 2, status: 'ready' }))
+    const endpoints: UploadEndpoints = { presign, confirm }
+
+    const { result } = renderHook(() => useUploadFactory(endpoints, anyAttachment))
+
+    const fileA = makeFile('a.jpg', 'image/jpeg', 1024)
+    const fileB = makeFile('b.jpg', 'image/jpeg', 1024)
+
+    // Start A — it blocks in presigning.
+    let pA!: Promise<AssetData>
+    await act(async () => {
+      pA = result.current.upload(fileA).catch(() => makeAsset({ id: -1 }))
+      await vi.waitFor(() => presign.mock.calls.length === 1)
+    })
+
+    // Start B — supersedes A, runs to completion.
+    await act(async () => {
+      const pB = result.current.upload(fileB)
+      await vi.waitFor(() => MockXHR.instances.length > 0)
+      MockXHR.instances[MockXHR.instances.length - 1]!.simulateSuccess()
+      await pB
+    })
+
+    expect(result.current.status).toBe('ready')
+    expect(result.current.asset?.id).toBe(2)
+
+    // Now let A's presign resolve LATE — the stale run must not clobber B.
+    await act(async () => {
+      releaseA({
+        asset: makeAsset({ id: 1, status: 'pending' }),
+        uploadUrl: 'https://s3.example.com/upload?a',
+        constraints: { maxSize: 10 * 1024 * 1024, access: 'public' },
+      })
+      await pA
+      await Promise.resolve()
+    })
+
+    // Replacement state intact — A never dragged it back into 'uploading'.
+    expect(result.current.status).toBe('ready')
+    expect(result.current.asset?.id).toBe(2)
+  })
+})
+
 // ── useMultiUploadFactory — initial state ─────────────────────────────────────
 
 describe('useMultiUploadFactory — initial state', () => {

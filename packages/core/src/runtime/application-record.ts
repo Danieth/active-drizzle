@@ -1,7 +1,7 @@
 import util from 'util'
 import { eq, and, inArray, sql, getTableColumns } from 'drizzle-orm'
-import { Relation, _lookupAssocTarget } from './relation.js'
-import { getExecutor, getSchema, MODEL_REGISTRY, transaction, transactionContext, afterCommitQueue, AbortChain, RecordNotFound } from './boot.js'
+import { Relation, _lookupAssocTarget, mapWriteAttributes } from './relation.js'
+import { getExecutor, getSchema, MODEL_REGISTRY, transaction, transactionContext, afterCommitQueue, AbortChain, RecordNotFound, StaleObjectError, databaseForTable } from './boot.js'
 import { modelClassName } from './class-name.js'
 import { runHooks, collectHooks } from './hooks.js'
 import type { AttrEnumConfig, AttrStateConfig } from './attr.js'
@@ -248,12 +248,13 @@ export class ApplicationRecord {
    * Use `findBy({ id })` or `first()` if you want null instead.
    */
   static async find(id: number | string): Promise<any> {
-    const table = getSchema()[(this as any).tableName]
-    if (!table) throw new Error(`Table "${(this as any).tableName}" not found. Did you call boot()?`)
-    const pkWhereExpr = _buildPkWhere(this as any, table, id)
-    const [row] = await getExecutor(((this as any).tableName ?? (this as any).constructor?.tableName) as string).select().from(table).where(pkWhereExpr).limit(1)
-    if (!row) throw new RecordNotFound(modelClassName(this), id)
-    return new (this as any)(row, false)
+    // Route through Relation so the ONE read pipeline runs: STI type scoping (a
+    // subclass can no longer find() a sibling's row), default scopes, and
+    // subclass resolution (an STI-parent find() instantiates the right class).
+    // The old inline SELECT forked all three.
+    const rec = await new Relation(this).where(_pkHash(this as any, id)).first()
+    if (!rec) throw new RecordNotFound(modelClassName(this), id)
+    return rec
   }
 
   /**
@@ -279,7 +280,21 @@ export class ApplicationRecord {
     return new Relation(this).findOrCreateBy(attrs)
   }
 
+  /**
+   * Rails' `create`: builds, saves, and ALWAYS returns the instance — saved on
+   * success, still-unsaved (isNewRecord === true, with `errors` populated) on a
+   * validation/DB failure. It never throws for a validation failure, so callers
+   * gate on `record.isNewRecord` (this is exactly what the controller's 422
+   * branch does). Use `createBang()` for the raise-on-invalid variant.
+   */
   static async create(attrs: Record<string, any>): Promise<any> {
+    const instance = new (this as any)(attrs, true)
+    await instance.save()
+    return instance
+  }
+
+  /** Rails' `create!` — saves and RAISES on validation failure. */
+  static async createBang(attrs: Record<string, any>): Promise<any> {
     const instance = new (this as any)(attrs, true)
     const saved    = await instance.save()
     if (!saved) throw new Error(`Validation failed: ${JSON.stringify(instance.errors.all())}`)
@@ -290,12 +305,29 @@ export class ApplicationRecord {
     const table = getSchema()[(this as any).tableName]
     if (!table) throw new Error(`Table "${(this as any).tableName}" not found.`)
     const Ctor  = this as any
+    const stiCol = Ctor.stiTypeColumn ?? 'type'
     const rows  = records.map(r => {
-      const out: Record<string, any> = {}
-      for (const [k, v] of Object.entries(r)) out[k] = Ctor[k]?._isAttr && Ctor[k].set ? Ctor[k].set(v) : v
+      // Cross the codec boundary: property→column AND value→raw for every field
+      // (the old version kept the property name, so a money('priceCents') write
+      // landed under `price` and drizzle dropped it).
+      const out = mapWriteAttributes(Ctor, r)
+      // Fill Attr defaults for columns this record didn't set — the bulk path
+      // skips the per-record constructor that normally applies them.
+      for (const [key, attrVal] of modelStaticEntries(Ctor)) {
+        const attr = attrVal as AttrConfig | undefined
+        if (attr?._isAttr !== true || attr.default === undefined) continue
+        const col = (attr as any)._column ?? key
+        if (col in out) continue
+        const def = typeof attr.default === 'function' ? attr.default() : attr.default
+        out[col] = attr.set ? attr.set(def) : def
+      }
+      // STI: stamp the discriminator so bulk-inserted subclass rows downcast on
+      // read — save() does the same on the per-record path.
+      if (Ctor.stiType !== undefined && !(stiCol in out)) out[stiCol] = Ctor.stiType
       return out
     })
-    await getExecutor(((this as any).tableName ?? (this as any).constructor?.tableName) as string).insert(table).values(rows)
+    if (rows.length === 0) return 0
+    await getExecutor((this as any).tableName as string).insert(table).values(rows)
     return rows.length
   }
 
@@ -312,20 +344,13 @@ export class ApplicationRecord {
   constructor(attributes: Record<string, any> = {}, isNew = true) {
     if (isNew) {
       // Constructor input for NEW records is model-space ('high', dollars) —
-      // run it through each Attr's set() so _attributes always holds raw DB
-      // values. Without this, Deal.create({ priority: 'high', amount: 480 })
-      // would write the label string and dollar units straight to the DB.
-      const ctor = this.constructor as any
-      const raw: Record<string, any> = {}
-      for (const [k, v] of Object.entries(attributes)) {
-        const attr = ctor[k] as AttrConfig | undefined
-        if (attr?._isAttr === true && typeof attr.set === 'function') {
-          raw[(attr as any)._column ?? k] = attr.set(v)
-        } else {
-          raw[k] = v
-        }
-      }
-      this._attributes = raw
+      // cross the SAME codec boundary every write path uses (property→column,
+      // value→raw via Attr.set) so _attributes always holds raw DB values.
+      // Without this, Deal.create({ priority: 'high', amount: 480 }) would write
+      // the label string and dollar units straight to the DB. (Nested
+      // *Attributes / habtm *Ids keys carry no Attr, so they pass through
+      // untouched and are stripped later by the save() payload builder.)
+      this._attributes = mapWriteAttributes(this.constructor, attributes)
     } else {
       this._attributes = attributes
     }
@@ -562,7 +587,6 @@ export class ApplicationRecord {
       return false
     }
 
-    const db = getExecutor(((this as any).tableName ?? (this as any).constructor?.tableName) as string)
     const table = getSchema()[(this.constructor as any).tableName]
     if (!table) throw new Error(`Table "${(this.constructor as any).tableName}" not found. Did you call boot()?`)
 
@@ -573,9 +597,16 @@ export class ApplicationRecord {
     // Same for habtm `<singular>Ids` sets — they sync join rows post-persist
     const habtmSnapshot = _captureHabtmIds(this, ctor)
 
-    // DB phase — database failures land in _handleDbError: raw error to
-    // the onError handlers, translated message onto this.errors.
-    try {
+    // The WRITE PHASE — parent INSERT/UPDATE plus every companion write (nested
+    // attributes, habtm id-sync, counter caches, autosave) and the afterSave/
+    // afterCreate hooks. Everything here must commit ATOMICALLY: before, the
+    // parent committed first and a later forged child id returned a lying 422
+    // while the parent (and earlier children) stayed committed → duplicate rows
+    // on resubmit. The executor is fetched INSIDE this closure so it picks up
+    // the transaction client when we wrap. Returns true only for the no-op
+    // update fast-path (which skips afterSave/afterCommit, as it always has).
+    const runWritePhase = async (): Promise<boolean> => {
+      const db = getExecutor(ctor.tableName as string)
       if (isNew) {
         const payload: Record<string, any> = {}
 
@@ -591,18 +622,24 @@ export class ApplicationRecord {
           payload[k] = is
         }
 
-        // Apply defaults for fields not yet set
+        // Apply defaults for columns not yet set. Key by the mapped COLUMN, not
+        // the property name — an Attr.money('priceCents') default keyed by
+        // `price` was dropped by drizzle, and the implicit not-null check (which
+        // keys defaults by _column) then vouched for the unfilled NOT NULL
+        // column → NULL-into-NOT-NULL. [DATA INTEGRITY]
         for (const [key, attrVal] of modelStaticEntries(ctor)) {
           const attr = attrVal as AttrConfig | undefined
           if (attr?._isAttr !== true || attr.default === undefined) continue
-          if (key in payload) continue
+          const col = (attr as any)._column ?? key
+          if (col in payload) continue
           const def = typeof attr.default === 'function' ? attr.default() : attr.default
-          payload[key] = attr.set ? attr.set(def) : def
+          payload[col] = attr.set ? attr.set(def) : def
         }
 
         // STI: ensure the discriminator column is always set on INSERT
-        if (ctor.stiType && !('type' in payload)) {
-          payload['type'] = ctor.stiType
+        const stiCol = ctor.stiTypeColumn ?? 'type'
+        if (ctor.stiType !== undefined && !(stiCol in payload)) {
+          payload[stiCol] = ctor.stiType
         }
 
         const [row] = await db.insert(table).values(payload).returning()
@@ -625,7 +662,25 @@ export class ApplicationRecord {
         if (realChanges.length > 0) {
           const payload: Record<string, any> = {}
           for (const [k, { is }] of realChanges) payload[k] = is
-          const [row] = await db.update(table).set(payload).where(_buildPkWhere(ctor, table, _getPkValue(ctor, this._attributes))).returning()
+
+          // Optimistic lock (compare-and-swap): if the model has a locking
+          // column (`lockVersion` by convention), bump it AND require its
+          // loaded value in the WHERE. The old UPDATE keyed on the pk only, so
+          // two stale writers both matched and the last one silently won.
+          const lockCol = _lockingColumn(ctor, table)
+          const loadedVersion = lockCol ? this._attributes[lockCol] : undefined
+          let where = _buildPkWhere(ctor, table, _getPkValue(ctor, this._attributes))
+          if (lockCol && typeof loadedVersion === 'number' && !(lockCol in payload)) {
+            payload[lockCol] = loadedVersion + 1
+            where = and(where, eq(table[lockCol], loadedVersion))!
+          }
+
+          const [row] = await db.update(table).set(payload).where(where).returning()
+          if (!row && lockCol && typeof loadedVersion === 'number') {
+            // CAS matched zero rows → a concurrent writer already advanced the
+            // version. Our write would clobber theirs — raise instead.
+            throw new StaleObjectError(modelClassName(ctor), _getPkValue(ctor, this._attributes))
+          }
           if (row) this._attributes = row
         }
       }
@@ -650,10 +705,30 @@ export class ApplicationRecord {
 
       await runHooks(this, 'afterSave', isNew)
       await runHooks(this, isNew ? 'afterCreate' : 'afterUpdate', isNew)
+      return false
+    }
+
+    // DB phase — database failures land in _handleDbError: raw error to
+    // the onError handlers, translated message onto this.errors.
+    try {
+      // Wrap in a transaction ONLY when there are companion writes to keep
+      // atomic AND we're not already inside a transaction (which already
+      // provides atomicity). A plain single-statement save stays unwrapped, so
+      // the common path takes no extra round-trip and never trips the nested-
+      // transaction warning.
+      const alreadyInTx = transactionContext.getStore() !== undefined
+      const needsWrap = !alreadyInTx && _saveNeedsTransaction(this, ctor, nestedSnapshot, habtmSnapshot, isNew)
+      const wasNoop = needsWrap
+        ? await transaction(runWritePhase, { database: databaseForTable(ctor.tableName) })
+        : await runWritePhase()
+
+      // No-op update fast-path: autosave ran, but there is nothing to commit —
+      // afterSave/afterCommit do not fire (unchanged behavior).
+      if (wasNoop) return true
 
       const pendingAfterCommit = afterCommitQueue.getStore()
       if (pendingAfterCommit !== undefined) {
-        // Inside a transaction — defer afterCommit until after the transaction commits
+        // Inside a transaction — defer afterCommit until after it commits.
         pendingAfterCommit.push(async () => { await runHooks(this, 'afterCommit', isNew) })
       } else {
         await runHooks(this, 'afterCommit', isNew)
@@ -661,6 +736,7 @@ export class ApplicationRecord {
 
       return true
     } catch (err) {
+      if (err instanceof StaleObjectError) throw err
       if (err instanceof NestedAttributesError) {
         // Forged/foreign nested ids surface as a validation failure (422),
         // matching the shape a failed validation already has
@@ -711,14 +787,17 @@ export class ApplicationRecord {
     if (this.isNewRecord) return false
     if (!(await runHooks(this, 'beforeDestroy', false))) return false
 
-    const db = getExecutor(((this as any).tableName ?? (this as any).constructor?.tableName) as string)
     const ctor = this.constructor as any
     const table = getSchema()[ctor.tableName]
     if (!table) throw new Error(`Table "${ctor.tableName}" not found.`)
     if (!_getPkValue(ctor, this._attributes)) throw new Error("Cannot destroy record without a primary key.")
 
-    try {
-      // Cascade destroy: any hasMany with dependent: 'destroy' fires destroy() per record
+    // Cascade child destroys + the parent DELETE + counter decrement commit
+    // ATOMICALLY: before, a failing parent DELETE left the already-destroyed
+    // children stranded. Executor fetched inside so it picks up the tx client.
+    const runDestroy = async (): Promise<void> => {
+      const db = getExecutor(ctor.tableName as string)
+      // Cascade destroy: any hasMany/hasOne with dependent: 'destroy' fires destroy() per record
       for (const [key, marker] of modelStaticEntries(ctor)) {
         if (!marker || typeof marker !== 'object') continue
         if ((marker._type === 'hasMany' || marker._type === 'hasOne') && marker.options?.dependent === 'destroy') {
@@ -741,6 +820,13 @@ export class ApplicationRecord {
       await _adjustCounterCaches(this, ctor, -1)
 
       await runHooks(this, 'afterDestroy', false)
+    }
+
+    try {
+      const alreadyInTx = transactionContext.getStore() !== undefined
+      const needsWrap = !alreadyInTx && _destroyNeedsTransaction(ctor)
+      if (needsWrap) await transaction(runDestroy, { database: databaseForTable(ctor.tableName) })
+      else await runDestroy()
       return true
     } catch (err) {
       return this._handleDbError(err, 'delete')
@@ -784,9 +870,13 @@ export class ApplicationRecord {
   }
 
   restoreAttributes(): void {
-    for (const [key, { was }] of this._changes) {
-      this._attributes[key] = was
-    }
+    // The set-trap NEVER mutates _attributes (it records the new value in
+    // _changes only), so _attributes still holds the original RAW value for
+    // every changed key. Discarding the pending changes is the whole revert.
+    // The old code wrote `was` back into _attributes — but `was` is DISPLAY
+    // space (label/dollars) while _attributes is RAW (int/cents), so it
+    // corrupted the codec on the record (a money field became 19.99 in a cents
+    // column, an enum became 'draft' in an int column).
     this._changes.clear()
   }
 
@@ -799,7 +889,15 @@ export class ApplicationRecord {
       const attr = ctor[key] as AttrConfig | undefined
       out[key] = attr?.get ? attr.get(this._attributes[key]) : this._attributes[key]
     }
-    for (const [k, { is }] of this._changes) out[k] = is
+    // Dirty fields carry the RAW new value in `.is`; run it through the same
+    // codec the clean branch above uses (keyed identically by column), so a
+    // dirty money/enum field serializes in DISPLAY space too. The old code
+    // wrote `.is` straight out, leaking cents / enum ints for edited fields —
+    // editing a field silently changed its serialized representation.
+    for (const [k, { is }] of this._changes) {
+      const attr = ctor[k] as AttrConfig | undefined
+      out[k] = attr?.get ? attr.get(is) : is
+    }
     return out
   }
 
@@ -1535,7 +1633,11 @@ async function _processNestedAttributes(record: any, ctor: any, snapshot: Record
         if (_destroy) {
           if (allowDestroy) await child.destroy()
         } else {
-          await child.update({ ...fields, ...forced })
+          // A failing child update() returns false — discarding it let an
+          // invalid nested edit return 200 while the change vanished. Surface
+          // it as this record's 422, with the child's own error message.
+          const ok = await child.update({ ...fields, ...forced })
+          if (!ok) throw new NestedAttributesError(key, _nestedChildError(child, key, id))
         }
       } else if (!_destroy) {
         // hasOne: an id-less write lands on the existing child when there is
@@ -1543,8 +1645,16 @@ async function _processNestedAttributes(record: any, ctor: any, snapshot: Record
         const existing = singular
           ? await new Relation(TargetModel).where(forced).first()
           : null
-        if (existing) await (existing as any).update({ ...fields, ...forced })
-        else await TargetModel.create({ ...fields, ...forced })
+        // create() no longer throws on invalid — it returns the unsaved record
+        // (isNewRecord === true). Detect that (and a failed update) and fail the
+        // whole nested write loudly as a 422 instead of silently dropping it.
+        if (existing) {
+          const ok = await (existing as any).update({ ...fields, ...forced })
+          if (!ok) throw new NestedAttributesError(key, _nestedChildError(existing, key))
+        } else {
+          const created = await TargetModel.create({ ...fields, ...forced })
+          if (created?.isNewRecord) throw new NestedAttributesError(key, _nestedChildError(created, key))
+        }
       }
     }
   }
@@ -1617,6 +1727,98 @@ async function _autosaveAssociations(record: any, ctor: any): Promise<void> {
 }
 
 // ── Primary-key helpers ────────────────────────────────────────────────────────
+
+/**
+ * The primary-key value(s) of a record expressed as a where-HASH (property →
+ * value), so `find()` can route through Relation (which resolves columns +
+ * applies STI/default scopes) instead of forking a raw SELECT.
+ */
+function _pkHash(ctor: any, id: any): Record<string, any> {
+  const pk = ctor.primaryKey ?? 'id'
+  if (Array.isArray(pk)) {
+    const vals = Array.isArray(id) ? id : [id]
+    return Object.fromEntries(pk.map((k: string, i: number) => [k, vals[i]]))
+  }
+  return { [pk as string]: id }
+}
+
+/**
+ * The optimistic-locking column for a model, or null. Opt-in by convention: an
+ * integer `lockVersion` column (Rails' lock_version) enables compare-and-swap
+ * on save automatically. Override the name with `static lockingColumn = 'x'`,
+ * or disable with `static lockingColumn = false`. Returns null when the column
+ * isn't actually in the schema, so models without it are unaffected.
+ */
+function _lockingColumn(ctor: any, table: any): string | null {
+  const configured = ctor.lockingColumn
+  if (configured === false) return null
+  const colName = typeof configured === 'string' ? configured : 'lockVersion'
+  return table && table[colName] ? colName : null
+}
+
+/**
+ * Cached per-ctor: does any belongsTo on this model point at a parent that
+ * declares a `counterCache` hasMany? Only such models do a companion counter
+ * write on create/destroy, so only they need the atomic transaction wrap —
+ * keeping the wrap off the common single-statement save path.
+ */
+const _counterCacheParentCache = new WeakMap<object, boolean>()
+function _ctorHasCounterCacheParent(ctor: any): boolean {
+  const cached = _counterCacheParentCache.get(ctor)
+  if (cached !== undefined) return cached
+  let result = false
+  outer: for (const [key, marker] of modelStaticEntries(ctor)) {
+    if (!marker || typeof marker !== 'object' || marker._type !== 'belongsTo') continue
+    let ParentModel: any = null
+    try { ParentModel = _findModelByMarker(marker, key) } catch { ParentModel = null }
+    if (!ParentModel) continue
+    for (const [, pm] of modelStaticEntries(ParentModel)) {
+      if (pm && typeof pm === 'object' && pm._type === 'hasMany' && pm.options?.counterCache) { result = true; break outer }
+    }
+  }
+  _counterCacheParentCache.set(ctor, result)
+  return result
+}
+
+/**
+ * Does this save() have companion writes (nested attributes, habtm id-sync,
+ * autosave, counter cache) that must commit atomically with the parent? Only
+ * then is the transaction wrap worth its round-trip.
+ */
+function _saveNeedsTransaction(record: any, ctor: any, nestedSnapshot: Record<string, any>, habtmSnapshot: Record<string, any>, isNew: boolean): boolean {
+  if (Object.keys(nestedSnapshot).length > 0) return true
+  if (Object.keys(habtmSnapshot).length > 0) return true
+  for (const [key, marker] of modelStaticEntries(ctor)) {
+    if (marker && typeof marker === 'object' && marker.options?.autosave && record._attributes[key] != null) return true
+  }
+  if (isNew && _ctorHasCounterCacheParent(ctor)) return true
+  return false
+}
+
+/** Does destroy() cascade to children or adjust a counter (→ needs the atomic wrap)? */
+function _destroyNeedsTransaction(ctor: any): boolean {
+  for (const [, marker] of modelStaticEntries(ctor)) {
+    if (marker && typeof marker === 'object'
+        && (marker._type === 'hasMany' || marker._type === 'hasOne')
+        && marker.options?.dependent === 'destroy') return true
+  }
+  return _ctorHasCounterCacheParent(ctor)
+}
+
+/** First human-readable validation message off a failed nested child. */
+function _nestedChildError(child: any, assoc: string, id?: any): string {
+  try {
+    const all = child?.errors?.all?.() as Record<string, string[]> | undefined
+    if (all) {
+      for (const [field, msgs] of Object.entries(all)) {
+        if (Array.isArray(msgs) && msgs.length > 0) {
+          return field === 'base' ? String(msgs[0]) : `${field} ${msgs[0]}`
+        }
+      }
+    }
+  } catch { /* fall through to a generic message */ }
+  return id != null ? `row ${id} in ${assoc} is invalid` : `${assoc} is invalid`
+}
 
 /**
  * Returns the primary key value(s) for a record's attributes.

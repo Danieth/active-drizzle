@@ -24,7 +24,20 @@ export function extractControllers(
   const controllers: CtrlMeta[] = []
 
   for (const filePath of ctrlFilePaths) {
-    const file = project.addSourceFileAtPath(filePath)
+    // A persistent ts-morph Project caches SourceFiles: `addSourceFileAtPath`
+    // returns the STALE in-memory copy for a file already added, so watch-mode
+    // edits to a `.ctrl.ts` were silently ignored. Re-read it from disk when it
+    // is already loaded — but ONLY when the file actually exists on the
+    // project's file system. Refreshing an in-memory-only SourceFile (unsaved
+    // test fixtures) would forget its node and break extraction.
+    const existing = project.getSourceFile(filePath)
+    let file
+    if (existing) {
+      if (project.getFileSystem().fileExistsSync(filePath)) existing.refreshFromFileSystemSync()
+      file = existing
+    } else {
+      file = project.addSourceFileAtPath(filePath)
+    }
     const classes = file.getClasses()
 
     for (const cls of classes) {

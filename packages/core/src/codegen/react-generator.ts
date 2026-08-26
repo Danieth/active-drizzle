@@ -32,7 +32,7 @@ import pluralize from 'pluralize'
 import type { CtrlProjectMeta, CtrlMeta, CtrlActionMeta, CtrlAttachmentMeta } from './controller-types.js'
 import type { ProjectMeta, ModelMeta, ColumnMeta } from './types.js'
 import { depsFitProjection } from './validation-deps.js'
-import { renderFieldMeta } from './generator.js'
+import { renderFieldMeta, jsString, COLUMN_TS_TYPE } from './generator.js'
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -444,13 +444,13 @@ import type { FC, ReactNode } from 'react'`)
 
     const enumByProp = new Map<string, string>()
     for (const e of model.enums) {
-      enumByProp.set(e.propertyName, Object.keys(e.values).map(k => `'${k}'`).join(' | '))
+      enumByProp.set(e.propertyName, Object.keys(e.values).map(k => jsString(k)).join(' | '))
     }
     // Attr.state fields hydrate as LABELS over the wire, exactly like enums —
     // without this, `stage` would be typed number while runtime yields 'draft'
     // (the class of bug this framework exists to prevent, in its own output)
     for (const st of model.states ?? []) {
-      enumByProp.set(st.propertyName, Object.keys(st.values).map(k => `'${k}'`).join(' | '))
+      enumByProp.set(st.propertyName, Object.keys(st.values).map(k => jsString(k)).join(' | '))
     }
 
     const allIncludes = new Set([
@@ -1504,7 +1504,7 @@ function emitFormHooks(
       const stateDef = (model.states ?? []).find(s => s.propertyName === f)
       const labels = enumDef ? Object.keys(enumDef.values) : stateDef ? Object.keys(stateDef.values) : null
       if (labels) {
-        filterMetaParts.push(`${f}: { kind: 'facet', label: ${label}, options: [${labels.map(l => `'${l}'`).join(', ')}] }`)
+        filterMetaParts.push(`${f}: { kind: 'facet', label: ${label}, options: [${labels.map(l => jsString(l)).join(', ')}] }`)
       } else if (kind === 'boolean') {
         filterMetaParts.push(`${f}: { kind: 'toggle', label: ${label} }`)
       } else {
@@ -1697,10 +1697,10 @@ function renderInlineAttrs(attrsType: string, projectMeta: ProjectMeta): string[
   }
   const enumByProp = new Map<string, string>()
   for (const e of childModel.enums) {
-    enumByProp.set(e.propertyName, Object.keys(e.values).map(k => `'${k}'`).join(' | '))
+    enumByProp.set(e.propertyName, Object.keys(e.values).map(k => jsString(k)).join(' | '))
   }
   for (const st of childModel.states ?? []) {
-    enumByProp.set(st.propertyName, Object.keys(st.values).map(k => `'${k}'`).join(' | '))
+    enumByProp.set(st.propertyName, Object.keys(st.values).map(k => jsString(k)).join(' | '))
   }
   const L: string[] = []
   L.push(`/** ${className} has no controller of its own — its wire shape is inlined here. */`)
@@ -1734,29 +1734,26 @@ function resolveAssocImports(
   })
 }
 
+/**
+ * Over-the-wire (JSON) deltas from the server-side {@link COLUMN_TS_TYPE} map.
+ * JSON has no `Date`, so timestamps arrive as ISO strings on the client. Every
+ * other column type derives from the ONE map — a second, forked copy of the
+ * type table is exactly the drift this framework exists to prevent (it once
+ * typed `bigint` as `number` client-side while the server said `string`).
+ */
+const CLIENT_WIRE_OVERRIDES: Record<string, string> = {
+  timestamp: 'string',
+  timestamptz: 'string',
+}
+
 function columnToClientType(col: ColumnMeta, enumByProp: Map<string, string>): string {
   const enumUnion = enumByProp.get(col.name)
   if (enumUnion) return col.isArray ? `(${enumUnion})[]` : enumUnion
   if (col.pgEnumValues?.length) {
-    const union = col.pgEnumValues.map(v => `'${v}'`).join(' | ')
+    const union = col.pgEnumValues.map(v => jsString(v)).join(' | ')
     return col.isArray ? `(${union})[]` : union
   }
-  const map: Record<string, string> = {
-    integer: 'number', smallint: 'number', bigint: 'number',
-    serial: 'number', smallserial: 'number', bigserial: 'number',
-    real: 'number', doublePrecision: 'number', decimal: 'string', numeric: 'string',
-    text: 'string', varchar: 'string', char: 'string', uuid: 'string', citext: 'string',
-    boolean: 'boolean',
-    date: 'string', timestamp: 'string', timestamptz: 'string', time: 'string', interval: 'string',
-    json: 'unknown', jsonb: 'unknown',
-    bytea: 'Buffer',
-    inet: 'string', cidr: 'string', macaddr: 'string', macaddr8: 'string',
-    tsvector: 'string', tsquery: 'string', bit: 'string', varbit: 'string',
-    xml: 'string', money: 'string', oid: 'number',
-    vector: 'number[]',
-    point: '{ x: number; y: number }',
-  }
-  const base = map[col.type] ?? 'unknown'
+  const base = CLIENT_WIRE_OVERRIDES[col.type] ?? (COLUMN_TS_TYPE as Record<string, string>)[col.type] ?? 'unknown'
   return col.isArray ? `${base}[]` : base
 }
 

@@ -362,7 +362,10 @@ export function createIndexSurface(cfg: IndexSurfaceConfig): IndexSurface {
     const session = ref.current
     useSessionState(session)
     const query = cfg.useIndexQuery(session.params())
-    const value = useMemo(() => ({ session, meta: cfg.meta, query }), [session, query.data, query.isLoading, query.isError])
+    // isFetching MUST be a dep: under keepPreviousData a background refetch
+    // keeps `data` identical while isFetching toggles true→false. Omitting it
+    // froze the memo, so the "refreshing" signal never reached Surface.use().
+    const value = useMemo(() => ({ session, meta: cfg.meta, query }), [session, query.data, query.isLoading, query.isError, query.isFetching])
     return (
       <Ctx.Provider value={value}>
         <div {...(className !== undefined ? { className } : {})}>{children}</div>

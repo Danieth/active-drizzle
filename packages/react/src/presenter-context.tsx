@@ -22,7 +22,7 @@
  * and the server lane (@frontendContext) arrive merged, and the generated
  * types make every key autocomplete.
  */
-import React, { createContext, useContext, type ComponentType, type ReactNode } from 'react'
+import React, { createContext, useContext, useMemo, type ComponentType, type ReactNode } from 'react'
 import type { PresenterProps } from './presenters.js'
 
 export type PresenterContextMap = Record<string, () => unknown>
@@ -66,12 +66,35 @@ const LayoutStack = createContext<LayerEntry[]>([])
 export function PresenterContextProvider({ map, children }: { map: PresenterContextMap; children?: ReactNode }): React.JSX.Element {
   const parent = useContext(ClientCtx)
   const parentStack = useContext(LayoutStack)
-  const bag: Record<string, unknown> = { ...parent }
-  for (const [key, fn] of Object.entries(map)) bag[key] = fn()
+
+  // The entry fns are hooks (they may read stores) — they MUST run every
+  // render, in stable order. But the resulting bag's IDENTITY must be stable
+  // when nothing changed: a fresh object every render makes every ClientCtx
+  // consumer (i.e. every field on the page) re-render on any ancestor render.
+  const entries = Object.entries(map)
+  const values = entries.map(([, fn]) => fn())
+  const bag = useMemo(() => {
+    const next: Record<string, unknown> = { ...parent }
+    entries.forEach(([key], i) => { next[key] = values[i] })
+    return next
+    // Depend on the parent identity and each computed value: identical inputs
+    // reuse the same bag object, so consumers don't re-render for nothing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [parent, ...values])
+
+  // The layout stack likewise gets a stable identity — it changes only when
+  // the parent stack or this folder's own layout/consumes change (both stable
+  // per registered map).
   const opts = (map as any)[PRESENTER_CONTEXT_OPTS] as PresenterContextOpts | undefined
-  const stack = opts?.layout
-    ? [...parentStack, { layout: opts.layout, consumes: opts.consumes ?? [] }]
-    : parentStack
+  const consumesKey = opts?.consumes ? opts.consumes.join(',') : ''
+  const stack = useMemo(
+    () => opts?.layout
+      ? [...parentStack, { layout: opts.layout, consumes: opts.consumes ?? [] }]
+      : parentStack,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [parentStack, opts?.layout, consumesKey],
+  )
+
   return (
     <ClientCtx.Provider value={bag}>
       <LayoutStack.Provider value={stack}>{children}</LayoutStack.Provider>

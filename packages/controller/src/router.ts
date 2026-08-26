@@ -8,6 +8,7 @@
  */
 import { os, ORPCError } from '@orpc/server'
 import { z } from 'zod'
+import { modelClassName } from '@active-drizzle/core'
 import {
   getCrudMeta, getSingletonMeta, getScopes, getMutations, getActions,
   getControllerMeta, getAttachableMeta,
@@ -287,9 +288,17 @@ export function buildRouter<TContext = Record<string, any>>(
             ...scopeSchema,
             // records:false mutations act on the WHOLE (scoped) set — ids
             // are optional noise there (`markAllRead` shouldn't send ids: [])
+            //
+            // records:true (default) mutations act on the SELECTED rows. An
+            // empty array must be rejected loudly, not treated as "all": with
+            // no ids the relation stays door-scoped and unfiltered, so an empty
+            // selection would silently apply the mutation to the ENTIRE door
+            // scope — the exact "works while doing the wrong thing" bug class
+            // this framework exists to kill. `.min(1)` teaches at the boundary.
             ids: mut.records === false
               ? z.array(z.number().int().positive()).optional()
-              : z.array(z.number().int().positive()),
+              : z.array(z.number().int().positive())
+                  .min(1, 'select at least one record'),
             data: z.record(z.string(), z.any()).optional(),
           }).passthrough()
         ).handler(async ({ input, context }) => {
@@ -337,7 +346,7 @@ export function buildRouter<TContext = Record<string, any>>(
           // scopeBy adds defence-in-depth: it's applied to ctrl.relation inside dispatch,
           // ensuring further queries within the action are fully scoped.
           const record = await rel.where({ id: (input as any).id }).first()
-          if (!record) throw new NotFound(model.name)
+          if (!record) throw new NotFound(modelClassName(model))
           return dispatch(ControllerClass, context as TContext, input as any, rel, mut.method,
             async (ctrl) => {
               // FIXES-NEEDED #8 (second half): the pre-load above only saw
@@ -345,7 +354,7 @@ export function buildRouter<TContext = Record<string, any>>(
               const verified = config.scopeBy
                 ? await ctrl.relation.where({ id: (input as any).id }).first()
                 : record
-              if (!verified) throw new NotFound(model.name)
+              if (!verified) throw new NotFound(modelClassName(model))
               ctrl.record = verified
               return ctrl[mut.method](verified,
                 enforceMutationRules(mut, verified, (input as any).data, context, ctrl))
@@ -375,7 +384,7 @@ export function buildRouter<TContext = Record<string, any>>(
           // Pass ctrl so findBy can access this.state (e.g., org resolved by @before hook)
           const findBy = config.findBy(context, ctrl)
           const record = await singletonModel.findBy(findBy)
-          if (!record) throw new NotFound(singletonModel.name)
+          if (!record) throw new NotFound(modelClassName(singletonModel))
           const inc = config.get?.include ?? []
           if (inc.length) return rel.where(findBy).includes(...inc).first()
           return record
@@ -405,7 +414,7 @@ export function buildRouter<TContext = Record<string, any>>(
           if (typeof ctrl.update === 'function') return ctrl.update()
           const findBy = config.findBy(context, ctrl)
           const record = await singletonModel.findBy(findBy)
-          if (!record) throw new NotFound(singletonModel.name)
+          if (!record) throw new NotFound(modelClassName(singletonModel))
           // THE governed pipeline — the same permit/nested-sanitize/autoSet
           // path as CRUD update. (This handler previously ran its own weaker
           // permit filter: no nested sanitization, no nestedAutoSet, permit
@@ -434,7 +443,7 @@ export function buildRouter<TContext = Record<string, any>>(
           async (ctrl) => {
             const findBy = config.findBy(context, ctrl)
             const record = await singletonModel.findBy(findBy)
-            if (!record) throw new NotFound(model.name)
+            if (!record) throw new NotFound(modelClassName(model))
             return ctrl[mut.method](record,
               enforceMutationRules(mut, record, (input as any).data, context, ctrl))
           })
@@ -465,7 +474,7 @@ export function buildRouter<TContext = Record<string, any>>(
         // Pre-load primes this.record for @before hooks (URL scopes only —
         // scopeBy needs ctrl.state, which doesn't exist yet)
         const record = await rel.where({ id: (input as any).id }).first()
-        if (!record) throw new NotFound(crudModel!.name)
+        if (!record) throw new NotFound(modelClassName(crudModel!))
         return dispatch(
           ControllerClass, context as TContext, input as any, rel, act.method,
           async (ctrl) => {
@@ -476,7 +485,7 @@ export function buildRouter<TContext = Record<string, any>>(
             const verified = crud?.config?.scopeBy
               ? await ctrl.relation.where({ id: (input as any).id }).first()
               : record
-            if (!verified) throw new NotFound(crudModel!.name)
+            if (!verified) throw new NotFound(modelClassName(crudModel!))
             ctrl.record = verified
             return ctrl[act.method](verified, (input as any).data ?? input)
           },
@@ -525,8 +534,8 @@ export function buildRouter<TContext = Record<string, any>>(
         async (ctrl) => {
           // Look up attachment declaration on the model
           const core = await import('@active-drizzle/core' as string) as any
-          const modelClassName = crudModel?.name
-          const entry = modelClassName ? core.getAttachmentEntry(modelClassName, name) : null
+          const modelName = crudModel ? modelClassName(crudModel) : ''
+          const entry = modelName ? core.getAttachmentEntry(modelName, name) : null
           if (!entry) {
             throw new BadRequest(`Unknown attachment slot '${name}'`)
           }
@@ -571,7 +580,7 @@ export function buildRouter<TContext = Record<string, any>>(
             access,
             metadata: {
               attachmentName: name,
-              model: modelClassName,
+              model: modelName,
               scope: scopeStamp,
               [UPLOAD_TOKEN_KEY]: uploadToken,
             },
@@ -625,8 +634,9 @@ export function buildRouter<TContext = Record<string, any>>(
           // belonging to another tenant (or nobody) is a 404, never an oracle
           const scopeByValues = typeof crud?.config?.scopeBy === 'function' ? crud.config.scopeBy(ctrl) : {}
           const fieldByParam = new Map(scopes.map(s => [s.field, s.paramName]))
+          const crudModelName = crudModel ? modelClassName(crudModel) : ''
           assertAssetTouchable(asset, {
-            model: crudModel?.name ?? '',
+            model: crudModelName,
             uploadToken: (input as any).uploadToken,
             anchor: (key) => (scopeByValues as any)[key]
               ?? (input as any)[fieldByParam.get(key) ?? key],
@@ -634,11 +644,11 @@ export function buildRouter<TContext = Record<string, any>>(
           if (asset.status !== 'pending') throw new BadRequest('Asset is not in pending state')
 
           const attachmentName = (asset.metadata as any)?.attachmentName
-          if (!attachmentName || !crudModel?.name) {
+          if (!attachmentName || !crudModelName) {
             throw new BadRequest('Asset is missing attachment metadata')
           }
 
-          const entry = core.getAttachmentEntry(crudModel.name, attachmentName)
+          const entry = core.getAttachmentEntry(crudModelName, attachmentName)
           if (!entry) throw new BadRequest(`Unknown attachment slot '${attachmentName}'`)
 
           const storage = core.getStorage()
@@ -679,7 +689,7 @@ export function buildRouter<TContext = Record<string, any>>(
         async (ctrl) => {
           const { assetId, name: attachName, attachableId } = input as any
           const record = await ctrl.relation.where({ id: attachableId }).first()
-          if (!record) throw new NotFound(crudModel.name)
+          if (!record) throw new NotFound(modelClassName(crudModel))
 
           // Ownership: the RECORD is the anchor — it came through the door,
           // so its own scope columns are the authorized tenancy. The asset's
@@ -688,7 +698,7 @@ export function buildRouter<TContext = Record<string, any>>(
           const asset = await core.Asset.where({ id: assetId }).first()
           if (!asset) throw new NotFound('Asset')
           assertAssetTouchable(asset, {
-            model: crudModel.name,
+            model: modelClassName(crudModel),
             uploadToken: (input as any).uploadToken,
             anchor: (key) => (record as any)[key],
             requireReady: true,

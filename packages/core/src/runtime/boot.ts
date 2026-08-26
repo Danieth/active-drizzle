@@ -112,6 +112,16 @@ export function getSchema(): Record<string, any> {
 }
 
 /**
+ * The name of the database a table is bound to ('default' unless bindDatabase
+ * routed it elsewhere). save()/destroy() use it so their atomic transaction
+ * wrap opens on the MODEL's own connection — a wrap on 'default' would never
+ * capture writes routed to another bound database.
+ */
+export function databaseForTable(table: string): string {
+  return _tableDb.get(table) ?? 'default'
+}
+
+/**
  * Raised by Model.find(id) when no record with the given primary key exists.
  * Matches Rails' ActiveRecord::RecordNotFound semantics.
  *
@@ -142,6 +152,24 @@ export class AbortChain extends Error {
   constructor(message = 'Transaction aborted') {
     super(message)
     this.name = 'AbortChain'
+  }
+}
+
+/**
+ * Raised by save() when an optimistic-lock conflict is detected: the row's
+ * locking column no longer holds the value this record was loaded with, so a
+ * concurrent writer already advanced it. The compare-and-swap UPDATE matched
+ * zero rows — this record's write would silently clobber theirs. Mirrors
+ * Rails' ActiveRecord::StaleObjectError.
+ */
+export class StaleObjectError extends Error {
+  public readonly model: string
+  public readonly id: unknown
+  constructor(model: string, id: unknown) {
+    super(`${model} (id=${JSON.stringify(id)}) was updated concurrently — reload before retrying`)
+    this.name  = 'StaleObjectError'
+    this.model = model
+    this.id    = id
   }
 }
 
@@ -189,6 +217,10 @@ export async function transaction<T>(
     )
   }
 
+  // The enclosing transaction's afterCommit queue, if this call is nested.
+  // Captured BEFORE we push our own queue onto the async context.
+  const parentQueue = depth > 0 ? afterCommitQueue.getStore() : undefined
+
   const queue: Array<() => Promise<void>> = []
   const result = await db.transaction((tx: any) =>
     txDepth.run(depth + 1, () =>
@@ -196,9 +228,15 @@ export async function transaction<T>(
         transactionDbName.run(dbName, () => transactionContext.run(tx as GlobalDb, callback)))
     )
   )
-  // Fire afterCommit hooks only at the outermost transaction boundary
   if (depth === 0) {
+    // Outermost boundary — the real commit happened. Fire everything queued,
+    // including callbacks handed up from committed nested transactions.
     for (const fn of queue) await fn()
+  } else if (parentQueue) {
+    // Nested commit (a savepoint). Its afterCommit callbacks must NOT fire yet
+    // and must NOT be dropped — hand them up to the enclosing transaction so
+    // they run once, after the OUTERMOST commit (and never if it rolls back).
+    for (const fn of queue) parentQueue.push(fn)
   }
   return result
 }

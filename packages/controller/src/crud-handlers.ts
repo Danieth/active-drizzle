@@ -3,6 +3,7 @@
  * These are the 12-step index, get, create, update, destroy implementations.
  * Controllers that define their own methods override these automatically.
  */
+import { modelClassName } from '@active-drizzle/core'
 import { BadRequest, Conflict, NotFound, ValidationError, toValidationError } from './errors.js'
 import { getMutations, getScopes, collectFrontendContext } from './metadata.js'
 import { PROJECTION_NODE, sliceByProjection, type NormalizedNode } from './projection.js'
@@ -741,7 +742,7 @@ export async function defaultGet(
   let rel = relation.where({ id })
   if (includes.length) rel = rel.includes(...includes)
   const record = await rel.first()
-  if (!record) throw new NotFound(model.name)
+  if (!record) throw new NotFound(modelClassName(model))
   // FIXES-NEEDED #9: @after hooks on get read this.record (audit trails —
   // "record who read this"); it was silently null forever
   if (ctrl) ctrl.record = record
@@ -810,7 +811,7 @@ export async function defaultUpdate(
   ctrl?: any,
 ): Promise<any> {
   const record = await relation.where({ id }).first()
-  if (!record) throw new NotFound(model.name)
+  if (!record) throw new NotFound(modelClassName(model))
 
   const envelope = usesEnvelope(config)
 
@@ -832,7 +833,7 @@ export async function defaultUpdate(
     }
   }
 
-  const permitted = await buildGovernedWriteData(fields, config.update, ctx, model, ctrl, record)
+  const permitted = await buildGovernedWriteData(fields, effectiveUpdateConfig(config), ctx, model, ctrl, record)
   for (const [k, v] of Object.entries(permitted)) {
     (record as any)[k] = v
   }
@@ -947,7 +948,7 @@ export async function defaultDestroy(
   id: number | string,
 ): Promise<void> {
   const record = await relation.where({ id }).first()
-  if (!record) throw new NotFound(model.name)
+  if (!record) throw new NotFound(modelClassName(model))
   await record.destroy()
 }
 
@@ -1093,6 +1094,38 @@ export function applyNestedAutoSet(
 }
 
 /**
+ * The write config an UPDATE actually runs under.
+ *
+ * `nestedAutoSet` forces server-owned fields onto STAGED nested children —
+ * it is what closes the forged-fk gap (a client planting `userId` on a nested
+ * reaction). Forging a child fk is exactly as forbidden on EDIT as on create,
+ * but the canonical LLM-GUIDE example declares `nestedAutoSet` only under
+ * `create`. Without this fallback the gap reopens on every subsequent edit:
+ * the parent already exists, the client PATCHes a forged nested child, and
+ * nothing forces the owning column.
+ *
+ * So update inherits create's nestedAutoSet, per nested-path AND per forced
+ * field — update's own declaration wins on a conflict, create fills every gap
+ * it leaves. All other write-config keys (permit/restrict/autoSet) come from
+ * update untouched.
+ */
+export function effectiveUpdateConfig(
+  config: { create?: any; update?: any } | undefined,
+): any {
+  const update = config?.update
+  const createNAS = config?.create?.nestedAutoSet
+  if (!createNAS) return update
+  const merged: Record<string, any> = { ...createNAS }
+  const updateNAS = update?.nestedAutoSet
+  if (updateNAS) {
+    for (const [path, forcers] of Object.entries(updateNAS)) {
+      merged[path] = { ...(merged[path] ?? {}), ...(forcers as Record<string, any>) }
+    }
+  }
+  return { ...(update ?? {}), nestedAutoSet: merged }
+}
+
+/**
  * THE governed write pipeline — permit (record-aware) → nested-write
  * sanitize → nested autoSet forcing. Every write surface goes through this
  * one function: create, update, AND singleton update. A second, weaker
@@ -1193,7 +1226,22 @@ export function buildSearchDoc(record: any, config: CrudConfig): Record<string, 
 
 /**
  * Race-safe findOrCreate for singleton resources.
- * Uses INSERT ... then falls back to SELECT on unique constraint violation (23505).
+ *
+ * The recovery is STRUCTURAL, not message-sniffing. `create()` signals a
+ * failed insert in one of two ways depending on the runtime, and a unique
+ * violation (23505) can arrive as either:
+ *   - it RETURNS the unsaved instance (`isNewRecord === true`, errors set) —
+ *     the DB error was translated onto `.errors`, no throw; OR
+ *   - it THROWS (a raw driver error, or the pre-taxonomy stringly
+ *     `Error('Validation failed: …')` that a 23505 also produced).
+ *
+ * Matching on `e.code === '23505'` / `'duplicate key'` caught NEITHER of
+ * those reliably, so the race recovery was dead. For a SINGLETON the only
+ * recoverable outcome is "a concurrent writer already created the row", and
+ * that is detectable without decoding the error at all: re-query `findBy`.
+ * If the row now exists, the race resolved — return it. Otherwise the failure
+ * was genuine (real validation error, non-unique constraint) and we surface
+ * it as a 422, exactly like defaultCreate.
  */
 export async function singletonFindOrCreate(
   model: any,
@@ -1202,16 +1250,26 @@ export async function singletonFindOrCreate(
 ): Promise<any> {
   const existing = await model.findBy(findByClause)
   if (existing) return existing
+
+  let created: any
   try {
-    return await model.create({ ...defaultValues, ...findByClause })
+    created = await model.create({ ...defaultValues, ...findByClause })
   } catch (e: any) {
-    // Unique constraint violation — another concurrent request created it
-    if (e.code === '23505' || e.message?.includes('duplicate key')) {
-      const retried = await model.findBy(findByClause)
-      if (retried) return retried
-    }
+    // create() threw — a concurrent insert winning the race is the one
+    // recoverable case, detected structurally by re-querying. Anything else
+    // (a real programming bug) re-throws untouched.
+    const retried = await model.findBy(findByClause)
+    if (retried) return retried
     throw e
   }
+
+  // create() returned. A persisted record (isNewRecord false) is the happy
+  // path. An unsaved instance means the insert failed — recover the race, or
+  // surface the genuine validation failure.
+  if (!created?.isNewRecord) return created
+  const retried = await model.findBy(findByClause)
+  if (retried) return retried
+  throw toValidationError(created.errors)
 }
 
 // ── Auto-attach helper ────────────────────────────────────────────────────────
@@ -1233,7 +1291,7 @@ async function _autoAttach(
 
   try {
     core = await import('@active-drizzle/core' as string) as any
-    attachmentEntries = core.getAttachments(model.name)
+    attachmentEntries = core.getAttachments(modelClassName(model))
   } catch {
     return
   }
@@ -1251,7 +1309,7 @@ async function _autoAttach(
     const asset = await core.Asset.where({ id: assetId }).first()
     if (!asset) throw new NotFound('Asset')
     assertAssetTouchable(asset, {
-      model: model.name,
+      model: modelClassName(model),
       anchor: (key) => record[key],
       skipToken: true,        // the column write carries only ids — the
       requireReady: true,     // model+scope stamp is the whole proof here

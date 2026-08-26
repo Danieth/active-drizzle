@@ -57,6 +57,18 @@ export {
 } from './projection.js'
 export { buildContractProbes, runContractProbes, type ContractProbe, type ContractProbeFailure } from './contract-probes.js'
 
+// Controller-concern system (documented in LLM-GUIDE — must be reachable)
+export {
+  defineControllerConcern,
+  includeInController,
+  Searchable,
+  CONTROLLER_CONCERN_META,
+  type ControllerConcernDef,
+  type ControllerConcern,
+  type ControllerConcernMeta,
+  type SearchableConfig,
+} from './concerns/index.js'
+
 // Handlers (useful for custom overrides)
 export {
   defaultIndex,

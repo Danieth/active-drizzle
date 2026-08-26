@@ -276,7 +276,7 @@ All of it now ships from `active-drizzle`:
 
 ```ts
 import { include, SoftDeletable, Sluggable, Publishable, Trackable,
-         defineModelConcern } from 'active-drizzle'
+         defineModelConcern } from '@active-drizzle/core'
 
 @model('posts')
 @include(SoftDeletable, Sluggable({ from: 'title' }))
@@ -679,7 +679,7 @@ NODE_ENV at boot. Secrets are REFERENCED from `process.env`, never stored
 — the file commits, the values deploy.
 
 ```ts
-import { defineConfig } from 'active-drizzle'
+import { defineConfig } from '@active-drizzle/core'
 export default defineConfig({
   server:   { port: 8787 },
   channels: { bus: process.env.REDIS_URL ? 'redis' : 'memory',
@@ -702,7 +702,7 @@ the whole config surface is one grep.
 ## `trails new` — a working app in one command (built)
 
 ```sh
-npx trails new myapp        # (--link <monorepo> during pre-release)
+npx @active-drizzle/trails new myapp   # (--link <monorepo> during pre-release)
 cd myapp && npm install && npm run dev
 ```
 

@@ -166,6 +166,12 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   /** Baseline for the submit diff — reset on load and on successful submit. */
   private baseline: Record<string, any>
 
+  /** Parked nested payloads that arrived (restoreParked) BEFORE their manager
+   *  registered. Nested managers register lazily on first render, so a park
+   *  restore at build time would otherwise drop these — they are replayed the
+   *  moment the owning manager registers. Keyed by association name. */
+  private pendingParkedNested = new Map<string, any>()
+
   private listeners = new Map<string, Set<() => void>>()
   private versions = new Map<string, number>()
   private globalVersion = 0
@@ -265,6 +271,16 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   }): void {
     this.nested.set(name, manager)
     manager.setLocked(!this.canEditNested(name))
+    // A parked nested payload that arrived before this manager registered is
+    // replayed now — restoreParked ran at build time, the manager only exists
+    // on first render. Without this the parked child edits would be dropped.
+    if (this.pendingParkedNested.has(name)) {
+      const payload = this.pendingParkedNested.get(name)
+      this.pendingParkedNested.delete(name)
+      if (typeof (manager as any).restorePayload === 'function') {
+        ;(manager as any).restorePayload(payload)
+      }
+    }
   }
 
   getNested(name: string): unknown { return this.nested.get(name) }
@@ -488,6 +504,16 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   async submit(opts: { event?: string } = {}): Promise<boolean> {
     this.markSubmitAttempted()
 
+    // Never race an in-flight or scheduled autoFlush: a concurrent PATCH under
+    // the SAME version token self-inflicts a 409. Cancel any pending flush and
+    // let an in-flight one settle first — it advances the version token AND
+    // folds its diff into the baseline, so our changedData()/_version below is
+    // computed against the settled truth instead of colliding with it.
+    this.cancelAutoFlush()
+    if (this.autoFlushInFlight && this.autoFlushPromise) {
+      try { await this.autoFlushPromise } catch { /* the flush reports its own status */ }
+    }
+
     // Children (and grandchildren) gate the parent: any invalid row blocks
     const clientErrors = this.gateErrors()
     if (Object.keys(clientErrors).length > 0) {
@@ -519,6 +545,10 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
 
     if (result.ok) {
       this.serverErrors = {}
+      // A successful save settles any standing conflict bookkeeping: the
+      // version token just advanced, so a leftover incoming/withheld pair
+      // would let a later adoptIncoming roll the token BACKWARD.
+      this.clearConflictBookkeeping()
       if (result.envelope) this.applyEnvelope(result.envelope)
       // Children settle: destroyed rows drop, new rows adopt server ids —
       // recursively, so grandchildren re-key too (settleNested)
@@ -587,8 +617,12 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     }
 
     if (result.ok) {
-      if (result.envelope) this.applyEnvelope(result.envelope)
-      else this.baseline[field] = now[field]
+      // NARROW success application (never the whole-record applyEnvelope):
+      // a per-field PATCH must not clobber keystrokes the user typed into
+      // OTHER fields during the flight. applyFlushSuccess folds server truth
+      // into a field only when it is unchanged since the snapshot, and moves
+      // just this field's baseline — sibling dirty edits stay dirty.
+      this.applyFlushSuccess(result.envelope, { [field]: now[field] })
       this.pendingWrites.delete(field)
       this.fieldStates.set(field, 'saved')
       this.notify(field)
@@ -616,8 +650,13 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
       return false
     }
 
-    // Server rejected it (validation/auth) — roll back to what the server has
-    ;(this.draft as any)[field] = previous
+    // Server rejected it (validation/auth) — roll back to what the server has,
+    // but ONLY if the user hasn't typed something newer during the flight:
+    // rolling a mid-flight keystroke back to the pre-save baseline would erase
+    // input the user never saw fail.
+    if (valueEquals(this.snapshotDraft()[field], now[field])) {
+      ;(this.draft as any)[field] = previous
+    }
     this.pendingWrites.delete(field)
     if (result.status === 401 || result.status === 403) {
       this.status = 'unauthenticated'
@@ -656,6 +695,9 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   private autoFlushTimer: ReturnType<typeof setTimeout> | null = null
   private autoFlushInFlight = false
   private autoFlushQueued = false
+  /** The in-flight flush promise — awaited by submit() so a manual save
+   *  never races an autosave under the same version token (self-409). */
+  private autoFlushPromise: Promise<boolean> | null = null
   private pendingFlush = false
   private lastSavedAt: number | null = null
 
@@ -690,6 +732,18 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
    */
   async autoFlush(): Promise<boolean> {
     if (this.autoFlushInFlight) { this.autoFlushQueued = true; return false }
+    // Track the in-flight run so submit() can await it before sending (a
+    // manual save under the same version token would otherwise self-409).
+    const p = this._autoFlush()
+    this.autoFlushPromise = p
+    try {
+      return await p
+    } finally {
+      if (this.autoFlushPromise === p) this.autoFlushPromise = null
+    }
+  }
+
+  private async _autoFlush(): Promise<boolean> {
     if (!this.submitFn) return false
     // A standing conflict PAUSES autosave — retrying with the stale token
     // would 409 forever; resolveConflict() re-arms the flush
@@ -776,6 +830,10 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
    */
   private applyFlushSuccess(envelope: ServerEnvelope | undefined, flushed: Record<string, any>): void {
     if (envelope?.version !== undefined) this.version = envelope.version ?? null
+    // A landed save settles any standing conflict bookkeeping: the token just
+    // advanced, so a leftover withheld/incoming pair would let a later
+    // adoptIncoming roll it BACKWARD.
+    this.clearConflictBookkeeping()
     const rec = envelope?.record
     if (rec) {
       const now = this.snapshotDraft()
@@ -847,6 +905,9 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
         const name = k.slice(0, -'Attributes'.length)
         const manager: any = this.nested.get(name)
         if (manager && typeof manager.restorePayload === 'function') manager.restorePayload(mine)
+        // Manager not registered yet (lazy, on first render) — defer the
+        // restore until registerNested runs, otherwise the edit is dropped.
+        else this.pendingParkedNested.set(name, mine)
         continue
       }
       const storedBase = parked.baseline[k]
@@ -909,6 +970,16 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     if (!this.recentChanges.length) return
     this.recentChanges = []
     this.notifyAll()
+  }
+
+  /** Drop every trace of a standing conflict — the incoming set, the withheld
+   *  token, and the retained 409 envelope. Called wherever a fresh
+   *  authoritative version is adopted (submit/flush success, applyEnvelope),
+   *  so a stale withheld token can never be restored after the fact. */
+  private clearConflictBookkeeping(): void {
+    this.incomingMap = {}
+    this.withheldVersion = null
+    this.conflictEnvelope = null
   }
 
   // ── Optimistic concurrency (409 conflicts) ───────────────────────────────
@@ -1116,6 +1187,10 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     }
     if (envelope.can !== undefined) { this.canMap = envelope.can ?? {}; this.whyMap = envelope.why ?? {}; this.canGoverned = envelope.can != null }
     if (envelope.version !== undefined) this.version = envelope.version ?? null
+    // Server truth folded in wholesale → any standing conflict is resolved.
+    // Clearing here stops a later adoptIncoming from restoring the withheld
+    // (now stale) token and rolling the version BACKWARD.
+    this.clearConflictBookkeeping()
     this.serverIssues = envelope.issues ?? []
     // A save that silently dropped fields is a permit/UI mismatch — never
     // invisible. Loud in the console for the developer, on base for the user.

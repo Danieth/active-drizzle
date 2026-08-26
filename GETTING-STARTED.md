@@ -7,7 +7,7 @@ index surfaces + permission-governed everything out.
 ## 1. One command
 
 ```sh
-npx trails new myapp        # (--link <monorepo-path> while pre-release)
+npx @active-drizzle/trails new myapp   # (--link <monorepo-path> while pre-release)
 cd myapp
 npm install
 npm run dev                 # API :8787 + client :5173

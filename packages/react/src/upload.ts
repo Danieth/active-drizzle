@@ -95,6 +95,11 @@ export function useUploadFactory(
   const xhrRef = useRef<XMLHttpRequest | null>(null)
   const previewUrlRef = useRef<string | null>(initialAsset?.url ?? null)
   const mountedRef = useRef(true)
+  /** Run-generation token: each upload() bumps it. A superseded run (the user
+   *  picked a new file mid-flight) must not write its stale status/asset/error
+   *  over the run that replaced it. Every post-await state write is gated on
+   *  the run still being current. */
+  const runGenRef = useRef(0)
 
   useEffect(() => {
     mountedRef.current = true
@@ -129,6 +134,12 @@ export function useUploadFactory(
   }, [])
 
   const upload = useCallback(async (browserFile: File): Promise<AssetData> => {
+    // Claim this run. Any earlier in-flight run is now superseded: its
+    // post-await state writes will no-op (isCurrent === false), and _cleanup
+    // aborts its XHR. Bump BEFORE cleanup so the aborted XHR's handlers already
+    // see themselves as stale.
+    const myGen = ++runGenRef.current
+    const isCurrent = (): boolean => mountedRef.current && runGenRef.current === myGen
     _cleanup()
 
     // Set file info + preview immediately
@@ -165,7 +176,7 @@ export function useUploadFactory(
         name: attachmentMeta.name,
       })
     } catch (e: any) {
-      if (!mountedRef.current) throw e
+      if (!isCurrent()) throw e
       const msg = e?.message ?? 'Presign failed'
       setStatus('error')
       setError(msg)
@@ -173,7 +184,7 @@ export function useUploadFactory(
     }
 
     // XHR upload with progress
-    if (!mountedRef.current) throw new Error('Component unmounted')
+    if (!isCurrent()) throw new Error('Upload superseded')
     setStatus('uploading')
 
     await new Promise<void>((resolve, reject) => {
@@ -181,15 +192,18 @@ export function useUploadFactory(
       xhrRef.current = xhr
 
       xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable && mountedRef.current) {
+        if (e.lengthComputable && isCurrent()) {
           setLoaded(e.loaded)
           setTotal(e.total)
           setProgress(Math.round((e.loaded / e.total) * 100))
         }
       }
 
+      // Only relinquish the shared ref if it still points at THIS xhr — a
+      // newer run may already have installed its own.
+      const clearIfMine = () => { if (xhrRef.current === xhr) xhrRef.current = null }
       xhr.onload = () => {
-        xhrRef.current = null
+        clearIfMine()
         if (xhr.status >= 200 && xhr.status < 300) {
           resolve()
         } else {
@@ -198,12 +212,12 @@ export function useUploadFactory(
       }
 
       xhr.onerror = () => {
-        xhrRef.current = null
+        clearIfMine()
         reject(new Error('Upload failed — network error'))
       }
 
       xhr.onabort = () => {
-        xhrRef.current = null
+        clearIfMine()
         reject(new Error('Upload aborted'))
       }
 
@@ -211,14 +225,14 @@ export function useUploadFactory(
       xhr.setRequestHeader('Content-Type', browserFile.type)
       xhr.send(browserFile)
     }).catch((e) => {
-      if (!mountedRef.current) throw e
+      if (!isCurrent()) throw e
       setStatus('error')
       setError(e.message)
       throw e
     })
 
     // Confirm
-    if (!mountedRef.current) throw new Error('Component unmounted')
+    if (!isCurrent()) throw new Error('Upload superseded')
     setStatus('confirming')
 
     let confirmedAsset: AssetData
@@ -230,14 +244,14 @@ export function useUploadFactory(
         ...(presignResult.uploadToken ? { uploadToken: presignResult.uploadToken } : {}),
       })
     } catch (e: any) {
-      if (!mountedRef.current) throw e
+      if (!isCurrent()) throw e
       const msg = e?.message ?? 'Confirm failed'
       setStatus('error')
       setError(msg)
       throw e
     }
 
-    if (!mountedRef.current) throw new Error('Component unmounted')
+    if (!isCurrent()) throw new Error('Upload superseded')
     setStatus('ready')
     setProgress(100)
     setAsset(confirmedAsset)

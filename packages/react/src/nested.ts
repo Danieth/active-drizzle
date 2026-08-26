@@ -382,6 +382,17 @@ export class NestedArrayManager {
       this.children.filter(c => !c.isNew).map(c => (c.session.draft as any).id),
     )
     const fresh = (savedRows ?? []).filter(r => r?.id != null && !knownIds.has(r.id))
+    // New rows adopt their saved id by the `_key` we sent (attributesPayload
+    // stamps `_key: child.key`; the server echoes it back). Matching by _key —
+    // not array position — is the ONLY correct join: an echo whose order
+    // diverges from local order (server sort, filtered rows) would otherwise
+    // graft the wrong id onto a row and write to a sibling's record next save.
+    const freshByKey = new Map<string, any>()
+    const freshNoKey: any[] = []
+    for (const r of fresh) {
+      if (r?._key != null) freshByKey.set(String(r._key), r)
+      else freshNoKey.push(r)
+    }
     if (!savedRows && this.children.some(c => c.isNew)) {
       // Without the server echoing this association we cannot adopt the new
       // rows' ids — the next save would re-create them. Loud in dev.
@@ -391,11 +402,16 @@ export class NestedArrayManager {
         + `adopt their server ids (otherwise the next save duplicates them).`,
       )
     }
-    let i = 0
+    let np = 0
     for (const child of this.children) {
       let row: any
       if (child.isNew) {
-        row = fresh[i++]
+        // Prefer the _key match; fall back to positional only for echoes that
+        // carry no _key (older/hand-rolled servers) — preserving old behavior
+        // exactly when the server doesn't round-trip the key.
+        row = freshByKey.get(child.key)
+        if (row) freshByKey.delete(child.key)
+        else row = freshNoKey[np++]
         if (row) {
           ;(child.session.draft as any).id = row.id
           child.isNew = false

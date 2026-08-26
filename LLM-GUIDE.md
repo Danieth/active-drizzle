@@ -34,7 +34,7 @@ You write THREE files per resource; everything else is generated:
    — declares the API surface AND the permission model AND the generated
    client/form/index surfaces.
 
-Codegen (vite plugin `active-drizzle/vite`) writes EVERYTHING into
+Codegen (vite plugin `@active-drizzle/core/vite`) writes EVERYTHING into
 `.gen/` (gitignored; never edit): `.gen/models/` (Client classes + type
 augmentations + _registry) and `.gen/controllers/` (typed client + hooks +
 form handles + index surface per controller, `_coherence.gen.ts`,
@@ -53,7 +53,7 @@ const { router } = buildRouter(DealController)   // oRPC router
 ## 0.5 WORKING the framework (the operational loop)
 
 ```sh
-npx trails new myapp && cd myapp && npm install   # scaffold a WORKING app
+npx @active-drizzle/trails new myapp && cd myapp && npm install   # scaffold a WORKING app
 npm run dev            # API (tsx watch) + client (vite, codegen plugin) together
 npm run regen          # clean-room codegen WITHOUT vite (stale suspicion, CI)
 npm run typecheck      # tsc --noEmit — generated code is tsc-clean by contract
@@ -115,7 +115,7 @@ refused, always.
 ```ts
 import { ApplicationRecord, model, Attr, Validates, belongsTo, hasMany,
          hasOne, habtm, validate, scope, computed, beforeSave, afterCommit,
-         include, SoftDeletable, defineModelConcern } from 'active-drizzle'
+         include, SoftDeletable, defineModelConcern } from '@active-drizzle/core'
 
 @model('deals')                       // arg = schema EXPORT name
 export class Deal extends ApplicationRecord {
@@ -289,13 +289,14 @@ RULES:
   field's representation is model-owned (one codec everywhere).
 - Filters/named-filters/sorts/scopes are allowlists; undeclared = 400.
 - `apply` in named filters gets the ALREADY-SCOPED relation: narrowing only.
-- Custom endpoints: `@mutation() async archive() {...}`, `@query()`.
+- Custom endpoints: `@mutation() async archive() {...}` (writes; POST) and
+  `@action('GET') async stats() {...}` (reads; GET aggregation route, §3).
 
 ## 4. Frontend — forms (generated)
 
 ```tsx
 import { useDealEditForm, useDealNewForm, Deals, DealController }
-  from '../../server/controllers/deal.gen'
+  from '@gen/controllers'
 
 const { status, form: deal } = useDealEditForm(id)            // envelope-wired
 const { status, form: deal } = useDealEditForm(id, {          // poll until a backend job finishes
@@ -508,9 +509,13 @@ TWO types across doors (declare it once in a concern both extend).
 
 ## 8. Recent surfaces (2026-07-24) — one-liners, details in code/design docs
 
-- **Presenter layouts**: app-defined chrome wrapping every bulb —
-  `registerPresenterLayout(name, C, {default:true})`; bulbs become
-  value+bind. FUTURE canonical home is folder context.ts (GOLDEN-RULE.md).
+- **Layouts ARE context** (GOLDEN-RULE.md; DESIGN-presenter-tree.md): app-defined
+  chrome wrapping every bulb is declared in a folder's `context.ts` (layout +
+  the responsibilities it CONSUMES — errors, dirty, state, …); the stack wraps
+  every presenter beside/below and the bulb receives the REMAINDER (value+bind).
+  Regen errors when a required responsibility is handled NOWHERE on a path. The
+  transitional per-presenter registration API (`registerPresenterLayout`) was
+  DELETED in the tree phase — do not use it.
 - **Typed presenter values**: `PresenterPropsFor<'money'>` types value by
   kind (BuiltinKindShapes; AdKindShapes for custom kinds).
 - **@frontendContext**: server-computed props.ctx in every presenter

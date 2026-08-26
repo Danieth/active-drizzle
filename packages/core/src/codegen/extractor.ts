@@ -69,13 +69,7 @@ export function extractSchema(project: Project, schemaPath: string): SchemaMeta 
     const dbName = tableNameArg.getLiteralValue();
     const columns: ColumnMeta[] = [];
 
-    for (const prop of columnsArg.getProperties()) {
-      if (!Node.isPropertyAssignment(prop)) continue;
-      const colName = prop.getName().replace(/^"|"$/g, ''); // strip surrounding quotes
-      const colInit = prop.getInitializer();
-      if (!colInit || !Node.isCallExpression(colInit)) continue;
-      columns.push(extractColumn(colName, colInit, pgEnumMap));
-    }
+    collectColumns(columnsArg, columns, pgEnumMap, decl.getName());
 
     // Key by the EXPORT identifier, not the SQL name — the runtime resolves
     // tables through boot()'s schema object and db.query.*, both keyed by
@@ -94,6 +88,76 @@ export function extractSchema(project: Project, schemaPath: string): SchemaMeta 
   }
 
   return { tables, filePath: schemaPath };
+}
+
+/**
+ * Collects every column out of a pgTable() columns object, following spread
+ * properties (`...timestamps`) into their referenced object literal.
+ *
+ * The Drizzle-recommended shared-columns pattern —
+ *   const timestamps = { createdAt: timestamp('created_at'), … }
+ *   export const posts = pgTable('posts', { id: …, ...timestamps })
+ * — previously dropped every spread column SILENTLY (the loop skipped any
+ * non-PropertyAssignment), so the generated model lost `createdAt`/`updatedAt`
+ * entirely. We now resolve the spread's symbol to its object-literal
+ * initializer and inline its columns; a spread we can't statically resolve to
+ * an object literal is a loud teaching error rather than a silent omission.
+ */
+function collectColumns(
+  obj: ObjectLiteralExpression,
+  out: ColumnMeta[],
+  pgEnumMap: Map<string, string[]>,
+  tableName: string,
+  depth = 0,
+): void {
+  if (depth > 10) return; // guard against pathological circular spreads
+  for (const prop of obj.getProperties()) {
+    if (Node.isPropertyAssignment(prop)) {
+      const colName = prop.getName().replace(/^["']|["']$/g, ''); // strip surrounding quotes
+      const colInit = prop.getInitializer();
+      if (!colInit || !Node.isCallExpression(colInit)) continue;
+      out.push(extractColumn(colName, colInit, pgEnumMap));
+      continue;
+    }
+    if (Node.isSpreadAssignment(prop)) {
+      const inner = resolveToObjectLiteral(prop.getExpression());
+      if (!inner) {
+        throw new Error(
+          `[active-drizzle] table '${tableName}': spread \`${prop.getText()}\` could not be ` +
+          `resolved to a plain object literal of columns. codegen reads columns statically — ` +
+          `define the shared columns as a top-level \`const <name> = { … }\` object (Drizzle's ` +
+          `recommended pattern) so the spread points at a literal it can inline.`,
+        );
+      }
+      collectColumns(inner, out, pgEnumMap, tableName, depth + 1);
+      continue;
+    }
+    // Other property kinds (shorthand, methods) aren't valid column defs — skip.
+  }
+}
+
+/**
+ * Resolves an expression appearing in a spread position to the object literal
+ * it ultimately refers to, following a single variable declaration (and simple
+ * `as const` / parenthesized wrappers). Returns null when it isn't statically
+ * an object literal.
+ */
+function resolveToObjectLiteral(expr: Node): ObjectLiteralExpression | null {
+  let cur: Node | undefined = expr;
+  // Unwrap `x as const`, `(x)`, `x satisfies T`
+  while (cur && (Node.isAsExpression(cur) || Node.isParenthesizedExpression(cur) || Node.isSatisfiesExpression?.(cur))) {
+    cur = (cur as any).getExpression();
+  }
+  if (!cur) return null;
+  if (Node.isObjectLiteralExpression(cur)) return cur;
+  if (Node.isIdentifier(cur)) {
+    const decl = cur.getSymbol()?.getValueDeclaration();
+    if (decl && Node.isVariableDeclaration(decl)) {
+      const init = decl.getInitializer();
+      if (init) return resolveToObjectLiteral(init);
+    }
+  }
+  return null;
 }
 
 /**
@@ -210,7 +274,15 @@ function extractColumn(
       const mod = expr.getName();
       if (mod === 'notNull')    nullable = false;
       if (mod === 'primaryKey') primaryKey = true;
-      if (mod === 'default' || mod === 'defaultNow') hasDefault = true;
+      // Drizzle defaults: `.default(v)` / `.defaultNow()` are DB-side; the
+      // `$`-prefixed forms (`$default`, `$defaultFn`, `$onUpdate`,
+      // `$onUpdateFn`) are runtime-side but STILL supply a value the writer
+      // need not provide — so all of them make the column optional on Create.
+      if (
+        mod === 'default' || mod === 'defaultNow' ||
+        mod === '$default' || mod === '$defaultFn' ||
+        mod === '$onUpdate' || mod === '$onUpdateFn'
+      ) hasDefault = true;
       if (mod === 'array')      isArray = true;
       // generatedAlwaysAsIdentity / generatedByDefaultAsIdentity
       if (mod === 'generatedAlwaysAsIdentity' || mod === 'generatedByDefaultAsIdentity') {
@@ -229,7 +301,10 @@ function extractColumn(
       } else if (pgEnumMap.has(typeName)) {
         type          = 'pgEnum';
         pgEnumValues  = pgEnumMap.get(typeName)!;
-        nullable      = false; // pgEnum columns are NOT NULL by default in Drizzle unless .nullable() called
+        // Do NOT force NOT NULL here: a pgEnum column follows the same rule as
+        // every other Drizzle column — nullable by default, made NOT NULL only
+        // by an explicit `.notNull()` in the chain (handled above). Forcing it
+        // unconditionally gave nullable enum columns a lying non-null type.
       }
       const firstArg = current.getArguments()[0];
       if (firstArg && Node.isStringLiteral(firstArg)) dbName = firstArg.getLiteralValue();
@@ -250,20 +325,26 @@ function toCamelCase(s: string): string {
 // extractModel
 // ---------------------------------------------------------------------------
 
-export function extractModel(project: Project, modelPath: string): ModelMeta {
+/**
+ * Extracts EVERY model class declared in a file — the base model plus any
+ * co-located STI subclass. A model file commonly holds the base and its
+ * subclasses together (the layout the STI guard below endorses); reading only
+ * `getClasses()[0]` made every class after the first invisible to codegen, so
+ * a co-located subclass' associations/enums/states/table never generated.
+ */
+export function extractModels(project: Project, modelPath: string): ModelMeta[] {
   const sourceFile = project.getSourceFile(modelPath);
   if (!sourceFile) throw new Error(`Model file not found at ${modelPath}`);
 
-  const classDecl = sourceFile.getClasses()[0];
-  if (!classDecl) throw new Error(`No class found in ${modelPath}`);
+  const allClasses = sourceFile.getClasses();
+  if (allClasses.length === 0) throw new Error(`No class found in ${modelPath}`);
 
   // TEACHING GUARD (bug #6): an STI subclass with `static stiType` but NO
   // @model decorator never registers — parent-table queries then SILENTLY
   // instantiate the BASE class for its rows (writes/counts/scoping all look
   // fine; only read-side downcast is wrong, and nothing warns). Scan EVERY
-  // class in the file — subclasses typically share the base's file and
-  // classes[1..n] were previously invisible here.
-  for (const cls of sourceFile.getClasses()) {
+  // class in the file — subclasses typically share the base's file.
+  for (const cls of allClasses) {
     const declaresSti = cls.getStaticProperties().some(
       p => Node.isPropertyDeclaration(p) && p.getName() === 'stiType',
     );
@@ -278,6 +359,23 @@ export function extractModel(project: Project, modelPath: string): ModelMeta {
     }
   }
 
+  // Every @model-decorated class is a model. When none is decorated, fall back
+  // to the first class (models declared via `static _activeDrizzleTableName`).
+  const decorated = allClasses.filter(c => c.getDecorator('model'));
+  const modelClasses = decorated.length > 0 ? decorated : [allClasses[0]!];
+
+  return modelClasses.map(cls => extractModelFromClass(cls, modelPath));
+}
+
+/**
+ * Extracts the FIRST model in a file. Retained for the many single-model
+ * call-sites and tests; delegates to {@link extractModels}.
+ */
+export function extractModel(project: Project, modelPath: string): ModelMeta {
+  return extractModels(project, modelPath)[0]!;
+}
+
+function extractModelFromClass(classDecl: ClassDeclaration, modelPath: string): ModelMeta {
   const className = classDecl.getName() ?? 'Unknown';
   const extendsClass = classDecl.getExtends()?.getExpression().getText() ?? 'ApplicationRecord';
   const isSti = extendsClass !== 'ApplicationRecord';
@@ -1003,8 +1101,14 @@ function extractPropertyValidations(classDecl: ClassDeclaration): {
   const analysis: Record<string, PropertyValidationAnalysis> = {};
   for (const prop of classDecl.getStaticProperties()) {
     if (!Node.isPropertyDeclaration(prop)) continue;
-    const init = prop.getInitializer();
-    if (!init || !Node.isCallExpression(init)) continue;
+    const rawInit = prop.getInitializer();
+    if (!rawInit) continue;
+    // Unwrap chained modifiers (`Attr.string({ validate }).encrypt()`) to the
+    // inner Attr.* call whose config object actually carries `validate(s)`.
+    // Without this, a chained Attr silently dropped its client-side validations.
+    const resolved = resolveAttrCall(rawInit);
+    if (!resolved) continue;
+    const init = resolved.call;
 
     // Attr.*(…, { validate / validates: … })
     for (const arg of init.getArguments()) {
