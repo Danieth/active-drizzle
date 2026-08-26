@@ -18,7 +18,7 @@ import { inferControllerPath } from './decorators.js'
 import {
   defaultIndex, defaultGet, defaultCreate, defaultUpdate, defaultDestroy,
   singletonFindOrCreate, enforceMutationRules, sanitizeMutationPayload,
-  buildGovernedWriteData, applyAutoAttach,
+  buildGovernedWriteData, applyAutoAttach, effectiveUpdateConfig,
 } from './crud-handlers.js'
 import { BadRequest, Conflict, HttpError, NotFound, ValidationError, toValidationError, serializeError } from './errors.js'
 import { assertAssetTouchable, generateUploadToken, UPLOAD_TOKEN_KEY } from './attach-guard.js'
@@ -419,8 +419,13 @@ export function buildRouter<TContext = Record<string, any>>(
           // path as CRUD update. (This handler previously ran its own weaker
           // permit filter: no nested sanitization, no nestedAutoSet, permit
           // functions never saw the record.)
+          // effectiveUpdateConfig: create.nestedAutoSet fills the gaps
+          // update leaves — identical to the CRUD update path, so a
+          // singleton whose config declares nestedAutoSet under create-only
+          // still forces the owning fk on nested children during PATCH
+          // (the singleton forged-fk gap, closed; invariant restored).
           const permitted = await buildGovernedWriteData(
-            (input as any).data, config.update, context, singletonModel, ctrl, record,
+            (input as any).data, effectiveUpdateConfig(config), context, singletonModel, ctrl, record,
           )
           for (const [k, v] of Object.entries(permitted)) (record as any)[k] = v
           if (!(await record.save())) throw toValidationError(record.errors)

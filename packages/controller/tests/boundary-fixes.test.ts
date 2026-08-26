@@ -20,8 +20,7 @@ import { ActiveController } from '../src/base.js'
 import { buildRouter } from '../src/router.js'
 import {
   defaultGet, defaultDestroy, defaultUpdate,
-  singletonFindOrCreate, effectiveUpdateConfig,
-} from '../src/crud-handlers.js'
+  singletonFindOrCreate, effectiveUpdateConfig } from '../src/crud-handlers.js'
 import { ValidationError } from '../src/errors.js'
 import * as controllerPkg from '../src/index.js'
 
@@ -273,5 +272,19 @@ describe('controller-concern system is reachable from the package entry', () => 
     expect(typeof controllerPkg.defineControllerConcern).toBe('function')
     expect(typeof controllerPkg.includeInController).toBe('function')
     expect(typeof controllerPkg.Searchable).toBe('object')
+  })
+})
+
+describe('singleton update inherits create.nestedAutoSet (divergence closed)', () => {
+  it('effectiveUpdateConfig is applied on the singleton path too', () => {
+    const config = {
+      create: { nestedAutoSet: { 'notes.reactions': { userId: () => 42 } } },
+      update: { permit: ['theme'] },
+    }
+    const eff = effectiveUpdateConfig(config)
+    // the create-declared forcer survives into the update config (both CRUD
+    // and singleton PATCH pass config THROUGH this same helper now)
+    expect(eff.nestedAutoSet['notes.reactions'].userId()).toBe(42)
+    expect(eff.permit).toEqual(['theme'])
   })
 })

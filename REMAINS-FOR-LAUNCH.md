@@ -10,6 +10,38 @@ Suites baseline at time of writing: core 1098 / controller 299 / react 251.
 
 ---
 
+
+## BURN-DOWN STATUS (2026-08-26, commit 0d23c7f + follow-up)
+
+Most of TIER 0 + TIER 1 landed via the 5-cluster parallel burn-down (core
+1137 / controller 318 / react 266, all green; demo regen clean). DONE:
+codec chokepoint (write side), atomic save/destroy, create()→422 contract,
+_clone flags, CAS lock, afterCommit nested-tx merge, last()/inBatches,
+find() STI, codegen watch-staleness/unlink/spread/escaping/failure-channel,
+model.name→modelClassName, bulk ids:[], nestedAutoSet (CRUD + singleton),
+concern exports, npm identity in scaffolder+docs, doc-lies, and the react
+state-machine cluster.
+
+STILL OPEN (explicit follow-ups, tracked here so nothing silently drops):
+- [ ] CODEC READ-SIDE COHERENCE: the WRITE boundary (mapWriteAttributes) is
+      genuine, but toJSON/get-trap/defaults READ paths still inline
+      `attr._column ?? key` + `.get` rather than routing through one helper.
+      Behavior is CORRECT + tested — this is a DRY/coherence cleanup, NOT a
+      bug. Deferred deliberately (serialization is delicate; not worth a
+      regression under the burn-down). Wire reads through the boundary +
+      delete the now-dead toDisplayValue/attrConfigFor exports.
+- [ ] SCALAR AGGREGATE UNITS: sum/avg/min/max return RAW db units (cents) for
+      property-named codec fields. The core agent correctly REFUSED to flip
+      this — pinned integration tests + a documented design decision (Attr
+      aggregation is intentionally raw-unit). Needs a cross-cutting owner
+      decision, not a unilateral change.
+- [ ] STABLE ERROR-CODE TAXONOMY (reviewer #4): the create() throw→return
+      contract that unblocked 422 landed, but machine-readable codes
+      (code:'blank'|'taken'|…) on every validation/DB error are still TODO —
+      breaking to add later, so pre-launch.
+- [ ] ENCRYPTION carve-out + blind indexes; SSR/RSC doc pass; generated-
+      output CI gate — Tier 1 items not in this burn-down's scope.
+
 ## TIER 0 — 🔴 CANNOT SHIP WITHOUT (correctness + installability)
 
 ### The codec chokepoint (ONE refactor kills 8 confirmed bugs)

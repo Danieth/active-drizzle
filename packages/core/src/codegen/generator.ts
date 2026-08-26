@@ -276,7 +276,7 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta, srcPr
   lines.push(`      validate(path?: string): Record<string, string[]>`);
   const clientEvents = chainStates.flatMap(st => st.transitions.map(t => t.event));
   if (clientEvents.length > 0) {
-    lines.push(`      can(event: ${clientEvents.map(e => `'${e}'`).join(' | ')}): boolean`);
+    lines.push(`      can(event: ${clientEvents.map(e => jsString(e)).join(' | ')}): boolean`);
   }
   if (chain.some(m => Object.keys(m.fieldMeta ?? {}).length > 0)) {
     lines.push(`      static fieldMeta: Record<string, unknown>`);
@@ -506,7 +506,7 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta, sr
           const provable = t.guardDeps && !t.guardDepsError && depsFitProjection(t.guardDeps, clientProjection);
           guardCheck = provable ? `Boolean((${t.guardSource})(this as any))` : 'false';
         }
-        lines.push(`    if (event === '${t.event}') return ${fromCheck} && ${guardCheck};`);
+        lines.push(`    if (event === ${jsString(t.event)}) return ${fromCheck} && ${guardCheck};`);
       }
     }
     lines.push(`    return false;`);
