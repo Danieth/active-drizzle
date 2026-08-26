@@ -86,6 +86,11 @@ export class NestedArrayManager {
   private instant = false
   private transport?: NestedTransport
   private foreignKey?: string
+  /** Children whose instant CREATE is still on the wire. The instant op owns
+   *  the row until it settles: parent payloads must skip it (restaging the
+   *  id-less copy would double-create the record), echo-id adoption must not
+   *  re-key it, and a server sync must not drop it (the echo predates it). */
+  private pendingInstant = new Set<NestedChild>()
 
   constructor(
     parent: FormSession<any>,
@@ -185,7 +190,10 @@ export class NestedArrayManager {
     // Instant: persist immediately and adopt the server id; on failure the
     // optimistic row is removed. When the parent is still new, this no-ops
     // and the row stages into the parent save.
-    if (this.isInstant()) void this.instantCreate(child)
+    if (this.isInstant()) {
+      this.pendingInstant.add(child)
+      void this.instantCreate(child)
+    }
     return child
   }
 
@@ -195,7 +203,15 @@ export class NestedArrayManager {
     if (this.foreignKey) payload[this.foreignKey] = this.parentId()
     let res: { ok: boolean; row?: Record<string, any>; error?: unknown }
     try { res = await this.transport!.create(payload) } catch (e) { res = { ok: false, error: e } }
+    this.pendingInstant.delete(child)
     if (res.ok && res.row?.id != null) {
+      // A concurrent parent echo may have already synced in the SERVER's copy
+      // of this row — the settling optimistic child IS that row, so the
+      // synced duplicate drops instead of rendering twice.
+      const dupe = this.children.findIndex(
+        c => c !== child && !c.isNew && (c.session.draft as any).id === res.row!.id,
+      )
+      if (dupe !== -1) this.children.splice(dupe, 1)
       ;(child.session.draft as any).id = res.row.id
       child.isNew = false
       child.key = `id:${res.row.id}`
@@ -314,6 +330,9 @@ export class NestedArrayManager {
       if (child.destroyed) {
         if (this.allowDestroy) out.push({ id: draft.id, _destroy: true })
       } else if (child.isNew) {
+        // An in-flight instant create owns this row — restaging the id-less
+        // copy here would have the server create it a SECOND time
+        if (this.pendingInstant.has(child)) continue
         const data = { ...child.session.changedData() }
         // A brand-new row's ENTIRE draft is its diff (baseline was the
         // defaults) — except raw grandchild arrays: those fold as
@@ -393,7 +412,7 @@ export class NestedArrayManager {
       if (r?._key != null) freshByKey.set(String(r._key), r)
       else freshNoKey.push(r)
     }
-    if (!savedRows && this.children.some(c => c.isNew)) {
+    if (!savedRows && this.children.some(c => c.isNew && !this.pendingInstant.has(c))) {
       // Without the server echoing this association we cannot adopt the new
       // rows' ids — the next save would re-create them. Loud in dev.
       console.warn(
@@ -406,6 +425,10 @@ export class NestedArrayManager {
     for (const child of this.children) {
       let row: any
       if (child.isNew) {
+        // A row whose instant create is still on the wire takes its identity
+        // from THAT response, never from this echo — adopting here (by _key
+        // or position) could graft a sibling's id onto it
+        if (this.pendingInstant.has(child)) continue
         // Prefer the _key match; fall back to positional only for echoes that
         // carry no _key (older/hand-rolled servers) — preserving old behavior
         // exactly when the server doesn't round-trip the key.
@@ -533,6 +556,11 @@ export class NestedArrayManager {
         destroyed: false,
       }
     })
+    // A row whose instant create is still on the wire is not the server's to
+    // drop — this snapshot predates it. Its own settle re-keys (or removes) it.
+    for (const child of this.pendingInstant) {
+      if (!this.children.includes(child)) this.children.push(child)
+    }
     this.parent.notifyExternal(this.name)
   }
 }

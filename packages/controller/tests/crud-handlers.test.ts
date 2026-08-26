@@ -222,12 +222,16 @@ describe('defaultUpdate optimistic lock', () => {
     expect(record.name).toBe('after')
   })
 
-  it('a NUMERIC lock field auto-increments on every governed update', async () => {
+  it('a NUMERIC lock field is NOT written by the controller — core CAS owns bump + WHERE guard', async () => {
     const record = makeRecord({ lockVersion: 3 })
     const relation = makeRelation(record)
     const config: any = { update: { permit: ['name'], optimisticLock: 'lockVersion' } }
     await defaultUpdate(relation, { name: 'Deal' }, config, 1, { name: 'after', _version: '3' }, {}, {})
-    expect(record.lockVersion).toBe(4)
+    // Writing the lock column would put it in the save payload, and core's
+    // compare-and-swap (auto-bump + WHERE version guard) only engages when
+    // the column is ABSENT from the payload — a controller-side bump used
+    // to disarm it, silently reopening the load→save race.
+    expect(record.lockVersion).toBe(3)
     expect(record.save).toHaveBeenCalled()
   })
 

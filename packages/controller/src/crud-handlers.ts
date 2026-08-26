@@ -133,6 +133,15 @@ function versionToken(record: any, field: string): string | null {
 }
 
 /**
+ * Duck-type check for core's StaleObjectError — thrown when save()'s
+ * compare-and-swap on the lock column matches zero rows (same
+ * no-hard-dep pattern as isRecordNotFound in router.ts).
+ */
+export function isStaleObjectError(e: unknown): boolean {
+  return e instanceof Error && (e as any).name === 'StaleObjectError'
+}
+
+/**
  * Static [key, value] pairs INCLUDING statics inherited from STI parents —
  * the controller-side mirror of core's modelStaticEntries (duck-typed, no
  * core dep). An own-properties-only scan makes an STI subclass controller
@@ -838,13 +847,13 @@ export async function defaultUpdate(
     (record as any)[k] = v
   }
 
-  // lock_version-style NUMERIC lock fields advance server-side on every
-  // governed update — the client never writes them (timestamp locks advance
-  // via the model's own touch instead)
-  if (lock) {
-    const rawLockVal = (record as any)[lock] ?? (record as any)._attributes?.[lock]
-    if (typeof rawLockVal === 'number') (record as any)[lock] = rawLockVal + 1
-  }
+  // NUMERIC lock columns are deliberately NOT bumped here. Core's save()
+  // compare-and-swaps (auto-bump + WHERE version guard) only when the lock
+  // column is ABSENT from the save payload — a controller-side pre-bump puts
+  // it in the payload and disarms exactly that guard, reopening the
+  // load→save race the CAS exists to close. The _version pre-check above is
+  // the friendly stale-client 409; core's StaleObjectError (caught at save
+  // below) is the correctness backstop for the race window.
 
   // Fire the transition in the SAME save as the field diff — there is no
   // saved-but-not-transitioned limbo. Guard failure ⇒ 422 transition_blocked.
@@ -861,7 +870,21 @@ export async function defaultUpdate(
     }
   }
 
-  if (!(await record.save())) throw toValidationError(record.errors)
+  let saved: boolean
+  try {
+    saved = await record.save()
+  } catch (e) {
+    if (!isStaleObjectError(e)) throw e
+    // Core's CAS lost the load→save race: a concurrent commit landed after
+    // the pre-check. Same conflict, same 409 — but the envelope must come
+    // from a RE-FETCH: the in-memory record now carries the client's
+    // rejected values, not the server truth the reload/overwrite UI needs.
+    const fresh = envelope ? await relation.where({ id }).first() : null
+    throw new Conflict(fresh
+      ? buildRecordEnvelope(await reloadWithIncludes(relation, config, id, fresh, model), model, config, ctx, ctrl)
+      : undefined)
+  }
+  if (!saved) throw toValidationError(record.errors)
   // Auto-attach: resolve permit list before passing (may be a function)
   const updatePermitRaw = config.update?.permit ?? config.create?.permit
   const updatePermit = typeof updatePermitRaw === 'function'

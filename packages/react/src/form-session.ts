@@ -502,6 +502,20 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
    * fields; unknown fields land on base. On 401, the draft SURVIVES (C15).
    */
   async submit(opts: { event?: string } = {}): Promise<boolean> {
+    // The counter spans the WHOLE submit — including the await on an
+    // in-flight flush — so autosave can never race it: the flush tail
+    // suppresses its follow-up re-arm, and any timer already armed finds
+    // the guard in _autoFlush. Counted, not boolean: an overlapping submit
+    // finishing first must not lift the guard early.
+    this.submitsInFlight++
+    try {
+      return await this._submit(opts)
+    } finally {
+      this.submitsInFlight--
+    }
+  }
+
+  private async _submit(opts: { event?: string } = {}): Promise<boolean> {
     this.markSubmitAttempted()
 
     // Never race an in-flight or scheduled autoFlush: a concurrent PATCH under
@@ -695,6 +709,9 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
   private autoFlushTimer: ReturnType<typeof setTimeout> | null = null
   private autoFlushInFlight = false
   private autoFlushQueued = false
+  /** >0 while a manual submit() is anywhere in progress — autosave must not
+   *  issue a PATCH under the same version token (self-409); see submit(). */
+  private submitsInFlight = 0
   /** The in-flight flush promise — awaited by submit() so a manual save
    *  never races an autosave under the same version token (self-409). */
   private autoFlushPromise: Promise<boolean> | null = null
@@ -748,6 +765,10 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
     // A standing conflict PAUSES autosave — retrying with the stale token
     // would 409 forever; resolveConflict() re-arms the flush
     if (this.status === 'conflict') return false
+    // A manual submit owns the wire: a flush now would ride the same version
+    // token and self-409. The submit's diff — computed after any in-flight
+    // flush settles — already carries this dirt.
+    if (this.submitsInFlight > 0) return false
     if (!this.isDirty()) return true
     if (Object.keys(this.gateErrors()).length > 0) return false   // stays local
 
@@ -812,8 +833,13 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
       this.notifyAll()
     }
 
-    // Mid-flight edits (or coalesced requests) ride the next flush
-    if (this.autoFlushQueued) {
+    // Mid-flight edits (or coalesced requests) ride the next flush — unless a
+    // manual submit is pending on THIS flush: its diff is computed after we
+    // settle, so the residue rides the submit instead of racing it (the
+    // re-armed timer would fire mid-submit and PATCH under the same token).
+    if (this.submitsInFlight > 0) {
+      this.autoFlushQueued = false
+    } else if (this.autoFlushQueued) {
       this.autoFlushQueued = false
       if (this.isDirty()) this.requestAutoFlush(0)
     } else if (result.ok && this.isDirty()) {
@@ -829,11 +855,18 @@ export class FormSession<T extends Record<string, any> = Record<string, any>> {
    * way, so mid-flight edits stay dirty and ride the next flush.
    */
   private applyFlushSuccess(envelope: ServerEnvelope | undefined, flushed: Record<string, any>): void {
-    if (envelope?.version !== undefined) this.version = envelope.version ?? null
-    // A landed save settles any standing conflict bookkeeping: the token just
-    // advanced, so a leftover withheld/incoming pair would let a later
-    // adoptIncoming roll it BACKWARD.
-    this.clearConflictBookkeeping()
+    // Conflict bookkeeping settles only on an actual token ADVANCE (a
+    // leftover withheld/incoming pair would let a later adoptIncoming roll
+    // the token backward). On UNVERSIONED forms no token ever advances, and
+    // a partial save (per-field autosave of an unrelated field) must not
+    // erase the standing changed-elsewhere record for a still-contested
+    // field — without a lock, that affordance is the only overwrite guard.
+    // A field the write DID land self-heals on the next poll: theirs==mine
+    // settles the entry out of the map.
+    if (envelope?.version !== undefined) {
+      this.version = envelope.version ?? null
+      this.clearConflictBookkeeping()
+    }
     const rec = envelope?.record
     if (rec) {
       const now = this.snapshotDraft()

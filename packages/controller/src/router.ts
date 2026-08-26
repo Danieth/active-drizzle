@@ -19,6 +19,7 @@ import {
   defaultIndex, defaultGet, defaultCreate, defaultUpdate, defaultDestroy,
   singletonFindOrCreate, enforceMutationRules, sanitizeMutationPayload,
   buildGovernedWriteData, applyAutoAttach, effectiveUpdateConfig,
+  isStaleObjectError,
 } from './crud-handlers.js'
 import { BadRequest, Conflict, HttpError, NotFound, ValidationError, toValidationError, serializeError } from './errors.js'
 import { assertAssetTouchable, generateUploadToken, UPLOAD_TOKEN_KEY } from './attach-guard.js'
@@ -141,10 +142,18 @@ export function buildRouter<TContext = Record<string, any>>(
         throw new ORPCError('NOT_FOUND', { message: (e as Error).message })
       }
 
-      // 3. HttpError subclasses (BadRequest, Unauthorized, etc.) → oRPC error
+      // 3. Auto-rescue: StaleObjectError from core's CAS → 409. A mid-request
+      // race (a concurrent commit between an action's load and its save) is
+      // the same conflict the client's reload/overwrite machinery already
+      // handles — it must never surface as a 500. (defaultUpdate catches it
+      // earlier to attach the fresh envelope; this is the backstop for
+      // custom actions, mutations, and the singleton update.)
+      if (isStaleObjectError(e)) throw httpToOrpc(new Conflict())
+
+      // 4. HttpError subclasses (BadRequest, Unauthorized, etc.) → oRPC error
       if (e instanceof HttpError) throw httpToOrpc(e)
 
-      // 4. Re-throw unknown errors as-is
+      // 5. Re-throw unknown errors as-is
       throw e
     }
   }
@@ -599,6 +608,12 @@ export function buildRouter<TContext = Record<string, any>>(
           }
 
           const asset = await Asset.create(assetData)
+          // create() returns the instance even when the INSERT failed
+          // (isNewRecord stays true, errors populated) — gate BEFORE
+          // presigning, or a phantom asset ships with a LIVE upload URL:
+          // the client uploads, confirm can never find the row, and the
+          // blob is orphaned outside the pending-row sweep.
+          if (asset.isNewRecord) throw toValidationError(asset.errors)
 
           // Generate presigned PUT URL with Content-Length conditions
           const { url: uploadUrl } = await storage.presignPut(key, contentType, maxSize)
