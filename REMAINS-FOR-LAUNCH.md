@@ -21,12 +21,12 @@ composite-PK, react-generator escaping twins, watcher red-gate, unlink
 sweep, STI self-import).
 
 STILL OPEN — tracked residuals (source in parens):
-- [ ] TAXONOMY THREADING in application-record.ts: switch validate to
+- [x] TAXONOMY THREADING in application-record.ts: switch validate to
       runValidatorsDetailed; code the implicit not-null ('blank'),
       state-machine ('invalid_event'/'invalid_transition'), nested
       ('nested_invalid'), and translateDbError.errorCode sites. Foundation +
       wire + controller lane landed (b684e83, 11ec88e). (mine, post-merge)
-- [ ] GENERATOR BARE-NAME EMISSIONS: generator.ts:99,399 emit
+- [x] GENERATOR BARE-NAME EMISSIONS: generator.ts:99,399 emit
       `from 'active-drizzle'` into generated code — masked in the demo by a
       legacy dual-alias dep; a FRESH scaffolded app breaks on first regen.
       (SSR/RSC pass, post-codegen-merge)
@@ -34,7 +34,7 @@ STILL OPEN — tracked residuals (source in parens):
       non-identifier chars breaks generated METHOD NAMES
       (`statusIsWon'tFix()`); string-literal positions are now escaped, but
       identifier positions need sanitize-or-refuse. (wave-2 codegen fixer)
-- [ ] _KEY SERVER ECHO: the client matches nested new-row ids by `_key`, but
+- [x] _KEY SERVER ECHO: the client matches nested new-row ids by `_key`, but
       no server component echoes it — adoption is inert; wrong-id graft
       reachable when echo order diverges. Needs core `_processNestedAttributes`
       to surface created id↔_key pairs + envelope threading. (merged-tree review)
@@ -65,6 +65,17 @@ STILL OPEN — tracked residuals (source in parens):
 - [ ] SINGLETON READ CEILING (SingletonConfig.get.expose) — now load-bearing:
       encrypted models REFUSE singleton doors until it exists. (Tier 2 item,
       promoted by the carve-out)
+- [ ] @transactional DECORATOR still db-blind: calls transaction() with no
+      { database }, so a bound-model method under it gets a default-db wrap —
+      no atomicity regression (each save opens its own wrap), but no
+      cross-statement atomicity on the bound db either. (core-tx reviewer)
+- [ ] COVERAGE GAPS from the core-tx review: destroy()-in-ambient-same-db-tx
+      restore leg; NULL lock-value teaching error; inner-commit afterCommit
+      fires exactly once at outermost commit on the REAL driver. (core-tx
+      reviewer)
+- [ ] STI DISCRIMINATOR condition now in 4 places (validation mirrors
+      save/insertAll/_buildFinalWhere by comment, not helper) — extract one
+      `stiDiscriminatorColumn(ctor)`. (core-tx reviewer DRY nit)
 - [ ] `helpers` package: publish or stop documenting. (Daniel's call)
 - [ ] Mismatched-lock-column teaching error and confirm-route save gate:
       LANDED 11ec88e (wave-2 controller reviewer follow-ups).
@@ -184,10 +195,9 @@ path instead of at one boundary. `save()` does it right; every other path forks.
       (form-session.ts commitField) — use the applyFlushSuccess narrow path.
 - [x] Conflict bookkeeping survives resolution: `adoptIncoming` after settle rolls
       the version token BACKWARD (form-session.ts:890). Clear on submit success.
-- [~] Nested new-row ids adopted POSITIONALLY (nested.ts:398) — wrong-record writes
+- [x] Nested new-row ids adopted POSITIONALLY (nested.ts:398) — wrong-record writes
       when echo order diverges. `_key` is sent but never used to match. Match by `_key`.
-      [client HALF landed (matches by _key when present); server never echoes _key —
-      see _KEY SERVER ECHO in STATUS residuals]
+      [CLOSED end-to-end 16d3fb7: core records id↔_key, envelope stitches, client matches]
 - [x] Parked nested edits dropped: `restoreParked` runs before lazy nested-manager
       registration (generated-form.ts:92).
 - [x] `last()` after explicit `.order()` emits invalid SQL `col asc desc`
