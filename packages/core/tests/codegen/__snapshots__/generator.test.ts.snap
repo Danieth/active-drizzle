@@ -2,7 +2,7 @@
 
 exports[`generator — snapshot tests > Asset model gen matches snapshot 1`] = `
 "// AUTO-GENERATED — do not edit manually
-import type { Relation, IncludeArg, MapInclude } from 'active-drizzle'
+import type { Relation, IncludeArg, MapInclude } from '@active-drizzle/core'
 
 declare module './Asset.model' {
   interface Asset {

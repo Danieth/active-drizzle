@@ -96,7 +96,7 @@ export function generateModelTypes(model: ModelMeta, project: ProjectMeta, srcPr
     : null;
 
   lines.push(`// AUTO-GENERATED — do not edit manually`);
-  lines.push(`import type { Relation, IncludeArg, MapInclude } from 'active-drizzle'`);
+  lines.push(`import type { Relation, IncludeArg, MapInclude } from '@active-drizzle/core'`);
   lines.push('');
 
   // ── Instance augmentation ─────────────────────────────────────────────
@@ -396,7 +396,7 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta, sr
   // shares its base's file, so `<ClassName>.model.js` may not exist).
   lines.push(`import { ${model.className} as _${model.className} } from '${srcPrefix}/${srcModuleName(model)}.js'`);
   if (needsValidates) {
-    lines.push(`import { Validates } from 'active-drizzle'`);
+    lines.push(`import { Validates } from '@active-drizzle/core'`);
   }
   for (const [cls, basename] of assocImports) {
     lines.push(`import { ${cls} as _${cls} } from '${srcPrefix}/${basename}.js'`);
@@ -597,14 +597,19 @@ export function generateClientRuntime(model: ModelMeta, project: ProjectMeta, sr
     const fieldUnion = [...fieldNames].sort().map(f => `'${f}'`).join(' | ') || 'never';
     const assocEntries: string[] = [];
     const projImports: string[] = [];
+    // Import gate keys on the OUTPUT FILE, not the class name: a co-located
+    // STI subclass whose association resolves to its co-located base would
+    // otherwise import a Projection its own combined module already declares
+    // (TS2440 in generated code).
+    const ownBase = model.filePath.split('/').pop()!.replace('.model.ts', '.model.gen');
     for (const assoc of model.associations) {
       const targetClass = resolveAssocClass(assoc, project);
       if (!targetClass) continue;
       const assocModel = project.models.find(mm => mm.className === targetClass);
       if (!assocModel) continue;
       assocEntries.push(`${assoc.propertyName}?: ${targetClass}Projection`);
-      if (targetClass !== model.className) {
-        const base = assocModel.filePath.split('/').pop()!.replace('.model.ts', '.model.gen');
+      const base = assocModel.filePath.split('/').pop()!.replace('.model.ts', '.model.gen');
+      if (base !== ownBase) {
         projImports.push(`import type { ${targetClass}Projection } from './${base}.js'`);
       }
     }

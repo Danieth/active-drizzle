@@ -20,7 +20,7 @@
  */
 
 import { Project, type CompilerOptions } from 'ts-morph'
-import { mkdirSync, writeFileSync, readFileSync, existsSync, statSync, realpathSync } from 'fs'
+import { mkdirSync, writeFileSync, readFileSync, existsSync, statSync, realpathSync, readdirSync, rmSync } from 'fs'
 import { dirname, join, resolve, relative } from 'path'
 import { glob } from 'glob'
 import { extractSchema, extractModels } from '../codegen/extractor.js'
@@ -214,7 +214,15 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     const modelPaths = await glob(modelGlob.replace(/\\/g, '/'))
     if (modelPaths.length === 0) {
       console.warn(`\x1b[33m[active-drizzle] No model files found matching: ${options.models}\x1b[0m`)
-      return false
+      // Distinguish "never saw a model" (fresh boot / misconfigured glob —
+      // don't guess an output home to rewrite) from "the LAST model file was
+      // just deleted mid-session" (modelCache still remembers it). The latter
+      // must FALL THROUGH to the prune loop + registry/globals regen, or the
+      // manifest freezes around an import of the deleted module. Legacy
+      // co-located mode without an outputDir has no knowable output home once
+      // every source is gone — leave its files alone too.
+      const lastModelDeleted = modelCache.size > 0 && (options.genDir !== false || options.outputDir)
+      if (!lastModelDeleted) return options.controllers ? await runControllerCodegen() : false
     }
 
     const p = getOrCreateProject()
@@ -259,11 +267,13 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     // Prune deleted model files
     const modelPathSet = new Set(modelPaths)
     let modelListChanged = changedFilePaths.size > 0  // new files always change the list
+    const prunedFiles: string[] = []
     for (const [path] of modelCache) {
       if (!modelPathSet.has(path)) {
         modelCache.delete(path)
         diagCache.delete(path)
         p.getSourceFile(path)?.delete()
+        prunedFiles.push(path)
         modelListChanged = true
       }
     }
@@ -273,7 +283,14 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     // (a model was pruned); it MUST fall through so the registry/globals/barrel
     // regenerate without the removed model. Without this, deleting a model file
     // left it in the manifest forever.
-    if (!schemaChanged && changedFilePaths.size === 0 && !modelListChanged) return false
+    if (!schemaChanged && changedFilePaths.size === 0 && !modelListChanged) {
+      // A `.ctrl.ts` save routes through HERE, not straight to controller
+      // codegen: the strict refuse-on-red channel and resolveAssociations()
+      // live in this function, and hooks/presenters must never regenerate
+      // from unvalidated or association-unresolved meta. Reaching this point
+      // means the cached model state is green — controller codegen may run.
+      return options.controllers ? await runControllerCodegen() : false
+    }
 
     resolveAssociations(models, schema.tables)
     const projectMeta: ProjectMeta = { schema, models }
@@ -337,7 +354,9 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     lastGlobalHash = globalHash
 
     const files: GeneratedFile[] = []
-    const firstModelDir = dirname(modelPaths[0]!)
+    // Zero models (last one deleted): no per-model file will reference the
+    // source tree, so the src prefix is moot — any existing dir anchors it.
+    const firstModelDir = modelPaths.length > 0 ? dirname(modelPaths[0]!) : root
     // .gen mode (default): generated files live under <genDir>/models,
     // OUT of the source tree; imports back to sources use a computed prefix
     const genRoot = options.genDir === false ? null : resolve(root, options.genDir ?? '.gen')
@@ -349,6 +368,33 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     // share one source file and thus one `.model.gen` output; their modules are
     // combined (imports de-duplicated) rather than one clobbering the other.
     const modelGroups = groupModelsByOutputBase(models)
+
+    // ── Stale-output cleanup ─────────────────────────────────────────────────
+    // A deleted (or de-@model-ed) source's derived `.gen` files would otherwise
+    // sit in the program forever, importing a module that no longer exists —
+    // tsc reports TS2307 inside a file stamped AUTO-GENERATED — DO NOT EDIT.
+    // genDir mode owns its models dir outright, so sweep it against the
+    // expected output set (this also heals orphans from deletions made while
+    // the server was down). Legacy co-located outputs are scattered beside
+    // their sources — there, delete exactly what this run pruned.
+    if (genRoot) {
+      const expectedOutputs = new Set<string>()
+      for (const base of modelGroups.keys()) {
+        expectedOutputs.add(`${base}.ts`)
+        expectedOutputs.add(`${base.replace(/\.model\.gen$/, '.model.types.gen')}.d.ts`)
+      }
+      for (const f of readdirSync(outDir)) {
+        const isModelOutput = f.endsWith('.model.gen.ts') || f.endsWith('.model.types.gen.d.ts')
+        if (isModelOutput && !expectedOutputs.has(f)) rmSync(join(outDir, f), { force: true })
+      }
+    } else {
+      for (const src of prunedFiles) {
+        const stem = src.split('/').pop()!.replace(/\.model\.ts$/, '')
+        rmSync(join(dirname(src), `${stem}.model.gen.ts`), { force: true })
+        rmSync(join(dirname(src), `${stem}.model.types.gen.d.ts`), { force: true })
+      }
+    }
+
     for (const [base, group] of modelGroups) {
       // .types.gen.d.ts — NOT `${base}.d.ts`: a d.ts sharing its basename
       // with the sibling .gen.ts is treated by tsc's include rules as that
@@ -513,6 +559,11 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
         const { extractSchema: es } = await import('../codegen/extractor.js')
         schemaMeta = es(p3, schemaPath)
       }
+      // Models are expected to arrive here already validated + resolved
+      // (runCodegen is the only caller and gates on the strict channel);
+      // resolveAssociations is idempotent, and this backstop keeps a future
+      // cold path from silently dropping inferred coherence edges.
+      resolveAssociations(extractedModels, schemaMeta!.tables)
       const projectMeta = { schema: schemaMeta!, models: extractedModels }
 
       const hookFiles = generateReactHooks(ctrlMeta, projectMeta, outDir, { clientDir, clientImportPrefix })
@@ -589,11 +640,19 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
       // auto-regeneration for the rest of the session.
       // Returns the scheduler promise so tests (and any awaiting caller) can
       // wait for the run; Vite's watcher ignores the return value.
+      // `.ctrl.ts` saves route through runCodegen TOO (which ends in
+      // runControllerCodegen): controller codegen re-reads model meta for
+      // hooks/presenters, and only runCodegen owns the validate()+strict
+      // refuse-on-red channel and resolveAssociations(). A direct route used
+      // to regenerate hooks from the exact invalid meta a red model save had
+      // just refused (with inferred coherence edges silently missing). When
+      // the caches are warm and green, the model half is a cheap no-op.
       const onChange = (file: string): Promise<void> | undefined => {
-        if (file.endsWith('.model.ts') || isSchemaFile(file)) {
+        if (
+          file.endsWith('.model.ts') || isSchemaFile(file)
+          || (file.endsWith('.ctrl.ts') && options.controllers)
+        ) {
           return scheduleCodegen(runCodegen)
-        } else if (file.endsWith('.ctrl.ts') && options.controllers) {
-          return scheduleCodegen(runControllerCodegen)
         }
         return undefined
       }

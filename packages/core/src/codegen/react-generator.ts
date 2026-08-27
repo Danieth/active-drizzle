@@ -590,7 +590,7 @@ import type { FC, ReactNode } from 'react'`)
       L.push('')
       for (const e of model.enums) {
         for (const label of Object.keys(e.values)) {
-          L.push(`  ${lcFirst(e.propertyName)}Is${capitalize(label)}() { return this.${e.propertyName} === '${label}' }`)
+          L.push(`  ${lcFirst(e.propertyName)}Is${capitalize(label)}() { return this.${e.propertyName} === ${jsString(label)} }`)
         }
       }
     }
@@ -605,7 +605,7 @@ import type { FC, ReactNode } from 'react'`)
       const attachmentEntries = (ctrl.attachments ?? []).map(att => {
         const parts = [
           `kind: '${att.kind === 'many' ? 'attachmentMany' : 'attachmentOne'}'`,
-          `accepts: ${att.accepts ? `'${att.accepts}'` : 'undefined'}`,
+          `accepts: ${att.accepts ? jsString(att.accepts) : 'undefined'}`,
           `maxSize: ${att.maxSize ?? 'undefined'}`,
           `access: '${att.access}'`,
           ...(att.kind === 'many' && att.max ? [`max: ${att.max}`] : []),
@@ -696,7 +696,7 @@ import type { FC, ReactNode } from 'react'`)
       L.push('')
       for (const st of model.states ?? []) {
         for (const label of Object.keys(st.values)) {
-          L.push(`  ${lcFirst(st.propertyName)}Is${capitalize(label)}() { return this.${st.propertyName} === '${label}' }`)
+          L.push(`  ${lcFirst(st.propertyName)}Is${capitalize(label)}() { return this.${st.propertyName} === ${jsString(label)} }`)
         }
       }
       const stateTransitions = (model.states ?? []).flatMap(st => st.transitions.map(t => ({ st, t })))
@@ -711,7 +711,7 @@ import type { FC, ReactNode } from 'react'`)
             const provable = t.guardDeps && !t.guardDepsError && depsFitProjection(t.guardDeps, stateProjection)
             guardCheck = provable ? `Boolean((${t.guardSource})(this as any))` : 'false'
           }
-          L.push(`    if (event === '${t.event}') return ${fromCheck} && ${guardCheck}`)
+          L.push(`    if (event === ${jsString(t.event)}) return ${fromCheck} && ${guardCheck}`)
         }
         L.push(`    return false`)
         L.push(`  }`)
@@ -823,7 +823,7 @@ import type { FC, ReactNode } from 'react'`)
     L.push(`export const ${modelKey}Attachments = {`)
     for (const att of (ctrl.attachments ?? [])) {
       const parts: string[] = [`kind: '${att.kind}'`]
-      parts.push(`accepts: ${att.accepts ? `'${att.accepts}'` : 'undefined'}`)
+      parts.push(`accepts: ${att.accepts ? jsString(att.accepts) : 'undefined'}`)
       parts.push(`maxSize: ${att.maxSize ?? 'undefined'}`)
       parts.push(`access: '${att.access}'`)
       if (att.kind === 'many' && att.max) parts.push(`max: ${att.max}`)
@@ -1567,9 +1567,9 @@ function emitFormHooks(
     // row transport → Board.move + inline edits (coherence-wired)
     const stateDef = (model.states ?? [])[0]
     if (stateDef) {
-      const states = Object.keys(stateDef.values).map(s => `'${s}'`).join(', ')
+      const states = Object.keys(stateDef.values).map(s => jsString(s)).join(', ')
       const transitions = stateDef.transitions.map(t =>
-        `{ event: '${t.event}', from: ${t.from === '*' ? `'*'` : `[${(t.from as string[]).map(f => `'${f}'`).join(', ')}]`}, to: '${t.to}' }`,
+        `{ event: ${jsString(t.event)}, from: ${t.from === '*' ? `'*'` : `[${(t.from as string[]).map(f => jsString(f)).join(', ')}]`}, to: ${jsString(t.to)} }`,
       ).join(', ')
       L.push(`  stateMeta: { field: '${stateDef.propertyName}', states: [${states}], transitions: [${transitions}] },`)
     }

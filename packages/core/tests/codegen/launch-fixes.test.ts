@@ -217,3 +217,27 @@ describe('columnToClientType folds into COLUMN_TS_TYPE', () => {
     expect(content).not.toMatch(/balance\s*:\s*number/)
   })
 })
+
+describe('npm identity in EMITTED code (the last bare-name leak)', () => {
+  it('generated output imports from @active-drizzle/core, never the unpublished bare name', () => {
+    const project = createTestProject({
+      schema: `import { pgTable, integer, text } from 'drizzle-orm/pg-core'
+        export const posts = pgTable('posts', { id: integer('id').primaryKey().notNull(), title: text('title') })`,
+      models: {
+        'Post.model.ts': `import { ApplicationRecord, model, Attr, Validates } from 'active-drizzle'
+          @model('posts')
+          export class Post extends ApplicationRecord {
+            static title = Attr.string({ validate: Validates.presence() })
+          }`,
+      },
+    })
+    const metas = extractModels(project.tsProject, '/project/models/Post.model.ts')
+    const files = generate({ schema: project.extractSchema(), models: metas })
+    expect(files.length).toBeGreaterThan(0)
+    const all = files.map(f => `// ${f.path}\n${f.content}`).join('\n')
+    // A fresh app installs only the SCOPED packages — the bare name is
+    // unpublished, so any emitted `from 'active-drizzle'` breaks on regen.
+    expect(all).not.toMatch(/from ['"]active-drizzle['"]/)
+    expect(all).toContain("from '@active-drizzle/core'")
+  })
+})
