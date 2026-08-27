@@ -10,8 +10,8 @@ import { reportError, translateDbError } from './error-reporting.js'
 import {
   ValidationErrors,
   createValidationErrors,
-  runValidators,
-  runAsyncValidators,
+  runValidatorsDetailed,
+  runAsyncValidatorsDetailed,
   normalizeMessage,
   type AttrValidator,
   type AsyncAttrValidator,
@@ -382,11 +382,11 @@ export class ApplicationRecord {
       if (!syncFns && !asyncFns) continue
 
       const value = (this as any)[key]
-      for (const msg of runValidators(syncFns, value, this, key)) {
-        this.errors.add(key, msg)
+      for (const f of runValidatorsDetailed(syncFns, value, this, key)) {
+        this.errors.addDetail(key, f)
       }
-      for (const msg of await runAsyncValidators(asyncFns, value, this, key)) {
-        this.errors.add(key, msg)
+      for (const f of await runAsyncValidatorsDetailed(asyncFns, value, this, key)) {
+        this.errors.addDetail(key, f)
       }
     }
 
@@ -413,7 +413,7 @@ export class ApplicationRecord {
         const fromLabel = change.was as string | null | undefined       // display label (set trap stores get(was))
         const toLabel = stateCfg.get!(change.is) as string              // raw stored → label
         const res = stateLegalMove(stateCfg, fromLabel, toLabel, this)
-        if (!res.ok) this.errors.add(key, res.reason)
+        if (!res.ok) this.errors.add(key, res.reason, { code: 'invalid_transition' })
       }
     }
 
@@ -492,21 +492,21 @@ export class ApplicationRecord {
         // On INSERT a missing required column is an error; on UPDATE only an
         // explicit assignment to null is (absent means "leave it alone").
         if (required && (this.isNewRecord || changed)) {
-          this.errors.add(colKey, "can't be blank")
+          this.errors.add(colKey, "can't be blank", { code: 'blank' })
         }
         continue
       }
 
       if (col.columnType === 'PgVarchar' && typeof col.length === 'number' && typeof value === 'string') {
         if (value.length > col.length) {
-          this.errors.add(colKey, `is too long (maximum is ${col.length} characters)`)
+          this.errors.add(colKey, `is too long (maximum is ${col.length} characters)`, { code: 'too_long', meta: { count: col.length } })
         }
       }
 
       const bounds = INT_BOUNDS[col.columnType as string]
       if (bounds && typeof value === 'number' && Number.isFinite(value)) {
         if (value < bounds[0] || value > bounds[1]) {
-          this.errors.add(colKey, `must be between ${bounds[0]} and ${bounds[1]}`)
+          this.errors.add(colKey, `must be between ${bounds[0]} and ${bounds[1]}`, { code: 'inclusion', meta: { in: [bounds[0], bounds[1]] } })
         }
       }
     }
@@ -550,13 +550,13 @@ export class ApplicationRecord {
       if (cfg?._type !== 'state' || !Object.hasOwn(cfg.transitions, event)) continue
       const res = stateCanFire(cfg, (this as any)[key], event, this)
       if (!res.ok) {
-        this.errors.add(key, res.reason)
+        this.errors.add(key, res.reason, { code: 'invalid_transition', meta: { event } })
         return false
       }
       ;(this as any)[key] = cfg.transitions[event]!.to
       return this.save()
     }
-    this.errors.add('base', `unknown event '${event}'`)
+    this.errors.add('base', `unknown event '${event}'`, { code: 'invalid_event', meta: { event } })
     return false
   }
 
@@ -781,7 +781,7 @@ export class ApplicationRecord {
       if (err instanceof NestedAttributesError) {
         // Forged/foreign nested ids surface as a validation failure (422),
         // matching the shape a failed validation already has
-        this.errors.add(err.field, err.message)
+        this.errors.add(err.field, err.message, { code: 'nested_invalid' })
         // Inside the ambient same-db transaction the parent INSERT is still
         // pending — returning false would let it COMMIT as an orphan. Rethrow
         // so the transaction rolls back (the same doctrine as hooks'
@@ -818,8 +818,8 @@ export class ApplicationRecord {
     // connection: this error did not abort it, and this model's own wrap (if
     // any) already rolled back — the validation-shaped false is correct.
     if (_inTransactionOn(ctor)) throw err
-    if (translated.field) this.errors.add(translated.field, translated.message)
-    else this.errors.add('base', translated.friendly)
+    if (translated.field) this.errors.add(translated.field, translated.message, { code: translated.errorCode })
+    else this.errors.add('base', translated.friendly, { code: translated.errorCode })
     return false
   }
 

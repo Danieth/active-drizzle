@@ -139,3 +139,35 @@ describe('translateDbError carries the taxonomy code beside the SQLSTATE', () =>
     })
   }
 })
+
+describe('codes flow through a real record save (the threading, end-to-end)', () => {
+  it('a validated model records coded details on its errors bag', async () => {
+    const { ApplicationRecord } = await import('../../src/runtime/application-record.js')
+    const { Attr } = await import('../../src/runtime/attr.js')
+    class Gadget extends ApplicationRecord {
+      static tableName = 'gadgets'
+      static name2 = Attr.string({ validates: [Validates.presence(), Validates.length({ min: 3 })] })
+    }
+    const g = new (Gadget as any)()
+    g.name2 = ''
+    const valid = await (g as any).isValid()
+    expect(valid).toBe(false)
+    const details = (g as any).errors.details()
+    expect(details.name2?.[0]).toMatchObject({ code: 'blank', message: "can't be blank" })
+  })
+
+  it("a custom message: on the model keeps its taxonomy code", async () => {
+    const { ApplicationRecord } = await import('../../src/runtime/application-record.js')
+    const { Attr } = await import('../../src/runtime/attr.js')
+    class Widget extends ApplicationRecord {
+      static tableName = 'widgets'
+      static label = Attr.string({ validates: [Validates.length({ max: 3, message: 'is way too wordy' })] })
+    }
+    const w = new (Widget as any)()
+    w.label = 'abcdef'
+    await (w as any).isValid()
+    expect((w as any).errors.details().label?.[0]).toMatchObject({
+      code: 'too_long', message: 'is way too wordy', meta: { count: 3 },
+    })
+  })
+})
