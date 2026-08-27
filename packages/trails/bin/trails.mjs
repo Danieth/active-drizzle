@@ -160,6 +160,7 @@ const files = {
       '@orpc/server': '^1.13.6',
       '@tanstack/react-query': '^5.90.0',
       'drizzle-orm': '^0.44.0',
+      'ioredis': '^6.0.0',
       'pg': '^8.13.0',
       'hono': '^4.6.0',
       'react': '^19.0.0',
@@ -195,12 +196,26 @@ export default defineConfig({
   // zero setup, data resets on restart, loudly announced at boot.
   database: { url: process.env.DATABASE_URL },
   channels: {
-    // memory = single process, zero infrastructure (the default). Running
-    // multiple processes? Opt into bus: 'pg-notify' (Postgres LISTEN/NOTIFY
-    // over database.url — needs a session-mode connection; boot probes and
-    // teaches if a pooler breaks it). Non-memory tiers are ALWAYS explicit
-    // opt-ins — never keyed off ambient env vars.
-    bus: 'memory',
+    // memory = single process, zero infrastructure. Set REDIS_URL and you
+    // get the multi-process tier: Redis pub/sub carrying ids-only commit
+    // events. Delivery is best-effort at-most-once BY DESIGN — push is
+    // latency, pull is correctness, so a lost event heals on the client's
+    // next revalidation pull. (bus: 'pg-notify' is the no-Redis fallback:
+    // Postgres LISTEN/NOTIFY over database.url — needs a session-mode
+    // connection; boot probes and teaches if a pooler breaks it.)
+    //
+    // CAUTION — this ternary keys a bus tier off an AMBIENT env var, a
+    // deliberate exception to the explicit-opt-in rule. Two edges:
+    //   - a REDIS_URL attached for some OTHER purpose (cache, rate
+    //     limiter) activates the tier; boot then probes that server and
+    //     REFUSES if it cannot deliver pub/sub.
+    //   - if REDIS_URL disappears (rotation, rename), this silently
+    //     degrades a multi-process deployment to single-process 'memory'.
+    // Boot always logs the resolved tier ("channels bus: …") — and once
+    // production depends on redis, pin bus: 'redis' explicitly so a
+    // missing url becomes a boot refusal instead of a downgrade.
+    bus: process.env.REDIS_URL ? 'redis' : 'memory',
+    redisUrl: process.env.REDIS_URL,
   },
   environments: {
     production: {},
@@ -540,8 +555,8 @@ npm run dev
 - **server/models/Post.model.ts** — attributes, validations, scopes
 - **server/controllers/Post.ctrl.ts** — the door: expose/permit/search/facets
 - **trails.config.ts** — the ONE config file (env overrides inline; secrets
-  via process.env — opt into \`channels: { bus: 'pg-notify' }\` when you
-  run more than one process)
+  via process.env — set \`REDIS_URL\` when you run more than one process
+  and channels fan out over Redis pub/sub; lost pushes heal via pull)
 - **src/App.tsx** — generated surface + form; register presenters to
   replace the labeled scaffolding
 

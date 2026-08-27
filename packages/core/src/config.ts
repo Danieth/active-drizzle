@@ -19,7 +19,7 @@
  *   export default defineConfig({
  *     server:   { port: 8787 },
  *     database: { url: process.env.DATABASE_URL ?? 'postgres://localhost/dev' },
- *     channels: { bus: 'memory' },   // multi-process: opt into 'pg-notify'
+ *     channels: { bus: 'memory' },   // multi-process: 'redis' (or the 'pg-notify' fallback)
  *     environments: {
  *       production: { channels: { revalidate: 'always' } },
  *       test:       { server: { port: 0 } },
@@ -30,14 +30,20 @@
 export interface ChannelsConfig {
   /**
    * Fan-out bus tier (transport WS4). 'memory' (default) = single process,
-   * zero infrastructure. 'pg-notify' = multi-process FALLBACK over Postgres
+   * zero infrastructure. 'redis' = THE multi-process tier: Redis pub/sub
+   * over `redisUrl`, at-most-once by design (push is latency, pull is
+   * correctness — a lost event heals on the client's next revalidation
+   * pull). 'pg-notify' = multi-process FALLBACK over Postgres
    * LISTEN/NOTIFY — deliberately opt-in, never a silent default: NOTIFY
    * takes a global commit-order lock (the `class 1262 … database 0`
    * lock-wait is the overload signal) and needs a session-mode connection
-   * (PgBouncer transaction pooling breaks LISTEN). 'redis' / 'nats' are
-   * typed adapter stubs today (their constructors teach).
+   * (PgBouncer transaction pooling breaks LISTEN). 'nats' is a typed
+   * adapter stub today (its constructor teaches).
    */
   bus?: 'memory' | 'pg-notify' | 'redis' | 'nats'
+  /** redis:// or rediss:// url for bus: 'redis' — reference it from the
+   *  environment (`redisUrl: process.env.REDIS_URL`); TLS, auth, and db
+   *  index all ride the url. Required when bus is 'redis'. */
   redisUrl?: string | undefined
   /** WS mount path on the HTTP server. Default '/cable'. */
   path?: string
@@ -149,7 +155,15 @@ export function assertChannelsServable(
     throw new Error(
       `trails.config channels: role 'publish-only' with bus 'memory' publishes frames to nowhere — ` +
       `an in-memory bus never leaves this process, and a publish-only process holds no sockets. ` +
-      `Set a cross-process bus (bus: 'pg-notify') or drop role: 'publish-only'.`,
+      `Set a cross-process bus (bus: 'redis', or the 'pg-notify' fallback) or drop role: 'publish-only'.`,
+    )
+  }
+  if (resolved.bus === 'redis' && !resolved.redisUrl) {
+    throw new Error(
+      `trails.config channels: bus 'redis' needs channels.redisUrl — the bus dials TWO dedicated ` +
+      `connections from it (Redis command-restricts a subscribing connection, so publisher and ` +
+      `subscriber cannot share one). Reference it from the environment, never inline: ` +
+      `channels: { bus: 'redis', redisUrl: process.env.REDIS_URL }.`,
     )
   }
   if (env === 'production' && resolved.role === 'serve'

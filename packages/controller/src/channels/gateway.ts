@@ -219,7 +219,21 @@ export async function attachChannels(
 
   const routers = new Map(options.routers.map(r => [r.basePath, r.router]))
   const bus = options.bus
-    ?? await createBus(cfg.bus, { databaseUrl: (options.config?.database as any)?.url })
+    ?? await createBus(cfg.bus, {
+      databaseUrl: (options.config?.database as any)?.url,
+      redisUrl: cfg.redisUrl,
+    })
+  if (!options.bus) {
+    // The resolved tier, announced at boot. The scaffold keys bus:'redis'
+    // off an ambient REDIS_URL, so BOTH failure directions of that
+    // convenience must be visible here: a stray REDIS_URL selecting the
+    // tier reads as 'redis', and a vanished one silently degrading a
+    // multi-process deployment reads as 'memory (single-process fan-out)'.
+    // eslint-disable-next-line no-console
+    console.log(
+      `[active-drizzle] channels bus: ${cfg.bus}${cfg.bus === 'memory' ? ' (single-process fan-out)' : ''}`,
+    )
+  }
   const stopEmitter = startChannelEmitter({ bus })
 
   // ── One-time upgrade tokens (attach-guard pattern; in-memory, sticky-LB) ──

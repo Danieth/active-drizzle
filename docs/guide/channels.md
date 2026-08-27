@@ -30,8 +30,8 @@ all defaults (memory bus, `/cable`).
 
 | Field | Default | Unset means | Notes |
 |---|---|---|---|
-| `bus` | `'memory'` | Single-process fan-out, zero infrastructure | `'pg-notify'` is the opt-in multi-process fallback. `'redis'` / `'nats'` are **typed stubs that throw at boot** with instructions — do not set them expecting them to work. |
-| `redisUrl` | `undefined` | — | Reserved for the future redis tier; unused today. |
+| `bus` | `'memory'` | Single-process fan-out, zero infrastructure | `'redis'` is **the** multi-process tier (Redis pub/sub over `redisUrl`, at-most-once by design). `'pg-notify'` is the opt-in multi-process fallback. `'nats'` is a **typed stub that throws at boot** with instructions — do not set it expecting it to work. |
+| `redisUrl` | `undefined` | — | `redis://` or `rediss://` url for `bus: 'redis'` (required with it — boot refuses otherwise). TLS, auth, and db index all ride the url. Reference it from the environment: `redisUrl: process.env.REDIS_URL`. |
 | `path` | `'/cable'` | WS upgrades handled at `/cable`; token mint at `/cable/token` | Change it if `/cable` collides with a route. |
 | `originAllowlist` | `undefined` | Dev: only `localhost` / `127.0.0.1` / `::1` origins may connect. **Production: boot refuses to serve** | The upgrade request rides ambient cookies; the Origin check is the only thing stopping any site the user visits from opening an authenticated socket (cross-site WebSocket hijacking). Non-browser clients (no Origin header) pass this gate — the token still gates them. |
 | `heartbeatMs` | `25000` | 25s protocol-level ws pings | Values > 55000 print a boot warning: they outlive common proxy idle timeouts. See [Heartbeats vs proxies](#heartbeats-vs-proxy-idle-timeouts). |
@@ -68,10 +68,13 @@ would run silently broken:
   List your app origins.
 - **`role: 'publish-only'` + `bus: 'memory'`** → boot refuses. Frames
   would go nowhere.
+- **`bus: 'redis'` + no `redisUrl`** → boot refuses. The bus dials two
+  dedicated connections from that url (Redis command-restricts a
+  subscribing connection, so publisher and subscriber cannot share one).
 - **`heartbeatMs > 55000`** → warning (not a refusal): idle sockets will
   be severed by infrastructure between heartbeats.
-- **`bus: 'redis'` or `'nats'`** → the stub constructor throws with the
-  interface contract and the working alternatives.
+- **`bus: 'nats'`** → the stub constructor throws with the interface
+  contract and the working alternatives.
 
 ## The boot sequence
 
@@ -93,9 +96,10 @@ app.post(`${channels.path}/token`,
 What `attachChannels` does, in order:
 
 1. Resolves `config.channels` defaults and runs the boot refusals above.
-2. Creates the bus (`memory` instantly; `pg-notify` connects its
-   dedicated session and runs the self-NOTIFY probe — boot **fails** if
-   the probe hears nothing, see below).
+2. Creates the bus (`memory` instantly; `redis` dials its connection
+   pair and runs a loopback probe; `pg-notify` connects its dedicated
+   session and runs the self-NOTIFY probe — boot **fails** if a probe
+   hears nothing, see below).
 3. Starts the emitter: every committed write (save, destroy, `insertAll`,
    `updateAll`, counter caches), after its transaction commits, is routed
    onto bus channels per door, silence rule applied.
@@ -165,8 +169,8 @@ Postgres `LISTEN`/`NOTIFY` as the cross-process wire. Deliberately
 teeth:
 
 - **When to use it:** a handful of processes, moderate write volume, and
-  you don't want to run Redis/NATS. It is a fallback, not the scaling
-  tier.
+  you don't want to run Redis. It is a fallback, not the scaling tier —
+  `redis` is.
 - **Ids-only, batched, chunked:** events are packed for ~10ms into one
   NOTIFY payload, chunked under 7.5KB of UTF-8 (the hard payload cap is
   ~8000 bytes). A single event that alone exceeds the cap (an enormous
@@ -179,7 +183,12 @@ teeth:
   restart, idle kill, network blip), the adapter reconnects with backoff
   and re-LISTENs — a node is never left permanently deaf while its own
   sockets look healthy. The PgBouncer probe runs at **boot only**; a
-  mid-life blip is not re-diagnosed as misconfiguration.
+  mid-life blip is not re-diagnosed as misconfiguration. While the
+  session is down, wire copies are **dropped loudly** (throttled to a
+  counted summary during a storm), never queued for the outage's
+  duration and never shipped stale after reconnect — the same gap
+  convention as the redis tier: local delivery already happened, remote
+  nodes heal via pull.
 - **PgBouncer: SESSION mode required.** `LISTEN` registers on a server
   session; transaction pooling hands every statement a different session,
   so notifications are delivered to a session nobody holds — *silently*.
@@ -197,17 +206,83 @@ teeth:
   move off it.
 - Requires `npm install pg` (a teaching error at boot says so if absent).
 
-### `redis` / `nats` (tiers 2/3) — stubs
+### `redis` (tier 2) — THE multi-process tier
 
-Typed adapter stubs whose constructors **throw at boot** with the frozen
-interface contract. To use Redis/NATS today, implement `ChannelBus`
+Redis pub/sub as the cross-process wire — no global commit lock, no
+payload cap, no pooler landmine. Same payload law as every tier: ids-only
+commit events on one broadcast channel, batched ~10ms per PUBLISH,
+self-published batches dropped on receipt (origin-id dedupe), local
+subscribers served directly with the record instance intact.
+
+- **At-most-once is the contract, not a caveat.** Redis pub/sub has no
+  replay, and this design *wants* none: push is latency, pull is
+  correctness (C1) — the client's revalidation pull already **is** the
+  replay mechanism. That is also why this is plain pub/sub and not Redis
+  Streams: a Stream's persistence and consumer groups would deliver a
+  guarantee nothing needs, at the cost of trimming policy and
+  pending-entry bookkeeping.
+- **Two dedicated connections.** Redis command-restricts a subscribing
+  connection, so the bus dials a publisher and a subscriber from
+  `redisUrl`. TLS (`rediss://`), auth, and db index all ride the url.
+- **The broadcast channel is namespaced per deployment.** pg-notify gets
+  isolation for free (NOTIFY is scoped to one Postgres database); Redis
+  pub/sub is **instance-wide** — the db index does not partition it — so
+  two deployments sharing one Redis (staging + prod on one ElastiCache,
+  or two apps) would cross-deliver commit rumors and drive each other's
+  dry-run/reload work. The channel is therefore
+  `adrz_cable:<hash of database.url's host+port+dbname>` — same data,
+  same channel; different database, isolated. Credentials and query
+  params are excluded from the hash, but the **host and database name
+  must match across processes** of one deployment (a per-region DB
+  hostname split means split namespaces — see troubleshooting). A custom
+  split rides `new RedisBus({ namespace })`.
+- **Reconnects self-heal, gaps heal via pull.** Both connections
+  reconnect with backoff (1s doubling, 30s cap); the subscriber
+  re-SUBSCRIBEs itself on reconnect. Events published during a gap are
+  **lost and logged loudly** — the ONE cross-process gap convention, and
+  `pg-notify` follows it identically: while the connection is down, wire
+  copies are **dropped** (loudly, throttled to a counted summary during a
+  storm), never queued unboundedly and never shipped stale after
+  reconnect. Clients on the gapped node stay eventually-fresh via pull;
+  no subscription is RESET (RESET is a revocation signal, never a
+  transport signal).
+- **A boot-only loopback probe** publishes to itself and must hear it
+  within 5s, or boot fails with a teaching error — this catches
+  Redis-compatible proxies/serverless providers that accept commands but
+  don't deliver pub/sub, and load balancers that route the two
+  connections to different isolated instances. Like pg-notify's probe, it
+  never re-runs on reconnect.
+- **Pub/sub is instance-wide.** The db index in the url does not
+  partition it (a "wrong DB" cannot silently mute it), `maxmemory`
+  eviction never touches it (nothing is stored), and in cluster mode a
+  PUBLISH reaches subscribers connected to any node. The silent failure
+  modes are the two the probe catches.
+- Requires `npm install ioredis` (a teaching error at boot says so if
+  absent; ioredis over node-redis deliberately — its reconnect owns
+  re-SUBSCRIBE, `retryStrategy` maps onto the house backoff, and
+  `redis://`/`rediss://` urls carry TLS/auth/db with no option plumbing).
+- **The scaffold selects this tier off an ambient `REDIS_URL`** — a
+  deliberate, documented exception to the explicit-opt-in rule, with two
+  edges the generated config warns about: a `REDIS_URL` attached for some
+  *other* purpose activates the tier (the boot probe then refuses a
+  non-pub/sub provider loudly), and a vanished `REDIS_URL` silently
+  degrades the config to single-process `memory`. Boot always logs the
+  resolved tier (`channels bus: …`); once production depends on redis,
+  pin `bus: 'redis'` explicitly so a missing url becomes a boot refusal
+  instead of a downgrade.
+
+### `nats` (tier 3) — stub
+
+A typed adapter stub whose constructor **throws at boot** with the frozen
+interface contract. To use NATS today, implement `ChannelBus`
 (publish / subscribe with `'prefix*'` support / close) over your client
 and pass it directly: `attachChannels(server, { bus: myBus, … })`.
 
 ### How to switch
 
 ```ts
-channels: { bus: 'pg-notify' }   // uses database.url for its dedicated session
+channels: { bus: 'redis', redisUrl: process.env.REDIS_URL }   // the multi-process tier
+channels: { bus: 'pg-notify' }   // fallback: uses database.url for its dedicated session
 ```
 
 That is the whole switch. Channel keys, frame building, epochs, and the
@@ -311,14 +386,18 @@ makes filter-crossing precise.
 |---|---|---|
 | WS connects, no frames ever arrive | The door isn't `wire: 'columnar'` (SUB was refused `BAD_CHANNEL` — check the client console) | Set `wire: 'columnar'` on the `@crud` config and pass that door's `buildRouter` result in `attachChannels({ routers })`. |
 | No frames for one field/change | The silence rule: the changed columns don't intersect that door's `expose` mask (record lane = `get` projection, index lane = `index` projection) | Working as designed — add the field to `expose` if clients should see it live. |
-| Multi-process: writes on one node never reach sockets on another | `bus: 'memory'` (single-process semantics) | Set `bus: 'pg-notify'` (or pass a custom `ChannelBus`). Clients were healing via pull all along. |
+| Multi-process: writes on one node never reach sockets on another | `bus: 'memory'` (single-process semantics) | Set `bus: 'redis'` (or the `'pg-notify'` fallback, or pass a custom `ChannelBus`). Clients were healing via pull all along. |
 | Upgrade fails 403 | Origin not in `originAllowlist` (production), or non-localhost origin in dev with no allowlist | Add the exact origin (scheme + host + port) to `channels.originAllowlist`. |
 | Upgrade fails 401 | Token expired (10s TTL), reused, or minted by a *different process* behind a non-sticky LB | Mint immediately before dialing; enable sticky sessions so `POST {path}/token` and the upgrade hit the same process. |
 | Connections drop every N seconds (N ≈ 60–100) | A proxy idle timeout shorter than the heartbeat, or `heartbeatMs` raised past 55s (boot warned) | Keep `heartbeatMs` at the 25s default; check Cloudflare (100s fixed) / ALB / nginx (`proxy_read_timeout`) in the path. |
 | Connections drop with close code 1013 | Backpressure: the client couldn't drain >4MB of queued frames (slow network / huge fan-in) | Nothing to fix server-side — reconnect heals. If chronic, the client is subscribed to far more than it can consume. |
 | `pg-notify` boot fails: "self-NOTIFY probe heard nothing" | PgBouncer (or another pooler) in transaction-pooling mode between channels and Postgres | Point `database.url` (or the channels bus) at a direct Postgres URL or a session-mode pool. |
 | `pg-notify` running but cross-process frames silent, no boot error | Bus was started against a different database/cluster than the writers | Both processes' `database.url` must reach the same Postgres — NOTIFY does not cross databases. |
-| Commits slow, `pg_locks` shows waits on `class 1262 … database 0` | NOTIFY's global commit-order lock — the `pg-notify` tier is saturated | Move off `pg-notify`: implement `ChannelBus` over Redis/NATS and pass it to `attachChannels({ bus })`. |
+| Commits slow, `pg_locks` shows waits on `class 1262 … database 0` | NOTIFY's global commit-order lock — the `pg-notify` tier is saturated | Move to `bus: 'redis'` — this saturation is exactly what the redis tier exists for. |
+| `redis` boot fails: "loopback probe … heard nothing" | Redis unreachable (connection errors logged above the refusal), a Redis-compatible proxy/serverless provider without pub/sub support, or an LB routing the publisher and subscriber connections to different isolated instances | Point `redisUrl` at one real Redis endpoint. (Not the db index — pub/sub is instance-wide — and not `maxmemory` eviction, which never touches pub/sub.) |
+| `redis` running but cross-process frames silent, no boot error | The processes' `redisUrl`s reach different Redis instances (per-region endpoints, a migration half-done) — or their `database.url`s name different **hosts/dbnames** for the same data, splitting the derived channel namespace | Every process must publish and subscribe on the same instance/cluster, and reach the database through the same host + dbname (credentials/params don't matter — the namespace hashes host+port+dbname only). Meanwhile clients were healing via pull. |
+| Two deployments share one Redis and you *want* them isolated | Nothing to fix — the broadcast channel is namespaced per database (`adrz_cable:<hash>`), so different databases never cross-deliver | Sharing one Redis between staging and prod is safe by default; only identical database host+port+dbname would share a channel (and then they share the data too). |
+| `redis` logs "connection error (reconnecting…)" bursts | A Redis restart, failover, or network blip — the reconnect gap | Nothing to drain or replay: missed events healed on the next pull; the subscriber re-SUBSCRIBEd itself. Chronic bursts mean unstable Redis, not a bus problem. |
 | Boot throws "originAllowlist is required in production" | Serving channels in production without an Origin allowlist (CSWSH) | List your app origins under `environments.production.channels.originAllowlist`. |
 | Boot throws "publishes frames to nowhere" | `role: 'publish-only'` with `bus: 'memory'` | Set a cross-process bus, or drop the role. |
 | Stale permissions still streaming for up to 30s | The `revalidate` TTL — the documented bounded leak | Lower `revalidate` or set `'always'` if the window is unacceptable. |

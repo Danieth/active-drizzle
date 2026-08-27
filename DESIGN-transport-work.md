@@ -484,7 +484,8 @@ by buildRouter, shared by emitter+gateway+WS3, zero app wiring); the bus
 (`controller/src/channels/bus.ts` — MemoryBus tier 0 with the record
 short-circuit, PgNotifyBus tier 1 opt-in with dedicated session connection
 + boot self-NOTIFY probe teaching the PgBouncer failure + batched/chunked
-<7.5KB payloads + the 1262 signal documented, Redis/NATS teaching stubs;
+<7.5KB payloads + the 1262 signal documented, Redis/NATS teaching stubs
+[Redis since made real — see the 2026-08-28 tier-2 entry below];
 ids-only events ALWAYS — epochs never ride the bus); the emitter
 (`controller/src/channels/emitter.ts` — silence rule per VIEW mask,
 tenant-hashed index lanes for URL-scoped doors, slice builders through
@@ -571,7 +572,15 @@ heartbeat-healthy sockets); chunk sizing counts UTF-8 BYTES not UTF-16
 length; a single over-cap event is dropped from the wire loudly.
 (h) **Scaffold honesty** — trails.config template no longer selects the
 THROWING 'redis' stub off ambient REDIS_URL; bus tiers are explicit
-opt-ins.
+opt-ins. [AMENDED 2026-08-28 with the tier-2 landing: the stub half of
+this rationale is gone, and per explicit direction the scaffold again
+keys `bus: REDIS_URL ? 'redis' : 'memory'` — now as an ACKNOWLEDGED
+exception, not an accident: the generated config's comment names both
+edges (a stray REDIS_URL activates the tier → the boot probe refuses a
+non-pub/sub provider; a vanished REDIS_URL silently degrades to
+'memory'), attachChannels logs the resolved tier at every boot so both
+failure directions are visible, and the docs tell production to pin
+`bus: 'redis'` explicitly. Non-scaffold configs remain explicit opt-ins.]
 (i) Cheap hardening from the same review: client epoch table is
 max-join at RESET and SUB_ACK (a forged old-epoch RESET cannot regress
 the O16 filter — pinned by a subId-reuse drive); degraded SIGNALs carry
@@ -588,6 +597,54 @@ async-rejecting publishers pinned. NOT taken, stated: a bus-delivered
 per-principal revocation push (the revalidate TTL is the documented
 bound; docs now say so explicitly), and a heartbeat-tolerance pin (node
 'ws' auto-answers protocol pings — no cheap deterministic seam).
+**TIER 2 LANDED 2026-08-28 — `bus: 'redis'` is real (review findings
+applied same-day):** RedisBus over ioredis (chosen over node-redis: its
+reconnect owns re-SUBSCRIBE on the dedicated subscriber connection,
+retryStrategy maps 1:1 onto the house backoff 1s→30s, redis://
+/rediss:// urls carry TLS/auth/db) — dedicated publisher+subscriber pair
+(Redis command-restricts a subscribing connection), the SAME hoisted
+wire shape as pg-notify (toWireEvent/encodeWireBatch — pinned
+byte-for-byte), plain pub/sub NOT Streams (C1: pull is the replay; a
+Stream's persistence would buy nothing and cost trimming/consumer-group
+babysitting), boot-only loopback probe (teaches non-pub/sub
+Redis-compatible providers and pair-splitting LBs), no chunking (no
+NOTIFY-style cap). Review-hardened, all pinned by
+controller tests/channels/redis-bus + redis-acceptance (real Redis +
+real-PG two-gateway topology, gateway B hearing ONLY the wire):
+(i) BLOCKER — dispatchWireBatch now shape-validates and per-event
+try/catches with LOUD skips: a parseable-but-misshapen payload from a
+foreign writer (or a future wire shape mid-rolling-deploy) previously
+threw inside the EventEmitter data path = uncaughtException = node down;
+(ii) the broadcast channel is NAMESPACED per deployment
+(`adrz_cable:<hash of database.url host+port+dbname>`, redisNamespaceFor)
+— Redis pub/sub is instance-wide, unlike NOTIFY's free per-database
+scoping, so shared-instance deployments would otherwise cross-deliver
+rumors and amplify each other's dry-run/reload load; creds+params
+excluded from the hash so same-data processes always share a channel;
+(iii) the GAP CONVENTION is now genuinely ONE convention: PgNotifyBus.flush
+previously RETAINED pending events unboundedly (and silently) across a
+reconnect gap, then shipped them stale — both tiers now drop the wire
+copy loudly (throttled: first drop immediate, then counted summaries per
+5s window — a 10ms batch window under load would otherwise log ~100
+lines/s during the exact incident) — pinned on both tiers;
+(iv) the self-origin dedupe pin was a mutant survivor (assertions ran
+before the echo could arrive) — both tiers now assert AFTER the wire
+round trip that the publisher heard itself exactly once, record intact;
+(v) originId is crypto.randomUUID() in both tiers (Math.random collision
+= two nodes silently deaf to each other, masked by pull-healing);
+(vi) start() is reentrancy-guarded (teaching throw; a second start()
+orphaned a forever-reconnecting pair) and `closed` resets on start.
+Config: channels.redisUrl (env-referenced) + assertChannelsServable
+refusal for redis-without-url; attachChannels threads it and LOGS the
+resolved tier at boot. Scaffold: ioredis shipped,
+`bus: REDIS_URL ? 'redis' : 'memory'` per the amended (h). Docs:
+channels.md tier section + troubleshooting rows (probe refusals,
+split-instance/split-namespace silence, reconnect bursts; at-most-once
+is the designed contract). STATED TEST DEBT (structurally verified, not
+pinned end-to-end): the redis acceptance lane drives an unscoped door —
+the record-less-event tenant gate (WS4(b)) is pinned with MemoryBus
+injection in gateway.test.ts, and the redis path feeds the same
+SubscriptionTable, but no scoped-door scenario crosses the real wire yet.
 - `ws` upgrade on the scaffold's http server at `config.channels.path`;
   upgrade-token mint endpoint (attach-guard pattern) + Origin allowlist;
   25s app-level heartbeat; reauth frame; SharedWorker tab sharing with

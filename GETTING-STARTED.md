@@ -116,7 +116,7 @@ options pickers, @mutation buttons, `<Can>`, skeletons, contract probes).
 // trails.config.ts — JS, not JSON; ONE file; envs are inline overrides
 export default defineConfig({
   server:   { port: 8787 },
-  channels: { bus: 'memory' },   // multi-process: opt into 'pg-notify'
+  channels: { bus: 'memory' },   // multi-process: 'redis' (set REDIS_URL)
   environments: {
     production: { channels: { revalidate: 'always' } },
   },
@@ -150,12 +150,19 @@ What operators must know, compressed (full manual: `docs/guide/channels.md`):
   Killing the socket layer loses liveness, never data.
 - **`bus: 'memory'` (default) is single-process.** Two API processes on
   it means a write on one is not pushed to sockets on the other (they
-  stay eventually-fresh via pull). Multi-process: `bus: 'pg-notify'` —
-  ids-only over Postgres NOTIFY, needs a session-mode connection
-  (PgBouncer transaction pooling breaks LISTEN; a boot probe refuses
-  loudly), and watch for `class 1262 … database 0` lock waits — the
-  saturation signal to move to a real broker. `'redis'`/`'nats'` are
-  teaching stubs that throw; implement `ChannelBus` and pass it to
+  stay eventually-fresh via pull). Multi-process: set `REDIS_URL` and the
+  scaffold config selects `bus: 'redis'` — ids-only commit events over
+  Redis pub/sub, at-most-once **by design** (pull is the replay; nothing
+  to drain or reconcile), reconnects self-heal with the gap healed by
+  pull. That env-keyed selection is a convenience with a sharp edge —
+  boot logs the resolved tier, and once production depends on redis, pin
+  `bus: 'redis'` explicitly so a vanished `REDIS_URL` refuses to boot
+  instead of silently degrading to single-process `memory`. No Redis?
+  `bus: 'pg-notify'` is the fallback — Postgres NOTIFY,
+  needs a session-mode connection (PgBouncer transaction pooling breaks
+  LISTEN; a boot probe refuses loudly); `class 1262 … database 0` lock
+  waits are its saturation signal to move to redis. `'nats'` is a
+  teaching stub that throws; implement `ChannelBus` and pass it to
   `attachChannels({ bus })`.
 - **Production refuses to boot without `channels.originAllowlist`** —
   the Origin check is what stops cross-site WebSocket hijacking.

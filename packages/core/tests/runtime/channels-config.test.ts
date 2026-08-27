@@ -72,6 +72,14 @@ describe('assertChannelsServable', () => {
     expect(() => assertChannelsServable(resolveChannelsConfig({}), 'development')).not.toThrow()
   })
 
+  it("refuses bus 'redis' without redisUrl; passes with one (env-referenced)", () => {
+    expect(() => assertChannelsServable(resolveChannelsConfig({ bus: 'redis' }), 'development'))
+      .toThrow(/redis.*redisUrl.*TWO dedicated.*process\.env\.REDIS_URL/s)
+    expect(() => assertChannelsServable(
+      resolveChannelsConfig({ bus: 'redis', redisUrl: 'redis://localhost:6379' }), 'development',
+    )).not.toThrow()
+  })
+
   it('warns (never throws) on a heartbeat that outlives proxy idle timeouts', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     assertChannelsServable(resolveChannelsConfig({ heartbeatMs: 60_000 }), 'development')

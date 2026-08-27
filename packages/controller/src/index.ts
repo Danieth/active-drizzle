@@ -122,10 +122,13 @@ export {
   NatsBus,
   createBus,
   pgBouncerTeachingError,
+  redisProbeTeachingError,
+  redisNamespaceFor,
   type ChannelBus,
   type BusCommitEvent,
   type BusListener,
   type PgNotifyBusOptions,
+  type RedisBusOptions,
 } from './channels/bus.js'
 export {
   startChannelEmitter,
