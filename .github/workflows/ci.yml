@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # tsc --noEmit across every workspace package (src trees).
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Core unit lane — includes the BEFORE_LAUNCH #1 gate
+      # (tests/codegen/generated-output-typecheck.test.ts), which regenerates a
+      # fixture app through the real vite-plugin pipeline and typechecks the
+      # GENERATED output, so codegen can never regress to failing `tsc`.
+      #
+      # The `integration` project (tests/integration/**, 9 files) is NOT run
+      # here: those suites boot their own throwaway Postgres via
+      # @testcontainers/postgresql (one Docker container per file) rather than
+      # honoring a DATABASE_URL, so a workflow-level postgres service can't
+      # feed them. They run locally / pre-publish. Wiring testcontainers into
+      # CI is a possible follow-up, kept out of this gate to stay fast and
+      # unflaky.
+      - name: Core unit tests
+        working-directory: packages/core
+        run: npx vitest run --project unit
+
+      # PG-bound suites excluded for the same testcontainers reason:
+      #   tests/controller.test.ts  (full-stack CRUD against real Postgres)
+      #   tests/columnar-parity.test.ts (columnar wire parity against real Postgres)
+      - name: Controller unit tests
+        working-directory: packages/controller
+        run: >
+          npx vitest run
+          --exclude 'tests/controller.test.ts'
+          --exclude 'tests/columnar-parity.test.ts'
+
+      # PG-bound suites excluded (testcontainers, see above):
+      #   tests/columnar-handshake.test.ts
+      #   tests/transport-forbidden-corruption.test.ts
+      - name: React unit tests
+        working-directory: packages/react
+        run: >
+          npx vitest run
+          --exclude 'tests/columnar-handshake.test.ts'
+          --exclude 'tests/transport-forbidden-corruption.test.ts'
+
+      - name: Helpers tests
+        working-directory: packages/helpers
+        run: npx vitest run

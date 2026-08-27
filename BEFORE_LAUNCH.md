@@ -6,6 +6,8 @@ Hard blockers to clear before a public/1.0 launch. These are things that are **e
 
 ## 🔴 1. Generated code must `tsc --noEmit` clean  (CRITICAL)
 
+> **Status (updated 2026-08-27): DONE — and gated.** `npm run typecheck` is green across all packages, and the regression gate exists: `packages/core/tests/codegen/generated-output-typecheck.test.ts` runs the REAL vite-plugin pipeline over a fixture app exercising all three historical failure shapes below (controller-less nested child include, `{Model}Client` extends, `static name = Attr.string(...)`) **plus a `wire: 'columnar'` door** (tracked lane: lock column + transport tables), then typechecks the generated output with the compiler API at the repo's strictness (strict + exactOptionalPropertyTypes + noUncheckedIndexedAccess), resolving workspace packages to their *source* so a stale build can't mask a regression — zero errors asserted. Runs in the core unit suite and in CI (`.github/workflows/ci.yml`), so generated code can no longer regress to failing `tsc` unnoticed. (The `react-generator.ts` TS2345 note below is resolved — core typecheck is clean.)
+
 **Why it's a blocker:** we are a *TypeScript-first* library. The first thing a skeptical adopter does is run `tsc`. A red typecheck reads as "not ready" even though the app runs fine — it torpedoes trust before anyone evaluates the actual DX. Right now `npm run typecheck` is **not** clean (documented in `README-BUGS-FOUND.md`).
 
 Known failures to fix (from `README-BUGS-FOUND.md`, verify the list is still current):
@@ -21,6 +23,8 @@ Known failures to fix (from `README-BUGS-FOUND.md`, verify the list is still cur
 ---
 
 ## 🟠 2. Don't leak internal errors across the trust boundary  (SECURITY — launch blocker)
+
+> **Status (updated 2026-08-27): VERIFIED DONE.** `packages/controller/src/adapters/hono.ts` catches every non-`HttpError`: it reports the raw error to the app's `onError` handlers, answers with `translateDbError`'s user-safe message when one applies, and otherwise returns a generic `{ error: 'Internal server error' }` 500 that never echoes `err.message` — pinned by `packages/controller/tests/hono-adapter.test.ts` ("unknown errors report + 500 with a SAFE body (no stack leak)"). Error-tracker payloads pass through the single `scrubDbError` chokepoint in `packages/core/src/runtime/error-reporting.ts` (save path AND query path). One caveat: `hono.ts` is the only shipped adapter — an app mounting the oRPC router directly relies on oRPC's own error masking, not ours.
 
 Confirm the controller adapter turns **any** non-`HttpError` into a generic 500 that does **not** echo `err.message`. Raw DB errors can leak schema/SQL/table names to the client. This is the error-side of the "model allows, controller gates" rule. Cheap to get wrong, expensive to discover in the wild. (The rest of the error-handling roadmap is in NICE_TO_HAVE — but this one item is a security blocker, not a nicety.)
 

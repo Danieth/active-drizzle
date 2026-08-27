@@ -198,8 +198,13 @@ path instead of at one boundary. `save()` does it right; every other path forks.
       `console.log`, then generation proceeds ON RED and writes files from invalid
       meta (vite/index.ts:293). "Errors that teach" must apply to the framework's
       OWN build — a hard error mode that refuses to emit.
-- [ ] Generated output `tsc --noEmit` clean + a CI gate that regenerates fixtures
+- [x] Generated output `tsc --noEmit` clean + a CI gate that regenerates fixtures
       and typechecks them (BEFORE_LAUNCH §1: dangling-import, `id?`, `Function.name`).
+      Gate: core/tests/codegen/generated-output-typecheck.test.ts — real vite
+      pipeline over a fixture app (all three shapes + a wire:'columnar' door),
+      generated output typechecked via ts.createProgram, zero errors; wired
+      into CI (.github/workflows/ci.yml: typecheck + unit suites; the
+      testcontainers-PG suites are excluded there by name, with the reason).
 
 ### Boundary correctness
 - [x] Controller reads `model.name` in ~10 places (router.ts:528) — the framework's
