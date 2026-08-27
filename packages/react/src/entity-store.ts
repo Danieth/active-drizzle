@@ -444,17 +444,34 @@ export class EntityStore {
   }
 
   /**
-   * M4, 304 shape (validation response for projection P at V):
-   * lastSeen(f) := max(lastSeen(f), V) for EXACTLY the fields of P —
-   * values untouched. PRECONDITION (dev-throw): every f ∈ P is a held,
-   * TRACKED cell — "a 304 never freshens a cell the client does not
-   * hold" is the O8 model-check target, enforced at the type of the
-   * operation. (M4's other two cases route elsewhere: gone(D) responses
-   * call destroy(); dirty slices call merge().) Also joins knownVersion.
+   * M4, 304 shape (validation response for projection P at V, issued at
+   * coverage watermark W = projFreshAt(P) at issue time):
+   * lastSeen(f) := max(lastSeen(f), V) for the fields of P **whose
+   * lastSeen(f) >= W at apply time** — values untouched. The per-field
+   * W guard is load-bearing: a cell evicted/GC'd after the request
+   * issued and re-merged from a STALER payload has lastSeen < W, and
+   * the in-flight 304 must not certify that value at V (TLC found the
+   * 11-state ComponentwiseTruth violation without it; proof M4 + T3
+   * case L < W, the O8 amendment). PRECONDITION (dev-throw): every
+   * f ∈ P is a held, TRACKED cell — "a 304 never freshens a cell the
+   * client does not hold" is the O8 model-check target, enforced at
+   * the type of the operation. (M4's other two cases route elsewhere:
+   * gone(D) responses call destroy(); dirty slices call merge().)
+   * Also joins knownVersion.
    */
-  certify(model: string, pk: EntityPk, fields: string[], token: number): void {
+  certify(model: string, pk: EntityPk, fields: string[], token: number, watermark: number): void {
     const V = this.requireToken(token, `certify(${model}, ${String(pk)})`)
-    if (V === null) return
+    const W = this.requireToken(watermark, `certify(${model}, ${String(pk)}) watermark`)
+    if (V === null || W === null) return
+    if (W > V) {
+      const msg =
+        `[entity-store] certify(${model}, ${String(pk)}): watermark ${W} exceeds the certified token ${V} — ` +
+        `a 304's token is never below the If-None-Match watermark it validated. This response is ill-formed; ` +
+        `refusing it whole. (Pass the projFreshAt(P) computed when the request was ISSUED, not a newer one.)`
+      if (DEV) throw new Error(msg)
+      warnOnce(msg)
+      return
+    }
     const key = keyOf(model, pk)
     const existing = this.entries.get(key)
     for (const f of fields) {
@@ -474,7 +491,11 @@ export class EntityStore {
     const seen = decodeSeen(existing)
     let moved = false
     for (const f of fields) {
-      if (V > seen[f]!) { seen[f] = V; moved = true }
+      // Apply-time W guard (proof M4, O8 amendment): a cell whose
+      // lastSeen fell below the issue-time watermark (eviction/GC +
+      // stale re-merge while the 304 was in flight) is NOT the cell
+      // the server certified — it receives no certification.
+      if (seen[f]! >= W && V > seen[f]!) { seen[f] = V; moved = true }
     }
     const knownVersion = Math.max(existing.knownVersion, V)
     if (!moved && knownVersion === existing.knownVersion) return

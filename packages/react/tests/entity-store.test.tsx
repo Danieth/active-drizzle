@@ -113,7 +113,7 @@ describe('unit contract', () => {
     expect(lastSeenOf(e, 'amount')).toBe(null)                 // …but the cell is UNTRACKED now
     expect(isCurrent(e, 'amount')).toBe(false)
     expect(projFreshAt(e, ['amount'])).toBe(null)              // no If-None-Match goes out at 20
-    expect(() => s.certify('Deal', 5, ['amount'], 25))         // a 304 can never bless the stale value
+    expect(() => s.certify('Deal', 5, ['amount'], 25, 20))         // a 304 can never bless the stale value
       .toThrow(/never freshens a cell the client does not hold/)
   })
 
@@ -384,7 +384,7 @@ describe('Rule M: destroy floor, signal, certify (WS1 acceptance)', () => {
     s.merge('Deal', 1, { a: 1, b: 2 }, { version: 10 })
     s.signal('Deal', 1, 30)
     expect(isCurrent(s.get('Deal', 1)!, 'a')).toBe(false)
-    s.certify('Deal', 1, ['a'], 30)                            // 304 for projection {a} at 30
+    s.certify('Deal', 1, ['a'], 30, 10)                            // 304 for projection {a} at 30
     const e = s.get('Deal', 1)!
     expect(lastSeenOf(e, 'a')).toBe(30)
     expect(lastSeenOf(e, 'b')).toBe(10)                        // outside P: untouched
@@ -396,19 +396,41 @@ describe('Rule M: destroy floor, signal, certify (WS1 acceptance)', () => {
   it('certify dev-throws on an unheld or untracked cell — a 304 never freshens a cell the client does not hold', () => {
     const s = new EntityStore()
     s.merge('Deal', 1, { a: 1 }, { version: 10 })
-    expect(() => s.certify('Deal', 1, ['a', 'ghost'], 20))
+    expect(() => s.certify('Deal', 1, ['a', 'ghost'], 20, 10))
       .toThrow(/never freshens a cell the client does not hold/)
     expect(lastSeenOf(s.get('Deal', 1)!, 'a')).toBe(10)        // ill-formed response refused WHOLE
     s.merge('Deal', 1, { u: 'untracked' })
-    expect(() => s.certify('Deal', 1, ['u'], 20))
+    expect(() => s.certify('Deal', 1, ['u'], 20, 10))
       .toThrow(/never freshens a cell the client does not hold/)
   })
 
   it('a stale 304 (fresher payload raced it) is a no-op join, not a regression', () => {
     const s = new EntityStore()
     s.merge('Deal', 1, { a: 1 }, { version: 20 })
-    s.certify('Deal', 1, ['a'], 15)                            // 304 at 15 arrives late — legal on 𝒞r
+    s.certify('Deal', 1, ['a'], 15, 10)                            // 304 at 15 arrives late — legal on 𝒞r
     expect(lastSeenOf(s.get('Deal', 1)!, 'a')).toBe(20)
+  })
+
+  it('the O8 apply-time watermark guard: an in-flight 304 cannot certify a cell that fell below its issue watermark (TLC counterexample)', () => {
+    const s = new EntityStore()
+    s.merge('Deal', 7, { name: 'fresh' }, { version: 10 })
+    const W = projFreshAt(s.get('Deal', 7)!, ['name'])!        // 10 — the If-None-Match that went out
+    s.remove('Deal', 7)                                        // entry evicted while the 304 is in flight
+    s.merge('Deal', 7, { name: 'stale' }, { version: 4 })      // re-merged from a lagging payload
+    s.certify('Deal', 7, ['name'], 12, W)                      // the 304 lands: server certified name@W..12 — but THIS cell is name@4
+    const e = s.get('Deal', 7)!
+    expect(lastSeenOf(e, 'name')).toBe(4)                      // no certification: 'stale' is not the value at 12
+    expect(isCurrent(e, 'name')).toBe(false)
+    expect(e.knownVersion).toBe(12)                            // M3's join still happens — the rumor is real
+  })
+
+  it('certify refuses W > V whole — a 304 token is never below the watermark it validated', () => {
+    const s = new EntityStore()
+    s.merge('Deal', 8, { a: 1 }, { version: 10 })
+    expect(() => s.certify('Deal', 8, ['a'], 9, 10)).toThrow(/watermark 10 exceeds the certified token 9/)
+    const e = s.get('Deal', 8)!
+    expect(lastSeenOf(e, 'a')).toBe(10)                        // refused whole: nothing moved
+    expect(e.knownVersion).toBe(10)
   })
 })
 
@@ -503,7 +525,8 @@ describe('WS1 acceptance properties (seeded; failures log the seed)', () => {
       const beforeSeen = Object.fromEntries(FIELDS.map(f => [f, lastSeenOf(before, f)!]))
       const beforeFields = { ...before.fields }
 
-      s.certify('Deal', 9, P, V)
+      const W = Math.min(V, ...P.map(f => beforeSeen[f]!))   // issue-time projFreshAt, capped by V (V >= W always on a real 304)
+      s.certify('Deal', 9, P, V, W)
       const e = s.get('Deal', 9)!
       for (const f of FIELDS) {
         expect(lastSeenOf(e, f)).toBe(
@@ -517,7 +540,7 @@ describe('WS1 acceptance properties (seeded; failures log the seed)', () => {
 
       // A P naming an unheld cell is an ill-formed response: dev-throw,
       // refused WHOLE — the snapshot object is untouched.
-      expect(() => s.certify('Deal', 9, [...P, 'ghost'], V + 100))
+      expect(() => s.certify('Deal', 9, [...P, 'ghost'], V + 100, W))
         .toThrow(/never freshens a cell the client does not hold/)
       expect(s.get('Deal', 9)).toBe(e)                         // same object — nothing moved
       expect('ghost' in e.fields).toBe(false)
@@ -716,7 +739,7 @@ describe('floorRetention (finite) — the safety-inequality knob, pinned', () =>
       // what advances the prune horizon.
       if (i % 3 === 0) s.merge('Deal', 'victim', { a: `a@${21 + i}` }, { version: 21 + i })
       else if (i % 3 === 1) s.signal('Deal', 'victim', 100 + i)
-      else s.certify('Deal', 'victim', ['a'], 200 + i)
+      else s.certify('Deal', 'victim', ['a'], 200 + i, 20)
       s.destroy('Deal', `other-${i}`, 1)
     }
     expect(s.exportFloors()).toContainEqual(['Deal', 'victim', 15])
