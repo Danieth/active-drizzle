@@ -353,6 +353,27 @@ describe('acceptsNestedAttributesFor runtime', () => {
     expect(db.insert).toHaveBeenCalledTimes(2)
   })
 
+  it("records created-row id ↔ client _key pairs for the envelope's _key echo", async () => {
+    const db = makeNestedDb()
+    boot(db, nestedSchema)
+
+    const order = new Order({ lineItemsAttributes: [{ name: 'Widget', _key: 'new:3' }] })
+    await order.save()
+
+    // The controller stitches these onto serialized child rows so the form
+    // adopts new-row ids EXACTLY (never positionally).
+    expect((order as any)._lastNestedKeys).toEqual({ lineItems: { '99': 'new:3' } })
+  })
+
+  it('rows without _key record nothing (hand-rolled clients unaffected)', async () => {
+    const db = makeNestedDb()
+    boot(db, nestedSchema)
+
+    const order = new Order({ lineItemsAttributes: [{ name: 'Widget' }] })
+    await order.save()
+    expect((order as any)._lastNestedKeys).toEqual({})
+  })
+
   it('does not include *Attributes keys in the parent DB payload', async () => {
     const capturedPayloads: any[] = []
     const db = makeNestedDb()

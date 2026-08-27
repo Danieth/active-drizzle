@@ -193,6 +193,10 @@ export class ApplicationRecord {
   public _changes: Map<string, { was: any; is: any }> = new Map()
   public errors: ValidationErrors = createValidationErrors()
   public isNewRecord: boolean = true
+  /** Created-nested-row id ↔ client `_key` pairs from the LAST save — the
+   *  controller stitches these onto echoed child rows. DECLARED here so the
+   *  proxy set trap routes it as an instance field, never a column write. */
+  public _lastNestedKeys: Record<string, Record<string, string>> = {}
 
   // ── Static table name ──────────────────────────────────────────────────
 
@@ -1642,6 +1646,11 @@ function _captureNestedAttributes(record: any, ctor: any): Record<string, any> {
  */
 async function _processNestedAttributes(record: any, ctor: any, snapshot: Record<string, any>): Promise<void> {
   const ownerId = record._attributes['id']
+  // Created-row id ↔ client `_key` pairs from THIS save, per association.
+  // The controller stitches `_key` back onto serialized child rows so the
+  // form adopts new-row ids EXACTLY (never positionally). Reset per save —
+  // the map describes one write, not the record.
+  record._lastNestedKeys = {}
   if (!ownerId || Object.keys(snapshot).length === 0) return
 
   for (const [key, nested] of Object.entries(snapshot)) {
@@ -1710,6 +1719,10 @@ async function _processNestedAttributes(record: any, ctor: any, snapshot: Record
         } else {
           const created = await TargetModel.create({ ...fields, ...forced })
           if (created?.isNewRecord) throw new NestedAttributesError(key, _nestedChildError(created, key))
+          const newId = created?.id ?? created?._attributes?.id
+          if (_key != null && newId != null) {
+            ;(record._lastNestedKeys[key] ??= {})[String(newId)] = String(_key)
+          }
         }
       }
     }

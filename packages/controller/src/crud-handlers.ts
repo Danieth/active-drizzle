@@ -324,6 +324,21 @@ export function buildRecordEnvelope(
     config, pk,
   )
 
+  // Stitch the client's ephemeral `_key` onto child rows CREATED by this
+  // save (core records id↔_key pairs in _processNestedAttributes). The form
+  // adopts new-row ids by _key — exact matching, no order assumptions.
+  const nestedKeys: Record<string, Record<string, string>> | undefined = (record as any)?._lastNestedKeys
+  if (nestedKeys) {
+    for (const [assoc, byId] of Object.entries(nestedKeys)) {
+      const rows = (serialized as any)?.[assoc]
+      if (!Array.isArray(rows)) continue
+      for (const row of rows) {
+        const k = row?.id != null ? byId[String(row.id)] : undefined
+        if (k !== undefined) row._key = k
+      }
+    }
+  }
+
   const envelope: RecordEnvelope = {
     record: serialized,
     abilities,
@@ -966,6 +981,12 @@ async function reloadWithIncludes(relation: any, config: CrudConfig, id: any, re
   }
   try {
     const fresh = (await relation.where({ id }).includes(...includes).first()) ?? record
+    // The saved instance carries this save's created-child id↔_key pairs;
+    // the reloaded instance is what serializes — carry the map across so
+    // buildRecordEnvelope can stitch _key onto the echoed child rows.
+    if (fresh !== record && (record as any)?._lastNestedKeys) {
+      (fresh as any)._lastNestedKeys = (record as any)._lastNestedKeys
+    }
     await hydrateHabtmIds(fresh, model ?? null, config)
     return fresh
   } catch {

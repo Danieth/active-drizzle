@@ -123,3 +123,29 @@ describe('taxonomy threading through the oRPC lane', () => {
     expect(err.data.errors).toEqual({ reason: ['is required'] })
   })
 })
+
+describe('_key echo: the envelope stitches created-child keys onto serialized rows', () => {
+  it('buildRecordEnvelope adds _key to rows named in _lastNestedKeys', async () => {
+    const { buildRecordEnvelope } = await import('../src/crud-handlers.js')
+    const record: any = {
+      id: 1,
+      _lastNestedKeys: { notes: { '41': 'new:3' } },
+      toJSON: () => ({ id: 1, notes: [{ id: 40, body: 'old' }, { id: 41, body: 'fresh' }] }),
+    }
+    const Model: any = class Deal {}
+    const env = buildRecordEnvelope(record, Model,
+      { get: { expose: ['notes'], include: ['notes'] } } as any, {}, { constructor: {} })
+    expect(env.record.notes).toEqual([
+      { id: 40, body: 'old' },
+      { id: 41, body: 'fresh', _key: 'new:3' },
+    ])
+  })
+
+  it('no map → rows untouched (hand-rolled and read paths unchanged)', async () => {
+    const { buildRecordEnvelope } = await import('../src/crud-handlers.js')
+    const record: any = { id: 1, toJSON: () => ({ id: 1, notes: [{ id: 40 }] }) }
+    const env = buildRecordEnvelope(record, class Deal {} as any,
+      { get: { expose: ['notes'], include: ['notes'] } } as any, {}, { constructor: {} })
+    expect(env.record.notes).toEqual([{ id: 40 }])
+  })
+})
