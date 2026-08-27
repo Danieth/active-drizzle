@@ -215,7 +215,13 @@ never a freshness claim. There is no tombstone object; "deleted" is an
   holds a cell for every f ∈ P (else lastSeen is undefined and the request
   is ill-formed — enforced by construction, since W is computed from held
   cells). On **304 carrying V**: lastSeen(f) := max(lastSeen(f), V) for
-  each f ∈ P. On **gone(D)**: apply M2. On a slice: apply M1.
+  each f ∈ P **with lastSeen(f) ≥ W at apply time** — per field: a cell of
+  P that was garbage-collected since issue (L3), and possibly re-merged
+  from a staler payload at a token < W, has lastSeen < W and receives no
+  certification. (The precondition is an issue-time statement; the ≥ W
+  guard is what survives of it at apply time. Found by the O8 model
+  checker; see T3's case L < W.) On **gone(D)**: apply M2. On a slice:
+  apply M1.
 
 Every payload also performs M3's knownVersion update with its token.
 
@@ -305,16 +311,24 @@ a 304 carrying V, every f ∈ P holds a value true at its (possibly
 advanced) lastSeen, and the record was live throughout the certified
 interval.
 
-*Proof.* Fix f ∈ P, let L = lastSeen(f) at processing time, and note the
-precondition (client holds f) makes L defined. **Case L ≥ V** (a fresher
-payload — e.g. a push at 20 — arrived while the 304 at V = 15 was in
-flight, legal on 𝒞w/𝒞r): M4 is the join with a smaller token, a no-op;
-validity is untouched. **Case L < V**: the request's watermark satisfied
-W ≤ L; A2′(i) gives last_write(f) ≤ W ≤ L, and A2′(ii) excludes any destroy
-or re-create in (W, V] ⊇ (L, V], so f's value is constant and the record
-continuously live on [L, V]; the held value (true at L, by T4) is the value
-at V, and advancing lastSeen to V is a certification. The gone(D) case is
-M2, sound by A2. ∎
+*Proof.* Fix f ∈ P and let L = lastSeen(f) at the moment the client applies
+the response (−∞ if the cell has been dropped in the interim). **Case
+L < W** (reachable only through L3 garbage collection of a dead cell after
+issue, optionally followed by a re-merge from a staler payload below W):
+M4's per-field guard skips f — no certification, trivially sound. This
+case is a real hole, not book-keeping: without the guard, GC plus a stale
+re-merge lets the 304 stamp the re-merged old value with V — a value–token
+pair that never existed, violating T4 (found by the O8 model checker at
+MaxToken = 3; the corrupted cell is provably invisible forever, since
+A2′(ii) forces the GC-enabling destroy above V, but T4 quantifies over σ,
+not over what renders). **Case L ≥ V** (a fresher payload — e.g. a push at
+20 — arrived while the 304 at V = 15 was in flight, legal on 𝒞w/𝒞r): M4 is
+the join with a smaller token, a no-op; validity is untouched. **Case
+W ≤ L < V**: A2′(i) gives last_write(f) ≤ W ≤ L, and A2′(ii) excludes any
+destroy or re-create in (W, V] ⊇ (L, V], so f's value is constant and the
+record continuously live on [L, V]; the held value (true at L, by T4) is
+the value at V, and advancing lastSeen to V is a certification. The
+gone(D) case is M2, sound by A2. ∎
 
 > **Rejected predicates — recorded as counterexamples.**
 > **(a)** "304 iff v(r) = W": after any signal it almost never fires — the
@@ -481,6 +495,14 @@ isolation, cross-record envelope atomicity, and non-interference are
 ---
 
 ## Revision history
+
+**Rev 3 + O8 amendment (2026-08-27).** Model checking the row lane
+(specs/RowLane.tla, obligation O8) found a hole in rev 3's T3: its case
+L < V silently assumed W ≤ lastSeen(f) still held at apply time, which L3
+garbage collection followed by a stale re-merge breaks — an unguarded 304
+could then manufacture a value–token pair (permanently invisible, but a
+T4 violation). M4's 304 case gained the per-field lastSeen(f) ≥ W guard
+and T3 the explicit case L < W. No other statement changed.
 
 **Rev 3** (this document) incorporates the second external review: rev 2's
 L2 was *false* — its tombstone-replacement rule was non-commutative
