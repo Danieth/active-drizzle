@@ -118,6 +118,20 @@ export function buildContractProbes(
     }
   }
 
+  // ── validate (columnar doors): projId is a CEILING, never a request ──────
+  // A forged/stale projId must answer the slice at the door's ACTUAL mask —
+  // 'fresh' off a mask the server did not compile would certify cells the
+  // door never shipped (deploy-skew rule, WS3). The strip-probe re-GET also
+  // proves the slice carries no forged echo.
+  if ((config as any).wire === 'columnar') {
+    probes.push({
+      name: 'validation with a forged projId never answers fresh',
+      procedure: 'validate',
+      input: { id, projId: FORGED, ifNoneMatch: 0 },
+      expect: 'strip', forgedField: 'status', forgedValue: 'fresh',
+    })
+  }
+
   // ── mutations: required params + payload allowlists ──────────────────────
   for (const mut of getMutations(ControllerClass)) {
     if (mut.bulk) continue

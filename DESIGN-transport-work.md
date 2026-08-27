@@ -292,23 +292,176 @@ WS2/WS3 when real destroy tokens exist at the call site.
   test; STI-door runtime serialization tests.
 
 ### WS3 — Validation path (the 304 machinery)
-Discharges: **O10, O5, O15** (server side).
-- Server write-log: per commit, persist (token, changedFieldsBitmap,
-  lifecycleFlag) per record — source is `previousChanges` (P4). Bounded
-  retention; expiry ⇒ conservative slice response. Schema in Appendix B.
-- Three-way validation endpoint `get(model, pk, projId,
-  If-None-Match: projFreshAt)` → 304(V) | gone(D) | dirty slice, with
-  A2′'s three clauses exactly. projId = hash of compiled field mask
-  (ceiling change ⇒ new id).
-- Membership tags: door-scoped commit-ordered counter (the theorem-grade
-  option — DECIDE here, record in wire-identity §4) + splice endpoint;
-  property-test apply(list@from, ops) = list@to per door (O15).
-- Storm controls: echo merging, membership-only refetch, oRPC batch link,
-  structure-token ETags (wire-identity §4).
-- Acceptance: model-checkable invariants asserted as integration tests —
-  "304 never freshens a cell the client does not hold"; "304 never
-  certifies across a lifecycle event" (create→destroy→validate with
-  stale W must NOT 304).
+Discharges: **O10 ✅, O5 ✅, O15 ⏳-pinned** (server side LANDED
+2026-08-27; client dispatch LANDED same day — see the storm-controls
+bullet below; O15's real splice ops remain the pinned residual).
+REVIEW-HARDENED same day (external review, all blockers closed): lazy
+fieldsRev wiring, hook aliasing for the generated siblings, scoped-door
+gone(D) refusal (§6 non-theorem), physical-lock registry verification,
+unlogged-root slice + W9 + symmetric client skip, insertAll/deleteAll
+contract closure, read-side degrade on unmigrated DBs, splice-route
+ordering + reserved names + tagless refusal, retention narrowed to the
+tombstone, bulk log batching + honest hot-row cost — details inline
+below and in proof §7 O5/O10/O15.
+- ✅ Server write-log (`core/src/runtime/write-log.ts` + hooks in
+  application-record.ts / relation.updateAll / counter-cache): per commit,
+  (token, changed bitmap over ONE declaration-order model numbering,
+  lifecycle 0/1/2/3 — undelete=3 so soft re-creation trips clause ii),
+  written **INSIDE the data transaction**, never afterCommit. THE
+  WRITE-POINT ARGUMENT, recorded: (a) tokens are DENSE per lineage
+  (create=0 by DB default, every bump +1 — lineage-tokens pins it), so
+  validation gap-checks (W,V] — count == V−W — and a lossy log degrades to
+  the conservative slice, never a wrong 304; but (b) gone(D) makes
+  afterCommit untenable regardless: after a hard destroy the lifecycle=2
+  row is the ONLY durable carrier of D, and a fabricated D violates T4.
+  In-tx logging makes log-row-exists ⟺ commit-happened a Postgres
+  atomicity fact. Cost accepted: logged models force the save()/destroy()
+  wrap (`_saveNeedsTransaction`/`_destroyNeedsTransaction` return true —
+  a partial dividend on O1, which stays open; the data-modifying-CTE
+  single-statement form is the later optimization). WHICH models: derived,
+  zero new config — lock-tokened ∩ reachable from a wire:'columnar' door
+  (codegen: `computeWriteLogRegistry` in wire-columnar.ts; runtime
+  backstop: `registerColumnarDoorTransport` at buildRouter). Schema: the
+  Appendix B sketch REVISED in code — text pk + tableName model key (uuid
+  pks are a framework default, O14; smallint model numbering was not
+  deploy-stable), `committed_at` added; retention prunes everything but
+  lifecycle=2 (default 72h, bounded per call) — ONLY the destroy
+  tombstone is load-bearing forever (O12 symmetry; creates are outside
+  every interval since W ≥ 0, a pruned undelete degrades to the slice,
+  and immortal create rows were unbounded growth + a pk-reuse collision
+  trap). fieldsRev reconciliation is WIRED LAZILY: memoized per table
+  per process, awaited before the FIRST bitmap read
+  (readWriteLogInterval) — zero-config, no boot hook to forget; a
+  drifted model's lifecycle=0 rows are deleted so bitmaps are never
+  misread, only degraded to slices (`reconcileWriteLogFieldsRev()`
+  remains as an optional boot accelerator). The logged registry verifies
+  the PHYSICAL lock column (lazily post-boot): a declared-but-absent
+  lock column no longer over-registers an untracked model into permanent
+  wrap overhead. The vite strict gate now runs `validateWriteLogSchema`
+  (both lanes) so a columnar project missing the transport tables
+  refuses AT BUILD with the paste-ready DDL; at runtime the READ side
+  (index tag) degrades by omission on an unmigrated DB while writes
+  refuse (atomicity is the point). CONTRACT EXCLUSION (extends WS0's):
+  out-of-contract writes (raw SQL, sequence resets) leave gaps — safe
+  for updates (slice), but an out-of-contract HARD delete never writes
+  its tombstone: gone(D) is then unanswerable forever. Because that loss
+  is permanent and invisible, `Relation.deleteAll` REFUSES on a logged
+  model (teaching error naming `destroyAll`); `insertAll` is in-contract
+  (bulk lifecycle=1 rows + ONE tag bump, atomic with the INSERT).
+- ✅ Three-way validation endpoint: a generated SIBLING PROCEDURE of show
+  (`validate` on every columnar door's router namespace, scope+scopeBy
+  through show's exact dispatch — and `only:`-scoped @before/@after
+  hooks run under the CRUD ALIASES too: validate ≈ get, splice ≈ index,
+  a conservative union, so an app auth gate naming only the CRUD actions
+  is never bypassed by a generated sibling; 'validate'/'splice' are
+  RESERVED procedure names on columnar doors, refused at route build for
+  custom @mutation/@action collisions; the REST `GET /splice` route is
+  registered BEFORE `GET /:id` so order-sensitive adapters reach it;
+  contract probe added by construction). Input `{id, projId,
+  ifNoneMatch: W}`; output the application-level tagged union
+  `{status:'fresh',v} | {status:'gone',d} | {status:'stale',envelope}`
+  (not HTTP-304 — oRPC batching + typed unions are the house style; A0
+  needs only that the stale envelope be buildColumnarEnvelope's bytes,
+  and it is — the ONE serializer through show's ONE assembly tail,
+  `finishColumnarRecordEnvelope`, shared with defaultGet). A2′'s clauses
+  literally; clause (iii) read from the row itself and never skipped at
+  V==W; projId validated against THIS door's ceiling (mismatch ⇒ slice
+  at the door's actual mask; grade is PROBABILISTIC — 48-bit hash,
+  declared in wire-identity §3a.4); an UNLOGGED root (no physical lock
+  column) answers the slice, never a registry 500 — codegen warns (W9)
+  and the react generator skips the client transport symmetrically; the
+  one known codegen/runtime mask divergence (Attr property→column
+  rename) warns at router build naming the field (ONE-computation
+  registry emitter is the named follow-up). Scope-miss = show's 404
+  (soft-deleted rows are re-scope-checked via `unscoped('SoftDeletable')`
+  before gone — no cross-tenant leak; hard-deleted gone(D) is answered
+  ONLY through UNSCOPED doors — the tombstone stores no scope columns,
+  and a scoped door answering it would be the cross-tenant destroy
+  oracle now recorded as its own §6 non-theorem in the proof doc, NOT a
+  T9 citation; scoped doors 404 and the client evicts via the legacy
+  lane). PROJECTION SCOPE V1: projId masks cover scalar +
+  belongsTo-FK columns ONLY — hasMany pk-array columns are EXCLUDED,
+  stated: child commits do not bump the owner's token or appear in its
+  previousChanges, so clause (i) over a pk-array is unanswerable from the
+  owner's log; list/child freshness rides the membership lane + per-child
+  validation. Doors dominated by includes therefore 304 rarely until that
+  lane matures — expected, not a bug report. The dirty slice is the
+  door's FULL record envelope at V (sound under Rule M; changed-fields
+  trimming is phase-7).
+- ✅ Membership tags: DECIDED — the door-scoped commit-ordered counter
+  (theorem grade; recorded in wire-identity §4). One row per door,
+  upsert-bumped by the write-log ON THE SAME EXECUTOR as lifecycle
+  writes — ALL doors of a table in ONE statement, and bulk paths
+  (updateAll/insertAll) log via one multi-row INSERT + at most one bump
+  per door per call. COST, stated honestly: the counter row is a
+  per-door serialization point — its lock is held until the surrounding
+  write transaction commits, so concurrent creates/destroys on a doored
+  table serialize on it (mitigation path recorded in write-log.ts's
+  header: tail-of-transaction bump / per-(tx,door) dedupe; it cannot
+  leave the transaction — rollback atomicity is the theorem).
+  Conservative v1 detection (create/destroy/undelete; value writes
+  don't bump — v1's splice is always replace-all so tag-equality is not
+  yet consumed as a skip; compiled scope-intersection is the named
+  precision trim that must precede real ops). Splice endpoint ships
+  keyed (door, paramsHash, fromTag), v1 always
+  `ops=[replace-all(list@to)]`; O15's apply(list@from,ops)=list@to
+  property test pins the contract, paramsHash is pinned for
+  distinctness + key-order invariance, and splice REFUSES when the door
+  cannot produce a tag (untracked root / unmigrated tables) — no
+  read-after-list fallback, no frozen-0 counter on the wire. SEPARATELY
+  the index-refetch guard is the pure STRUCTURE token (truncated
+  SHA-256 of pk-set+order+count+cursor; facets excluded; declared
+  probabilistic — landmine 10) riding `membership.structureToken`, with
+  `membership.tag` (the counter, read BEFORE the list queries so a race
+  yields an old tag, never a mislabeled list — stated invariant; a
+  deterministic pinning test for the ordering is NAMED TEST DEBT: it
+  needs a write injected between the tag read and the list queries)
+  beside it on columnar index responses.
+- ✅ Storm controls, both halves: echo merging + the structure-token guard
+  live server-side; the CLIENT dispatch LANDED 2026-08-27 as ONE module —
+  `react/src/validation-client.ts` `revalidateProjection` (signal ⇒
+  echo-merge skip [W ≥ knownVersion, §4 path 2] ⇒ unheld-fields fetch via
+  the door's GET, never validate [projFreshAt null ⇒ no lawful W, T3/O8] ⇒
+  W=projFreshAt at ISSUE time ⇒ fresh⇒certify(fields, V, the SAME W) /
+  gone⇒destroy(D) / stale⇒mergeEnvelope / NOT_FOUND⇒legacy remove()).
+  Generated doors embed the codegen twin literals (`_xValidatableFields` +
+  `_xProjId` via the shared projIdFor — no runtime hashing, no drift) and
+  expose `.with(scopes).revalidate(id, {signal?, force?})`; the membership
+  structure-token guard rides the generated index queries as
+  `structuralSharing: shareMembershipData` (token-equal confirming refetch
+  keeps pks/pagination identity — and the whole data object when passengers
+  are unchanged; facets stay fresh, never frozen by the token). The oRPC
+  batch link is documented in the user-owned `_client.ts` stub (enabling it
+  is an app choice — the stub is written once, never overwritten).
+- ✅ Acceptance MET (server): the two forbidden-corruption invariants as
+  real-PG integration tests through buildRouter's real procedures +
+  EntityStore — `react/tests/transport-forbidden-corruption.test.ts`
+  ("304 never freshens a cell the client does not hold" incl. the
+  GC/stale-re-merge certify-guard replay; "304 never certifies across a
+  lifecycle event" incl. gone(D) from the tombstone, soft
+  destroy→undelete ⇒ slice-never-fresh, the UNDELETE-ONLY interval
+  (W = the destroy token, restore after — lifecycle=3 alone must trip
+  clause ii), destroyed-at-exactly-W hitting clause iii on BOTH lanes —
+  the 404 re-check AND the record path of a door that serves
+  soft-deleted rows — and the W>V clamp), the hook-alias and
+  scoped-door (scopeBy) A3 pins, the depth-2 include-tree registry
+  walk, plus substrate pins in
+  `core/tests/integration/write-log.test.ts` (density, per-path bitmaps
+  under a NON-PREFIX mask numbering, tombstone permanence,
+  prune⇒detectable-gap, fieldsRev truncation, in-tx atomicity for
+  save AND destroy AND updateAll via error injection, bulk
+  soft-delete/restore lifecycle classification, insertAll logging +
+  single bump, deleteAll refusal, the conservative full-bitmap fill)
+  and the codegen registry in
+  `core/tests/codegen/write-log-registry.test.ts` (incl. the
+  validateWriteLogSchema green path, the W9 lock-token warning, and the
+  Attr-rename mask exclusion). NAMED TEST DEBT (deliberate, cheap-first
+  filter): the tag-read-before-list ordering pin (needs deterministic
+  write injection inside the window) and a single cross-world
+  codegen↔runtime mask/projId equality assertion on one shared door
+  (the two computations share one rule + one hash and each side is
+  pinned separately; the ONE-computation registry emitter supersedes
+  the test when it lands).
 
 ### WS4 — Channels: gateway, frames, bus
 Discharges: **O16**; consumes ChannelsConfig.
@@ -411,19 +564,35 @@ create table doc_updates (
 --   body bytea, body_text text (FTS/LIKE), body_json jsonb (optional)
 
 -- validation write-log (WS3, O10). Source: previousChanges at commit.
+-- LANDED FORM (write-log.ts WRITE_LOG_SCHEMA_SQL) revises this sketch:
+-- model = TABLE NAME text (smallint numbering is not deploy-stable),
+-- pk = text (uuid pks are a framework default — O14), committed_at added
+-- for retention, lifecycle gains 3 = undelete (soft re-creation trips
+-- clause ii). Plus record_write_log_meta(model, fields_hash) — fieldsRev
+-- reconciliation (wired LAZILY before each table's first bitmap read;
+-- optional boot accelerator) deletes a drifted model's lifecycle=0 rows.
 create table record_write_log (
-  model      smallint not null,        -- codegen-numbered
-  pk         bigint   not null,
-  token      bigint   not null,        -- the lock int
-  changed    bytea    not null,        -- field bitmap, codegen field order
-  lifecycle  smallint not null default 0,  -- 0 none, 1 create, 2 destroy
+  model        text     not null,      -- table name (identity space)
+  pk           text     not null,
+  token        bigint   not null,      -- the lock int
+  changed      bytea    not null,      -- field bitmap, declaration order
+  lifecycle    smallint not null default 0,  -- 0 none, 1 create, 2 destroy, 3 undelete
+  committed_at timestamptz not null default now(),
   primary key (model, pk, token)
 );
--- bounded retention (e.g. 24h); expiry ⇒ validation answers with the slice.
+-- retention: everything but lifecycle=2 prunable by age (default ~72h;
+-- expiry ⇒ the gap rule ⇒ conservative slice; creates are outside every
+-- interval since W ≥ 0); lifecycle=2 EXEMPT forever — the tombstone map
+-- (gone(D)'s only lawful source; O12 symmetry).
 
--- membership tags (WS3, O5): counter option
--- per (door, paramsHash): last_tag bigint bumped in-commit when membership
--- changes; splice rows keyed (door, paramsHash, from_tag).
+-- membership tags (WS3, O5): counter option — LANDED as ONE row per door
+-- (not per paramsHash: unbounded rows, multiplied writes), upsert-bumped
+-- in-commit by lifecycle writes; splice wire shape stays keyed
+-- (door, paramsHash, from_tag) so per-paramsHash precision can land later.
+create table membership_tags (
+  door text   not null primary key,
+  tag  bigint not null default 0
+);
 ```
 
 ## 6. Landmine list (each has bitten someone; the proof found several)

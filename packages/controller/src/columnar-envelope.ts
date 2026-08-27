@@ -72,6 +72,14 @@ export interface ColumnarMembership {
   metric?: number | string | null
   options?: Array<{ value: any; label: any }>
   emptyReason?: 'no-records' | 'no-matches'
+  /** WS3 membership lane: the pure STRUCTURE token — strong truncated crypto
+   *  hash of pk-set + order + count + cursor identity (facets EXCLUDED; value
+   *  churn cannot bust it). The index-refetch 304 guard (wire-identity §4). */
+  structureToken?: string
+  /** WS3 membership lane: the door-scoped commit-ordered COUNTER (T8 theorem
+   *  grade), bumped in-commit by lifecycle writes on the root model. Present
+   *  only when the door's root table is write-logged. */
+  tag?: number
 }
 
 export interface ColumnarEnvelope {

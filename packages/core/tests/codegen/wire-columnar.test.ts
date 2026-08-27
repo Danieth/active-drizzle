@@ -24,6 +24,7 @@ import { extractSchema, extractModel } from '../../src/codegen/extractor.js'
 import { extractControllers } from '../../src/codegen/controller-extractor.js'
 import { validateColumnarDoors } from '../../src/codegen/wire-columnar.js'
 import { generateReactHooks } from '../../src/codegen/react-generator.js'
+import { projIdFor } from '../../src/runtime/write-log.js'
 import type { Diagnostic } from '../../src/codegen/types.js'
 
 const SCHEMA = `
@@ -460,6 +461,25 @@ describe('react generator — flagged door emission', () => {
     const gen = generate(FLAGGED).get('loan.gen.ts')!
     expect(gen).toContain(`mergeIndexEnvelope(entityStore, await client.loans.index(params as any), _loanWireSpecIndex)`)
     expect(gen).toContain(`.then((env: any) => mergeIndexEnvelope(entityStore, env, _loanWireSpecIndex))`)
+  })
+
+  it('WS3 client half: the validatable mask + embedded projId + revalidate dispatch + structure-token sharing', () => {
+    const gen = generate(FLAGGED).get('loan.gen.ts')!
+    // The mask: pk + exposed physical columns; lock column and the hasMany
+    // pk-array (noteIds) EXCLUDED by construction — the codegen twin of the
+    // server's validatableMask.
+    expect(gen).toContain(`const _loanValidatableFields = ['id', 'title', 'stage', 'brokerId']`)
+    // projId embedded as a LITERAL via the shared hash helper — the client
+    // never hashes at runtime, and the two sides cannot drift.
+    expect(gen).toContain(`const _loanProjId = '${projIdFor(['id', 'title', 'stage', 'brokerId'])}'`)
+    // The dispatch is ONE module call — no protocol logic in generated strings.
+    expect(gen).toContain(`revalidateProjection(entityStore, _loanValidator(scopes), id, opts)`)
+    expect(gen).toContain(`client.loans.validate({ ...input })`)
+    // W comes from the store (projFreshAt over HELD fields) inside the module;
+    // the generated string must never compute or pass knownVersion.
+    expect(gen).not.toContain('knownVersion')
+    // Membership structure-token guard rides the index queries as structuralSharing.
+    expect(gen).toContain(`structuralSharing: shareMembershipData`)
   })
 
   it('a flagged door in a project with ZERO non-scalar kinds still gets _entities.gen.ts (the generated import must resolve)', () => {

@@ -23,6 +23,9 @@ import {
 } from './crud-handlers.js'
 import { BadRequest, Conflict, HttpError, NotFound, ValidationError, toValidationError, serializeError } from './errors.js'
 import { assertAssetTouchable, generateUploadToken, UPLOAD_TOKEN_KEY } from './attach-guard.js'
+import { usesColumnar } from './columnar-envelope.js'
+import { defaultValidate, registerColumnarDoorTransport } from './validate-handler.js'
+import { buildSplice, paramsHashOf } from './membership-tags.js'
 
 // ── Route record (for REST adapter + CLI) ─────────────────────────────────────
 
@@ -117,10 +120,19 @@ export function buildRouter<TContext = Record<string, any>>(
      * state (e.g., this.state.org) is available when computing the scope.
      */
     scopeByFn?: (ctrl: any) => Record<string, any>,
+    /**
+     * Hook-scope ALIAS for generated transport siblings (validate ≈ get,
+     * splice ≈ index): before/after hooks run when they apply to EITHER
+     * name, so an `only:`-scoped auth gate on the CRUD action can never be
+     * silently bypassed by the sibling that serves the same bytes.
+     * (@rescue handlers keep the literal action name.)
+     */
+    hookAlias?: string,
   ): Promise<any> {
     const ctrl = makeController(context, params, relation, record)
+    const hookNames = hookAlias ? [actionName, hookAlias] : actionName
     try {
-      await ctrl._runBeforeHooks(actionName)
+      await ctrl._runBeforeHooks(hookNames)
 
       // Apply scopeBy after before hooks so this.state is fully populated.
       // This updates ctrl.relation in-place — all default handlers use ctrl.relation.
@@ -130,7 +142,7 @@ export function buildRouter<TContext = Record<string, any>>(
       }
 
       const result = await handler(ctrl)
-      await ctrl._runAfterHooks(actionName)
+      await ctrl._runAfterHooks(hookNames)
       return result
     } catch (e) {
       // 1. User-defined @rescue handlers (can convert or swallow the error)
@@ -217,6 +229,109 @@ export function buildRouter<TContext = Record<string, any>>(
       )
     })
     routes.push({ method: 'GET', path: basePath, procedure: 'index', action: 'index' })
+
+    // VALIDATE + SPLICE — generated siblings of show on every columnar door
+    // (transport WS3: A2′'s three-way validation + the membership lane).
+    // Framework CRUD by construction — scope/scopeBy run exactly as show's
+    // pipeline, and before/after hooks run under BOTH the sibling name and
+    // its CRUD alias (validate ≈ get, splice ≈ index — dispatch's hookAlias),
+    // so an `only:`-scoped app auth gate can never be silently bypassed.
+    // Registration also derives the write-logged model set from this door
+    // (runtime backstop of the codegen registry — zero new config).
+    // REGISTERED BEFORE the `:id` routes: order-sensitive REST adapters
+    // (hono registers routes[] in array order) would otherwise match
+    // GET /splice as GET /:id with id='splice' and 400 on the id parse.
+    if (usesColumnar(config)) {
+      registerColumnarDoorTransport(model, config, basePath)
+
+      // The two procedure names are RESERVED on a columnar door: a custom
+      // @mutation/@action of the same name would silently overwrite the
+      // generated procedure (or be overwritten), sending transport traffic
+      // into app code with an incompatible input shape. Teach at route
+      // build, like every other hook/name gate in this file.
+      {
+        const reserved = new Set(['validate', 'splice'])
+        const collision = [...mutations, ...plainActions].find(m => reserved.has(m.method))
+        if (collision) {
+          throw new Error(
+            `${ControllerClass.name}.${collision.method}: 'validate' and 'splice' are reserved ` +
+            `procedure names on a wire:'columnar' door (the generated transport siblings of ` +
+            `get/index). Rename the ${'bulk' in collision ? '@mutation' : '@action'} — the ` +
+            `generated client would otherwise call your method with the transport's input shape.`,
+          )
+        }
+      }
+
+      router.validate = builder.input(
+        z.object({
+          ...scopeSchema,
+          id: z.number().int().positive(),
+          projId: z.string().min(1),
+          ifNoneMatch: z.number().int().nonnegative(),
+        }).passthrough()
+      ).handler(async ({ input, context }) => {
+        const rel = buildScopedRelation(model, input as any)
+        return dispatch(ControllerClass, context as TContext, input as any, rel, 'validate',
+          async (ctrl) => defaultValidate(
+            ctrl.relation, model, config, input as any, context, ctrl),
+          undefined,
+          config.scopeBy,
+          'get',                              // hook alias: validate ≈ get
+        )
+      })
+      routes.push({ method: 'GET', path: `${basePath}/:id/validate`, procedure: 'validate', action: 'validate' })
+
+      router.splice = builder.input(
+        z.object({
+          ...scopeSchema,
+          fromTag: z.number().int().nonnegative(),
+          scopes:  z.array(z.string()).optional(),
+          filters: z.record(z.string(), z.any()).optional(),
+          q:       z.string().optional(),
+          ids:     z.array(z.number()).optional(),
+          sort:    z.object({ field: z.string(), dir: z.enum(['asc', 'desc']) }).optional(),
+          page:    z.number().int().min(0).optional(),
+          perPage: z.number().int().nonnegative().optional(),
+        }).passthrough()
+      ).handler(async ({ input, context }) => {
+        const rel = buildScopedRelation(model, input as any)
+        return dispatch(ControllerClass, context as TContext, input as any, rel, 'splice',
+          async (ctrl) => {
+            // v1 answers ops = [replace-all with list@to] — the wire shape is
+            // keyed (door, paramsHash, fromTag) so real ops can land later
+            // without a protocol change; the O15 axiom holds trivially and
+            // its property test pins the contract. The tag comes ONLY from
+            // defaultIndex's read-BEFORE-the-list (conservative order); there
+            // is deliberately no read-after fallback — a tag read after the
+            // list could label a stale list with a newer tag, and a door
+            // that cannot produce a tag (untracked root, unmigrated
+            // transport tables) must refuse rather than serve a counter
+            // frozen at 0, which would poison every tag-equality consumer.
+            const env: any = await defaultIndex(ctrl.relation, model, config, input as any, context, ctrl)
+            const toTag = env?.membership?.tag
+            if (typeof toTag !== 'number') {
+              throw new BadRequest(
+                `${ControllerClass.name}: splice needs the door's membership tag, which this ` +
+                `door cannot serve — the root model must carry its lock-token column and the ` +
+                `transport tables must be migrated (see the write-log teaching error). ` +
+                `Use the index endpoint for full refetches instead.`,
+              )
+            }
+            return buildSplice(
+              basePath,
+              paramsHashOf(input as any),
+              (input as any).fromTag,
+              toTag,
+              env?.membership?.pks ?? [],
+            )
+          },
+          undefined,
+          config.scopeBy,
+          'index',                            // hook alias: splice ≈ index
+        )
+      })
+      routes.push({ method: 'GET', path: `${basePath}/splice`, procedure: 'splice', action: 'splice' })
+    }
 
     // GET
     router.get = builder.input(

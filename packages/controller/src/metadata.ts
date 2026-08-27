@@ -457,12 +457,19 @@ export function getActions(cls: any): ActionEntry[] {
 /**
  * Collect @before hooks applicable to `actionName`, walking the prototype
  * chain so parent hooks fire first (like Rails before_action inheritance).
+ *
+ * `actionName` may be a UNION of names: the generated transport siblings of
+ * the CRUD actions (validate ≈ get, splice ≈ index — same bytes through the
+ * same door) run every hook that applies to EITHER name, so an auth gate
+ * written as `@before(requireRole, { only: ['get', ...] })` can never be
+ * silently bypassed by a procedure the app author has not heard of. The
+ * union is deliberately conservative: MORE hooks fire, never fewer.
  */
-export function collectBeforeHooks(cls: any, actionName: string): HookEntry[] {
+export function collectBeforeHooks(cls: any, actionName: string | string[]): HookEntry[] {
   return collectHooks(cls, BEFORE_META, actionName)
 }
 
-export function collectAfterHooks(cls: any, actionName: string): HookEntry[] {
+export function collectAfterHooks(cls: any, actionName: string | string[]): HookEntry[] {
   return collectHooks(cls, AFTER_META, actionName)
 }
 
@@ -503,7 +510,8 @@ export function collectFrontendContext(cls: any): FrontendContextMap {
   return merged
 }
 
-function collectHooks(cls: any, sym: symbol, actionName: string): HookEntry[] {
+function collectHooks(cls: any, sym: symbol, actionName: string | string[]): HookEntry[] {
+  const names = Array.isArray(actionName) ? actionName : [actionName]
   const chain: HookEntry[][] = []
   let proto = cls
   while (proto && proto !== Function.prototype) {
@@ -512,7 +520,7 @@ function collectHooks(cls: any, sym: symbol, actionName: string): HookEntry[] {
     }
     proto = Object.getPrototypeOf(proto)
   }
-  return chain.flat().filter(h => appliesToAction(h, actionName))
+  return chain.flat().filter(h => names.some(n => appliesToAction(h, n)))
 }
 
 function appliesToAction(hook: HookEntry | RescueEntry, action: string): boolean {

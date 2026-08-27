@@ -98,7 +98,7 @@ export class ActiveController<
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
-  async _runBeforeHooks(actionName: string): Promise<void> {
+  async _runBeforeHooks(actionName: string | string[]): Promise<void> {
     const hooks = collectBeforeHooks(this.constructor, actionName)
     for (const hook of hooks) {
       if (hook.condition !== undefined) {
@@ -112,7 +112,7 @@ export class ActiveController<
     }
   }
 
-  async _runAfterHooks(actionName: string): Promise<void> {
+  async _runAfterHooks(actionName: string | string[]): Promise<void> {
     const hooks = collectAfterHooks(this.constructor, actionName)
     for (const hook of hooks) {
       if (hook.condition !== undefined) {

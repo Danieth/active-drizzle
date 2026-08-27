@@ -12,7 +12,10 @@ import {
   nonNumericTokenMessage,
   getSchema,
   attachFlatIncludes,
+  isWriteLogged,
+  isWriteLogTablesMissing,
 } from '@active-drizzle/core'
+import { attachStructureToken, membershipTagOf } from './membership-tags.js'
 import {
   usesColumnar,
   buildColumnarEnvelope,
@@ -555,6 +558,24 @@ export async function defaultIndex(
   const idx = config.index ?? {}
   let rel = relation
 
+  // WS3 membership lane: read the door COUNTER tag BEFORE the list queries —
+  // a commit racing this request then yields a tag OLDER than the list it
+  // labels, which costs at most a spurious refetch; the other order could
+  // label a stale list with a newer tag (tag-equal ⇒ same-list broken).
+  // The tag is an OPTIONAL envelope field: on an unmigrated database (the
+  // transport tables missing) the READ side degrades by omitting it — an
+  // existing columnar door must keep serving index responses; only WRITES
+  // refuse (atomicity is the point there).
+  const _rootTable = (model as any)?._activeDrizzleTableName ?? (model as any)?.tableName
+  let _membershipTag: number | undefined
+  if (usesColumnar(config) && ctrl && _rootTable && isWriteLogged(_rootTable)) {
+    try {
+      _membershipTag = await membershipTagOf(ctrl.constructor, _rootTable)
+    } catch (err) {
+      if (!isWriteLogTablesMissing(err)) throw err
+    }
+  }
+
   // 1. defaultScopes (always applied)
   for (const s of idx.defaultScopes ?? []) {
     if (typeof (model as any)[s] !== 'function') throw new BadRequest(`Scope '${s}' not found on model`)
@@ -874,7 +895,7 @@ export async function defaultIndex(
   // rides top-level. ONE serializer builds the tables (A3).
   if (columnar) {
     const feCtx = computeFrontendContext(ctrl, ctx)
-    return buildColumnarEnvelope(data, model, config, {
+    const envelope = buildColumnarEnvelope(data, model, config, {
       includeSpecs: idx.include ?? [],
       membership: {
         pagination,
@@ -885,7 +906,14 @@ export async function defaultIndex(
         ...(emptyReason !== undefined ? { emptyReason } : {}),
       },
       ...(feCtx ? { ctx: feCtx } : {}),
-    }) as any
+    })
+    // WS3 membership lane (wire-identity §4): the STRUCTURE token guards the
+    // membership-only refetch (pure pk-set/order/count/cursor hash — facets
+    // excluded, value churn can't bust it); the door COUNTER tag rides along
+    // when this door's root table is write-logged (in-commit bumps).
+    attachStructureToken(envelope.membership)
+    if (_membershipTag !== undefined) envelope.membership.tag = _membershipTag
+    return envelope as any
   }
 
   // 11. The read ceiling applies to index too — a list endpoint must not
@@ -919,6 +947,28 @@ export async function defaultIndex(
 
 // ── Get ───────────────────────────────────────────────────────────────────────
 
+/**
+ * The ONE "loaded record → columnar record envelope" tail — shared by
+ * defaultGet and defaultValidate's dirty slice, so the slice's bytes can
+ * never drift from show's (A0: one serializer, one assembly choreography).
+ * Any hydration step added to show's pipeline lands here and reaches both.
+ */
+export async function finishColumnarRecordEnvelope(
+  record: any,
+  model: any,
+  config: CrudConfig,
+  ctx?: any,
+  ctrl?: any,
+): Promise<any> {
+  const includes = config.get?.include ?? []
+  if (includes.length) await attachFlatIncludes([record], model, includes)
+  // FIXES-NEEDED #9: @after hooks on get read this.record (audit trails —
+  // "record who read this"); it was silently null forever
+  if (ctrl) ctrl.record = record
+  await hydrateHabtmIds(record, model, config)
+  return buildColumnarRecordEnvelope(record, model, config, ctx, ctrl)
+}
+
 export async function defaultGet(
   relation: any,
   model: any,
@@ -933,13 +983,12 @@ export async function defaultGet(
   if (includes.length && !columnar) rel = rel.includes(...includes)
   const record = await rel.first()
   if (!record) throw new NotFound(modelClassName(model))
-  if (columnar && includes.length) await attachFlatIncludes([record], model, includes)
+  if (columnar) return finishColumnarRecordEnvelope(record, model, config, ctx, ctrl)
   // FIXES-NEEDED #9: @after hooks on get read this.record (audit trails —
   // "record who read this"); it was silently null forever
   if (ctrl) ctrl.record = record
   await hydrateHabtmIds(record, model, config)
 
-  if (columnar) return buildColumnarRecordEnvelope(record, model, config, ctx, ctrl)
   if (usesEnvelope(config)) return buildRecordEnvelope(record, model, config, ctx, ctrl)
   if (config.get?.expose?.length && typeof record.toJSON === 'function') {
     return applyProjectionSlice(
@@ -1150,7 +1199,7 @@ async function reloadWithIncludes(relation: any, config: CrudConfig, id: any, re
  * pattern as sanitizeNestedWrites); without core it's a silent no-op and the
  * key simply doesn't serialize.
  */
-async function hydrateHabtmIds(record: any, model: any, config: CrudConfig): Promise<void> {
+export async function hydrateHabtmIds(record: any, model: any, config: CrudConfig): Promise<void> {
   const expose = config.get?.expose ?? []
   if (!record || !expose.length) return
   let resolveIds: ((m: any) => Array<{ idsKey: string; prop: string }>) | null = null

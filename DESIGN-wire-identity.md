@@ -195,8 +195,14 @@ projection are COVERAGE of identity, never part of the key.
    dirty slice. The server validates projId against the requesting
    door's ceiling — a client-supplied id can never widen access — and
    projId is a HASH of the compiled field mask, so a door whose ceiling
-   changes gets a new id and can never 304 against a slice that is no
-   longer the door. The receipt NEVER goes upstream beyond this: no
+   changes gets a new id and does not 304 against a slice that is no
+   longer the door's. GRADE, declared (T8/landmine 10): projId is a
+   48-bit truncated SHA-256, so this mask-agreement guarantee is
+   PROBABILISTIC, not by-construction — a collision between an
+   old-deploy client mask and the door's current mask (~2⁻⁴⁸ per skewed
+   pair) would let the server verify its own mask while the client
+   certifies its own field set. Negligible and accepted; never call it
+   "can never". The receipt NEVER goes upstream beyond this: no
    field-mask uploads, no "what I hold" inventories (see §7).
 
 Two definitional footnotes the clauses depend on:
@@ -302,6 +308,29 @@ a separately-validatable section of the response — structure can 304
 while facets 200 alone. Unchanged membership costs one RTT and zero
 bytes; the coherence engine's deliberate coarseness stops costing bytes
 — over-invalidation becomes over-*confirmation*.
+
+> **DECIDED + LANDED (2026-08-27, transport WS3 — discharges O5's "choose
+> and say which", T8's two grades kept deliberately separate):**
+> **(a) Membership tag identity = the door-scoped commit-ordered COUNTER**
+> — the *theorem* grade. One `membership_tags` row per door, upsert-bumped
+> ON THE SAME EXECUTOR as the write-log's lifecycle rows (in-commit:
+> tag-equal ⇒ same-list needs snapshot atomicity; a sequence survives
+> rollback and breaks it). v1 detection is the conservative bump —
+> create/destroy/undelete on the door's root model; value writes do not
+> bump, which is admissible ONLY while the splice answers replace-all
+> (nothing consumes tag-equality as a skip yet); compiled
+> scope-intersection is the precision trim that must land before real
+> splice ops do. The tag is read BEFORE the list queries on index
+> responses (`membership.tag`), so a racing commit yields an old tag for
+> a new list — a spurious refetch — never a new tag on a stale list.
+> **(b) The index-refetch 304 guard = the pure STRUCTURE token**
+> (`membership.structureToken`) — truncated SHA-256 (64 bits) over
+> pk-set + order + count + pagination-cursor identity, facets excluded,
+> exactly as this section specifies. This is the *probabilistic* grade
+> and is DECLARED as such (a short non-crypto hash is landmine 10 —
+> neither theorem nor negligible-collision). The counter and the
+> structure token do different jobs; both ship, neither substitutes for
+> the other.
 
 ## 4b. The collaborative lane (what makes foreign writes feel like Meteor)
 

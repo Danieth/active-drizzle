@@ -48,8 +48,13 @@
 import type { CtrlProjectMeta, CtrlMeta } from './controller-types.js'
 import type { ProjectMeta, ModelMeta, Diagnostic } from './types.js'
 import { resolveLockColumnName } from '../runtime/optimistic-lock.js'
+import { projIdFor, fieldsRevOf, WRITE_LOG_SCHEMA_SQL } from '../runtime/write-log.js'
 
 const WIRE_VALUES = new Set(['columnar', 'nested'])
+
+function warn(modelFile: string, message: string, suggestion?: string): Diagnostic {
+  return { severity: 'warning', modelFile, message, ...(suggestion ? { suggestion } : {}) }
+}
 
 function err(modelFile: string, message: string, suggestion?: string): Diagnostic {
   const d: Diagnostic = { severity: 'error', modelFile, message }
@@ -126,6 +131,217 @@ function declaredFieldSurface(m: ModelMeta): Set<string> {
   ])
 }
 
+// ── WS3: the write-log registry (O10's codegen substrate) ────────────────────
+//
+// WHICH models are logged is DERIVED, never a knob: a model is logged iff it
+// is lock-tokened AND appears (as root or include, at any depth) in a door
+// with wire:'columnar' — logging piggybacks on the opt-in that already
+// exists. This pass computes that set, each model's ONE declaration-order
+// field numbering (+ fieldsRev hash for deploy-drift detection), and each
+// door's projId = hash of its compiled validatable mask (scalar + belongsTo-
+// FK columns ONLY — hasMany pk-array columns are EXCLUDED by construction:
+// child commits do not bump the owner's token or appear in the owner's
+// previousChanges, so A2′ clause (i) over a pk-array is unanswerable from
+// the owner's write-log; list/child freshness rides the membership-tag lane
+// and per-child validation instead).
+//
+// The runtime backstop (plugin-less apps) computes the same set at router
+// build via registerLoggedModel/validatableMask — packages/controller/src/
+// validate-handler.ts. The hash helpers are SHARED (runtime/write-log.ts) so
+// codegen, server, and generated client can never disagree by construction.
+
+export interface WriteLogModelEntry {
+  className: string
+  /** Schema export identifier — the identity space (matches runtime tableName). */
+  tableName: string
+  /** THE model-level numbering: all table columns in declaration order. */
+  fields: string[]
+  fieldsRev: string
+  lockColumn: string
+  softDelete: boolean
+}
+
+export interface WriteLogDoorEntry {
+  controller: string
+  modelClass: string
+  tableName: string
+  /** The validatable mask: pk + exposed physical columns + included
+   *  belongsTo FKs. hasMany pk-arrays excluded (see header note). */
+  maskFields: string[]
+  projId: string
+}
+
+export interface WriteLogRegistry {
+  models: WriteLogModelEntry[]
+  doors: WriteLogDoorEntry[]
+}
+
+/** Paste-ready drizzle fragment for the transport tables (schema authoring). */
+export const WRITE_LOG_DRIZZLE_SNIPPET = `
+export const recordWriteLog = pgTable('record_write_log', {
+  model:       text('model').notNull(),
+  pk:          text('pk').notNull(),
+  token:       bigint('token', { mode: 'number' }).notNull(),
+  changed:     customType<{ data: Buffer }>({ dataType: () => 'bytea' })('changed').notNull(),
+  lifecycle:   smallint('lifecycle').notNull().default(0),
+  committedAt: timestamp('committed_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [primaryKey({ columns: [t.model, t.pk, t.token] })])
+
+export const recordWriteLogMeta = pgTable('record_write_log_meta', {
+  model:      text('model').primaryKey(),
+  fieldsHash: text('fields_hash').notNull(),
+})
+
+export const membershipTags = pgTable('membership_tags', {
+  door: text('door').primaryKey(),
+  tag:  bigint('tag', { mode: 'number' }).notNull().default(0),
+})`.trim()
+
+/**
+ * Does this model's table actually carry its resolved lock column?
+ * Exported: the react generator gates the client validation-transport
+ * emission on it, symmetric with the server (an unlogged root's validate
+ * route answers the conservative slice — a client should not be generated
+ * to call a lane that can never 304).
+ */
+export function physicalLockColumnOf(m: ModelMeta, project: ProjectMeta): string | null {
+  const col = resolveLockColumnName(m.lockingColumn)
+  if (col === null) return null
+  const table = project.schema.tables[m.tableName]
+  return table?.columns.some(c => c.name === col) ? col : null
+}
+
+/** Every model reached by a door's include trees (get + index), root included. */
+function reachableModels(ctrl: CtrlMeta, project: ProjectMeta): ModelMeta[] {
+  const root = ctrl.modelClass
+    ? project.models.find(m => m.className === ctrl.modelClass)
+    : undefined
+  if (!root) return []
+  const modelByTable = new Map(project.models.map(m => [m.tableName, m]))
+  const out = new Map<string, ModelMeta>([[root.tableName, root]])
+  const walk = (specs: any[] | undefined, owner: ModelMeta): void => {
+    for (const [name, children] of includeEntries(specs)) {
+      const assoc = owner.associations.find(a => a.propertyName === name)
+      const childTable = assoc?.resolvedTable ?? assoc?.explicitTable
+      const child = childTable ? modelByTable.get(childTable) : undefined
+      if (!child) continue
+      if (!out.has(child.tableName)) out.set(child.tableName, child)
+      if (children.length) walk(children, child)
+    }
+  }
+  walk((ctrl.crudConfig as any)?.get?.include, root)
+  walk((ctrl.crudConfig as any)?.index?.include, root)
+  return [...out.values()]
+}
+
+/** The door's compiled validatable mask (see registry header). Empty when the
+ *  door has no ceiling — such a door cannot validate and gets no projId. */
+export function validatableMaskFields(ctrl: CtrlMeta, project: ProjectMeta): string[] {
+  const model = ctrl.modelClass
+    ? project.models.find(m => m.className === ctrl.modelClass)
+    : undefined
+  const expose = effectiveExpose(ctrl.crudConfig)
+  if (!model || !expose?.length) return []
+  const table = project.schema.tables[model.tableName]
+  const physical = new Set((table?.columns ?? []).map(c => c.name))
+  const pk = (table?.columns ?? []).find(c => c.primaryKey)?.name ?? 'id'
+  const mask = new Set<string>([pk])
+  for (const f of expose) if (physical.has(f)) mask.add(f)
+  // Included belongsTo FKs ride the columnar row as linkage columns and are
+  // part of the door's projection even when expose omits them.
+  for (const [name] of includeEntries((ctrl.crudConfig as any)?.get?.include)) {
+    const assoc = model.associations.find(a => a.propertyName === name)
+    if (assoc?.kind !== 'belongsTo' || assoc.polymorphic) continue
+    const fk = assoc.foreignKey ?? `${name}Id`
+    if (physical.has(fk)) mask.add(fk)
+  }
+  const lockCol = resolveLockColumnName(model.lockingColumn)
+  if (lockCol) mask.delete(lockCol)   // the token is never a wire field (WS0)
+  return [...mask]
+}
+
+/**
+ * The write-log registry for a project: logged models (with THE field
+ * numbering + fieldsRev) and columnar-door projIds. Consumed today by the
+ * react generator (embedded mask + projId literals) and by
+ * validateWriteLogSchema (the vite gate); the runtime backstop
+ * (registerColumnarDoorTransport) mirrors the same derivation at router
+ * build. A codegen-EMITTED server registry — making the mask ONE
+ * computation instead of two twins sharing one rule — is the named
+ * follow-up in DESIGN-transport-work WS3.
+ */
+export function computeWriteLogRegistry(
+  ctrlProject: CtrlProjectMeta,
+  project: ProjectMeta,
+): WriteLogRegistry {
+  const models = new Map<string, WriteLogModelEntry>()
+  const doors: WriteLogDoorEntry[] = []
+  for (const ctrl of ctrlProject.controllers) {
+    if ((ctrl.crudConfig as any)?.wire !== 'columnar') continue
+    for (const m of reachableModels(ctrl, project)) {
+      const lockCol = physicalLockColumnOf(m, project)
+      if (!lockCol) continue                       // untracked lane — never logged
+      if (!models.has(m.tableName)) {
+        const table = project.schema.tables[m.tableName]
+        const fields = (table?.columns ?? []).map(c => c.name)
+        models.set(m.tableName, {
+          className: m.className,
+          tableName: m.tableName,
+          fields,
+          fieldsRev: fieldsRevOf(fields),
+          lockColumn: lockCol,
+          softDelete: Boolean(m.softDelete),
+        })
+      }
+    }
+    const rootModel = ctrl.modelClass
+      ? project.models.find(m => m.className === ctrl.modelClass)
+      : undefined
+    if (rootModel && physicalLockColumnOf(rootModel, project)) {
+      const maskFields = validatableMaskFields(ctrl, project)
+      if (maskFields.length) {
+        doors.push({
+          controller: ctrl.className,
+          modelClass: rootModel.className,
+          tableName: rootModel.tableName,
+          maskFields,
+          projId: projIdFor(maskFields),
+        })
+      }
+    }
+  }
+  return { models: [...models.values()], doors }
+}
+
+/**
+ * O2a-pattern teaching refusal: a project whose columnar doors imply logged
+ * models MUST declare the transport tables in its schema — the log row
+ * commits inside every data transaction, so a missing table fails every
+ * write on those models at runtime. Separate from validateColumnarDoors so
+ * the vite gate can adopt it per-project (paste-ready fix in the message).
+ */
+export function validateWriteLogSchema(
+  ctrlProject: CtrlProjectMeta,
+  project: ProjectMeta,
+): Diagnostic[] {
+  const registry = computeWriteLogRegistry(ctrlProject, project)
+  if (registry.models.length === 0) return []
+  const missing = ['record_write_log', 'record_write_log_meta', 'membership_tags']
+    .filter(t => !Object.values(project.schema.tables).some(tb => tb.dbName === t || tb.name === t))
+  if (missing.length === 0) return []
+  const doorList = registry.models.map(m => m.className).join(', ')
+  return [{
+    severity: 'error',
+    modelFile: project.schema.filePath,
+    message:
+      `wire:'columnar' doors make ${doorList} write-logged (validation 304s and gone(D) depend ` +
+      `on the per-commit log), but the schema lacks ${missing.map(t => `'${t}'`).join(', ')} — ` +
+      `every save on those models would refuse at runtime.`,
+    suggestion:
+      `Add the transport tables to the schema and migrate:\n${WRITE_LOG_SCHEMA_SQL}`,
+  }]
+}
+
 export function validateColumnarDoors(
   ctrlProject: CtrlProjectMeta,
   project: ProjectMeta,
@@ -175,6 +391,25 @@ export function validateColumnarDoors(
         `can, version }), so a door serving a bare record today would change its app-visible ` +
         `hook shape on flag flip (the flag is a transport migration, never an API change).`,
         `Add \`abilities: true\` beside the expose list, or keep \`wire: 'nested'\` on this door.`,
+      ))
+    }
+
+    // ── W9: the validation lane needs the lock token ─────────────────────────
+    // A columnar door whose root model has no PHYSICAL lock column is never
+    // write-logged: the validate procedure can only answer the conservative
+    // slice (correct, never a 304), the splice endpoint has no counter, and
+    // the generated client emits no revalidate transport (symmetric skip).
+    // Warn — the door still works, but the whole 304 lane is silently dead.
+    if (model && !physicalLockColumnOf(model, project)) {
+      out.push(warn(
+        file,
+        `${ctrl.className} (columnar): ${model.className}'s table has no lock-token column ` +
+        `(resolved '${resolveLockColumnName(model.lockingColumn) ?? 'lockVersion'}' is not on ` +
+        `'${model.tableName}'${model.lockingColumn === false ? `, and lockingColumn is false` : ''}) — ` +
+        `the validation/304 lane and the membership counter need it, so this door will answer ` +
+        `every revalidation with the full record and serve no membership tag.`,
+        `Add the integer lock column (e.g. \`lockVersion: integer('lock_version').notNull().default(0)\`) ` +
+        `and enable \`update: { optimisticLock: true }\`, or accept the always-refetch behavior.`,
       ))
     }
 

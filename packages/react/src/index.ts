@@ -167,6 +167,16 @@ export {
   type WireMembership,
   type WireTouched,
 } from './wire-envelope.js'
+// Validation lane (transport WS3, client half) — the ONE dispatch module +
+// the membership structure-token guard
+export {
+  revalidateProjection,
+  shareMembershipData,
+  type ProjectionValidator,
+  type RevalidateOptions,
+  type RevalidateOutcome,
+  type ValidateResponse,
+} from './validation-client.js'
 export {
   type PresenterLayout,
   type PresenterPropsFor,

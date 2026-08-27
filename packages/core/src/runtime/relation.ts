@@ -1,8 +1,9 @@
 import { eq, and, or, inArray, notInArray, arrayContains, isNull, ilike, desc, asc, gte, lte, gt, lt, ne, sql, type SQL } from 'drizzle-orm'
 import { union, unionAll, intersect, except } from 'drizzle-orm/pg-core'
-import { getExecutor, getSchema, MODEL_REGISTRY, transaction, RecordNotFound, databaseForTable } from './boot.js'
+import { getExecutor, getSchema, MODEL_REGISTRY, transaction, transactionContext, transactionDbName, RecordNotFound, databaseForTable } from './boot.js'
 import { modelClassName } from './class-name.js'
 import { lockingColumnFor } from './optimistic-lock.js'
+import { isWriteLogged, writeLogRows, softDeleteColumnFor, LIFECYCLE } from './write-log.js'
 import { reportError } from './error-reporting.js'
 import type { ApplicationRecord } from './application-record.js'
 
@@ -1145,7 +1146,6 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    */
   public async updateAll(updates: Record<string, any>): Promise<number> {
     const rel = this._withDefaultScopes()
-    const db = getExecutor(this._tableName)
     const table = rel.getTable()
     const Ctor = rel._ctor
     // Cross the codec boundary: property→column AND value→raw, in one place.
@@ -1159,8 +1159,53 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     if (lockCol && !(lockCol in mapped)) {
       mapped[lockCol] = sql`${table[lockCol]} + 1`
     }
-    let q: any = db.update(table).set(mapped)
     const whereExpr = rel._buildFinalWhere()
+
+    // WS3 write-log: a bulk UPDATE on a logged model is N commits in N
+    // lineages — RETURNING hands back (pk, committed token) per row, and the
+    // bulk log rows ride the SAME transaction (the wrap opens here unless an
+    // ambient same-db tx already covers us). The bitmap is statically known:
+    // the mapped SET keys. (The data-modifying-CTE single-statement form is
+    // the later optimization, not v1.)
+    const pkField = typeof (Ctor as any)?.primaryKey === 'string' ? (Ctor as any).primaryKey : 'id'
+    const logged = lockCol !== null && isWriteLogged(Ctor) && table[pkField] !== undefined
+    if (logged) {
+      const softCol = softDeleteColumnFor(this._tableName)
+      const changedKeys = Object.keys(mapped)
+      const run = async (): Promise<number> => {
+        const db = getExecutor(this._tableName)
+        let q: any = db.update(table).set(mapped)
+        if (whereExpr) q = q.where(whereExpr)
+        q = q.returning({
+          pk: table[pkField],
+          token: table[lockCol!],
+          ...(softCol && table[softCol] ? { soft: table[softCol] } : {}),
+        })
+        const rows: any[] = await this._exec<any>(q, 'update')
+        // ONE multi-row log INSERT + at most ONE tag bump per door for the
+        // whole call (writeLogRows) — a bulk soft-delete must not issue 2N
+        // sequential statements while holding the hot counter row.
+        await writeLogRows(db, this._tableName, rows
+          .filter(row => typeof row.token === 'number' && row.pk != null)
+          .map(row => {
+            // Lifecycle from the NEW soft-delete value when the bulk write
+            // set it (per-row `was` is unknowable here — a spurious
+            // lifecycle row costs a conservative slice, never a wrong 304).
+            let lifecycle: number = LIFECYCLE.none
+            if (softCol && changedKeys.includes(softCol)) {
+              lifecycle = row.soft != null ? LIFECYCLE.destroy : LIFECYCLE.undelete
+            }
+            return { pk: row.pk, token: row.token, changed: changedKeys, lifecycle }
+          }))
+        return rows.length
+      }
+      const inSameDbTx = transactionContext.getStore() !== undefined
+        && (transactionDbName.getStore() ?? 'default') === databaseForTable(this._tableName)
+      return inSameDbTx ? run() : transaction(run, { database: databaseForTable(this._tableName) })
+    }
+
+    const db = getExecutor(this._tableName)
+    let q: any = db.update(table).set(mapped)
     if (whereExpr) q = q.where(whereExpr)
     const result = await this._exec<any>(q, 'update')
     return (result as any)?.rowCount ?? (result as any)?.length ?? 0
@@ -1174,8 +1219,26 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    * fire and `dependent: 'destroy'` associations are NOT cascaded (database
    * `ON DELETE` constraints still apply). Use it when you want speed and the
    * model has no destroy-time behavior to honor.
+   *
+   * REFUSES on a write-logged model (any model reachable from a
+   * wire:'columnar' door): a hard DELETE with no tombstone permanently
+   * destroys gone(D) answerability for every removed pk AND skips the
+   * membership bump — a silent, irreversible invariant loss on exactly the
+   * models that opted into the transport. `destroyAll()` is the in-contract
+   * path (per-record destroy writes the lifecycle=2 tombstone and bumps).
    */
   public async deleteAll(): Promise<number> {
+    if (isWriteLogged(this._ctor)) {
+      throw new Error(
+        `[active-drizzle] ${this._ctor?.name ?? this._tableName}.deleteAll(): this model is ` +
+        `write-logged (it is served by a wire:'columnar' door), and deleteAll's raw bulk DELETE ` +
+        `writes no destroy tombstones — gone(D) would be unanswerable FOREVER for every deleted ` +
+        `pk, and the door's membership tag would miss the change. Use destroyAll() (in-contract: ` +
+        `tombstones + tag bumps, hooks and cascades honored), a soft delete via ` +
+        `updateAll({ deletedAt: ... }) on a SoftDeletable model, or raw SQL if you are ` +
+        `deliberately stepping outside the transport contract.`,
+      )
+    }
     const rel = this._withDefaultScopes()
     const db = getExecutor(this._tableName)
     const table = rel.getTable()

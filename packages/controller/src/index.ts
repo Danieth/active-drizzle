@@ -98,3 +98,26 @@ export {
   type ColumnarMembership,
   type ColumnarExtras,
 } from './columnar-envelope.js'
+
+// Validation path (transport WS3 — A2′'s three-way endpoint, O10 server side)
+export {
+  defaultValidate,
+  validatableMask,
+  registerColumnarDoorTransport,
+  type ValidateInput,
+  type ValidateResult,
+  type ValidatableMask,
+} from './validate-handler.js'
+
+// Membership lane (transport WS3 — O5 counter tags, structure tokens, O15 splice)
+export {
+  doorIdOf,
+  membershipTagOf,
+  structureTokenOf,
+  attachStructureToken,
+  paramsHashOf,
+  buildSplice,
+  applySplice,
+  type SpliceOp,
+  type SpliceResult,
+} from './membership-tags.js'

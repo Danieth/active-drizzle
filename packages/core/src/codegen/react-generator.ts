@@ -35,7 +35,12 @@ import { depsFitProjection } from './validation-deps.js'
 import { renderFieldMeta, jsString, COLUMN_TS_TYPE } from './generator.js'
 // The ONE include-shape walker + effective-ceiling rule, shared with the
 // columnar gate (drift between the two was a reported near-miss).
-import { includeTopNames, effectiveExpose } from './wire-columnar.js'
+// validatableMaskFields + projIdFor: the door's validation identity is
+// computed HERE with the same helpers the server's validatableMask uses, and
+// the projId is embedded as a literal — the client never hashes at runtime
+// and the two sides cannot drift (transport WS3, wire-identity §3a.4).
+import { includeTopNames, effectiveExpose, validatableMaskFields, physicalLockColumnOf } from './wire-columnar.js'
+import { projIdFor } from '../runtime/write-log.js'
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -339,6 +344,23 @@ function generateControllerFile(
     && ctrl.crudConfig?.wire === 'columnar'
     && Boolean(model)
 
+  // WS3 validation lane: the door's validatable mask (pk + exposed physical
+  // columns + belongsTo-FK linkage, lock column excluded, hasMany pk-arrays
+  // excluded by construction). Empty ⇒ the door is not validatable and no
+  // revalidate transport is emitted (W1 makes this unreachable for columnar
+  // doors in practice — expose is required). GATED on the model's PHYSICAL
+  // lock column, symmetric with the server: an unlocked root is never
+  // write-logged, its validate lane can only answer the conservative slice
+  // (codegen's W9 warning names this), so the client must not ship a
+  // revalidate transport that can never 304.
+  const validatableModel = wireColumnar && projectMeta
+    ? projectMeta.models.find(m => m.className === ctrl.modelClass)
+    : undefined
+  const validatableFields = validatableModel && projectMeta
+    && physicalLockColumnOf(validatableModel, projectMeta)
+    ? validatableMaskFields(ctrl, projectMeta)
+    : []
+
   // Nested form members the typed handle must declare — same permit gate as
   // the nested-meta emission (an unpermitted array never becomes a handle,
   // so it must not be typed as one either)
@@ -418,6 +440,13 @@ import type { FC, ReactNode } from 'react'`)
     if (needsCoherence) adImports.push('applyEntityChange')
     if (wireColumnar) {
       adImports.push('entityStore', 'mergeEnvelope', 'mergeRecordEnvelope', 'mergeIndexEnvelope', 'useProjectedRows')
+      // WS3 client half: the ONE validation dispatch module + the membership
+      // structure-token guard (structuralSharing on the index queries)
+      adImports.push('shareMembershipData')
+      if (validatableFields.length) {
+        adImports.push('revalidateProjection')
+        adTypeImports.push('RevalidateOptions')
+      }
     }
     L.push(`import { ${adImports.join(', ')} } from '@active-drizzle/react'`)
     L.push(`import type { ${adTypeImports.join(', ')} } from '@active-drizzle/react'`)
@@ -840,7 +869,7 @@ import type { FC, ReactNode } from 'react'`)
 
     // ── Columnar wire spec + echo decoder (flagged doors only) ─────────────
     if (wireColumnar) {
-      emitWireSpec(L, ctrl, model, projectMeta!, modelName)
+      emitWireSpec(L, ctrl, model, projectMeta!, modelName, validatableFields)
     }
 
     // ── Typed form handle + wired hooks (envelope controllers only) ────────
@@ -899,7 +928,7 @@ import type { FC, ReactNode } from 'react'`)
   L.push(`   * Call outside React for direct async calls — event handlers, SSR, tests.`)
   L.push(`   */`)
   L.push(`  with: (${scopeParam}) => ({`)
-  emitWith(L, ctrl, clientKey, wireColumnar)
+  emitWith(L, ctrl, clientKey, wireColumnar, validatableFields.length > 0)
   L.push(`  }),`)
   L.push(`}`)
   L.push('')
@@ -975,6 +1004,7 @@ function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string, tableName: stri
     L.push(`          return { membership: env.membership, ...(env.ctx !== undefined ? { ctx: env.ctx } : {}) }`)
     L.push(`        },`)
     L.push(`        placeholderData: keepPreviousData,   // search/filter changes keep rows mounted`)
+    L.push(`        structuralSharing: shareMembershipData,  // membership structure-token guard: a confirming refetch keeps identity (wire-identity §4)`)
     L.push(`      })`)
     L.push(`      const _m: any = (query.data as any)?.membership`)
     L.push(`      const rows = useProjectedRows('${tableName}', _m?.pks ?? [], _${lc}WireFields, _${lc}WireSpecIndex)`)
@@ -1001,6 +1031,7 @@ function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string, tableName: stri
     L.push(`        },`)
     L.push(`        initialPageParam: 0,`)
     L.push(`        getNextPageParam:  (last: any) => last?.membership?.pagination?.hasMore ? (last.membership.pagination.page + 1) : undefined,`)
+    L.push(`        structuralSharing: shareMembershipData,  // membership structure-token guard, page-wise`)
     L.push(`      })`)
     L.push(`      const _pages: any[] = (query.data as any)?.pages ?? []`)
     L.push(`      const _allPks = _pages.flatMap((p: any) => p?.membership?.pks ?? [])`)
@@ -1133,7 +1164,7 @@ function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string, tableName: stri
 
 // ── .with() body ──────────────────────────────────────────────────────────────
 
-function emitWith(L: string[], ctrl: CtrlMeta, clientKey: string, wireColumnar = false): void {
+function emitWith(L: string[], ctrl: CtrlMeta, clientKey: string, wireColumnar = false, hasValidator = false): void {
   const modelName   = ctrl.modelClass
   const scopeSpread = ctrl.scopes.length > 0 ? '...scopes, ' : ''
   const lc          = modelName ? lcFirst(modelName) : ''
@@ -1144,6 +1175,10 @@ function emitWith(L: string[], ctrl: CtrlMeta, clientKey: string, wireColumnar =
     L.push(`    index:         (params?: ${modelName}SearchState) => client.${clientKey}.index({ ${scopeSpread}...params }).then((env: any) => mergeIndexEnvelope(entityStore, env, _${lc}WireSpecIndex)),`)
     L.push(`    infiniteIndex: (params?: Omit<${modelName}SearchState, 'page'>) => client.${clientKey}.index({ ${scopeSpread}...params }).then((env: any) => mergeIndexEnvelope(entityStore, env, _${lc}WireSpecIndex)),`)
     L.push(`    get:           (id: number | string) => client.${clientKey}.get({ ${scopeSpread}id }).then(_${lc}MergeEcho),`)
+    if (hasValidator) {
+      L.push(`    /** WS3 validation dispatch: W = projFreshAt over HELD mask fields (unheld ⇒ full GET, never validate); fresh(V) ⇒ certify(fields, V, W) with the SAME issue-time W; gone(D) ⇒ destroy floor; stale ⇒ mergeEnvelope; scope-miss 404 ⇒ legacy eviction. */`)
+      L.push(`    revalidate:    (id: number | string, opts?: RevalidateOptions) => revalidateProjection(entityStore, _${lc}Validator(scopes), id, opts),`)
+    }
     L.push(`    mutateCreate:  (data: ${modelName}Write) => client.${clientKey}.create({ ${scopeSpread}data }).then(_${lc}MergeEcho),`)
     L.push(`    mutateUpdate:  (id: number | string, data: Partial<${modelName}Write>) => client.${clientKey}.update({ ${scopeSpread}id, data }).then(_${lc}MergeEcho),`)
     L.push(`    mutateDestroy: (id: number | string) => client.${clientKey}.destroy({ ${scopeSpread}id }).then(_${lc}MergeEcho),`)
@@ -1311,10 +1346,17 @@ function generateClientStub(): string {
  *
  *   import { createORPCClient } from '@orpc/client'
  *   import { RPCLink } from '@orpc/client/fetch'
+ *   import { BatchLinkPlugin } from '@orpc/client/plugins'
  *   import type { AppRouter } from '../server/_routes.gen'
  *
  *   export const client = createORPCClient<AppRouter>(
- *     new RPCLink({ url: '/api/rpc' })
+ *     new RPCLink({
+ *       url: '/api/rpc',
+ *       // Coalesces same-tick calls (validate/membership bursts after a
+ *       // signal storm) into ONE HTTP request — recommended for columnar
+ *       // doors (DESIGN-wire-identity §4 storm controls).
+ *       plugins: [new BatchLinkPlugin({ groups: [{ condition: () => true, context: {} }] })],
+ *     })
  *   )
  *
  * The type of AppRouter is inferred from _routes.gen.ts (generated alongside
@@ -1888,6 +1930,7 @@ function emitWireSpec(
   model: ModelMeta,
   projectMeta: ProjectMeta,
   modelName: string,
+  validatableFields: string[] = [],
 ): void {
   const lc = lcFirst(modelName)
   const access = ctrl.crudConfig?.access
@@ -1928,6 +1971,31 @@ function emitWireSpec(
   L.push(`      ? (mergeEnvelope(entityStore, res), res)`)
   L.push(`      : res`)
   L.push('')
+
+  // ── WS3 validation lane (client half) ────────────────────────────────────
+  // The mask + projId are the codegen twin of the server's validatableMask —
+  // computed with the SAME rule and hashed with the SAME shared projIdFor, so
+  // the two can only disagree where an Attr maps a property to a column
+  // codegen cannot see (documented edge: permanent conservative slices on
+  // that door, never unsoundness).
+  if (validatableFields.length) {
+    const scopeType   = scopeType_fromFields(ctrl.scopes.map(s => s.field))
+    const scopeSpread = ctrl.scopes.length > 0 ? '...scopes, ' : ''
+    const clientKey   = toClientKey(ctrl)
+    L.push(`/** WS3 validatable mask — scalar + belongsTo-FK columns only (lock + hasMany pk-arrays excluded by construction). */`)
+    L.push(`const _${lc}ValidatableFields = [${validatableFields.map(f => `'${f}'`).join(', ')}]`)
+    L.push(`/** projIdFor(_${lc}ValidatableFields), embedded at build time — the server refuses any other id with the conservative slice. */`)
+    L.push(`const _${lc}ProjId = '${projIdFor(validatableFields)}'`)
+    L.push(`/** The door's validation transport — everything revalidateProjection (the ONE dispatch module) needs. */`)
+    L.push(`const _${lc}Validator = (scopes: ${scopeType}) => ({`)
+    L.push(`  model: '${model.tableName}',`)
+    L.push(`  fields: _${lc}ValidatableFields,`)
+    L.push(`  projId: _${lc}ProjId,`)
+    L.push(`  validate: (input: { id: number | string; projId: string; ifNoneMatch: number }) => client.${clientKey}.validate({ ${scopeSpread}...input }),`)
+    L.push(`  fetch: (id: number | string) => client.${clientKey}.get({ ${scopeSpread}id }),`)
+    L.push(`})`)
+    L.push('')
+  }
 }
 
 /**

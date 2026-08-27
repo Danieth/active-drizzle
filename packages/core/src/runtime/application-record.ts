@@ -4,6 +4,9 @@ import { Relation, _lookupAssocTarget, mapWriteAttributes } from './relation.js'
 import { getExecutor, getSchema, MODEL_REGISTRY, transaction, transactionContext, transactionDbName, afterCommitQueue, AbortChain, RecordNotFound, StaleObjectError, databaseForTable } from './boot.js'
 import { modelClassName } from './class-name.js'
 import { lockingColumnFor } from './optimistic-lock.js'
+import {
+  isWriteLogged, writeLogRow, writeLogRows, fieldNumberingFor, fullBitmap, softDeleteColumnFor, LIFECYCLE,
+} from './write-log.js'
 import { runHooks, collectHooks } from './hooks.js'
 import type { AttrEnumConfig, AttrStateConfig } from './attr.js'
 import { stateCanFire, stateLegalMove } from './attr.js'
@@ -332,7 +335,33 @@ export class ApplicationRecord {
       return out
     })
     if (rows.length === 0) return 0
-    await getExecutor((this as any).tableName as string).insert(table).values(rows)
+    const tableName = (this as any).tableName as string
+
+    // WS3 write-log: bulk creates on a LOGGED model are in-contract — each
+    // row logs lifecycle=1 at its birth token (RETURNING pk+token) and the
+    // door counters bump ONCE, inside the same transaction as the INSERT
+    // (T8/O5's conservative-bump invariant: any create bumps; a silent miss
+    // here would let a tag-equal list hide a row the moment tag-equality is
+    // consumed as a skip). Untracked models keep the plain single statement.
+    const pkField = typeof Ctor.primaryKey === 'string' ? Ctor.primaryKey : 'id'
+    const lockCol = lockingColumnFor(Ctor, table)
+    if (isWriteLogged(Ctor) && lockCol && table[pkField] !== undefined) {
+      const full = fullBitmap(fieldNumberingFor(tableName))
+      const run = async (): Promise<number> => {
+        const db = getExecutor(tableName)
+        const inserted: any[] = await db.insert(table).values(rows)
+          .returning({ pk: table[pkField], token: table[lockCol] })
+        await writeLogRows(db, tableName, inserted
+          .filter(r => r.pk != null && typeof r.token === 'number')
+          .map(r => ({ pk: r.pk, token: r.token, changed: full, lifecycle: LIFECYCLE.create })))
+        return inserted.length
+      }
+      return _inTransactionOn(Ctor)
+        ? run()
+        : transaction(run, { database: databaseForTable(tableName) })
+    }
+
+    await getExecutor(tableName).insert(table).values(rows)
     return rows.length
   }
 
@@ -707,6 +736,14 @@ export class ApplicationRecord {
       this._changes.clear()
       this.isNewRecord = false
 
+      // WS3 write-log (O10): THE write point — the log row commits INSIDE
+      // this write phase, on the SAME executor (the transaction wrap is
+      // forced for logged models via _saveNeedsTransaction), immediately
+      // after _previousChanges is populated. Never afterCommit: in-tx
+      // logging makes log-row-exists ⟺ commit-happened a Postgres atomicity
+      // fact — see write-log.ts's write-point argument.
+      await _writeRecordLog(this, ctor, db, isNew)
+
       // Process acceptsNestedAttributesFor associations after parent is persisted
       await _processNestedAttributes(this, ctor, nestedSnapshot)
 
@@ -884,6 +921,21 @@ export class ApplicationRecord {
           // CAS matched zero rows → a concurrent writer advanced the version
           // (or already deleted the row). This stale DELETE must not win.
           throw new StaleObjectError(modelClassName(ctor), _getPkValue(ctor, this._attributes))
+        }
+        // WS3 write-log: the DESTROY-COMMIT token is D = loaded + 1 (A1: the
+        // chain is strictly increasing across destroys; matches the columnar
+        // destroy echo). After the hard DELETE this lifecycle=2 row is the
+        // ONLY durable carrier of D — gone(D)'s tombstone — which is why it
+        // rides the same transaction as the DELETE (_destroyNeedsTransaction
+        // forces the wrap for logged models).
+        if (isWriteLogged(ctor)) {
+          await writeLogRow(db, {
+            tableName: ctor.tableName as string,
+            pk: _getPkValue(ctor, this._attributes),
+            token: loadedVersion + 1,
+            changed: [],
+            lifecycle: LIFECYCLE.destroy,
+          })
         }
       } else {
         await db.delete(table).where(where)
@@ -1856,11 +1908,33 @@ async function _adjustCounterCaches(record: any, ctor: any, delta: 1 | -1): Prom
         set[parentLockCol] = sql`${parentTable[parentLockCol]} + 1`
       }
 
-      const db = getExecutor((ParentModel._activeDrizzleTableName ?? ParentModel.tableName) as string)
-      await db
-        .update(parentTable)
-        .set(set)
-        .where(eq(parentTable.id, parentId))
+      const parentTableName = (ParentModel._activeDrizzleTableName ?? ParentModel.tableName) as string
+      const db = getExecutor(parentTableName)
+      // WS3 write-log: a counter-cache bump on a LOGGED parent is a real
+      // commit in the parent's lineage (its token advanced in the same SET),
+      // so it owes a log row — RETURNING gives the committed token, and this
+      // whole block already runs inside save()/destroy()'s wrap.
+      if (parentLockCol && parentLockCol !== counterCol && isWriteLogged(ParentModel)) {
+        const [row] = await db
+          .update(parentTable)
+          .set(set)
+          .where(eq(parentTable.id, parentId))
+          .returning({ pk: parentTable.id, token: parentTable[parentLockCol] })
+        if (row && typeof row.token === 'number') {
+          await writeLogRow(db, {
+            tableName: parentTableName,
+            pk: row.pk,
+            token: row.token,
+            changed: [counterCol],
+            lifecycle: LIFECYCLE.none,
+          })
+        }
+      } else {
+        await db
+          .update(parentTable)
+          .set(set)
+          .where(eq(parentTable.id, parentId))
+      }
     }
   }
 }
@@ -1967,6 +2041,12 @@ function _ctorHasCounterCacheParent(ctor: any): boolean {
  * then is the transaction wrap worth its round-trip.
  */
 function _saveNeedsTransaction(record: any, ctor: any, nestedSnapshot: Record<string, any>, habtmSnapshot: Record<string, any>, isNew: boolean): boolean {
+  // WS3: a LOGGED model's save always wraps — the write-log row must commit
+  // atomically with the data write (write-log.ts's write-point argument).
+  // This is the accepted cost of in-tx logging on exactly the hot columnar
+  // models (a partial dividend on O1, which stays its own open blocker; the
+  // data-modifying-CTE single-statement variant is the later optimization).
+  if (isWriteLogged(ctor)) return true
   if (Object.keys(nestedSnapshot).length > 0) return true
   if (Object.keys(habtmSnapshot).length > 0) return true
   for (const [key, marker] of modelStaticEntries(ctor)) {
@@ -1978,12 +2058,62 @@ function _saveNeedsTransaction(record: any, ctor: any, nestedSnapshot: Record<st
 
 /** Does destroy() cascade to children or adjust a counter (→ needs the atomic wrap)? */
 function _destroyNeedsTransaction(ctor: any): boolean {
+  // WS3: the lifecycle=2 tombstone row must commit atomically with the
+  // DELETE — it is gone(D)'s only durable carrier (same rule as save).
+  if (isWriteLogged(ctor)) return true
   for (const [, marker] of modelStaticEntries(ctor)) {
     if (marker && typeof marker === 'object'
         && (marker._type === 'hasMany' || marker._type === 'hasOne')
         && marker.options?.dependent === 'destroy') return true
   }
   return _ctorHasCounterCacheParent(ctor)
+}
+
+/**
+ * WS3 (O10): persist this commit's write-log row — called from inside
+ * runWritePhase on the phase's own executor, right after _previousChanges
+ * is populated. Skips models that are not logged, tokens that are not
+ * numbers (partial select — the CAS already threw for real updates), and
+ * companion-only saves (no parent row write happened, so no token moved and
+ * no log row is owed; child writes log through their own save()).
+ */
+async function _writeRecordLog(record: any, ctor: any, db: any, isNew: boolean): Promise<void> {
+  if (!isWriteLogged(ctor)) return
+  const table = getSchema()[ctor.tableName]
+  const lockCol = lockingColumnFor(ctor, table)
+  if (!lockCol) return
+  const token = record._attributes[lockCol]
+  if (typeof token !== 'number') return
+  const pk = _getPkValue(ctor, record._attributes)
+  if (pk == null || Array.isArray(pk)) return          // composite pks are not wire-addressable
+  const tableName = ctor.tableName as string
+  const prev: Record<string, [any, any]> = record._previousChanges ?? {}
+  const changedKeys = Object.keys(prev)
+    .filter(k => !_isNestedAttrsKey(k, ctor) && !_isHabtmIdsKey(k, ctor))
+  if (!isNew && changedKeys.length === 0) return       // companion-only save: parent row untouched
+
+  let lifecycle: number = isNew ? LIFECYCLE.create : LIFECYCLE.none
+  if (!isNew) {
+    // SoftDeletable rides save(): destroy is update({deletedAt}) and restore
+    // is update({deletedAt: null}). The lifecycle flag is what makes A2′'s
+    // clause (ii) trip on soft destroy AND soft re-creation (undelete = 3):
+    // a client validating across either must get the slice/gone, never a 304.
+    const softCol = softDeleteColumnFor(tableName)
+    if (softCol && softCol in prev) {
+      const [was, is] = prev[softCol]!
+      if (was == null && is != null) lifecycle = LIFECYCLE.destroy
+      else if (was != null && is == null) lifecycle = LIFECYCLE.undelete
+    }
+  }
+  await writeLogRow(db, {
+    tableName,
+    pk,
+    token,
+    // A create's bitmap is the full set (every field came into existence at
+    // this token); clause (ii) trips on the lifecycle flag regardless.
+    changed: isNew ? fullBitmap(fieldNumberingFor(tableName)) : changedKeys,
+    lifecycle,
+  })
 }
 
 /** First human-readable validation message off a failed nested child. */

@@ -38,7 +38,7 @@ import {
 import type { ProjectMeta, ModelMeta, SchemaMeta, Diagnostic } from '../codegen/types.js'
 import { extractControllers } from '../codegen/controller-extractor.js'
 import { validateVersionedModels } from '../codegen/versioned-models.js'
-import { validateColumnarDoors } from '../codegen/wire-columnar.js'
+import { validateColumnarDoors, validateWriteLogSchema } from '../codegen/wire-columnar.js'
 import { generateRoutesFile, generateRoutesDoc } from '../codegen/controller-generator.js'
 import { generateReactHooks } from '../codegen/react-generator.js'
 
@@ -340,6 +340,10 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     allDiags.push(...validateVersionedModels(ctrlGate.meta, projectMeta))
     // Cross-IR: columnar doors (transport WS2) — same gate, same lanes
     allDiags.push(...validateColumnarDoors(ctrlGate.meta, projectMeta))
+    // Cross-IR: columnar doors imply write-logged models — the transport
+    // tables must exist in the schema (transport WS3, O2a-pattern refusal:
+    // every save on a logged model would refuse at runtime otherwise).
+    allDiags.push(...validateWriteLogSchema(ctrlGate.meta, projectMeta))
 
     printDiagnostics(allDiags, root)
 
@@ -536,6 +540,7 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     const diags = [
       ...validateVersionedModels(ctrlMeta, crossIrProject),
       ...validateColumnarDoors(ctrlMeta, crossIrProject),
+      ...validateWriteLogSchema(ctrlMeta, crossIrProject),
     ]
     if (diags.length === 0) return
     printDiagnostics(diags, root)
