@@ -22,11 +22,15 @@ function getConcernMeta(target: any): ConcernMeta {
   return target[CONCERN_META]
 }
 
-function applySoftDeleteOverride(target: any) {
+function applySoftDeleteOverride(target: any, concernName: string) {
   const originalDestroy = target.prototype.destroy
 
   target.prototype.destroy = async function () {
-    await this.update({ deletedAt: new Date() })
+    // Honor the concern's configured columnName (defaultScope/restore already
+    // did) — hardcoding 'deletedAt' made destroy write a nonexistent field on
+    // any custom-column model, silently never soft-deleting it.
+    const colName = (this.constructor as any).__concern_config?.[concernName]?.columnName ?? 'deletedAt'
+    await this.update({ [colName]: new Date() })
   }
 
   target.prototype.hardDestroy = async function () {
@@ -162,7 +166,7 @@ export function include<TConfig = void>(
 
     // Apply overrides
     if (def.overrides?.destroy === 'soft') {
-      applySoftDeleteOverride(target)
+      applySoftDeleteOverride(target, def.name)
     }
   }
 }

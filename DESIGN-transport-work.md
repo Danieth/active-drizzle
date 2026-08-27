@@ -95,26 +95,45 @@ Discharges: **O1 (OPEN), O2 ✅, O14 ✅** (O2/O14 landed 2026-08-27).
   locking column, `versionToken()` refuses Dates with the migration in
   the message, and timestamp lock columns are refused at build time.
   `relation.updateAll()` now bumps the token in the same statement
-  (the one write path that bypassed the CAS). Runtime backstop for
-  plugin-less apps: `lockField(config, model)` throws the same teaching
-  errors per-request (shared builders in
-  `packages/core/src/runtime/optimistic-lock.ts`).
+  (the one write path that bypassed the CAS), counter-cache parent
+  writes bump it in the same SET, and `destroy()` WHERE-guards it
+  (stale hard-deletes raise StaleObjectError — Rails lock_version
+  parity). The wire can never carry the token: `buildGovernedWriteData`
+  and `sanitizeNestedWrites` strip the resolved lock column from every
+  payload (a client-supplied value disarmed the CAS and could regress
+  the token). Runtime backstop for plugin-less apps: `lockField(config,
+  model)` throws the same teaching errors per-request — including the
+  missing-column O2a error when core's schema is booted (shared rule +
+  builders in `packages/core/src/runtime/optimistic-lock.ts`;
+  `resolveLockColumnName` is THE resolution rule, consumed by core's
+  CAS, updateAll, the controller, and the codegen pass).
 - ✅ O14 — pk-lineage rule: codegen REFUSES a lock-tokened model whose pk
-  is reusable (natural key, plain integer, or undetectable — composite
-  third-arg pks are invisible to the extractor and refuse conservatively)
-  unless `@include(SoftDeletable)` is declared; SoftDeletable's destroy is
-  `update({deletedAt})` riding save()'s CAS, so destroy/un-delete keep one
-  strictly increasing chain on the same pk (no new runtime code needed).
+  is reusable (natural key, plain integer, DEFAULTLESS uuid — i.e.
+  client-supplied — or undetectable — composite third-arg pks are
+  invisible to the extractor and refuse conservatively) unless
+  `@include(SoftDeletable)` is declared; SoftDeletable's destroy is
+  `update({<configured column>})` riding save()'s CAS, so
+  destroy/un-delete keep one strictly increasing chain on the same pk
+  (the concern's destroy override now honors a custom `columnName`, and
+  the validator checks the soft-delete column exists and is a
+  timestamp). uuid pks WITH a default (defaultRandom/$defaultFn) stay
+  automatic.
 - Acceptance MET for O2/O14: every write path bumps the token atomically
   with its data (statement-local; the multi-write snapshot claim awaits
   O1); the lineage property test
   (`packages/core/tests/integration/lineage-tokens.test.ts`, real PG)
   pins DB-default init, per-update CAS bumps, StaleObjectError on stale
   copies, never-reused serial pks across destroy→create, the soft-delete
-  same-pk chain, and the updateAll auto-bump. CONTRACT EXCLUSION: A1
-  across recreation on serial tables holds only while nobody inserts
-  explicit pk values or resets sequences on a lock-tokened hard-delete
-  table — Postgres allows both; out of contract.
+  same-pk chain, the updateAll auto-bump, and the destroy()-vs-token
+  semantics in both directions (stale destroy raises, fresh destroy
+  lands). CONTRACT EXCLUSION: A1 across recreation on serial tables
+  holds only while nobody inserts explicit pk values or resets
+  sequences on a lock-tokened hard-delete table, and — on
+  soft-delete-certified models — while `hardDestroy()` /
+  `Relation.deleteAll()` are not used to physically remove rows whose
+  pk is then re-created (codegen cannot see those calls; they end the
+  lineage the SoftDeletable certificate promised to keep) — Postgres
+  and the runtime allow all of these; out of contract.
 
 ### WS1 — Store hardening: Rule M in `packages/react` — ✅ LANDED 2026-08-27
 Discharges: **O9, O12-store-half** (client side of O3′ prepared).

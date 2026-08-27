@@ -3,7 +3,15 @@
  * These are the 12-step index, get, create, update, destroy implementations.
  * Controllers that define their own methods override these automatically.
  */
-import { modelClassName } from '@active-drizzle/core'
+import {
+  modelClassName,
+  resolveLockColumnName,
+  undeclaredLockColumnMessage,
+  lockingDisabledMessage,
+  missingLockColumnMessage,
+  nonNumericTokenMessage,
+  getSchema,
+} from '@active-drizzle/core'
 import { BadRequest, Conflict, NotFound, ValidationError, toValidationError } from './errors.js'
 import { getMutations, getScopes, collectFrontendContext } from './metadata.js'
 import { PROJECTION_NODE, sliceByProjection, type NormalizedNode } from './projection.js'
@@ -121,24 +129,65 @@ export function sanitizeMutationPayload(
   return payload
 }
 
-/** The optimistic-lock field name, or null when locking is off. */
-function lockField(config: CrudConfig): string | null {
+/**
+ * The optimistic-lock field name, or null when locking is off.
+ *
+ * `optimisticLock: true` means THE MODEL'S LOCKING COLUMN — `lockVersion`
+ * by convention, or its declared `static lockingColumn`. It never means
+ * `updatedAt`: a timestamp is not strictly increasing per commit
+ * (same-millisecond commits, clock skew) and core's CAS never touches it,
+ * so a timestamp token could only cosplay the check. Config bugs fail loud
+ * here with the fix in the message (the build-time versioned-models pass
+ * catches the same bugs earlier for apps running the vite plugin).
+ */
+function lockField(config: CrudConfig, model: any, record?: any): string | null {
   const lock = (config.update as any)?.optimisticLock
   if (!lock) return null
-  return lock === true ? 'updatedAt' : String(lock)
+  // THE resolution rule, from core's shared module: false → off, string →
+  // that name, otherwise the `lockVersion` convention.
+  const resolved = resolveLockColumnName((model as any)?.lockingColumn)
+  if (resolved === null) throw new Error(lockingDisabledMessage(modelClassName(model)))
+  const field = lock === true ? resolved : String(lock)
+  // A string opt-in must name the RESOLVED column — comparing against the
+  // literal 'lockVersion' would let `optimisticLock: 'lockVersion'` over a
+  // model with `static lockingColumn = 'rev'` serve tokens the CAS never
+  // bumps (a permanently-passing pre-check, i.e. a silently dead lock).
+  if (field !== resolved) {
+    // A Date in the named column is the killed updatedAt-cosplay — teach the
+    // lockVersion migration DIRECTLY instead of routing through "declare
+    // lockingColumn = '<timestamp>'", which would only error again next hop.
+    const raw = record?.[field] ?? record?._attributes?.[field]
+    if (raw instanceof Date) throw new Error(nonNumericTokenMessage(modelClassName(model), field, raw))
+    throw new Error(undeclaredLockColumnMessage(modelClassName(model), field))
+  }
+  // Runtime backstop for plugin-less apps: a controller that DECLARED
+  // optimistic locking over a table WITHOUT the lock column would otherwise
+  // degrade to silent last-write-wins (no token on envelopes, no pre-check,
+  // no CAS). When core is booted the model's table is visible — fail loud
+  // with the same teaching error the build-time O2a check raises. (Without a
+  // booted schema — e.g. controller used standalone — the partial-select
+  // tolerance in versionToken() remains the behavior.)
+  const tableName = (model as any)?._activeDrizzleTableName ?? (model as any)?.tableName
+  const table = tableName ? getSchema()?.[tableName] : undefined
+  if (table && !table[field]) {
+    throw new Error(missingLockColumnMessage(modelClassName(model), field, tableName))
+  }
+  return field
 }
 
 /**
- * The record's current version as an OPAQUE wire token. Dates compare by
- * epoch millis (serialization round-trips must not change the token);
- * everything else by String(). A record without the field yields null —
- * no token, no check.
+ * The record's current version as an OPAQUE wire token — the model's
+ * INTEGER locking column, stringified. A record without the field yields
+ * null — no token, no check (partial selects and pre-lock clients keep
+ * working). Anything non-numeric (a Date above all) is the killed
+ * updatedAt-cosplay and throws a teaching error naming the lockVersion
+ * migration.
  */
-function versionToken(record: any, field: string): string | null {
+function versionToken(record: any, field: string, model: any): string | null {
   const raw = record?.[field] ?? record?._attributes?.[field]
   if (raw == null) return null
-  if (raw instanceof Date) return String(raw.getTime())
-  return String(raw)
+  if (typeof raw === 'number') return String(raw)
+  throw new Error(nonNumericTokenMessage(modelClassName(model), field, raw))
 }
 
 /**
@@ -349,10 +398,11 @@ export function buildRecordEnvelope(
   const feCtx = computeFrontendContext(ctrl, ctx)
   if (feCtx) envelope.ctx = feCtx
   // Optimistic lock: the version token rides every envelope so the client
-  // can echo it back on PATCH
-  const lock = lockField(config)
+  // can echo it back on PATCH. lockField throws on config bugs — reads fail
+  // loud too: a misconfigured lock door must not serve token-less envelopes.
+  const lock = lockField(config, model, record)
   if (lock) {
-    const token = versionToken(record, lock)
+    const token = versionToken(record, lock, model)
     if (token != null) envelope.version = token
   }
   if (issues && issues.length > 0) envelope.issues = issues
@@ -865,29 +915,17 @@ export async function defaultUpdate(
   // client read it — 409 BEFORE any field applies, carrying the CURRENT
   // envelope so the client can offer reload/overwrite without a round-trip.
   // No `_version` on the wire → no check (pre-lock clients keep working).
-  const lock = lockField(config)
+  // lockField() itself refuses the config bugs — a column core will not CAS
+  // ('lockVersion' by convention, or the model's declared lockingColumn)
+  // would never advance now that the controller pre-bump is gone: the
+  // _version pre-check token would stay frozen and the lock silently dead.
+  const lock = lockField(config, model, record)
   if (lock && _version != null) {
-    const current = versionToken(record, lock)
+    const current = versionToken(record, lock, model)
     if (current != null && String(_version) !== current) {
       throw new Conflict(envelope
         ? buildRecordEnvelope(await reloadWithIncludes(relation, config, id, record, model), model, config, ctx, ctrl)
         : undefined)
-    }
-  }
-  // A NUMERIC lock column core will not CAS ('lockVersion' by convention, or
-  // the model's declared lockingColumn) never advances now that the
-  // controller pre-bump is gone — the _version pre-check token would stay
-  // frozen and the lock would be silently dead. Config bugs fail loud.
-  if (lock) {
-    const rawLockVal = (record as any)[lock] ?? (record as any)._attributes?.[lock]
-    if (typeof rawLockVal === 'number' && lock !== 'lockVersion' && (model as any).lockingColumn !== lock) {
-      throw new Error(
-        `[active-drizzle] update.optimisticLock names numeric column '${lock}', but core's ` +
-        `compare-and-swap only owns 'lockVersion' (convention) or the model's declared locking ` +
-        `column. Declare \`static lockingColumn = '${lock}'\` on ${modelClassName(model)} so ` +
-        `save() bumps and WHERE-guards it — without that the lock never advances and stale ` +
-        `writes silently win.`,
-      )
     }
   }
 
@@ -1082,6 +1120,11 @@ export async function sanitizeNestedWrites(
    *  class the rows belong to (its nested assocs authorize grandchildren). */
   const sanitizeRows = (items: any[], fkField: string | null, rowModel: any): any[] => {
     const grandAssocs = rowModel && resolveNested ? resolveNested(rowModel) : []
+    // The child's lock token is as server-owned as the parent's: a nested row
+    // carrying it would disarm the child's CAS inside _processNestedAttributes
+    // (same A1 hole as the top-level strip in buildGovernedWriteData). With an
+    // unresolvable child model, strip the `lockVersion` convention (fail closed).
+    const rowLockCol = rowModel ? resolveLockColumnName(rowModel.lockingColumn) : 'lockVersion'
     const out: any[] = []
     for (const item of items) {
       if (!isRow(item)) continue
@@ -1092,6 +1135,7 @@ export async function sanitizeNestedWrites(
       for (const [k, v] of Object.entries(item)) {
         if (k === 'id' || k === '_destroy' || k === '_key') continue
         if (NESTED_ALWAYS_STRIPPED.has(k)) continue
+        if (rowLockCol && k === rowLockCol) continue
         if (fkField && k === fkField) continue
         if (k.endsWith('Attributes')) {
           const grand = grandAssocs.find(a => a.attrsKey === k)
@@ -1222,9 +1266,16 @@ export async function buildGovernedWriteData(
   ctrl?: any,
   record?: any,
 ): Promise<Record<string, any>> {
-  return applyNestedAutoSet(await sanitizeNestedWrites(
-    buildPermittedData(rawInput, writeConfig, ctx, model, ctrl, record), model,
-  ), writeConfig, ctx, ctrl)
+  const permitted = buildPermittedData(rawInput, writeConfig, ctx, model, ctrl, record)
+  // The wire must NEVER carry the lock token. Core's save() CAS engages only
+  // when the lock column is ABSENT from the save payload — a client-supplied
+  // value both DISARMS the WHERE-version guard and can REGRESS the token
+  // (A1: per-lineage strictly increasing). Stripped unconditionally, even
+  // from an explicit permit list; server-side APIs (updateAll's explicit
+  // value) are a different trust domain — this strip is wire-only.
+  const lockCol = resolveLockColumnName((model as any)?.lockingColumn)
+  if (lockCol) delete permitted[lockCol]
+  return applyNestedAutoSet(await sanitizeNestedWrites(permitted, model), writeConfig, ctx, ctrl)
 }
 
 /** The auto-attach pass, exported for the singleton write surface. */

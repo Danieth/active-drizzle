@@ -2,6 +2,7 @@ import { eq, and, or, inArray, notInArray, arrayContains, isNull, ilike, desc, a
 import { union, unionAll, intersect, except } from 'drizzle-orm/pg-core'
 import { getExecutor, getSchema, MODEL_REGISTRY, transaction, RecordNotFound, databaseForTable } from './boot.js'
 import { modelClassName } from './class-name.js'
+import { lockingColumnFor } from './optimistic-lock.js'
 import { reportError } from './error-reporting.js'
 import type { ApplicationRecord } from './application-record.js'
 
@@ -1134,6 +1135,13 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
   /**
    * Bulk UPDATE — bypasses proxies and hooks.
    * Values are run through Attr.set() before hitting the database.
+   *
+   * On a model with a locking column the token is bumped IN the same
+   * statement (`SET lockVersion = lockVersion + 1`) — updateAll bypasses
+   * save()'s compare-and-swap, and a bulk write that left the token frozen
+   * would let every holder of the old token keep writing over the new data.
+   * Deliberately no CAS here: updateAll documents "bypasses proxies and
+   * hooks"; it must not silently skip the token either.
    */
   public async updateAll(updates: Record<string, any>): Promise<number> {
     const rel = this._withDefaultScopes()
@@ -1145,6 +1153,12 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     // `Attr.money('priceCents')` write landed under `price` — a column that
     // doesn't exist — and drizzle silently dropped it.
     const mapped = mapWriteAttributes(Ctor, updates)
+    // Token bump AFTER mapWriteAttributes — the raw SQL increment must never
+    // pass through an Attr codec. An explicit lock value in the updates wins.
+    const lockCol = lockingColumnFor(Ctor, table)
+    if (lockCol && !(lockCol in mapped)) {
+      mapped[lockCol] = sql`${table[lockCol]} + 1`
+    }
     let q: any = db.update(table).set(mapped)
     const whereExpr = rel._buildFinalWhere()
     if (whereExpr) q = q.where(whereExpr)

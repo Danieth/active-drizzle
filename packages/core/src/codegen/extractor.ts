@@ -274,12 +274,14 @@ function extractColumn(
       const mod = expr.getName();
       if (mod === 'notNull')    nullable = false;
       if (mod === 'primaryKey') primaryKey = true;
-      // Drizzle defaults: `.default(v)` / `.defaultNow()` are DB-side; the
-      // `$`-prefixed forms (`$default`, `$defaultFn`, `$onUpdate`,
-      // `$onUpdateFn`) are runtime-side but STILL supply a value the writer
-      // need not provide — so all of them make the column optional on Create.
+      // Drizzle defaults: `.default(v)` / `.defaultNow()` / `.defaultRandom()`
+      // are DB-side; the `$`-prefixed forms (`$default`, `$defaultFn`,
+      // `$onUpdate`, `$onUpdateFn`) are runtime-side but STILL supply a value
+      // the writer need not provide — so all of them make the column optional
+      // on Create. (`defaultRandom` matters doubly: without it a
+      // `uuid().defaultRandom().primaryKey()` pk read as no-default.)
       if (
-        mod === 'default' || mod === 'defaultNow' ||
+        mod === 'default' || mod === 'defaultNow' || mod === 'defaultRandom' ||
         mod === '$default' || mod === '$defaultFn' ||
         mod === '$onUpdate' || mod === '$onUpdateFn'
       ) hasDefault = true;
@@ -395,6 +397,8 @@ function extractModelFromClass(classDecl: ClassDeclaration, modelPath: string): 
   const { sources: propertyValidations, analysis: propertyValidationAnalysis } = extractPropertyValidations(classDecl);
   const propertyDefaults = extractPropertyDefaults(classDecl);
   const attrSetReturnTypes = extractAttrSetReturnTypes(classDecl);
+  const lockingColumn = extractLockingColumn(classDecl);
+  const softDelete = extractSoftDelete(classDecl);
 
   return {
     className,
@@ -404,6 +408,8 @@ function extractModelFromClass(classDecl: ClassDeclaration, modelPath: string): 
     isSti,
     stiParent,
     stiTypeValue,
+    ...(lockingColumn !== undefined ? { lockingColumn } : {}),
+    ...(softDelete ? { softDelete: true, softDeleteColumn: softDelete.columnName } : {}),
     associations,
     enums,
     enumGroups,
@@ -417,6 +423,47 @@ function extractModelFromClass(classDecl: ClassDeclaration, modelPath: string): 
     propertyDefaults,
     attrSetReturnTypes,
   };
+}
+
+/**
+ * Literal of `static lockingColumn = '<name>' | false` — the optimistic-lock
+ * column override (string) or the explicit disable (false). `undefined` when
+ * not declared, so the runtime's `lockVersion` convention applies.
+ */
+function extractLockingColumn(classDecl: ClassDeclaration): string | false | undefined {
+  for (const prop of classDecl.getStaticProperties()) {
+    if (!Node.isPropertyDeclaration(prop)) continue;
+    if (prop.getName() !== 'lockingColumn') continue;
+    const init = prop.getInitializer();
+    if (init && Node.isStringLiteral(init)) return init.getLiteralValue();
+    if (init && init.getKind() === SyntaxKind.FalseKeyword) return false;
+  }
+  return undefined;
+}
+
+/**
+ * Detects `@include(SoftDeletable)` (static decorator form only — a
+ * dynamically applied concern is invisible to codegen) and its optional
+ * `columnName` config literal. Feeds the versioned-models O14 rule: only the
+ * concern's destroy override rides save()'s CAS, so only it certifies
+ * same-pk lineage across destroy→recreate.
+ */
+function extractSoftDelete(classDecl: ClassDeclaration): { columnName: string } | null {
+  for (const dec of classDecl.getDecorators()) {
+    if (dec.getName() !== 'include') continue;
+    const args = dec.getArguments();
+    if (!args[0] || args[0].getText() !== 'SoftDeletable') continue;
+    let columnName = 'deletedAt';
+    if (args[1] && Node.isObjectLiteralExpression(args[1])) {
+      const p = args[1].getProperty('columnName');
+      if (Node.isPropertyAssignment(p)) {
+        const v = p.getInitializer();
+        if (v && Node.isStringLiteral(v)) columnName = v.getLiteralValue();
+      }
+    }
+    return { columnName };
+  }
+  return null;
 }
 
 /** Literal value of `static stiType = '…'` — the runtime STI discriminator. */

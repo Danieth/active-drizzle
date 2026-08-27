@@ -138,6 +138,25 @@ path instead of at one boundary. `save()` does it right; every other path forks.
       both pass. **The coherence proofs rest on this.** Add version to the WHERE.
 - [x] `afterCommit` callbacks in nested transactions are silently discarded
       (boot.ts:200) — inner queue never merged into outer. Merge on nested commit.
+- [x] (2026-08-27, transport WS0 O2/O14) The `updatedAt`-cosplay lock path is
+      DELETED: `optimisticLock: true` now means the model's INTEGER locking
+      column (`lockVersion` convention / `static lockingColumn`), never a
+      timestamp — Date tokens throw a teaching error naming the
+      `lock_version` migration. New cross-IR codegen pass
+      (`core/src/codegen/versioned-models.ts`) refuses mis-shaped/missing
+      lock columns and reusable pks without `@include(SoftDeletable)`;
+      `relation.updateAll()` auto-bumps the token. BREAKING for deployments
+      that used `optimisticLock: true` with updatedAt tokens — ship
+      server+client together; no wire-compat shim. Review hardening
+      (2026-08-27, same day): the lock column is now STRIPPED from every wire
+      payload, nested rows included (a client-supplied value disarmed the CAS
+      and could regress the token); counter-cache parent writes and
+      `destroy()` bump/guard the token too (destroy now raises
+      StaleObjectError on a stale copy — BREAKING for code that relied on
+      stale hard-deletes succeeding); a declared lock over a table missing
+      the column now fails loud at request time (was silent last-write-wins
+      for plugin-less apps); O14 treats a DEFAULTLESS uuid pk as reusable.
+      O1 (transactional save, "Atomicity" above) remains WS0's open blocker.
 
 ### Installability (the framework cannot be installed today)
 - [x] npm identity: apps depend on bare `active-drizzle` (unpublished); package is

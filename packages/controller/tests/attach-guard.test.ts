@@ -118,6 +118,14 @@ vi.mock('@active-drizzle/core', () => ({
   // resolution here: a class/function → its `.name`, never the raw object.
   modelClassName: (m: any) =>
     typeof m === 'function' && typeof m.name === 'string' ? m.name : '',
+  // The wire-strip in buildGovernedWriteData resolves the lock column through
+  // the shared rule; mirror it (false → off, string → that name, else the
+  // lockVersion convention). No fixture here locks, but the strip always runs.
+  resolveLockColumnName: (declared: any) =>
+    declared === false ? null : typeof declared === 'string' ? declared : 'lockVersion',
+  // lockField's plugin-less backstop looks the model's table up in the booted
+  // schema — none is booted in this suite, so mirror the "not booted" shape.
+  getSchema: () => undefined,
 }))
 
 import { defaultUpdate } from '../src/crud-handlers.js'

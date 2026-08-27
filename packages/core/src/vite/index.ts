@@ -37,6 +37,7 @@ import {
 } from '../codegen/generator.js'
 import type { ProjectMeta, ModelMeta, SchemaMeta, Diagnostic } from '../codegen/types.js'
 import { extractControllers } from '../codegen/controller-extractor.js'
+import { validateVersionedModels } from '../codegen/versioned-models.js'
 import { generateRoutesFile, generateRoutesDoc } from '../codegen/controller-generator.js'
 import { generateReactHooks } from '../codegen/react-generator.js'
 
@@ -322,6 +323,21 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
       if (cached) allDiags.push(...cached)
     }
 
+    // ── Cross-IR: versioned models (O2/O14) ──────────────────────────────────
+    // Runs HERE, inside the strict gate BEFORE any emit — a versioned-model
+    // error must refuse the model files too, not just the routes. The pass
+    // needs controller config × model statics × schema pk kind at once, so it
+    // cannot live in the per-model validate() loop; and it runs every model-
+    // side change (no per-model cache key could carry a cross-IR verdict).
+    // Without the controllers option it still enforces model-side opt-ins —
+    // a lockVersion column alone engages core's CAS, so its shape is load-
+    // bearing either way. The ctrl-only save path (models unchanged) early-
+    // exits above this function and is guarded inside runControllerCodegen.
+    // The extracted ctrl meta is threaded into runControllerCodegen below so
+    // the model-side lane globs + extracts + validates the controllers ONCE.
+    const ctrlGate = await extractCtrlMetaForGate(p)
+    allDiags.push(...validateVersionedModels(ctrlGate.meta, projectMeta))
+
     printDiagnostics(allDiags, root)
 
     // ── Failure channel (golden-rule: errors that teach apply to OUR OWN build) ─
@@ -333,15 +349,7 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     // build: fails the build). Warnings never block.
     const errorDiags = allDiags.filter(d => d.severity === 'error')
     if (options.strict !== false && errorDiags.length > 0) {
-      const summary = errorDiags
-        .map(d => `  • ${relative(root, d.modelFile)}: ${d.message}${d.suggestion ? `\n      → ${d.suggestion}` : ''}`)
-        .join('\n')
-      throw new Error(
-        `[active-drizzle] Refusing to generate — ${errorDiags.length} extraction/validation ` +
-        `error${errorDiags.length === 1 ? '' : 's'} would produce INVALID code. Fix the ` +
-        `error${errorDiags.length === 1 ? '' : 's'} below, or set \`strict: false\` on the plugin ` +
-        `to emit anyway (not recommended — generated files will be wrong):\n${summary}`,
-      )
+      throw strictRefusal(errorDiags, 'extraction/validation')
     }
 
     // ── Generate ─────────────────────────────────────────────────────────────
@@ -469,18 +477,90 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     }
 
     // ── Controller codegen (optional) ─────────────────────────────────────────
+    // Reaching here means the model side CHANGED (schema, a model file, or the
+    // model list) — the unchanged case early-exited above. Cross-IR results
+    // (versioned-models) depend on model meta too, so the controller pass must
+    // not serve its stale early-return when only the model side moved.
     let ctrlRuntimeChanged = false
     if (options.controllers) {
-      ctrlRuntimeChanged = await runControllerCodegen()
+      ctrlRuntimeChanged = await runControllerCodegen(true, ctrlGate)
     }
     return runtimeChanged || ctrlRuntimeChanged
   }
 
-  /** Runs controller/route codegen. Returns whether a runtime file (_routes.gen.ts or a React hook) changed. */
-  async function runControllerCodegen(): Promise<boolean> {
+  /**
+   * Controller meta + paths for runCodegen's cross-IR gate — empty when the
+   * option is off. The result is threaded into runControllerCodegen so the
+   * model-side lane never extracts the same controllers twice.
+   */
+  async function extractCtrlMetaForGate(p: Project): Promise<{
+    meta: import('../codegen/controller-types.js').CtrlProjectMeta
+    paths: string[]
+  }> {
+    if (!options.controllers) return { meta: { controllers: [] }, paths: [] }
+    const ctrlPaths = await glob(resolve(root, options.controllers).replace(/\\/g, '/'))
+    return {
+      meta: ctrlPaths.length > 0 ? extractControllers(p, ctrlPaths) : { controllers: [] },
+      paths: ctrlPaths,
+    }
+  }
+
+  /**
+   * The strict-mode refusal, in one voice for both gates (model-side
+   * diagnostics and the ctrl-only versioned-models gate).
+   */
+  function strictRefusal(errors: Diagnostic[], kind: string): Error {
+    const summary = errors
+      .map(d => `  • ${relative(root, d.modelFile)}: ${d.message}${d.suggestion ? `\n      → ${d.suggestion}` : ''}`)
+      .join('\n')
+    return new Error(
+      `[active-drizzle] Refusing to generate — ${errors.length} ${kind} ` +
+      `error${errors.length === 1 ? '' : 's'} would produce INVALID code. Fix the ` +
+      `error${errors.length === 1 ? '' : 's'} below, or set \`strict: false\` on the plugin ` +
+      `to emit anyway (not recommended — generated files will be wrong):\n${summary}`,
+    )
+  }
+
+  /**
+   * Validates the cross-IR versioned-models contract from the CACHED model
+   * state and throws the strict refusal on any error — the ctrl-save twin of
+   * runCodegen's diagnostics gate (which handles the model-side changes).
+   */
+  function versionedModelsGate(ctrlMeta: import('../codegen/controller-types.js').CtrlProjectMeta): void {
+    if (!schemaCache) return // no model run yet — nothing to cross-check against
+    const cachedModels = [...modelCache.values()].flatMap(c => c.meta)
+    const diags = validateVersionedModels(ctrlMeta, { schema: schemaCache.meta, models: cachedModels })
+    if (diags.length === 0) return
+    printDiagnostics(diags, root)
+    const errors = diags.filter(d => d.severity === 'error')
+    if (options.strict !== false && errors.length > 0) {
+      throw strictRefusal(errors, 'versioned-model (optimistic-lock contract)')
+    }
+  }
+
+  /**
+   * Runs controller/route codegen. Returns whether a runtime file
+   * (_routes.gen.ts or a React hook) changed.
+   *
+   * @param modelSideChanged - true when the caller (runCodegen) saw the schema
+   *   or a model file change this run. The cross-IR versioned-models pass
+   *   reads controller config × model statics × schema pk kind, so a
+   *   model-side change must invalidate it even when every `.ctrl.ts` mtime is
+   *   untouched — the ctrl-only early return below would otherwise pin stale
+   *   cross-IR verdicts for the rest of the watch session.
+   * @param pre - controller meta + paths already extracted (and cross-IR
+   *   validated, green) by runCodegen's own gate this run — reusing it keeps
+   *   the model-side lane from globbing/extracting/validating the same
+   *   controllers a second time on the hot watch path.
+   */
+  async function runControllerCodegen(
+    modelSideChanged = false,
+    pre?: { meta: import('../codegen/controller-types.js').CtrlProjectMeta; paths: string[] },
+  ): Promise<boolean> {
     if (!options.controllers) return false
-    const ctrlGlob = resolve(root, options.controllers)
-    const ctrlPaths = await glob(ctrlGlob.replace(/\\/g, '/'))
+    const ctrlPaths = pre
+      ? pre.paths
+      : await glob(resolve(root, options.controllers).replace(/\\/g, '/'))
     if (ctrlPaths.length === 0) return false
 
     // Check if any ctrl file changed
@@ -499,13 +579,21 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
       if (!ctrlPaths.includes(path)) { ctrlCache.delete(path); anyChanged = true }
     }
 
-    // Global hash guard — skip regeneration if routes haven't changed
+    // Global hash guard — skip regeneration if routes haven't changed AND the
+    // model side didn't move (cross-IR checks depend on both, see doc above)
     const routeHash = ctrlPaths.sort().join(':')
-    if (!anyChanged && routeHash === lastRouteHash) return false
+    if (!anyChanged && routeHash === lastRouteHash && !modelSideChanged) return false
     lastRouteHash = routeHash
 
-    const p = getOrCreateProject()
-    const ctrlMeta = extractControllers(p, ctrlPaths)
+    const ctrlMeta = pre ? pre.meta : extractControllers(getOrCreateProject(), ctrlPaths)
+
+    // ── Cross-IR: versioned models (O2/O14) — the ctrl-only path's gate ──────
+    // A `.ctrl.ts` save with unchanged models early-exits runCodegen BEFORE
+    // its diagnostics gate, so the cross-IR pass must ALSO guard here (before
+    // any route/hook write). Model-side changes carry `pre` and hit the gate
+    // inside runCodegen instead (before the model files emit) — re-validating
+    // that already-green meta here would be a guaranteed-green third pass.
+    if (!pre) versionedModelsGate(ctrlMeta)
 
     // Output dir: <genDir>/controllers (default), or legacy co-located
     const genRoot = options.genDir === false ? null : resolve(root, options.genDir ?? '.gen')

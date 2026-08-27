@@ -62,12 +62,11 @@ describe('defaultUpdate leaves numeric lock columns to core CAS', () => {
 
 describe('StaleObjectError from save() → 409 Conflict', () => {
   it('envelope door: the Conflict carries the RE-FETCHED server truth, not the rejected client values', async () => {
-    const updatedAt = new Date('2026-08-01T00:00:00.000Z')
     const record: any = {
-      id: 1, name: 'loaded', updatedAt,
+      id: 1, name: 'loaded', lockVersion: 3,
       save: vi.fn(async () => { throw staleObjectError() }), errors: {},
     }
-    const fresh: any = { id: 1, name: 'server-won', updatedAt: new Date('2026-08-01T00:00:05.000Z') }
+    const fresh: any = { id: 1, name: 'server-won', lockVersion: 4 }
     let loads = 0
     const relation: any = { where: () => ({ first: async () => (loads++ === 0 ? record : fresh) }) }
     const config: any = {
@@ -80,12 +79,12 @@ describe('StaleObjectError from save() → 409 Conflict', () => {
       // _version matches the loaded record — the friendly pre-check passes;
       // the CAS then loses the load→save race inside save()
       await defaultUpdate(relation, Deal as any, config, 1,
-        { name: 'client-value', _version: String(updatedAt.getTime()) }, {}, { state: {} })
+        { name: 'client-value', _version: '3' }, {}, { state: {} })
     } catch (e) { thrown = e }
 
     expect(thrown).toBeInstanceOf(Conflict)
     expect(thrown.envelope?.record?.name).toBe('server-won')
-    expect(thrown.envelope?.version).toBe(String(fresh.updatedAt.getTime()))
+    expect(thrown.envelope?.version).toBe('4')
   })
 
   it('non-envelope door: a plain Conflict (no envelope), never the raw error', async () => {

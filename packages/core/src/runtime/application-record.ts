@@ -3,6 +3,7 @@ import { eq, and, inArray, sql, getTableColumns } from 'drizzle-orm'
 import { Relation, _lookupAssocTarget, mapWriteAttributes } from './relation.js'
 import { getExecutor, getSchema, MODEL_REGISTRY, transaction, transactionContext, transactionDbName, afterCommitQueue, AbortChain, RecordNotFound, StaleObjectError, databaseForTable } from './boot.js'
 import { modelClassName } from './class-name.js'
+import { lockingColumnFor } from './optimistic-lock.js'
 import { runHooks, collectHooks } from './hooks.js'
 import type { AttrEnumConfig, AttrStateConfig } from './attr.js'
 import { stateCanFire, stateLegalMove } from './attr.js'
@@ -674,7 +675,7 @@ export class ApplicationRecord {
           // column (`lockVersion` by convention), bump it AND require its
           // loaded value in the WHERE. The old UPDATE keyed on the pk only, so
           // two stale writers both matched and the last one silently won.
-          const lockCol = _lockingColumn(ctor, table)
+          const lockCol = lockingColumnFor(ctor, table)
           const loadedVersion = lockCol ? this._attributes[lockCol] : undefined
           let where = _buildPkWhere(ctor, table, _getPkValue(ctor, this._attributes))
           if (lockCol && !(lockCol in payload)) {
@@ -867,7 +868,26 @@ export class ApplicationRecord {
         }
       }
 
-      await db.delete(table).where(_buildPkWhere(ctor, table, _getPkValue(ctor, this._attributes)))
+      // Optimistic lock rides the DELETE too (Rails guards destroy with
+      // lock_version): a stale copy must not silently win via hard delete —
+      // the row it thinks it's removing is not the row that exists.
+      let where = _buildPkWhere(ctor, table, _getPkValue(ctor, this._attributes))
+      const lockCol = lockingColumnFor(ctor, table)
+      if (lockCol) {
+        const loadedVersion = this._attributes[lockCol]
+        if (typeof loadedVersion !== 'number') {
+          throw new Error(_lockVersionTypeMessage(ctor, lockCol, loadedVersion))
+        }
+        where = and(where, eq(table[lockCol], loadedVersion))!
+        const rows = await db.delete(table).where(where).returning()
+        if (rows.length === 0) {
+          // CAS matched zero rows → a concurrent writer advanced the version
+          // (or already deleted the row). This stale DELETE must not win.
+          throw new StaleObjectError(modelClassName(ctor), _getPkValue(ctor, this._attributes))
+        }
+      } else {
+        await db.delete(table).where(where)
+      }
       ;(this as any).isDestroyed = true
 
       // counterCache: decrement parent counter on destroy
@@ -889,6 +909,7 @@ export class ApplicationRecord {
       // The DELETE rolled back (own wrap) or will (aborted ambient same-db
       // tx — _handleDbError rethrows into it): the instance must reflect that.
       if (needsWrap || inSameDbTx) (this as any).isDestroyed = wasDestroyed
+      if (err instanceof StaleObjectError) throw err
       return this._handleDbError(err, 'delete')
     }
   }
@@ -1760,10 +1781,20 @@ async function _adjustCounterCaches(record: any, ctor: any, delta: 1 | -1): Prom
       const parentTable = getSchema()[ParentModel._activeDrizzleTableName ?? ParentModel.tableName]
       if (!parentTable || !parentTable[counterCol]) continue
 
+      // A1: this UPDATE writes the parent identity, so on a lock-tokened
+      // parent the token must advance in the SAME statement — a counter that
+      // moved under a frozen token would let every holder of the old token
+      // keep certifying the stale count (same doctrine as updateAll's bump).
+      const parentLockCol = lockingColumnFor(ParentModel, parentTable)
+      const set: Record<string, any> = { [counterCol]: sql`${parentTable[counterCol]} + ${delta}` }
+      if (parentLockCol && parentLockCol !== counterCol) {
+        set[parentLockCol] = sql`${parentTable[parentLockCol]} + 1`
+      }
+
       const db = getExecutor((ParentModel._activeDrizzleTableName ?? ParentModel.tableName) as string)
       await db
         .update(parentTable)
-        .set({ [counterCol]: sql`${parentTable[counterCol]} + ${delta}` })
+        .set(set)
         .where(eq(parentTable.id, parentId))
     }
   }
@@ -1809,20 +1840,6 @@ function _pkHash(ctor: any, id: any): Record<string, any> {
     return Object.fromEntries(pk.map((k: string, i: number) => [k, vals[i]]))
   }
   return { [pk as string]: id }
-}
-
-/**
- * The optimistic-locking column for a model, or null. Opt-in by convention: an
- * integer `lockVersion` column (Rails' lock_version) enables compare-and-swap
- * on save automatically. Override the name with `static lockingColumn = 'x'`,
- * or disable with `static lockingColumn = false`. Returns null when the column
- * isn't actually in the schema, so models without it are unaffected.
- */
-function _lockingColumn(ctor: any, table: any): string | null {
-  const configured = ctor.lockingColumn
-  if (configured === false) return null
-  const colName = typeof configured === 'string' ? configured : 'lockVersion'
-  return table && table[colName] ? colName : null
 }
 
 /** Teaching error for a locking column whose loaded value can't drive the CAS. */

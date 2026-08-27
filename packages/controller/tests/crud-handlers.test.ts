@@ -172,12 +172,14 @@ describe('buildRecordEnvelope — nested abilities keys', () => {
 import { Conflict } from '../src/errors.js'
 
 describe('defaultUpdate optimistic lock', () => {
-  const updatedAt = new Date('2026-07-19T10:00:00.000Z')
-  const freshToken = String(updatedAt.getTime())
+  // `optimisticLock: true` = the model's INTEGER locking column (lockVersion
+  // by convention) — the updatedAt-cosplay is dead: timestamps are not
+  // strictly increasing per commit and core never CASes them.
+  const freshToken = '3'
 
   function makeRecord(extra: Record<string, any> = {}) {
     return {
-      id: 1, name: 'before', updatedAt,
+      id: 1, name: 'before', lockVersion: 3,
       save: vi.fn().mockResolvedValue(true),
       errors: {},
       ...extra,
@@ -214,6 +216,39 @@ describe('defaultUpdate optimistic lock', () => {
     expect(record.save).toHaveBeenCalled()
   })
 
+  it('a record WITHOUT the lock column yields no token → no check (partial-select tolerance)', async () => {
+    const record = makeRecord({ lockVersion: undefined })
+    const relation = makeRelation(record)
+    await defaultUpdate(relation, { name: 'Deal' }, lockConfig, 1, { name: 'after', _version: '99' }, {}, {})
+    expect(record.name).toBe('after')
+    expect(record.save).toHaveBeenCalled()
+  })
+
+  it('versionToken NEVER falls back to updatedAt — a lockless record with a timestamp yields no token', async () => {
+    // The exact pre-WS0 behavior being pinned dead: `optimisticLock: true`
+    // used to tokenize updatedAt. Now a record with updatedAt but no lock
+    // column is "no token, no check" — the timestamp is never consulted.
+    const staleTimestamp = new Date('2026-07-19T10:00:00.000Z')
+    const record = makeRecord({ lockVersion: undefined, updatedAt: staleTimestamp })
+    const relation = makeRelation(record)
+    // A wire _version carrying the old updatedAt-derived token neither
+    // matches nor conflicts — it is simply not checked.
+    await defaultUpdate(relation, { name: 'Deal' }, lockConfig, 1,
+      { name: 'after', _version: staleTimestamp.toISOString() }, {}, {})
+    expect(record.name).toBe('after')
+    expect(record.save).toHaveBeenCalled()
+  })
+
+  it('the envelope of a lockless record carries NO version — updatedAt is not tokenized', () => {
+    const record = { id: 1, name: 'x', updatedAt: new Date('2026-07-19T10:00:00.000Z') }
+    const config: any = {
+      get: { expose: ['name'], abilities: true },
+      update: { permit: ['name'], optimisticLock: true },
+    }
+    const env = buildRecordEnvelope(record, { tableName: 'deals' }, config, {}, {})
+    expect(env.version).toBeUndefined()
+  })
+
   it('optimisticLock off → _version is ignored entirely', async () => {
     const record = makeRecord()
     const relation = makeRelation(record)
@@ -223,7 +258,7 @@ describe('defaultUpdate optimistic lock', () => {
   })
 
   it('a NUMERIC lock field is NOT written by the controller — core CAS owns bump + WHERE guard', async () => {
-    const record = makeRecord({ lockVersion: 3 })
+    const record = makeRecord()
     const relation = makeRelation(record)
     const config: any = { update: { permit: ['name'], optimisticLock: 'lockVersion' } }
     await defaultUpdate(relation, { name: 'Deal' }, config, 1, { name: 'after', _version: '3' }, {}, {})
@@ -235,8 +270,8 @@ describe('defaultUpdate optimistic lock', () => {
     expect(record.save).toHaveBeenCalled()
   })
 
-  it('the envelope carries the version token (Dates → epoch millis, opaque)', () => {
-    const record = { id: 1, name: 'x', updatedAt }
+  it('the envelope carries the version token (integer lock column, stringified, opaque)', () => {
+    const record = { id: 1, name: 'x', lockVersion: 3 }
     const config: any = {
       get: { expose: ['name'], abilities: true },
       update: { permit: ['name'], optimisticLock: true },
@@ -259,6 +294,147 @@ describe('defaultUpdate optimistic lock', () => {
     expect(thrown).toBeInstanceOf(Conflict)
     expect(thrown.envelope?.record?.name).toBe('before')
     expect(thrown.envelope?.version).toBe(freshToken)
+  })
+
+  it('a Date in the lock column is the killed updatedAt-cosplay → teaching error naming the migration', async () => {
+    const record = makeRecord({ lockVersion: new Date('2026-07-19T10:00:00.000Z') })
+    const relation = makeRelation(record)
+    await expect(
+      defaultUpdate(relation, { name: 'Deal' }, lockConfig, 1, { name: 'after', _version: '3' }, {}, {}),
+    ).rejects.toThrow(/Timestamps are not\s+strictly increasing.*lock_version/s)
+    expect(record.save).not.toHaveBeenCalled()
+  })
+
+  it('optimisticLock: true against `static lockingColumn = false` → teaching error (config contradiction)', async () => {
+    const record = makeRecord()
+    const relation = makeRelation(record)
+    const model: any = { name: 'Deal', lockingColumn: false }
+    await expect(
+      defaultUpdate(relation, model, lockConfig, 1, { name: 'after', _version: '3' }, {}, {}),
+    ).rejects.toThrow(/lockingColumn = false/)
+  })
+
+  it("optimisticLock: true honors the model's declared lockingColumn", async () => {
+    const record = makeRecord({ rev: 7 })
+    const relation = makeRelation(record)
+    const model: any = { name: 'Deal', lockingColumn: 'rev' }
+    await expect(
+      defaultUpdate(relation, model, lockConfig, 1, { name: 'after', _version: 'not-7' }, {}, {}),
+    ).rejects.toBeInstanceOf(Conflict)
+    await defaultUpdate(relation, model, lockConfig, 1, { name: 'after', _version: '7' }, {}, {})
+    expect(record.name).toBe('after')
+    expect(record.save).toHaveBeenCalled()
+  })
+
+  it("optimisticLock: 'lockVersion' over a model with `static lockingColumn = 'rev'` is refused — comparison is against the RESOLVED column", async () => {
+    // Slipping this through would serve envelope tokens from lockVersion
+    // while core's CAS bumps 'rev' — a token that never advances, i.e. a
+    // permanently-passing pre-check and a silently dead lock.
+    const record = makeRecord({ rev: 7 })
+    const relation = makeRelation(record)
+    const model: any = { name: 'Deal', lockingColumn: 'rev' }
+    const config: any = { update: { permit: ['name'], optimisticLock: 'lockVersion' } }
+    await expect(
+      defaultUpdate(relation, model, config, 1, { name: 'after', _version: '7' }, {}, {}),
+    ).rejects.toThrow(/never advance/)
+    expect(record.save).not.toHaveBeenCalled()
+  })
+
+  it("optimisticLock: 'updatedAt' over a record holding a Date teaches the lockVersion migration DIRECTLY (no two-hop error chain)", async () => {
+    const record = makeRecord({ updatedAt: new Date('2026-07-19T10:00:00.000Z') })
+    const relation = makeRelation(record)
+    const config: any = { update: { permit: ['name'], optimisticLock: 'updatedAt' } }
+    // NOT the "declare `static lockingColumn = 'updatedAt'`" hop (which would
+    // only error again next request) — the migration message, first try.
+    await expect(
+      defaultUpdate(relation, { name: 'Deal' }, config, 1, { name: 'after', _version: 'x' }, {}, {}),
+    ).rejects.toThrow(/Timestamps are not\s+strictly increasing.*lock_version/s)
+  })
+
+  it('a STRING in the lock column (pg bigint/numeric) is a teaching error, never silently tokenized', async () => {
+    const record = makeRecord({ lockVersion: '3' })
+    const relation = makeRelation(record)
+    await expect(
+      defaultUpdate(relation, { name: 'Deal' }, lockConfig, 1, { name: 'after', _version: '3' }, {}, {}),
+    ).rejects.toThrow(/INTEGER locking column/)
+    expect(record.save).not.toHaveBeenCalled()
+  })
+
+  it('the read path fails loud too: buildRecordEnvelope throws on the lockingColumn = false contradiction', () => {
+    const model: any = { name: 'Deal', lockingColumn: false }
+    const config: any = {
+      get: { expose: ['name'], abilities: true },
+      update: { permit: ['name'], optimisticLock: true },
+    }
+    expect(() => buildRecordEnvelope({ id: 1, name: 'x' }, model, config, {}, {}))
+      .toThrow(/lockingColumn = false/)
+  })
+})
+
+// ── The lock column is server-owned: the wire may NEVER carry it ─────────────
+
+import { buildGovernedWriteData } from '../src/crud-handlers.js'
+
+describe('wire payloads cannot set the lock column (CAS disarm/regression sealed)', () => {
+  it('permit-less lane: a PATCH body smuggling lockVersion never reaches the record', async () => {
+    const record: any = {
+      id: 1, name: 'before', lockVersion: 5,
+      save: vi.fn().mockResolvedValue(true), errors: {},
+    }
+    const relation: any = { where: vi.fn().mockReturnValue({ first: vi.fn().mockResolvedValue(record) }) }
+    const config: any = { update: { optimisticLock: true } }   // no permit → allowed = keys(input)
+    await defaultUpdate(relation, { name: 'Deal' }, config, 1, { name: 'after', lockVersion: 1 }, {}, {})
+    expect(record.name).toBe('after')
+    // A staged lockVersion would land in the save payload, skipping BOTH the
+    // bump and the WHERE version guard in core — and regressing 5 → 1.
+    expect(record.lockVersion).toBe(5)
+  })
+
+  it('even an explicit permit listing the lock column is overridden by the strip', async () => {
+    const out = await buildGovernedWriteData(
+      { name: 'x', lockVersion: 1 },
+      { permit: ['name', 'lockVersion'] },
+      {}, { name: 'Deal', tableName: 'deals' },
+    )
+    expect(out).toEqual({ name: 'x' })
+  })
+
+  it("a declared lockingColumn strips under ITS name (and 'lockVersion' passes as an ordinary column)", async () => {
+    const out = await buildGovernedWriteData(
+      { name: 'x', rev: 9, lockVersion: 2 },
+      undefined,
+      {}, { name: 'Deal', tableName: 'deals', lockingColumn: 'rev' },
+    )
+    expect(out).not.toHaveProperty('rev')
+    expect(out.lockVersion).toBe(2)   // not the lock column on this model
+  })
+
+  it('nested child rows lose their lock column too (the child CAS must stay armed)', async () => {
+    const out = await sanitizeNestedWrites(
+      { notesAttributes: [{ id: 3, body: 'edit', lockVersion: 1 }] },
+      DuckOwner,
+    )
+    expect(out['notesAttributes']).toEqual([{ id: 3, body: 'edit' }])
+  })
+})
+
+// ── Runtime backstop: a declared lock over a column the table lacks fails loud ─
+
+import { boot as coreBoot } from '@active-drizzle/core'
+
+describe('optimisticLock over a table WITHOUT the lock column is a teaching error, not silent last-write-wins', () => {
+  it('when core is booted (the table is visible), lockField throws the O2a-equivalent error', async () => {
+    // A unique table name so the shared boot() schema never collides with the
+    // duck-typed models used elsewhere in this file.
+    coreBoot({} as any, { lockless_widgets: { id: { name: 'id' }, name: { name: 'name' } } })
+    const record: any = { id: 1, name: 'x', save: vi.fn().mockResolvedValue(true), errors: {} }
+    const relation: any = { where: vi.fn().mockReturnValue({ first: vi.fn().mockResolvedValue(record) }) }
+    const model: any = { name: 'Widget', tableName: 'lockless_widgets' }
+    const config: any = { update: { permit: ['name'], optimisticLock: true } }
+    await expect(
+      defaultUpdate(relation, model, config, 1, { name: 'after' }, {}, {}),
+    ).rejects.toThrow(/has no 'lockVersion' column/)
+    expect(record.save).not.toHaveBeenCalled()
   })
 })
 

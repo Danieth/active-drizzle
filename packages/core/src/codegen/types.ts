@@ -214,6 +214,16 @@ export type ModelMeta = {
   stiParent: string | null
   /** Literal value of `static stiType = '…'` on STI subclasses (null when absent). */
   stiTypeValue: string | null
+  /**
+   * Literal of `static lockingColumn = '<name>'` (string) or `= false`
+   * (locking explicitly disabled). Absent when not declared — the runtime
+   * then falls back to the `lockVersion` convention.
+   */
+  lockingColumn?: string | false
+  /** True when `@include(SoftDeletable)` is applied (static decorator form only). */
+  softDelete?: boolean
+  /** SoftDeletable's `columnName` config literal (default 'deletedAt'). */
+  softDeleteColumn?: string
   associations: AssociationMeta[]
   enums: EnumMeta[]
   enumGroups: EnumGroupMeta[]

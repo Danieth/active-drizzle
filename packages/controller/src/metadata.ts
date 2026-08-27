@@ -268,14 +268,22 @@ export interface CrudConfig<F extends string = string> {
   update?: Omit<WriteConfig<F>, 'autoSet'> & {
     /**
      * Optimistic concurrency for updates. The envelope gains a `version`
-     * token read from this field; the client echoes it as `_version` on
-     * PATCH; a mismatch throws 409 Conflict carrying the CURRENT envelope
-     * (so the client can offer reload/overwrite without a round-trip).
+     * token read from the model's INTEGER locking column; the client echoes
+     * it as `_version` on PATCH; a mismatch throws 409 Conflict carrying the
+     * CURRENT envelope (so the client can offer reload/overwrite without a
+     * round-trip). Core's save() compare-and-swaps the column — auto-bump +
+     * WHERE version guard — so the controller never writes it, and the wire
+     * never carries it: buildGovernedWriteData strips the lock column from
+     * every payload (nested rows included) because a client-supplied value
+     * would disarm the CAS and could regress the token.
      *
-     *   true       → version from `updatedAt` (the model must touch it on
-     *                save — a @beforeSave hook or DB trigger)
-     *   '<field>'  → version from that field; NUMERIC fields (lock_version
-     *                style) auto-increment on every governed update
+     *   true       → the model's locking column: `lockVersion` by
+     *                convention (`integer('lock_version').notNull().default(0)`
+     *                in the schema), or its declared `static lockingColumn`
+     *   '<field>'  → that column — it must BE the model's locking column;
+     *                anything else is a teaching error, and timestamp
+     *                columns are refused outright (not strictly increasing
+     *                per commit, never CAS'd by core)
      *
      * A PATCH without `_version` skips the check (old clients still work).
      */

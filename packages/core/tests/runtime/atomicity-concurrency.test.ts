@@ -6,7 +6,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { ApplicationRecord } from '../../src/runtime/application-record.js'
 import { boot, transaction, StaleObjectError } from '../../src/runtime/boot.js'
 import { model, afterCommit } from '../../src/runtime/decorators.js'
-import { hasMany } from '../../src/runtime/markers.js'
+import { hasMany, belongsTo } from '../../src/runtime/markers.js'
 import { Attr } from '../../src/runtime/attr.js'
 
 function fakeTable(cols: string[]): Record<string, any> {
@@ -220,5 +220,231 @@ describe('afterCommit callbacks survive nested transactions', () => {
       expect(log).toHaveLength(0)     // inner queue MERGED up, still deferred
     })
     expect(log).toEqual(['committed'])  // fires once, after the outer commit
+  })
+})
+
+// ── the shared resolver's override + disable branches (save side) ─────────────
+
+describe('save() CAS follows the RESOLVED locking column, not the literal convention', () => {
+  function makeCaptureDb(matched: boolean) {
+    const sets: any[] = []
+    const db: any = {
+      query: new Proxy({}, { get: () => ({ findMany: vi.fn(async () => []) }) }),
+      insert: vi.fn(() => ({ values: vi.fn(() => ({ returning: vi.fn(async () => [{ id: 1 }]) })) })),
+      update: vi.fn(() => ({ set: vi.fn((s: any) => { sets.push(s); return { where: vi.fn(() => ({ returning: vi.fn(async () => (matched ? [{ id: 1, ...s }] : [])) })) } }) })),
+      delete: vi.fn(() => ({ where: vi.fn(async () => []) })),
+      transaction: vi.fn((cb: any) => cb(db)),
+    }
+    return { db, sets }
+  }
+
+  it("a declared `static lockingColumn = 'rev'` is what bumps and guards (a hardcoded 'lockVersion' lookup would freeze it)", async () => {
+    @model('rv_docs')
+    class RvDoc extends ApplicationRecord {
+      static lockingColumn = 'rev'
+      static title = Attr.string()
+    }
+    const { db, sets } = makeCaptureDb(true)
+    boot(db, { rv_docs: fakeTable(['id', 'title', 'rev']) })
+    const doc = new RvDoc({ id: 1, title: 'a', rev: 6 }, false)
+    ;(doc as any).title = 'b'
+    expect(await doc.save()).toBe(true)
+    expect(sets[0].rev).toBe(7)
+    expect(sets[0]).not.toHaveProperty('lockVersion')
+  })
+
+  it("a declared `static lockingColumn = 'rev'` raises StaleObjectError on a stale copy", async () => {
+    @model('rv2_docs')
+    class Rv2Doc extends ApplicationRecord {
+      static lockingColumn = 'rev'
+      static title = Attr.string()
+    }
+    const { db } = makeCaptureDb(false)
+    boot(db, { rv2_docs: fakeTable(['id', 'title', 'rev']) })
+    const doc = new Rv2Doc({ id: 1, title: 'a', rev: 6 }, false)
+    ;(doc as any).title = 'b'
+    await expect(doc.save()).rejects.toBeInstanceOf(StaleObjectError)
+  })
+
+  it('`static lockingColumn = false` disables the CAS even when a lockVersion column exists', async () => {
+    @model('off_docs')
+    class OffDoc extends ApplicationRecord {
+      static lockingColumn = false
+      static title = Attr.string()
+    }
+    const { db, sets } = makeCaptureDb(true)
+    boot(db, { off_docs: fakeTable(['id', 'title', 'lockVersion']) })
+    const doc = new OffDoc({ id: 1, title: 'a', lockVersion: 3 }, false)
+    ;(doc as any).title = 'b'
+    expect(await doc.save()).toBe(true)
+    expect(sets[0]).not.toHaveProperty('lockVersion')   // no bump — locking is off
+  })
+})
+
+// ── destroy() rides the CAS too ───────────────────────────────────────────────
+
+describe('destroy() is guarded by the lock column (a stale copy cannot silently hard-delete)', () => {
+  function makeDeleteDb(deletedRows: any[]) {
+    const deleteWheres: any[] = []
+    const db: any = {
+      query: new Proxy({}, { get: () => ({ findMany: vi.fn(async () => []) }) }),
+      delete: vi.fn(() => ({ where: vi.fn((w: any) => { deleteWheres.push(w); const p: any = Promise.resolve([]); p.returning = vi.fn(async () => deletedRows); return p }) })),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: vi.fn(async () => []) })) })),
+      transaction: vi.fn((cb: any) => cb(db)),
+    }
+    return { db, deleteWheres }
+  }
+
+  it('a stale copy raises StaleObjectError and stays un-destroyed', async () => {
+    @model('dl_docs')
+    class DlDoc extends ApplicationRecord { static title = Attr.string() }
+    const { db } = makeDeleteDb([])   // CAS DELETE matches zero rows
+    boot(db, { dl_docs: fakeTable(['id', 'title', 'lockVersion']) })
+    const doc = new DlDoc({ id: 1, title: 'a', lockVersion: 3 }, false)
+    await expect(doc.destroy()).rejects.toBeInstanceOf(StaleObjectError)
+    expect((doc as any).isDestroyed).toBeFalsy()
+  })
+
+  it('a fresh copy destroys normally (the CAS matches)', async () => {
+    @model('dl2_docs')
+    class Dl2Doc extends ApplicationRecord { static title = Attr.string() }
+    const { db } = makeDeleteDb([{ id: 1 }])
+    boot(db, { dl2_docs: fakeTable(['id', 'title', 'lockVersion']) })
+    const doc = new Dl2Doc({ id: 1, title: 'a', lockVersion: 3 }, false)
+    expect(await doc.destroy()).toBe(true)
+    expect((doc as any).isDestroyed).toBe(true)
+  })
+
+  it('a lockless model takes the plain DELETE path (no returning round-trip)', async () => {
+    @model('dl3_docs')
+    class Dl3Doc extends ApplicationRecord { static title = Attr.string() }
+    // The plain path awaits .where() directly — a mock WITHOUT returning
+    // support proves the guarded branch is never entered.
+    const db: any = {
+      query: new Proxy({}, { get: () => ({ findMany: vi.fn(async () => []) }) }),
+      delete: vi.fn(() => ({ where: vi.fn(async () => []) })),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: vi.fn(async () => []) })) })),
+      transaction: vi.fn((cb: any) => cb(db)),
+    }
+    boot(db, { dl3_docs: fakeTable(['id', 'title']) })
+    const doc = new Dl3Doc({ id: 1, title: 'a' }, false)
+    expect(await doc.destroy()).toBe(true)
+  })
+})
+
+// ── counter-cache writes bump the parent's token in the SAME statement ────────
+
+describe('counterCache bumps a lock-tokened parent token atomically with the count', () => {
+  function makeCcDb() {
+    const sets: any[] = []
+    const db: any = {
+      query: new Proxy({}, { get: () => ({ findMany: vi.fn(async () => []) }) }),
+      insert: vi.fn(() => ({ values: vi.fn((v: any) => ({ returning: vi.fn(async () => [{ id: 7, ...v }]) })) })),
+      update: vi.fn(() => ({ set: vi.fn((s: any) => { sets.push(s); return { where: vi.fn(async () => []) } }) })),
+      delete: vi.fn(() => {
+        const p: any = { where: vi.fn(() => { const q: any = Promise.resolve([]); q.returning = vi.fn(async () => [{ id: 7 }]); return q }) }
+        return p
+      }),
+      transaction: vi.fn((cb: any) => cb(db)),
+    }
+    return { db, sets }
+  }
+
+  @model('cc_locked_posts')
+  class CcLockedPost extends ApplicationRecord {
+    static comments = hasMany('cc_lc_comments', { counterCache: true } as any)
+  }
+  void CcLockedPost
+  @model('cc_lc_comments')
+  class CcLcComment extends ApplicationRecord {
+    static post = belongsTo('cc_locked_posts')
+  }
+  const schema = {
+    cc_locked_posts: fakeTable(['id', 'commentsCount', 'lockVersion']),
+    cc_lc_comments: fakeTable(['id', 'postId', 'body']),
+  }
+
+  it('child create: ONE parent UPDATE carries counter + token together (a frozen token would keep certifying the stale count)', async () => {
+    const { db, sets } = makeCcDb()
+    boot(db, schema)
+    const c = new CcLcComment({ postId: 5 }, true)
+    expect(await c.save()).toBe(true)
+    expect(sets).toHaveLength(1)                       // one statement, not a follow-up bump
+    expect(sets[0]).toHaveProperty('commentsCount')
+    expect(sets[0]).toHaveProperty('lockVersion')      // sql`lock_version + 1` rides the same SET
+  })
+
+  it('a lockless parent gets only the counter (no phantom token column)', async () => {
+    @model('cc_plain_posts')
+    class CcPlainPost extends ApplicationRecord {
+      static comments = hasMany('cc_pl_comments', { counterCache: true } as any)
+    }
+    void CcPlainPost
+    @model('cc_pl_comments')
+    class CcPlComment extends ApplicationRecord {
+      static post = belongsTo('cc_plain_posts')
+    }
+    const { db, sets } = makeCcDb()
+    boot(db, {
+      cc_plain_posts: fakeTable(['id', 'commentsCount']),
+      cc_pl_comments: fakeTable(['id', 'postId']),
+    })
+    const c = new CcPlComment({ postId: 5 }, true)
+    expect(await c.save()).toBe(true)
+    expect(sets[0]).toHaveProperty('commentsCount')
+    expect(sets[0]).not.toHaveProperty('lockVersion')
+  })
+})
+
+// ── updateAll: the bump is IN the single generated statement ──────────────────
+
+describe('updateAll bumps the resolved lock column in the SAME statement', () => {
+  function makeBulkDb() {
+    const sets: any[] = []
+    const db: any = {
+      query: new Proxy({}, { get: () => ({ findMany: vi.fn(async () => []) }) }),
+      update: vi.fn(() => ({ set: vi.fn((s: any) => { sets.push(s); return { where: vi.fn(async () => ({ rowCount: 1 })) } }) })),
+      delete: vi.fn(() => ({ where: vi.fn(async () => []) })),
+      transaction: vi.fn((cb: any) => cb(db)),
+    }
+    return { db, sets }
+  }
+
+  it("the one .set() payload carries the data column AND `lockVersion + 1` — no second statement to race through", async () => {
+    @model('ba_docs')
+    class BaDoc extends ApplicationRecord { static title = Attr.string() }
+    const { db, sets } = makeBulkDb()
+    boot(db, { ba_docs: fakeTable(['id', 'title', 'lockVersion']) })
+    await (BaDoc as any).all().updateAll({ title: 'bulk' })
+    expect(db.update).toHaveBeenCalledTimes(1)
+    expect(sets).toHaveLength(1)
+    expect(sets[0].title).toBe('bulk')
+    expect(sets[0]).toHaveProperty('lockVersion')       // the sql`… + 1` expression, same SET
+    expect(typeof sets[0].lockVersion).not.toBe('number') // an increment, not an absolute write
+  })
+
+  it("a declared `static lockingColumn = 'rev'` is the column bumped", async () => {
+    @model('ba_rev_docs')
+    class BaRevDoc extends ApplicationRecord {
+      static lockingColumn = 'rev'
+      static title = Attr.string()
+    }
+    const { db, sets } = makeBulkDb()
+    boot(db, { ba_rev_docs: fakeTable(['id', 'title', 'rev', 'lockVersion']) })
+    await (BaRevDoc as any).all().updateAll({ title: 'bulk' })
+    expect(sets[0]).toHaveProperty('rev')
+    expect(sets[0]).not.toHaveProperty('lockVersion')   // convention column ignored under an override
+  })
+
+  it('`static lockingColumn = false` suppresses the bump entirely', async () => {
+    @model('ba_off_docs')
+    class BaOffDoc extends ApplicationRecord {
+      static lockingColumn = false
+      static title = Attr.string()
+    }
+    const { db, sets } = makeBulkDb()
+    boot(db, { ba_off_docs: fakeTable(['id', 'title', 'lockVersion']) })
+    await (BaOffDoc as any).all().updateAll({ title: 'bulk' })
+    expect(sets[0]).not.toHaveProperty('lockVersion')
   })
 })

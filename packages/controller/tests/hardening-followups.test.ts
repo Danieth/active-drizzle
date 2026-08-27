@@ -71,7 +71,7 @@ describe('mismatched numeric lock column fails loud (reviewer follow-up)', () =>
     await expect(
       defaultUpdate(relation, model, { update: { optimisticLock: 'rev', permit: ['name'] } } as any,
         { id: 1, data: { name: 'x' } }, {}, undefined, { constructor: {} }),
-    ).rejects.toThrow(/lockingColumn = 'rev'.*never advances/s)
+    ).rejects.toThrow(/never advance.*lockingColumn = 'rev'/s)
   })
 
   it('the declared lockingColumn silences it', async () => {

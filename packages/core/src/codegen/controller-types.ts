@@ -30,7 +30,15 @@ export interface CtrlWriteConfig {
 export interface CtrlCrudConfig {
   index?: CtrlIndexConfig
   create?: CtrlWriteConfig
-  update?: Omit<CtrlWriteConfig, 'autoSet'>
+  update?: Omit<CtrlWriteConfig, 'autoSet'> & {
+    /**
+     * `update.optimisticLock` literal — `true` (the model's locking column)
+     * or a column-name string. Feeds the cross-IR versioned-models pass
+     * (O2/O14): the opted-in model must carry a well-shaped integer lock
+     * column and a non-reusable pk lineage.
+     */
+    optimisticLock?: boolean | string
+  }
   get?: {
     include?: string[]
     /** Serialization ceiling — when present it IS the client projection. */
