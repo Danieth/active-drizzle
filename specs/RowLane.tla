@@ -26,21 +26,19 @@
 (*     covers loss (never delivered), duplication (delivered repeatedly),  *)
 (*     and reorder (any delivery order).                                   *)
 (*   - The RPC channel Cr (Definition 1.2) carries pulls and validation.   *)
-(*     Validation is split into issue / server-process / client-apply so   *)
-(*     that Cw traffic can interleave while a response is in flight (the   *)
-(*     T3 "case L >= V" race).  A response may also be dropped ("a         *)
-(*     response, IF delivered at all, ...").  Pulls are modeled            *)
-(*     atomically -- a deliberate gap, stated precisely: a DELAYED full-   *)
-(*     slice pull response applied at an old V is NOT behaviorally         *)
-(*     identical to any stale Cw frame, because it merges                  *)
-(*     (ValueAt(f,V), V) even for a field f not written at V -- a cell     *)
-(*     shape no live frame carries (frames carry exactly the fields        *)
-(*     written at their token).  The extra states are invariant-silent:    *)
-(*     f's value is constant on [LastWriteUpTo(f,V), V] and PullLive       *)
-(*     answers only while Alive, so such cells satisfy Componentwise-      *)
-(*     Truth, and the merge is still a per-field max-join (NoRegression,   *)
-(*     No304Freshen).  So the pull twin of the T3 in-flight race is        *)
-(*     argued here, not model-checked; only validation is three-phase.     *)
+(*     BOTH are split into issue / server-process / client-apply so that   *)
+(*     Cw traffic and further commits can interleave while a response is   *)
+(*     in flight (the T3 "case L >= V" race, and its pull twin).  A        *)
+(*     response may also be dropped ("a response, IF delivered at all,     *)
+(*     ...").  Three-phase pulls close a gap an earlier revision only      *)
+(*     argued: a DELAYED full-projection pull response computed at token   *)
+(*     V merges (ValueAt(f,V), V) even for a field f NOT written at V --   *)
+(*     advancing certification (lastSeen) of UNCHANGED fields to V, a      *)
+(*     cell shape no per-commit partial frame carries (frames carry        *)
+(*     exactly the fields written at their token), so no stale-live-frame  *)
+(*     argument covers it.  It is now modeled, not argued: TLC beats       *)
+(*     delayed pull responses against destroys, re-creates, newer pushes,  *)
+(*     and L3 GC, under every invariant and action property below.        *)
 (*   - N >= 2 clients, each holding entry = (floor, cells with per-field   *)
 (*     lastSeen) plus knownVersion (Section 3), merging via Rule M.        *)
 (*   - Subscription epochs (T9/O16): every push frame is stamped with the  *)
@@ -72,7 +70,7 @@
 (* T6 own-write floor (needs mutation RPCs); T7 overlay; T8 membership;    *)
 (* door masking / auth content of T9 (the epoch FILTER is modeled, the     *)
 (* leak bound is not); session snapshots (deliberately refused);           *)
-(* in-flight pull responses (argued above); door-masked SUB-slice frames   *)
+(* door-masked SUB-slice frames                                            *)
 (* (A3) -- emitted frames always carry the full written set; harmless      *)
 (* because every invariant here is componentwise, so a masked frame is a   *)
 (* frame with a smaller F.                                                 *)
@@ -108,6 +106,8 @@ VARIABLES
   known,          \* per client: knownVersion -- a rumor bound, never a freshness claim
   epoch,          \* per client: current subscription epoch (T9/O16)
   vstate,         \* per client: validation state machine (idle/req/304/gone/slice)
+  pstate,         \* per client: pull state machine (idle/req/live/gone) -- Cr,
+                  \* three-phase like vstate so responses can be delayed/dropped
   destroysMerged, \* HISTORY per client: every destroy token ever applied via M2.
                   \* Auxiliary only -- no rule reads it.  Gives NoResurrection
                   \* real teeth: floor-vs-visibility alone is true by definition
@@ -117,7 +117,7 @@ VARIABLES
                   \* for every accepted push frame.  Auxiliary; gives
                   \* NoPreEpochAccept teeth if someone deletes the epoch guard.
 
-vars == <<hist, chan, srvEpoch, cells, floor, known, epoch, vstate,
+vars == <<hist, chan, srvEpoch, cells, floor, known, epoch, vstate, pstate,
           destroysMerged, acceptedPairs>>
 
 (***************************************************************************)
@@ -181,7 +181,7 @@ SrvCreate ==            \* create, or RE-create after a destroy (same lineage, A
   /\ hist' = Append(hist, [kind |-> "create", flds |-> Fields])
   /\ chan' = chan \cup EmitTo("live", STok + 1, Fields)
                   \cup EmitTo("sig", STok + 1, {})
-  /\ UNCHANGED <<srvEpoch, cells, floor, known, epoch, vstate,
+  /\ UNCHANGED <<srvEpoch, cells, floor, known, epoch, vstate, pstate,
                  destroysMerged, acceptedPairs>>
 
 SrvWrite(F) ==
@@ -192,7 +192,7 @@ SrvWrite(F) ==
   /\ chan' = chan \cup EmitTo("live", STok + 1, F)     \* frame carries only the
                   \cup EmitTo("sig", STok + 1, {})     \* written fields (a door
                                                         \* slice; absence /= null)
-  /\ UNCHANGED <<srvEpoch, cells, floor, known, epoch, vstate,
+  /\ UNCHANGED <<srvEpoch, cells, floor, known, epoch, vstate, pstate,
                  destroysMerged, acceptedPairs>>
 
 SrvDestroy ==
@@ -201,7 +201,7 @@ SrvDestroy ==
   /\ hist' = Append(hist, [kind |-> "destroy", flds |-> {}])
   /\ chan' = chan \cup EmitTo("dest", STok + 1, {})
                   \cup EmitTo("sig", STok + 1, {})
-  /\ UNCHANGED <<srvEpoch, cells, floor, known, epoch, vstate,
+  /\ UNCHANGED <<srvEpoch, cells, floor, known, epoch, vstate, pstate,
                  destroysMerged, acceptedPairs>>
 
 \* T9/O16: a RESET establishes a new epoch for one client's channel.  The
@@ -211,7 +211,7 @@ SrvReset(c) ==
   /\ srvEpoch' = [srvEpoch EXCEPT ![c] = @ + 1]
   /\ chan' = chan \cup {[k |-> "reset", dst |-> c, tok |-> 0,
                          ep |-> srvEpoch[c] + 1, flds |-> {}]}
-  /\ UNCHANGED <<hist, cells, floor, known, epoch, vstate,
+  /\ UNCHANGED <<hist, cells, floor, known, epoch, vstate, pstate,
                  destroysMerged, acceptedPairs>>
 
 (***************************************************************************)
@@ -241,7 +241,8 @@ DeliverLive(c, m) ==
        \* "every payload also performs M3's knownVersion update"
   /\ acceptedPairs' = [acceptedPairs EXCEPT
                          ![c] = @ \cup {<<m.ep, epoch[c]>>}]
-  /\ UNCHANGED <<hist, chan, srvEpoch, floor, epoch, vstate, destroysMerged>>
+  /\ UNCHANGED <<hist, chan, srvEpoch, floor, epoch, vstate, pstate,
+                 destroysMerged>>
 
 DeliverDest(c, m) ==
   /\ m \in chan /\ m.k = "dest" /\ m.dst = c
@@ -253,7 +254,7 @@ DeliverDest(c, m) ==
   /\ known' = [known EXCEPT ![c] = Max2(@, m.tok)]                    \* M3 rider
   /\ acceptedPairs' = [acceptedPairs EXCEPT
                          ![c] = @ \cup {<<m.ep, epoch[c]>>}]
-  /\ UNCHANGED <<hist, chan, srvEpoch, cells, epoch, vstate>>
+  /\ UNCHANGED <<hist, chan, srvEpoch, cells, epoch, vstate, pstate>>
 
 DeliverSig(c, m) ==
   /\ m \in chan /\ m.k = "sig" /\ m.dst = c
@@ -263,7 +264,7 @@ DeliverSig(c, m) ==
        \* Nothing else.  Signals never certify.
   /\ acceptedPairs' = [acceptedPairs EXCEPT
                          ![c] = @ \cup {<<m.ep, epoch[c]>>}]
-  /\ UNCHANGED <<hist, chan, srvEpoch, cells, floor, epoch, vstate,
+  /\ UNCHANGED <<hist, chan, srvEpoch, cells, floor, epoch, vstate, pstate,
                  destroysMerged>>
 
 \* T9/O16: processing a RESET bumps the client's current epoch.  Joined via
@@ -271,7 +272,7 @@ DeliverSig(c, m) ==
 DeliverReset(c, m) ==
   /\ m \in chan /\ m.k = "reset" /\ m.dst = c
   /\ epoch' = [epoch EXCEPT ![c] = Max2(@, m.ep)]
-  /\ UNCHANGED <<hist, chan, srvEpoch, cells, floor, known, vstate,
+  /\ UNCHANGED <<hist, chan, srvEpoch, cells, floor, known, vstate, pstate,
                  destroysMerged, acceptedPairs>>
 
 \* L3 -- garbage collection: physically dropping a dead cell
@@ -281,27 +282,89 @@ DropDeadCell(c, f) ==
   /\ cells[c][f].ls > 0
   /\ cells[c][f].ls =< floor[c]
   /\ cells' = [cells EXCEPT ![c][f] = [val |-> 0, ls |-> 0]]
-  /\ UNCHANGED <<hist, chan, srvEpoch, floor, known, epoch, vstate,
+  /\ UNCHANGED <<hist, chan, srvEpoch, floor, known, epoch, vstate, pstate,
                  destroysMerged, acceptedPairs>>
 
 (***************************************************************************)
-(* Pull (Cr).  A GET response is a payload satisfying A0-A3 like any       *)
-(* frame; pulls bypass the epoch filter (Cr, not the push channel).        *)
+(* Pull (Cr) -- three-phase, exactly like validation:                      *)
+(*   issue (client) -> process (server: token V recorded, payload          *)
+(*   determined by the CURRENT committed snapshot) -> apply-or-drop        *)
+(*   (client, after arbitrary interleaving).                               *)
+(* A GET response is a payload satisfying A0-A3 like any frame; pulls      *)
+(* bypass the epoch filter (Cr, not the push channel).  The projection P   *)
+(* is an arbitrary nonempty field set; P = Fields is the full-slice GET    *)
+(* and the load-bearing case: a DELAYED full-projection response           *)
+(* certifies fields UNCHANGED at V (lastSeen -> V with the same value),    *)
+(* a cell shape no per-commit Cw frame produces.                           *)
+(*                                                                         *)
+(* The payload {f \in P |-> ValueAt(f, V)} is recomputed at apply time     *)
+(* from (P, V): sound because hist is append-only and ValueAt(f, V)        *)
+(* depends only on hist[1..V], so the recomputed value equals the          *)
+(* process-time snapshot value (the same argument as the slice response).  *)
+(*                                                                         *)
+(* Bounded in-flight discipline (state-space control, same as vstate):     *)
+(* pstate is ONE record per client, so at most one pull is in flight per   *)
+(* client.  Two concurrent pulls by the SAME client interleave their       *)
+(* applies, but each apply is an independent max-join merge of an          *)
+(* independently computed (P, V); the one-at-a-time machine plus Cw        *)
+(* traffic already produces every apply-time client state a second         *)
+(* in-flight pull could meet, so a larger cap multiplies the space         *)
+(* without new checkable behavior.                                         *)
 (***************************************************************************)
-PullLive(c) ==
-  /\ Alive
-  /\ cells' = [cells EXCEPT ![c] = M1Cells(c, Fields, STok)]  \* M1: full slice at V
-  /\ known' = [known EXCEPT ![c] = Max2(@, STok)]             \* M3 rider
+IdleP == [st |-> "idle", P |-> {}, V |-> 0]
+
+IssuePull(c) ==
+  /\ pstate[c].st = "idle"
+  /\ \E P \in (SUBSET Fields) \ {{}} :
+       pstate' = [pstate EXCEPT ![c] = [st |-> "req", P |-> P, V |-> 0]]
+  /\ UNCHANGED <<hist, chan, srvEpoch, cells, floor, known, epoch, vstate,
+                 destroysMerged, acceptedPairs>>
+
+\* The server answers from its CURRENT state (V = STok), like A2'
+\* processing: a live record yields the P-projection payload at V; a
+\* destroyed record yields gone(D), D = STok (a dead record's last
+\* lineage event is its destroy).  A pull issued before any create
+\* (STok = 0) pends until a lineage exists -- there is no token to
+\* answer with; the pending request is inert and can only wait.
+SrvProcessPull(c) ==
+  /\ pstate[c].st = "req"
+  /\ STok > 0
+  /\ pstate' = [pstate EXCEPT ![c] =
+                  [st |-> IF Alive THEN "live" ELSE "gone",
+                   P  |-> pstate[c].P, V |-> STok]]
+  /\ UNCHANGED <<hist, chan, srvEpoch, cells, floor, known, epoch, vstate,
+                 destroysMerged, acceptedPairs>>
+
+\* M1 merge of the recorded payload -- possibly long after V: the server
+\* may have advanced through pushes, destroys, and re-creates since the
+\* response was computed, and the client may have merged newer frames or
+\* GC'd dead cells (L3) in between.  The per-field max-join makes stale
+\* components no-ops, and a pre-destroy V can never lift a cell over the
+\* floor (the floor only rises).  This is the pull twin of T3's
+\* in-flight race, now checked rather than argued.
+ApplyPullLive(c) ==
+  /\ pstate[c].st = "live"
+  /\ cells' = [cells EXCEPT ![c] = M1Cells(c, pstate[c].P, pstate[c].V)] \* M1
+  /\ known' = [known EXCEPT ![c] = Max2(@, pstate[c].V)]          \* M3 rider
+  /\ pstate' = [pstate EXCEPT ![c] = IdleP]
   /\ UNCHANGED <<hist, chan, srvEpoch, floor, epoch, vstate,
                  destroysMerged, acceptedPairs>>
 
-PullGone(c) ==       \* GET of a destroyed record answers gone(D); D = STok
-  /\ STok > 0
-  /\ ~Alive
-  /\ floor' = [floor EXCEPT ![c] = Max2(@, STok)]             \* M2
-  /\ destroysMerged' = [destroysMerged EXCEPT ![c] = @ \cup {STok}]
-  /\ known' = [known EXCEPT ![c] = Max2(@, STok)]             \* M3 rider
+\* M2 merge of a gone(D) response (delayed like any other response).
+ApplyPullGone(c) ==
+  /\ pstate[c].st = "gone"
+  /\ floor' = [floor EXCEPT ![c] = Max2(@, pstate[c].V)]                 \* M2
+  /\ destroysMerged' = [destroysMerged EXCEPT ![c] = @ \cup {pstate[c].V}]
+  /\ known' = [known EXCEPT ![c] = Max2(@, pstate[c].V)]          \* M3 rider
+  /\ pstate' = [pstate EXCEPT ![c] = IdleP]
   /\ UNCHANGED <<hist, chan, srvEpoch, cells, epoch, vstate, acceptedPairs>>
+
+\* Cr may lose a response ("a response, IF delivered at all, ...", Def 1.2)
+DropPullResponse(c) ==
+  /\ pstate[c].st \in {"live", "gone"}
+  /\ pstate' = [pstate EXCEPT ![c] = IdleP]
+  /\ UNCHANGED <<hist, chan, srvEpoch, cells, floor, known, epoch, vstate,
+                 destroysMerged, acceptedPairs>>
 
 (***************************************************************************)
 (* Validation (Cr) -- M4 + A2'.  Three-phase to let Cw interleave:         *)
@@ -322,7 +385,7 @@ IssueValidation(c) ==
        vstate' = [vstate EXCEPT ![c] =
                     [st |-> "req", P |-> P,
                      W  |-> MinS({cells[c][f].ls : f \in P}), V |-> 0]]
-  /\ UNCHANGED <<hist, chan, srvEpoch, cells, floor, known, epoch,
+  /\ UNCHANGED <<hist, chan, srvEpoch, cells, floor, known, epoch, pstate,
                  destroysMerged, acceptedPairs>>
 
 \* A2' -- the validation predicate (lifecycle-aware), evaluated against the
@@ -354,7 +417,7 @@ SrvProcessValidation(c) ==
                \* values depend only on hist[1..V].
                vstate' = [vstate EXCEPT ![c] =
                             [st |-> "slice", P |-> P, W |-> W, V |-> STok]]
-  /\ UNCHANGED <<hist, chan, srvEpoch, cells, floor, known, epoch,
+  /\ UNCHANGED <<hist, chan, srvEpoch, cells, floor, known, epoch, pstate,
                  destroysMerged, acceptedPairs>>
 
 \* M4 case 304 (carrying V): lastSeen(f) := max(lastSeen(f), V) for each
@@ -386,7 +449,7 @@ Apply304(c) ==
                        ELSE cells[c][f]]]
      /\ known' = [known EXCEPT ![c] = Max2(@, V)]        \* M3 rider
      /\ vstate' = [vstate EXCEPT ![c] = IdleV]
-  /\ UNCHANGED <<hist, chan, srvEpoch, floor, epoch, destroysMerged,
+  /\ UNCHANGED <<hist, chan, srvEpoch, floor, epoch, pstate, destroysMerged,
                  acceptedPairs>>
 
 \* M4 case gone(D): apply M2.
@@ -396,7 +459,7 @@ ApplyGone(c) ==
   /\ destroysMerged' = [destroysMerged EXCEPT ![c] = @ \cup {vstate[c].V}]
   /\ known' = [known EXCEPT ![c] = Max2(@, vstate[c].V)]              \* M3 rider
   /\ vstate' = [vstate EXCEPT ![c] = IdleV]
-  /\ UNCHANGED <<hist, chan, srvEpoch, cells, epoch, acceptedPairs>>
+  /\ UNCHANGED <<hist, chan, srvEpoch, cells, epoch, pstate, acceptedPairs>>
 
 \* M4 case slice: apply M1 with the dirty fields at V.  Note the doc's M4
 \* says slice -> M1, and M1 touches only carried fields: the CLEAN fields
@@ -412,14 +475,14 @@ ApplySlice(c) ==
      /\ cells' = [cells EXCEPT ![c] = M1Cells(c, Dirty, V)]           \* M1
      /\ known' = [known EXCEPT ![c] = Max2(@, V)]                     \* M3 rider
      /\ vstate' = [vstate EXCEPT ![c] = IdleV]
-  /\ UNCHANGED <<hist, chan, srvEpoch, floor, epoch, destroysMerged,
+  /\ UNCHANGED <<hist, chan, srvEpoch, floor, epoch, pstate, destroysMerged,
                  acceptedPairs>>
 
 \* Cr may lose a response ("a response, IF delivered at all, ...", Def 1.2)
 DropValidationResponse(c) ==
   /\ vstate[c].st \in {"304", "gone", "slice"}
   /\ vstate' = [vstate EXCEPT ![c] = IdleV]
-  /\ UNCHANGED <<hist, chan, srvEpoch, cells, floor, known, epoch,
+  /\ UNCHANGED <<hist, chan, srvEpoch, cells, floor, known, epoch, pstate,
                  destroysMerged, acceptedPairs>>
 
 (***************************************************************************)
@@ -434,6 +497,7 @@ Init ==
   /\ known = [c \in Clients |-> 0]
   /\ epoch = [c \in Clients |-> 1]
   /\ vstate = [c \in Clients |-> IdleV]
+  /\ pstate = [c \in Clients |-> IdleP]
   /\ destroysMerged = [c \in Clients |-> {}]
   /\ acceptedPairs = [c \in Clients |-> {}]
 
@@ -448,8 +512,11 @@ Next ==
                           \/ DeliverSig(c, m)
                           \/ DeliverReset(c, m)
        \/ \E f \in Fields : DropDeadCell(c, f)
-       \/ PullLive(c)
-       \/ PullGone(c)
+       \/ IssuePull(c)
+       \/ SrvProcessPull(c)
+       \/ ApplyPullLive(c)
+       \/ ApplyPullGone(c)
+       \/ DropPullResponse(c)
        \/ IssueValidation(c)
        \/ SrvProcessValidation(c)
        \/ Apply304(c)
@@ -472,6 +539,8 @@ CellT   == [val: TokOpt, ls: TokOpt]
 EventT  == [kind: {"create", "write", "destroy"}, flds: SUBSET Fields]
 VStateT == [st: {"idle", "req", "304", "gone", "slice"},
             P: SUBSET Fields, W: TokOpt, V: TokOpt]
+PStateT == [st: {"idle", "req", "live", "gone"},
+            P: SUBSET Fields, V: TokOpt]
 
 TypeOK ==
   /\ hist \in Seq(EventT) /\ Len(hist) =< MaxToken
@@ -482,6 +551,7 @@ TypeOK ==
   /\ known \in [Clients -> TokOpt]
   /\ epoch \in [Clients -> Epochs]
   /\ vstate \in [Clients -> VStateT]
+  /\ pstate \in [Clients -> PStateT]
   /\ destroysMerged \in [Clients -> SUBSET Tokens]
   /\ acceptedPairs \in [Clients -> SUBSET (Epochs \X Epochs)]
 
@@ -597,7 +667,8 @@ No304Freshen == [][No304FreshenStep]_vars
 (* pair that never existed (T4 violated; invisible -- floor 3 > 2 --      *)
 (* but manufactured).  See ambiguity note (2).                            *)
 (*                                                                         *)
-(* POST-FIX RUNS (this revision of the spec; TLC 2.19, vendored jar,      *)
+(* POST-FIX RUNS (atomic-pull revision -- before pulls were made          *)
+(* three-phase; TLC 2.19, vendored jar,                                   *)
 (* Apple Silicon, 2026-08-27).  Neither run was carried to exhaustion --  *)
 (* the reachable space even at the minimum constants is order 10^8        *)
 (* distinct states (see the .cfg header) -- but TLC's search is BFS and   *)
@@ -612,8 +683,22 @@ No304Freshen == [][No304FreshenStep]_vars
 (*   - MaxToken = 3, MaxEpoch = 3 (the shipped constants): NO violation   *)
 (*     in 89.8M distinct states (530M generated), frontier at depth 15,   *)
 (*     stopped at 17 min on 14 workers.                                   *)
-(* Full exhaustion at any config is an overnight job: run                 *)
-(* specs/run-tlc.sh RowLane and let it finish.                            *)
+(*                                                                         *)
+(* THREE-PHASE-PULL REVISION (this file: pstate + IssuePull /             *)
+(* SrvProcessPull / ApplyPullLive / ApplyPullGone / DropPullResponse      *)
+(* enabled alongside everything above).  SMOKE RUN ONLY so far            *)
+(* (TLC 2.19, vendored jar, Apple Silicon, 14 workers, 2026-08-27,        *)
+(* shipped constants MaxToken = 3, MaxEpoch = 3): killed after ~2 min     *)
+(* wall.  Last checkpoint at 1 min: 46,196,199 states generated,          *)
+(* 10,223,069 distinct, BFS frontier at depth 12 -- i.e. every state      *)
+(* reachable in <= 11 steps checked, past the depth-10 pre-fix            *)
+(* violation -- with NO violation of any invariant or action property     *)
+(* reported at any point before the kill (TLC checks each state/step as   *)
+(* generated and halts on violation).  That is ALL this run establishes:  *)
+(* the pull actions do not trip TypeOK or any invariant in the early      *)
+(* frontier.  Full exhaustion with the pull actions is still an           *)
+(* overnight job and has NOT been done: run specs/run-tlc.sh RowLane      *)
+(* and let it finish.                                                     *)
 (*                                                                         *)
 (* MUTATION COVERAGE (why the .cfg says MaxEpoch = 3): replacing          *)
 (* DeliverReset's Max2 join with blind assignment epoch' := m.ep -- a     *)
