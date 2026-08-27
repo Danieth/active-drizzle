@@ -224,15 +224,7 @@ path instead of at one boundary. `save()` does it right; every other path forks.
 
 ---
 
-## TIER 2 — 🟢 POST-LAUNCH, NON-BREAKING (the DX epoch + query algebra + exceed moves)
-
-### The proxy → generated-real migration (Rails' method_missing → defined-methods move)
-- [ ] Generate real accessors/predicates/transition methods onto each prototype at
-      boot (from a `.gen` module), delete the Proxy. Kills the type-lie drift class,
-      IS the clean delivery of the codec chokepoint, restores stack traces /
-      breakpoints / `console.log` / spread / DevTools, removes trap-deopt perf work.
-      Migrate the 3 dynamic trap behaviors (`<assoc>Attributes`, habtm `<x>Ids`,
-      unknown-column passthrough) to explicit installed handlers. Whole suite is the net.
+## TIER 2 — 🟢 POST-LAUNCH, NON-BREAKING (the DX epoch + query algebra)
 
 ### Query algebra (breadth ~90%, algebra ~60% — finish the composition layer)
 - [ ] `whereNot({...})` — negate a whole condition group (today: per-field ops only).
@@ -268,27 +260,6 @@ path instead of at one boundary. `save()` does it right; every other path forks.
       _routes.gen.md / manifest / registry + capability queries + structured report
       intake. Projection, not new truth — passes the golden rule. Capstone, last.
 
-### The three "exceed" moves (uniquely positioned)
-- [ ] Compile doors INTO Postgres: derive RLS policies + per-door views + column
-      grants from `expose`/`permit`/`scopeBy`. The DB enforces the door even if the
-      app is bypassed. No framework does this because none owns a validated door model.
-- [ ] Content-addressed protocol manifest: hash `ProjectMeta` into every artifact +
-      the envelope. ONE hash closes gen-staleness, deploy skew, and router↔codegen
-      conformance. `generate()` is already pure. Also fixes: boot never verifies the
-      live DB against the booted schema; deploy skew has no reload handshake.
-- [ ] Event-sourcing-lite on the unified write path: `previousChanges` alive at
-      `afterCommit` is a complete CDC point — generate history/audit surfaces +
-      point-in-time envelopes. Same consumer feeds webhooks AND realtime frames.
-
-### Realtime / webhooks (blocked on Tier 0 atomicity + CAS + afterCommit — build after)
-- [ ] Wire entity-store slice 1: responses normalize into the store (`mergeRows`),
-      row handles read through `useEntity` + `composeEntity`. Makes the app
-      realtime-SHAPED with zero sockets.
-- [ ] WS channels build (DESIGN-ws-channels): afterCommit consumer computing
-      `changedFields ∩ each door's projection`, emitting `store.merge()` frames;
-      Redis bus for multi-process (`bus` config already exists); silence rule.
-- [ ] Webhooks: the SAME afterCommit consumer over HTTP instead of a socket.
-
 ### Smaller confirmed bugs (medium tier — batch when touching the area)
 - [ ] Cached `ModelMeta` mutated in place — association resolution frozen at first
       computation.
@@ -317,6 +288,98 @@ path instead of at one boundary. `save()` does it right; every other path forks.
       the same component name.
 
 ---
+
+## ARCHITECTURAL CHANGES (the big moves — each enters as an EVALUATION, never a build)
+
+The three "exceed" moves (RLS compilation, content-addressed manifest,
+event-sourcing-lite) are DELETED, not deferred — they were framework
+vanity, not leverage; building them violates the golden rule. What
+replaces them is this category, with one law: **an architectural change
+enters as an evaluation of what exists — can it be bolted in, what
+bends, what breaks — and NO code happens until Daniel signs the
+verdict.** Each evaluation's deliverable is a short verdict doc against
+the existing designs, not a prototype.
+
+### A1. Compiled output instead of proxies (models, controllers — and nothing else)
+- [ ] Explicitly generate a "compiled" file per model/controller and delete the
+      Proxy. This is the WHOLE move — no other machinery rides along. Absorbs
+      the former Tier-2 "proxy → generated-real migration": real accessors/
+      predicates/transition methods emitted (not installed at boot), killing
+      the type-lie drift class, restoring stack traces / breakpoints /
+      DevTools / spread, removing trap-deopt work; the 3 dynamic trap
+      behaviors (`<assoc>Attributes`, habtm `<x>Ids`, unknown-column
+      passthrough) become explicit generated handlers. Whole suite is the net.
+      Independent workstream — schedulable on its own.
+- [ ] INVESTIGATE FIRST: Meta's generated-code conventions — `@generated` /
+      `@partially-generated` docblock markers with SignedSource content
+      hashes, and marked hand-editable islands inside generated files — the
+      point being comments that let FURTHER codegen make intelligent, rapid,
+      TARGETED modifications to compiled output instead of wholesale
+      regeneration. The investigation decides our marker vocabulary before
+      the first compiled file is emitted (markers are forever once apps
+      hold generated files).
+
+### A2. CRDT live-document editing (Notion-class)
+- [ ] Design exists: "One Door, Two Theorems"
+      (https://claude.ai/code/artifact/202546eb-81ba-4360-ae7d-c3c290e478ec) —
+      two lanes through one door: rows stay LWW absolute-value frames
+      (Theorem A: lose any prefix → one refetch heals); documents are
+      `Attr.crdtDoc()` — Loro deltas appended to a `doc_updates` ledger
+      (Theorem B: lose or duplicate any frame → cursor replay heals). Sync is
+      a door action (same permit resolution as update + pg advisory lock, no
+      resident doc server); derived `_text`/`_json` columns keep documents
+      inside SQL/search; client-side the doc manager is a third FormSession
+      field class copying the nested-manager precedent; the loro-prosemirror
+      binding is vendored + fuzzed as its own firewalled workstream.
+- [ ] EVALUATION: verify the artifact's "foundations owed" against what has
+      since LANDED (save-tx wrap ✓, codec chokepoint ✓, CAS ✓ — remaining:
+      the universal framework-touched version column, one token kind per
+      model) and confirm its bolt-in claims file-by-file (Attr seam, save
+      path exclusion of crdtDoc from the LWW diff, FormSession manager slot).
+      Its own build order stands: ledger + sync action FIRST, proven with two
+      tabs converging over plain HTTP polling — no socket dependency.
+
+### A3. WebSocket integration (high-level, light-touch)
+- [ ] DESIGN-ws-channels covers part of this (door-dry-run subscribe,
+      @broadcasts, bus seam); the artifact supersedes its frame/bus sections;
+      it still needs its OWN evaluation pass — the two docs must be reconciled
+      into one story before anything is built.
+- [ ] REQUIREMENT — graceful presence/absence: if the WS server exists the
+      frontend uses it for a TON of cases; if it does NOT exist the frontend
+      gracefully uses polling for EXACTLY the cases we would want. Detection,
+      the case matrix (which surfaces upgrade, which poll, which do neither),
+      and the degradation story are deliverables of the evaluation. (Much is
+      pre-designed: ws-channels §7 already treats WS as an optimization over
+      the refetch/poll/409 stack — the evaluation verifies it holds surface
+      by surface.)
+- [ ] REQUIREMENT — ActionCable, except better: subscription authorization
+      with controller-grade auth ("just like a controller") — subscribe =
+      dry-running the door's own read path, revocation on ability change,
+      contract probes for the subscribe surface. No second permission system.
+- [ ] REQUIREMENT — foreign publishers: background jobs that are NOT
+      active-drizzle-aware must be able to trigger WS events and have it
+      JUST WORK, with a clear written explanation. The seam already exists in
+      the designs: the bus accepts a minimal id-and-version frame from ANY
+      process (the tier-1 postgres-NOTIFY degrade shape); an AD-aware
+      instance re-projects through the door before fan-out, so a foreign job
+      needs zero projection or auth knowledge — it publishes
+      `(channel, id, version)` and is done. The evaluation must produce the
+      DOCUMENTED frame contract + the one-paragraph "from any worker" recipe.
+- [ ] Webhooks ride the same afterCommit consumer over HTTP (folded from the
+      former realtime section) — same evaluation, not a separate system.
+
+### A4. Transport bus protocol
+- [ ] DESIGN-wire-identity is the reference (normalized/columnar envelope,
+      the partial-merge law, identity/membership split, phased §6); the
+      artifact adds the push-side bus tiers (memory → postgres NOTIFY →
+      redis → NATS behind one publish/subscribe interface, each with its
+      honest ceiling and exit ramp).
+- [ ] EVALUATION: which phases are independent of A3 (the HTTP envelope +
+      store hardening + flat loading stand alone; signals-with-versions and
+      the bus ride A3), what the entity-store slice-1 wiring (folded from
+      the former realtime section: responses → `store.mergeRows`, handles
+      through `useEntity`/`composeEntity`) unlocks with ZERO sockets, and
+      the sequencing verdict across A3/A4.
 
 ## DOCS + HOUSEKEEPING CLEANUP
 
@@ -462,8 +525,9 @@ as a matching `onQuery`/`onSlowQuery` sink — telemetry + errors share one mode
 6. **Codegen failure channel + watch-staleness + string escaping.**
 7. **Encryption carve-out + format + blind indexes.**
 8. Doc sweep + CI gates (do continuously, not last).
-9. Then the epoch: `createTestApp`, why-panel, `trails dev`, algebra slice, realtime
-   wiring, exceed moves.
+9. Then the epoch: `createTestApp`, why-panel, `trails dev`, algebra slice — and
+   the ARCHITECTURAL CHANGES evaluations (A1 compiled output may run
+   independently at any point; A2–A4 evaluate before anything builds).
 
 Tier 0 + Tier 1 is the launch. Everything in Tier 2 makes it the framework the
 skin already promises.
