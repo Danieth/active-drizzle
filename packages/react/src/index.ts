@@ -142,8 +142,16 @@ export {
   entityStore,
   composeEntity,
   useEntity,
+  lastSeenOf,
+  isVisible,
+  isGone,
+  isCurrent,
+  projFreshAt,
+  visibleFields,
   type EntityEntry,
   type EntityPk,
+  type FieldKind,
+  type MergeOptions,
 } from './entity-store.js'
 export { useEntityStatus } from './entity-store.js'
 export {

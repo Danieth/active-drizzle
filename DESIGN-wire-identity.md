@@ -234,13 +234,19 @@ Store hardening required first (the critique ledger):
   nested-envelope poisoning path becomes unrepresentable.
 - **Per-field versions** (the partial-merge law, §3a) beside fieldTicks;
   door handles expose slice-scoped freshness.
-- **Versioned tombstones for destroy.** Today's `remove()` just deletes
-  the entry — a slow in-flight GET resolving after the destroy would
-  re-insert the record (resurrection). A destroy at token V replaces
-  the entry with a tombstone at V: merges below V drop against it (rule
-  4 unchanged — a tombstone is a value), mounted surfaces render the
-  gone-state, and tombstones age out with the LRU. Membership
-  invalidation removes the pk from lists; the tombstone is what makes
+- **Destroy is a monotone FLOOR, not a tombstone.** *(SUPERSEDED
+  2026-08-27 — this bullet originally specified a versioned tombstone
+  entry; that replace-semantics was exactly the rev-2 L2 counterexample
+  in DESIGN-transport-proof.md — non-commutative, and resurrectable
+  through recreation. The landed WS1 store implements the proof's §3
+  form instead:)* a destroy at token D joins `floor := max(floor, D)`
+  in a compact pk → floor map that survives LRU eviction (O12); a cell
+  is visible iff `lastSeen(f) > floor`, so a slow in-flight GET
+  resolving after the destroy merges its cells DEAD rather than
+  re-inserting the record. Mounted surfaces render the gone-state as an
+  interpretation (`isGone`), never a state shape; floors never age out
+  with the LRU (only by explicit retention policy). Membership
+  invalidation still removes the pk from lists; the floor is what makes
   the IDENTITY layer's answer correct in the gap.
 - **fieldTicks equality per Attr kind** (scalar `!==`; jsonb/pk-array by
   cheap structural compare) — no spurious flashes.
@@ -264,8 +270,10 @@ refetches its FULL payload. After:
 The three value paths, exhaustively (no fourth exists):
 
 1. **Own writes: values never refetch.** The mutation echo's `touched`
-   (`op ∈ create|update|destroy` — destroy drops the entry AND lets
-   optimistic rows the server did not commit drain) + entity payloads
+   (`op ∈ create|update|destroy` — destroy raises the entry's floor
+   (M2; dead cells become GC candidates per L3, never a semantic
+   removal) AND lets optimistic rows the server did not commit drain)
+   + entity payloads
    merge into the store; every surface rendering those records updates
    instantly. (Own-write payloads are door-authorized — REV 3 rule 6.)
 2. **Other-client values, already current:** signal `{resource, id, op,
@@ -368,7 +376,16 @@ guarantees are exactly as strong as their enforcement:
 Snapshot the EntityStore (+ RQ persister for membership keys) into
 IndexedDB. Restore on boot paints instantly from stale truth; P3 makes
 restoration SAFE (a restored entity is just an old merge — anything
-fresher wins) and revalidation cheap (§4's machinery). What P3 does NOT
+fresher wins) and revalidation cheap (§4's machinery). One ordering
+rule matters (O12): the floor map restores BEFORE the first merge
+(`importFloors`, already landed) — a restored entry replayed without
+its floor is exactly the resurrection hole the floor exists to close.
+The rule is now healed rather than merely documented: `importFloors`
+joins (max — a stale snapshot can never LOWER a floor learned live)
+and reconciles any EXISTING entry whose floor it raises in the same
+call (recommit + L3 GC + notify), so a late import costs at most one
+stale frame, never an indefinitely rendered pre-delete cell. What P3
+does NOT
 make free, and phase 6 must carry: a store schema version beside the
 snapshot (codegen bump invalidates it wholesale), quota handling
 (snapshot is best-effort, never load-bearing), and a single-writer lock

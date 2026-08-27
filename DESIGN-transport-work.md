@@ -77,21 +77,65 @@ Dependency graph: WS0 → WS1 → {WS2, WS3} → WS4 → WS5; WS6 parallel from
 WS1. Each WS lists: obligations discharged, files, precedent, acceptance.
 
 ### WS0 — Foundations (BLOCKER; overlaps REMAINS-FOR-LAUNCH Tier 0)
-Discharges: **O1, O2, O14.**
-- Transactional `save()` (`application-record.ts:640` area) — A2's
-  precondition. Already Tier 0; the transport work may not start past WS1
-  until it lands.
-- Codegen-maintained lock integer per model (A1): emit column + touch in
-  the unified write path; ONE token kind per model, enforced
-  (wire-identity P3). Kill the `updatedAt`-cosplay path.
-- pk-lineage rule: codegen REFUSES a crdtDoc/live-enabled model whose pk
-  is reusable (natural key) unless soft-delete is declared (O14).
-- Acceptance: every write bumps the token atomically with its data; a
-  property test creates→destroys→re-creates a pk and asserts strictly
-  increasing tokens across the lineage.
+Discharges: **O1 (OPEN), O2 ✅, O14 ✅** (O2/O14 landed 2026-08-27).
+- **O1 — OPEN, the remaining WS0 blocker.** Transactional `save()`
+  (`application-record.ts:640` area) — A2's precondition. Already Tier 0;
+  the transport work may not start past WS1 until it lands. Deliberately
+  untouched by the O2/O14 change.
+- ✅ O2 — ONE token kind per model, enforced. The schema is user-authored,
+  so enforcement is REFUSE-with-teaching-error, not auto-emit: the
+  cross-IR `validateVersionedModels` pass
+  (`packages/core/src/codegen/versioned-models.ts`, wired into the vite
+  plugin's strict gate on BOTH the model-side and ctrl-side change lanes)
+  refuses a lock-tokened model without
+  `lockVersion: integer('lock_version').notNull().default(0)` (the DB
+  default IS the insert initializer; core's existing CAS at
+  `application-record.ts:673` is the bump). The `updatedAt`-cosplay path
+  is DELETED: `optimisticLock: true` now means the model's integer
+  locking column, `versionToken()` refuses Dates with the migration in
+  the message, and timestamp lock columns are refused at build time.
+  `relation.updateAll()` now bumps the token in the same statement
+  (the one write path that bypassed the CAS). Runtime backstop for
+  plugin-less apps: `lockField(config, model)` throws the same teaching
+  errors per-request (shared builders in
+  `packages/core/src/runtime/optimistic-lock.ts`).
+- ✅ O14 — pk-lineage rule: codegen REFUSES a lock-tokened model whose pk
+  is reusable (natural key, plain integer, or undetectable — composite
+  third-arg pks are invisible to the extractor and refuse conservatively)
+  unless `@include(SoftDeletable)` is declared; SoftDeletable's destroy is
+  `update({deletedAt})` riding save()'s CAS, so destroy/un-delete keep one
+  strictly increasing chain on the same pk (no new runtime code needed).
+- Acceptance MET for O2/O14: every write path bumps the token atomically
+  with its data (statement-local; the multi-write snapshot claim awaits
+  O1); the lineage property test
+  (`packages/core/tests/integration/lineage-tokens.test.ts`, real PG)
+  pins DB-default init, per-update CAS bumps, StaleObjectError on stale
+  copies, never-reused serial pks across destroy→create, the soft-delete
+  same-pk chain, and the updateAll auto-bump. CONTRACT EXCLUSION: A1
+  across recreation on serial tables holds only while nobody inserts
+  explicit pk values or resets sequences on a lock-tokened hard-delete
+  table — Postgres allows both; out of contract.
 
-### WS1 — Store hardening: Rule M in `packages/react`
-Discharges: **O9, O12** (client side of O3′ prepared).
+### WS1 — Store hardening: Rule M in `packages/react` — ✅ LANDED 2026-08-27
+Discharges: **O9, O12-store-half** (client side of O3′ prepared).
+Landed in `packages/react/src/entity-store.ts` (+ barrel exports, test
+suite renegotiated, DESIGN-entity-store I2 amended). Scope notes, stated
+rather than claimed wholesale: (a) the O12 checkbox covers the STORE half
+— floor authority map surviving eviction + exportFloors/importFloors +
+revision-keyed floorRetention (reviewer pass 2026-08-27: finite
+retention is now PINNED by tests — prune-at-distance, keep-alive via
+merge/signal/certify all routing through floorOf, and eviction
+re-seeding the authority map from an entry whose FloorRec was pruned;
+importFloors joins max and reconciles existing entries, so the
+restore-ordering rule is healed, not prose. Finite retention remains
+an explicit T2-for-memory trade — 𝒞w delay is unbounded, default
+Infinity is the safe setting); the IndexedDB restore wiring itself is
+future work that now needs no store rewrite. (b) the fieldTicks
+kind-equality acceptance is fully met only once WS2's codegen emits
+`registerFieldKinds` per model — unregistered models keep scalar `!==`
+(today's behavior, no regression). (c) `remove()` keeps its legacy
+untokened-evict semantics; call sites migrate to `destroy(token)` in
+WS2/WS3 when real destroy tokens exist at the call site.
 - Rewrite `entity-store.ts` merge to Rule M: entry = (floor, cells with
   per-field lastSeen), interpretation layer (visible/current/projFreshAt),
   knownVersion as rumor bound, L3 GC. Encoding: (defaultToken +

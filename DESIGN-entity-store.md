@@ -16,21 +16,53 @@ we compile both ends).
 ## The consistency contract (the ACID/CAP answer)
 
 Server is the single writer; per-record serialization via the optimistic
-LOCK (409 + fresh envelope on stale write). Clients are read replicas:
-read-your-writes via echo (an intent drops only AFTER its echo merges);
-bounded staleness for others' writes via model-keyed invalidation (WS
-frames shrink the bound later). Optimistic UI is NOT in the consistency
-story — it is rendering of in-flight intent, composed at read time.
+LOCK (409 + fresh envelope on stale write). Clients are read replicas.
+The client-side guarantees are exactly T6 of DESIGN-transport-proof.md —
+scoped claims, deliberately NOT the Terry session guarantees (O11):
+**own-write floor** (T6a: after a mutation returns, every echoed field's
+lastSeen ≥ that mutation's token — you read your own write *or a
+causally later server value*, never anything preceding your write) and
+**per-field monotonic reads** (T2i: lastSeen, floor, knownVersion never
+decrease). Bounded staleness for others' writes via model-keyed
+invalidation (WS frames shrink the bound later). Optimistic UI is NOT in
+the consistency story — it is rendering of in-flight intent, composed at
+read time.
 
 ## Invariants (each enforced by construction, each property-tested)
 
 - **I1 single origin** — only generated response handlers call
   `merge()`; app code has no write path. Cache-corruption is
   unrepresentable.
-- **I2 monotonic** — merges are version-gated (numeric tokens: lock ints
-  / epoch millis; falls back to a numeric-able `updatedAt`; no version →
-  arrival order, i.e. today's document-cache guarantee). A stale slice
-  drops WHOLE — no field-picking, no resurrection.
+- **I2 monotonic (per-field join — Rule M1)** — merges are token-gated
+  PER FIELD: incoming payload at token V writes field f iff
+  `V ≥ lastSeen(f)` (a missing cell has lastSeen = −∞), then
+  `lastSeen(f) = V`; fields absent from the payload are untouched —
+  absence is projection, never null. Deletion is a monotone FLOOR
+  (`destroy(token)`), never a tombstone object: a cell is visible iff
+  `lastSeen(f) > floor`, so no delivery order can resurrect a pre-delete
+  cell (T2, DESIGN-transport-proof.md §3/L2). *This supersedes the old
+  drop-whole clause, deliberately (2026-08-27, proof rev 3 / WS1)* —
+  drop-whole was correct only while a
+  record-level version couldn't say which fields were fresher; per-field
+  monotonicity is strictly more precise and preserves I2's intent
+  exactly: no field ever renders backwards (see the supersession note at
+  DESIGN-wire-identity.md §3a.1). Tokens are the model's lock int
+  (proof §3, WS0); `updatedAt` is inert data, never a token
+  (landmine 12). No token → the named UNTRACKED lane: arrival-order
+  value writes, never `current`, never 304-able, hidden once a floor
+  exists — and an untracked overwrite of a TRACKED cell **demotes** it
+  to untracked (its old lastSeen is deleted, not kept): a value must
+  never stay paired with a token it was not read at (T4), or a stale
+  arrival-order row would become 304-certifiable at a commit it never
+  came from. *Migration note (supersession, stated):* the old
+  drop-whole rule also guaranteed that a rendered record was a
+  token-coherent snapshot; per-field joins deliberately give that up —
+  a stale slice's *novel* cells land at their own (older) token, so a
+  record may render cells from mixed generations (exactly the window a
+  document cache always had). The store cannot see cross-field
+  semantic coupling (e.g. `status`+`closedAt`); an invariant pair that
+  must render from one generation belongs in one payload, and WS
+  `changedFields` frames shrink the window.
 - **I3 optimism never enters truth** — intents live in RQ's mutation
   cache and compose via pure `composeEntity()`. No rollback code exists,
   so no rollback bugs can.
@@ -81,7 +113,10 @@ mandatory, not optional.
 
 `useEntityStatus(model, pk)` → `{ pending, tick, entry }`:
 - `pending` — a write is in flight (store.markPending, counted/stacking,
-  released only AFTER the echo merges: read-your-writes ordering)
+  released only AFTER the echo merges: the own-write-floor ordering of
+  T6a — once released, every echoed field's lastSeen ≥ the mutation's
+  token, i.e. you read your write or a causally later server value,
+  never anything earlier; deliberately not literal read-your-writes)
 - `tick` — bumps on every APPLIED merge (stale drops never flash);
   effect-on-tick = the row highlight
 FormSession keeps its own reality (draft/baseline) and FEEDS the store
