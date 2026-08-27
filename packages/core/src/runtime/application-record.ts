@@ -1,7 +1,7 @@
 import util from 'util'
 import { eq, and, inArray, sql, getTableColumns } from 'drizzle-orm'
 import { Relation, _lookupAssocTarget, mapWriteAttributes } from './relation.js'
-import { getExecutor, getSchema, MODEL_REGISTRY, transaction, transactionContext, afterCommitQueue, AbortChain, RecordNotFound, StaleObjectError, databaseForTable } from './boot.js'
+import { getExecutor, getSchema, MODEL_REGISTRY, transaction, transactionContext, transactionDbName, afterCommitQueue, AbortChain, RecordNotFound, StaleObjectError, databaseForTable } from './boot.js'
 import { modelClassName } from './class-name.js'
 import { runHooks, collectHooks } from './hooks.js'
 import type { AttrEnumConfig, AttrStateConfig } from './attr.js'
@@ -471,9 +471,12 @@ export class ApplicationRecord {
       PgBigInt53: [-Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER],
     }
 
+    // STI discriminator: stamped by save() after validation — never blank. The
+    // skip must match the stamping condition EXACTLY (custom stiTypeColumn,
+    // and `!== undefined` so a falsy discriminator value like 0 still counts).
+    const stiCol = ctor.stiType !== undefined ? (ctor.stiTypeColumn ?? 'type') : null
     for (const [colKey, col] of Object.entries(columns)) {
-      // STI discriminator is stamped by save() after validation — never blank.
-      if (colKey === 'type' && ctor.stiType) continue
+      if (colKey === stiCol) continue
       // Primary keys are DB-generated or app-assigned (sometimes in
       // beforeCreate hooks, which run AFTER validate) — never police them.
       if (col.primary) continue
@@ -670,7 +673,15 @@ export class ApplicationRecord {
           const lockCol = _lockingColumn(ctor, table)
           const loadedVersion = lockCol ? this._attributes[lockCol] : undefined
           let where = _buildPkWhere(ctor, table, _getPkValue(ctor, this._attributes))
-          if (lockCol && typeof loadedVersion === 'number' && !(lockCol in payload)) {
+          if (lockCol && !(lockCol in payload)) {
+            // The CAS needs a JS number to compare-and-bump. Anything else
+            // (pg bigint/numeric → string, a timestamp lockingColumn → Date,
+            // a partial SELECT that omitted the column → undefined) must be a
+            // TEACHING error — silently skipping the predicate is last-write-
+            // wins on exactly the models that opted into locking.
+            if (typeof loadedVersion !== 'number') {
+              throw new Error(_lockVersionTypeMessage(ctor, lockCol, loadedVersion))
+            }
             payload[lockCol] = loadedVersion + 1
             where = and(where, eq(table[lockCol], loadedVersion))!
           }
@@ -708,16 +719,32 @@ export class ApplicationRecord {
       return false
     }
 
+    // Snapshot the persistence state ENTERING the write phase. runWritePhase
+    // flips isNewRecord / clears _changes / adopts the INSERT row mid-phase;
+    // when the surrounding transaction rolls those writes back, the instance
+    // must roll back with it — otherwise save() returns false while the
+    // record claims it was persisted, and create()'s documented contract
+    // ("still-unsaved on failure, gate on isNewRecord") reports a phantom
+    // success for a row that does not exist in the DB.
+    const stateBefore = {
+      isNewRecord: this.isNewRecord,
+      attributes: this._attributes,
+      changes: new Map(this._changes),
+      previousChanges: (this as any)._previousChanges,
+    }
+
+    // Wrap in a transaction ONLY when there are companion writes to keep
+    // atomic AND we're not already inside a transaction ON THIS MODEL'S OWN
+    // DATABASE (a tx on a different database is a different connection — it
+    // neither captures these writes nor provides them any atomicity). A plain
+    // single-statement save stays unwrapped, so the common path takes no
+    // extra round-trip and never trips the nested-transaction warning.
+    const inSameDbTx = _inTransactionOn(ctor)
+    const needsWrap = !inSameDbTx && _saveNeedsTransaction(this, ctor, nestedSnapshot, habtmSnapshot, isNew)
+
     // DB phase — database failures land in _handleDbError: raw error to
     // the onError handlers, translated message onto this.errors.
     try {
-      // Wrap in a transaction ONLY when there are companion writes to keep
-      // atomic AND we're not already inside a transaction (which already
-      // provides atomicity). A plain single-statement save stays unwrapped, so
-      // the common path takes no extra round-trip and never trips the nested-
-      // transaction warning.
-      const alreadyInTx = transactionContext.getStore() !== undefined
-      const needsWrap = !alreadyInTx && _saveNeedsTransaction(this, ctor, nestedSnapshot, habtmSnapshot, isNew)
       const wasNoop = needsWrap
         ? await transaction(runWritePhase, { database: databaseForTable(ctor.tableName) })
         : await runWritePhase()
@@ -726,9 +753,12 @@ export class ApplicationRecord {
       // afterSave/afterCommit do not fire (unchanged behavior).
       if (wasNoop) return true
 
-      const pendingAfterCommit = afterCommitQueue.getStore()
+      // Defer afterCommit only to a transaction the write actually ran in —
+      // the ambient tx on the model's OWN database. Inside a foreign-db tx
+      // the write is already durable (own wrap or autocommit): deferring into
+      // that queue would drop the callback if the unrelated tx rolls back.
+      const pendingAfterCommit = inSameDbTx ? afterCommitQueue.getStore() : undefined
       if (pendingAfterCommit !== undefined) {
-        // Inside a transaction — defer afterCommit until after it commits.
         pendingAfterCommit.push(async () => { await runHooks(this, 'afterCommit', isNew) })
       } else {
         await runHooks(this, 'afterCommit', isNew)
@@ -736,11 +766,27 @@ export class ApplicationRecord {
 
       return true
     } catch (err) {
+      // Restore the pre-write persistence state whenever the write phase's
+      // effects do not survive: our own wrap rolled back, or the ambient
+      // same-db transaction is being aborted (every path below rethrows into
+      // it). The UNWRAPPED single-statement path is excluded — its INSERT may
+      // be durable when a later hook throws, and the state must keep saying so.
+      if (needsWrap || inSameDbTx) {
+        this.isNewRecord = stateBefore.isNewRecord
+        this._attributes = stateBefore.attributes
+        this._changes = stateBefore.changes
+        ;(this as any)._previousChanges = stateBefore.previousChanges
+      }
       if (err instanceof StaleObjectError) throw err
       if (err instanceof NestedAttributesError) {
         // Forged/foreign nested ids surface as a validation failure (422),
         // matching the shape a failed validation already has
         this.errors.add(err.field, err.message)
+        // Inside the ambient same-db transaction the parent INSERT is still
+        // pending — returning false would let it COMMIT as an orphan. Rethrow
+        // so the transaction rolls back (the same doctrine as hooks'
+        // AbortChain and _handleDbError's in-tx rethrow).
+        if (inSameDbTx) throw err
         return false
       }
       return this._handleDbError(err, isNew ? 'insert' : 'update')
@@ -767,7 +813,11 @@ export class ApplicationRecord {
     })
     const translated = translateDbError(err)
     if (!translated) throw err
-    if (transactionContext.getStore()) throw err
+    // Inside a transaction ON THIS MODEL'S DATABASE the tx is aborted — it
+    // must roll back, so rethrow. A tx on a DIFFERENT database is a different
+    // connection: this error did not abort it, and this model's own wrap (if
+    // any) already rolled back — the validation-shaped false is correct.
+    if (_inTransactionOn(ctor)) throw err
     if (translated.field) this.errors.add(translated.field, translated.message)
     else this.errors.add('base', translated.friendly)
     return false
@@ -822,13 +872,19 @@ export class ApplicationRecord {
       await runHooks(this, 'afterDestroy', false)
     }
 
+    const wasDestroyed = (this as any).isDestroyed
+    // Same db-aware gate as save(): a tx on a DIFFERENT database provides no
+    // atomicity for this model's cascade — open our own wrap anyway.
+    const inSameDbTx = _inTransactionOn(ctor)
+    const needsWrap = !inSameDbTx && _destroyNeedsTransaction(ctor)
     try {
-      const alreadyInTx = transactionContext.getStore() !== undefined
-      const needsWrap = !alreadyInTx && _destroyNeedsTransaction(ctor)
       if (needsWrap) await transaction(runDestroy, { database: databaseForTable(ctor.tableName) })
       else await runDestroy()
       return true
     } catch (err) {
+      // The DELETE rolled back (own wrap) or will (aborted ambient same-db
+      // tx — _handleDbError rethrows into it): the instance must reflect that.
+      if (needsWrap || inSameDbTx) (this as any).isDestroyed = wasDestroyed
       return this._handleDbError(err, 'delete')
     }
   }
@@ -1754,6 +1810,36 @@ function _lockingColumn(ctor: any, table: any): string | null {
   if (configured === false) return null
   const colName = typeof configured === 'string' ? configured : 'lockVersion'
   return table && table[colName] ? colName : null
+}
+
+/** Teaching error for a locking column whose loaded value can't drive the CAS. */
+function _lockVersionTypeMessage(ctor: any, lockCol: string, loaded: unknown): string {
+  const name = modelClassName(ctor)
+  if (loaded === undefined) {
+    return `active-drizzle: optimistic locking is enabled for ${name} via '${lockCol}', ` +
+      `but this record was loaded without that column (partial select?). Saving would silently skip ` +
+      `the stale-write check — reload() or include '${lockCol}' in the select, or disable locking ` +
+      `with \`static lockingColumn = false\`.`
+  }
+  const got = loaded === null ? 'null'
+    : loaded instanceof Date ? 'a Date'
+    : typeof loaded === 'bigint' ? `a BigInt (${String(loaded)})`
+    : `a ${typeof loaded} (${JSON.stringify(loaded)})`
+  return `active-drizzle: optimistic locking is enabled for ${name} via '${lockCol}', but its loaded ` +
+    `value is ${got} — the compare-and-swap needs a JS number. Use an integer column that the driver ` +
+    `returns as a number (pg bigint/numeric return strings; timestamps return Dates; NULLs need a ` +
+    `backfill + DEFAULT 0), or disable locking with \`static lockingColumn = false\`.`
+}
+
+/**
+ * Is there an ambient transaction open on THIS model's database? A tx on a
+ * DIFFERENT database is a different connection — it neither captures this
+ * model's writes nor provides them any atomicity, so it must not suppress
+ * the model's own wrap (save/destroy) or the in-tx rethrow (_handleDbError).
+ */
+function _inTransactionOn(ctor: any): boolean {
+  if (transactionContext.getStore() === undefined) return false
+  return (transactionDbName.getStore() ?? 'default') === databaseForTable(ctor.tableName)
 }
 
 /**

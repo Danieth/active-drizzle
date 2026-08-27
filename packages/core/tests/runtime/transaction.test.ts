@@ -412,13 +412,22 @@ describe('@transactional decorator', () => {
 // ── Nested transaction detection ─────────────────────────────────────────────
 
 describe('nested transaction() detection', () => {
-  it('calls db.transaction() once per nesting level', async () => {
-    let txCallCount = 0
+  it('opens ONE top-level transaction; the nested level is a savepoint on the tx client', async () => {
+    let rootCalls = 0
+    let savepointCalls = 0
     const nestedTxDb = {
       ...mockDb,
       transaction: vi.fn((cb: (tx: any) => Promise<any>) => {
-        txCallCount++
-        return cb({ ...mockDb, _isTx: true })
+        rootCalls++
+        return cb({
+          ...mockDb,
+          _isTx: true,
+          // the tx client's own transaction() — drizzle's savepoint API
+          transaction: vi.fn((cb2: (tx: any) => Promise<any>) => {
+            savepointCalls++
+            return cb2({ ...mockDb, _isTx: true })
+          }),
+        })
       }),
     } as any
     boot(nestedTxDb, { posts: {} })
@@ -429,8 +438,13 @@ describe('nested transaction() detection', () => {
       })
     })
 
-    // Drizzle's transaction() should be invoked for each nesting level
-    expect(txCallCount).toBe(2)
+    // ONE real BEGIN on the root connection; the nested level runs via the
+    // CURRENT tx client (a real savepoint). Calling db.transaction() on the
+    // root per nesting level — the old assertion here — checks out a SECOND
+    // pool connection and runs an INDEPENDENT top-level transaction that an
+    // outer rollback cannot undo.
+    expect(rootCalls).toBe(1)
+    expect(savepointCalls).toBe(1)
   })
 })
 

@@ -1,6 +1,6 @@
 import { eq, and, or, inArray, notInArray, arrayContains, isNull, ilike, desc, asc, gte, lte, gt, lt, ne, sql, type SQL } from 'drizzle-orm'
 import { union, unionAll, intersect, except } from 'drizzle-orm/pg-core'
-import { getExecutor, getSchema, MODEL_REGISTRY, transaction, RecordNotFound } from './boot.js'
+import { getExecutor, getSchema, MODEL_REGISTRY, transaction, RecordNotFound, databaseForTable } from './boot.js'
 import { modelClassName } from './class-name.js'
 import { reportError } from './error-reporting.js'
 import type { ApplicationRecord } from './application-record.js'
@@ -1206,8 +1206,19 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
     callback: (batch: this) => Promise<void>
   ): Promise<void> {
     const pk = (this._ctor as any).primaryKey ?? 'id'
-    const pkField = Array.isArray(pk) ? pk[0]! : pk
-    let after: any = undefined
+    // EVERY pk component participates: ordering, cursor, and batch scope. A
+    // composite pk collapsed to pk[0] is non-unique — a batch boundary landing
+    // mid-group made `pk[0] > cursor` skip the rest of the group silently.
+    const pkFields: string[] = Array.isArray(pk) ? pk : [pk]
+    const table = this.getTable()
+    const cols = pkFields.map(f => {
+      const colKey = _resolveColKey(this._ctor, f)
+      const col = table[colKey]
+      if (!col) throw new Error(`Primary key column "${f}" (mapped to "${colKey}") not found on table "${this._tableName}"`)
+      return { colKey, col }
+    })
+    const pkValuesOf = (r: any) => cols.map(({ colKey }) => (r as any)._attributes[colKey])
+    let after: any[] | undefined
 
     while (true) {
       // Load one chunk by KEYSET SEEK — ORDER BY pk ASC, pk > cursor — never
@@ -1219,8 +1230,16 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
       const cursor = this._clone() as this
       cursor._order = []
       cursor._orderSpecs = []
-      cursor.order(pkField)
-      if (after !== undefined) cursor.where({ [pkField]: { gt: after } })
+      for (const f of pkFields) cursor.order(f)
+      if (after !== undefined) {
+        if (cols.length === 1) {
+          cursor._where.push(gt(cols[0]!.col, after[0]) as SQL)
+        } else {
+          // SQL-standard row-value seek: (a, b) > (x, y) is lexicographic over
+          // the WHOLE key — exactly the ORDER BY a, b ordering above.
+          cursor._where.push(sql`(${sql.join(cols.map(c => c.col), sql`, `)}) > (${sql.join(after.map(v => sql`${v}`), sql`, `)})`)
+        }
+      }
       cursor._limit = batchSize
       const rows = await cursor.load()
       if (rows.length === 0) break
@@ -1229,13 +1248,17 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
       // batch.updateAll()/destroyAll() act on the loaded rows and nothing past
       // them (UPDATE/DELETE ignore LIMIT, so a bare seek relation would hit
       // every row after the cursor).
-      const ids = rows.map(r => (r as any)._attributes[pkField])
       const batch = this._clone() as this
-      batch.where({ [pkField]: ids })
+      if (cols.length === 1) {
+        batch._where.push(inArray(cols[0]!.col, rows.map(r => pkValuesOf(r)[0])) as SQL)
+      } else {
+        const tuples = rows.map(r => sql`(${sql.join(pkValuesOf(r).map(v => sql`${v}`), sql`, `)})`)
+        batch._where.push(sql`(${sql.join(cols.map(c => c.col), sql`, `)}) IN (${sql.join(tuples, sql`, `)})`)
+      }
       await callback(batch)
 
       if (rows.length < batchSize) break
-      after = (rows[rows.length - 1] as any)._attributes[pkField]
+      after = pkValuesOf(rows[rows.length - 1])
     }
   }
 
@@ -1270,11 +1293,15 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
    * })
    */
   public withLock<T>(callback: (locked: this) => Promise<T>): Promise<T> {
+    // The wrap must open on the MODEL's own database — a transaction on
+    // 'default' never captures queries routed to another bound database, so
+    // FOR UPDATE would run in autocommit and the lock would evaporate at
+    // statement end (zero mutual exclusion, silently).
     return transaction(async () => {
       const locked = this._clone() as this
       ;(locked as any)._forUpdate = true
       return callback(locked)
-    })
+    }, { database: databaseForTable(this._tableName) })
   }
 
   /**

@@ -188,55 +188,58 @@ export class StaleObjectError extends Error {
  *   await business.update({ assetCount: business.assetCount + 1 })
  * })
  */
-/**
- * Tracks how deeply nested the current async context is inside transactions.
- * When > 0, a new `transaction()` call re-uses the existing connection rather
- * than opening a savepoint — Drizzle handles the nesting at the driver level.
- * A dev-mode warning is emitted so accidental nesting is surfaced early.
- */
-const txDepth = new AsyncLocalStorage<number>()
-
 export async function transaction<T>(
   callback: () => Promise<T>,
   opts: { database?: string } = {},
 ): Promise<T> {
   const dbName = opts.database ?? 'default'
-  const bound = dbName === 'default' ? _activeDb : _databases.get(dbName)
+  // A nested call for the SAME database must run on the CURRENT tx client —
+  // tx.transaction() opens a real SAVEPOINT on the connection that owns the
+  // outer transaction. Resolving the ROOT instance here instead would check
+  // out a NEW pool connection and run an INDEPENDENT top-level transaction:
+  // the outer rollback would not undo it, and it can deadlock (invisibly to
+  // Postgres) against the outer's own row locks. A nested call for a
+  // DIFFERENT database is genuinely independent — different connection — and
+  // runs as its own outermost transaction.
+  const enclosingTx = transactionContext.getStore()
+  const sameDbNested = enclosingTx !== undefined
+    && (transactionDbName.getStore() ?? 'default') === dbName
+  const bound = sameDbNested
+    ? enclosingTx
+    : (dbName === 'default' ? _activeDb : _databases.get(dbName))
   if (!bound) throw new Error(`active-drizzle: database '${dbName}' is not bound — boot()/bindDatabase() first.`)
   const db = bound as any
   if (typeof db.transaction !== 'function') {
     throw new Error('active-drizzle: DB driver does not support transactions.')
   }
 
-  const depth = txDepth.getStore() ?? 0
-  if (depth > 0 && process.env['NODE_ENV'] !== 'test') {
+  if (sameDbNested && process.env['NODE_ENV'] !== 'test') {
     // eslint-disable-next-line no-console
     console.warn(
-      `[active-drizzle] Nested transaction detected (depth=${depth}). ` +
-      'Drizzle will use a savepoint. Ensure this is intentional.',
+      '[active-drizzle] Nested transaction detected — running it as a savepoint ' +
+      `on the enclosing '${dbName}' transaction. Ensure this is intentional.`,
     )
   }
 
-  // The enclosing transaction's afterCommit queue, if this call is nested.
-  // Captured BEFORE we push our own queue onto the async context.
-  const parentQueue = depth > 0 ? afterCommitQueue.getStore() : undefined
+  // The enclosing transaction's afterCommit queue. Only a same-db SAVEPOINT
+  // hands its callbacks up — its fate is the outer commit's. A nested
+  // different-db transaction commits on its own, so its queue flushes below.
+  const parentQueue = sameDbNested ? afterCommitQueue.getStore() : undefined
 
   const queue: Array<() => Promise<void>> = []
   const result = await db.transaction((tx: any) =>
-    txDepth.run(depth + 1, () =>
-      afterCommitQueue.run(queue, () =>
-        transactionDbName.run(dbName, () => transactionContext.run(tx as GlobalDb, callback)))
-    )
+    afterCommitQueue.run(queue, () =>
+      transactionDbName.run(dbName, () => transactionContext.run(tx as GlobalDb, callback)))
   )
-  if (depth === 0) {
-    // Outermost boundary — the real commit happened. Fire everything queued,
-    // including callbacks handed up from committed nested transactions.
-    for (const fn of queue) await fn()
-  } else if (parentQueue) {
-    // Nested commit (a savepoint). Its afterCommit callbacks must NOT fire yet
-    // and must NOT be dropped — hand them up to the enclosing transaction so
-    // they run once, after the OUTERMOST commit (and never if it rolls back).
+  if (parentQueue) {
+    // Savepoint released. Its afterCommit callbacks must NOT fire yet and must
+    // NOT be dropped — hand them up to the enclosing transaction so they run
+    // once, after the OUTERMOST commit (and never if it rolls back).
     for (const fn of queue) parentQueue.push(fn)
+  } else {
+    // Outermost boundary FOR THIS DATABASE — a real commit happened. Fire
+    // everything queued, including callbacks handed up from savepoints.
+    for (const fn of queue) await fn()
   }
   return result
 }
