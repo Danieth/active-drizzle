@@ -469,7 +469,11 @@ function parseConfigObject(node: Node): Record<string, any> {
     if (Node.isObjectLiteralExpression(v)) {
       result[key] = parseConfigObject(v)
     } else if (Node.isArrayLiteralExpression(v)) {
-      result[key] = resolveStringArray(v)
+      // `include` may mix strings and nested-object forms (`['notes',
+      // { notes: ['author'] }]`) — the nesting is load-bearing for the
+      // columnar wire spec (grandchild reassembly) and for assoc typing, so
+      // it is preserved. Every other array key is a flat string allowlist.
+      result[key] = key === 'include' ? resolveIncludeArray(v) : resolveStringArray(v)
     } else if (Node.isIdentifier(v)) {
       // permit: EDITABLE — a const array declared nearby
       const resolved = resolveIdentifierArray(v)
@@ -486,6 +490,57 @@ function parseConfigObject(node: Node): Record<string, any> {
     // functions and anything else: intentionally omitted (see doc comment)
   }
   return result
+}
+
+/**
+ * An `include` array with nesting preserved: string entries pass through,
+ * object entries (`{ notes: ['author'] }`) keep their tree (values parsed as
+ * include arrays recursively; `true` accepted as an empty subtree). Spreads
+ * of local const arrays resolve like resolveStringArray's — `include:
+ * [...SHARED, 'extra']` is the idiomatic DRY form, and silently dropping the
+ * spread would empty the projection/import lists for EVERY door using it
+ * (flag-off included). Other unparseable entries drop — same conservative
+ * posture as the rest of the parser.
+ */
+function resolveIncludeArray(arr: Node): any[] {
+  if (!Node.isArrayLiteralExpression(arr)) return []
+  const out: any[] = []
+  for (const el of arr.getElements()) {
+    const e = unwrapAs(el)
+    if (Node.isStringLiteral(e)) {
+      out.push(e.getLiteralValue())
+    } else if (Node.isSpreadElement(e)) {
+      const inner = unwrapAs(e.getExpression())
+      if (Node.isArrayLiteralExpression(inner)) {
+        out.push(...resolveIncludeArray(inner))
+      } else if (Node.isIdentifier(inner)) {
+        for (const def of inner.getDefinitionNodes()) {
+          if (!Node.isVariableDeclaration(def)) continue
+          const init = def.getInitializer()
+          if (!init) continue
+          const unwrapped = unwrapAs(init)
+          if (Node.isArrayLiteralExpression(unwrapped)) {
+            out.push(...resolveIncludeArray(unwrapped))
+            break
+          }
+        }
+      }
+    } else if (Node.isObjectLiteralExpression(e)) {
+      const entry: Record<string, any> = {}
+      for (const prop of e.getProperties()) {
+        if (!Node.isPropertyAssignment(prop)) continue
+        const k = prop.getName().replace(/^['"]|['"]$/g, '')
+        const init = prop.getInitializer()
+        if (!init) continue
+        const val = unwrapAs(init)
+        if (Node.isArrayLiteralExpression(val)) entry[k] = resolveIncludeArray(val)
+        else if (Node.isStringLiteral(val)) entry[k] = [val.getLiteralValue()]
+        else if (val.getText() === 'true') entry[k] = []
+      }
+      if (Object.keys(entry).length) out.push(entry)
+    }
+  }
+  return out
 }
 
 /**

@@ -1623,6 +1623,71 @@ export function resolveNestedAssociations(model: any): Array<{
   return out
 }
 
+// ── Wire association resolution (columnar envelope / flat loader) ───────────
+
+/**
+ * Everything the transport layer needs to know about ONE association to put
+ * it on the columnar wire: the target's identity space (table name — STI
+ * subclasses share it, matching signal `resource` and coherence edges), the
+ * FK column that carries the linkage flat, and the pk-array ids key an
+ * included hasMany rides the owner as.
+ */
+export interface WireAssociationMeta {
+  name: string
+  kind: 'belongsTo' | 'hasOne' | 'hasMany' | 'habtm'
+  targetModel: any
+  /** The identity-space key: the target's TABLE name. */
+  targetTable: string
+  /** belongsTo: FK column on the OWNER row. hasOne/hasMany: FK column on the
+   *  CHILD row. habtm / hasMany-through: null (linkage lives in a join table). */
+  foreignKey: string | null
+  /** The target model's pk field ('id' unless overridden; composite pks are
+   *  not wire-addressable and resolve to null → caller refuses). */
+  primaryKey: string | null
+  /** True for hasMany `{ through }` — the flat loader refuses these in v1. */
+  through: boolean
+  polymorphic: boolean
+  /** The ordered pk-array column name an included hasMany/habtm contributes
+   *  to the OWNER: `${singular(name)}Ids` (matches the habtm ids convention). */
+  idsKey: string
+}
+
+/**
+ * Resolves an association marker on `model` into its wire metadata, or null
+ * when `prop` is not an association / the target model is unresolvable /
+ * the target is polymorphic (no fixed identity space — a columnar door must
+ * refuse to include it).
+ */
+export function resolveWireAssociation(model: any, prop: string): WireAssociationMeta | null {
+  const marker = model?.[prop]
+  if (!marker || typeof marker !== 'object' || !_ASSOC_MARKER_TYPES.has(marker._type)) return null
+  if (marker._type === 'belongsTo' && marker.options?.polymorphic) return null
+  const TargetModel = _findModelByMarker(marker, prop)
+  if (!TargetModel) return null
+  const targetTable = (TargetModel as any)._activeDrizzleTableName ?? (TargetModel as any).tableName
+  const pkRaw = (TargetModel as any).primaryKey
+  const primaryKey = typeof pkRaw === 'string' ? pkRaw : Array.isArray(pkRaw) ? null : 'id'
+  const asName = marker.options?.as as string | undefined
+  let foreignKey: string | null = null
+  if (marker._type === 'belongsTo') {
+    foreignKey = marker.options?.foreignKey ?? `${prop}Id`
+  } else if (marker._type === 'hasOne' || (marker._type === 'hasMany' && !marker.options?.through)) {
+    foreignKey = marker.options?.foreignKey
+      ?? (asName ? `${asName}Id` : `${_singularize(model.tableName)}Id`)
+  }
+  return {
+    name: prop,
+    kind: marker._type,
+    targetModel: TargetModel,
+    targetTable,
+    foreignKey,
+    primaryKey,
+    through: marker._type === 'hasMany' && Boolean(marker.options?.through),
+    polymorphic: false,
+    idsKey: `${_singularize(prop)}Ids`,
+  }
+}
+
 /**
  * Captures all `*Attributes` data from both `_attributes` (constructor-passed)
  * and `_changes` (proxy-set) BEFORE the parent DB operation overwrites `_attributes`.

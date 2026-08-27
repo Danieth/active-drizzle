@@ -250,6 +250,30 @@ export interface CrudConfig<F extends string = string> {
    * never restates access.
    */
   access?: import('./projection.js').ProjectionNode
+  /**
+   * Wire format for this door — THE per-door migration flag (transport WS2).
+   *
+   *   'nested'   (default) today's JSON: nested record envelopes, embedded
+   *              association objects. Byte-identical to before the flag existed.
+   *   'columnar' the normalized columnar envelope: table sections with a
+   *              self-describing `k` header, per-row `v` version tokens,
+   *              membership separated from entity values. Measured on the
+   *              bench fixture: raw JSON ~50% of the nested payload; after
+   *              brotli the two lanes roughly converge — the wins are decode
+   *              cost, keys-once structure, and above all the identity/token
+   *              semantics (per-row versions, one record per response). The
+   *              generated hooks for a flagged door decode + merge through
+   *              the EntityStore; the app-visible hook API is unchanged.
+   *
+   * Requirements enforced by the codegen gate (teaching errors, build time)
+   * and backstopped at runtime: `get.expose` must be declared (the k header
+   * IS the column picking); including a hasMany additionally requires
+   * `update.optimisticLock` (the ordered pk-array on the owner needs the
+   * owner's CAS — DESIGN-wire-identity §1); STI doors whose subclasses
+   * diverge in field surface are refused (columnar JSON cannot express
+   * per-row absence, and absence ≠ null is load-bearing).
+   */
+  wire?: 'columnar' | 'nested'
   index?: IndexConfig<F>
   /**
    * Dynamically scope all CRUD queries using resolved controller state.

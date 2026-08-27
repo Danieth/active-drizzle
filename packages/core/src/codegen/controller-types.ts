@@ -16,7 +16,8 @@ export interface CtrlIndexConfig {
   sortable?: string[]
   defaultSort?: { field: string; dir: 'asc' | 'desc' }
   filterable?: string[]
-  include?: string[]
+  /** Eager-load specs — bare names or nested objects ({ notes: ['author'] }); nesting preserved. */
+  include?: Array<string | Record<string, any>>
   perPage?: number
   maxPerPage?: number
 }
@@ -28,6 +29,23 @@ export interface CtrlWriteConfig {
 }
 
 export interface CtrlCrudConfig {
+  /**
+   * `wire` literal — the per-door transport flag ('columnar' | 'nested',
+   * default 'nested'). ONE extracted source drives BOTH the runtime
+   * serializer branch (usesColumnar reads the same config object) and the
+   * generated hook bodies, so server shape and client consumption can never
+   * disagree. Feeds the columnar-doors codegen gate (expose required,
+   * hasMany-include ⇒ optimisticLock, STI-divergence refusal).
+   */
+  wire?: string
+  /**
+   * The explicit `access:` ceiling, extracted structurally ({ editable?,
+   * viewable?, include?: { name: <node> } }). At runtime @crud desugars it
+   * into expose/permit/include; codegen reads the SOURCE form — the columnar
+   * gate checks includes against it (W7/W8) and the react generator derives
+   * per-child field masks from it.
+   */
+  access?: Record<string, any>
   index?: CtrlIndexConfig
   create?: CtrlWriteConfig
   update?: Omit<CtrlWriteConfig, 'autoSet'> & {
@@ -40,7 +58,8 @@ export interface CtrlCrudConfig {
     optimisticLock?: boolean | string
   }
   get?: {
-    include?: string[]
+    /** Eager-load specs — bare names or nested objects; nesting preserved. */
+    include?: Array<string | Record<string, any>>
     /** Serialization ceiling — when present it IS the client projection. */
     expose?: string[]
     /** Forms envelope enabled ({ record, abilities, can, version }). */

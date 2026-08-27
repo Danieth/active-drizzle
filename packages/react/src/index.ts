@@ -154,6 +154,19 @@ export {
   type MergeOptions,
 } from './entity-store.js'
 export { useEntityStatus } from './entity-store.js'
+// Columnar wire (transport WS2) — the ONE envelope decoder + live projection
+export {
+  mergeEnvelope,
+  mergeRecordEnvelope,
+  mergeIndexEnvelope,
+  useProjectedRows,
+  type WireSpec,
+  type WireSpecInclude,
+  type WireEnvelope,
+  type WireTableSection,
+  type WireMembership,
+  type WireTouched,
+} from './wire-envelope.js'
 export {
   type PresenterLayout,
   type PresenterPropsFor,

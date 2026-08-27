@@ -38,6 +38,7 @@ import {
 import type { ProjectMeta, ModelMeta, SchemaMeta, Diagnostic } from '../codegen/types.js'
 import { extractControllers } from '../codegen/controller-extractor.js'
 import { validateVersionedModels } from '../codegen/versioned-models.js'
+import { validateColumnarDoors } from '../codegen/wire-columnar.js'
 import { generateRoutesFile, generateRoutesDoc } from '../codegen/controller-generator.js'
 import { generateReactHooks } from '../codegen/react-generator.js'
 
@@ -337,6 +338,8 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
     // the model-side lane globs + extracts + validates the controllers ONCE.
     const ctrlGate = await extractCtrlMetaForGate(p)
     allDiags.push(...validateVersionedModels(ctrlGate.meta, projectMeta))
+    // Cross-IR: columnar doors (transport WS2) — same gate, same lanes
+    allDiags.push(...validateColumnarDoors(ctrlGate.meta, projectMeta))
 
     printDiagnostics(allDiags, root)
 
@@ -529,7 +532,11 @@ export default function activeDrizzle(options: ActiveDrizzlePluginOptions) {
   function versionedModelsGate(ctrlMeta: import('../codegen/controller-types.js').CtrlProjectMeta): void {
     if (!schemaCache) return // no model run yet — nothing to cross-check against
     const cachedModels = [...modelCache.values()].flatMap(c => c.meta)
-    const diags = validateVersionedModels(ctrlMeta, { schema: schemaCache.meta, models: cachedModels })
+    const crossIrProject = { schema: schemaCache.meta, models: cachedModels }
+    const diags = [
+      ...validateVersionedModels(ctrlMeta, crossIrProject),
+      ...validateColumnarDoors(ctrlMeta, crossIrProject),
+    ]
     if (diags.length === 0) return
     printDiagnostics(diags, root)
     const errors = diags.filter(d => d.severity === 'error')

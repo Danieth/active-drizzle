@@ -11,7 +11,14 @@ import {
   missingLockColumnMessage,
   nonNumericTokenMessage,
   getSchema,
+  attachFlatIncludes,
 } from '@active-drizzle/core'
+import {
+  usesColumnar,
+  buildColumnarEnvelope,
+  type ColumnarEnvelope,
+  type ColumnarExtras,
+} from './columnar-envelope.js'
 import { BadRequest, Conflict, NotFound, ValidationError, toValidationError } from './errors.js'
 import { getMutations, getScopes, collectFrontendContext } from './metadata.js'
 import { PROJECTION_NODE, sliceByProjection, type NormalizedNode } from './projection.js'
@@ -313,16 +320,19 @@ function stateEventReason(model: any, record: any, event: string): string | null
  * - can: server-computed verdict per Attr.state event (full data, no
  *   projection problem — the client's own can() only ever narrows this)
  */
-export function buildRecordEnvelope(
+/**
+ * The abilities / can / why verdict maps for a record — the envelope's
+ * permission projection, shared VERBATIM by the nested and columnar
+ * serializers (one rule, two wire shapes).
+ */
+export function computeEnvelopeVerdicts(
   record: any,
   model: any,
   config: CrudConfig,
   ctx: any,
   ctrl: any,
-  issues?: Array<{ field: string; code: string }>,
-): RecordEnvelope {
+): { abilities: Record<string, 'edit' | 'view'>; can: Record<string, boolean>; why: Record<string, string> } {
   const expose = config.get?.expose ?? []
-  const includes = config.get?.include ?? []
 
   const permitRaw = config.update?.permit
   const resolvedPermit = typeof permitRaw === 'function' ? permitRaw(ctx, ctrl, record) : (permitRaw ?? [])
@@ -362,6 +372,21 @@ export function buildRecordEnvelope(
       if (hint) why[mut.method] = hint
     }
   }
+  return { abilities, can, why }
+}
+
+export function buildRecordEnvelope(
+  record: any,
+  model: any,
+  config: CrudConfig,
+  ctx: any,
+  ctrl: any,
+  issues?: Array<{ field: string; code: string }>,
+): RecordEnvelope {
+  const expose = config.get?.expose ?? []
+  const includes = config.get?.include ?? []
+
+  const { abilities, can, why } = computeEnvelopeVerdicts(record, model, config, ctx, ctrl)
 
   // The primary key always serializes — an envelope without `id` is a record
   // the client can never PATCH back (mirrors codegen, which always projects id)
@@ -412,6 +437,49 @@ export function buildRecordEnvelope(
 /** True when this controller responds with the Forms envelope. */
 export function usesEnvelope(config: CrudConfig): boolean {
   return Boolean(config.get?.abilities && config.get?.expose?.length)
+}
+
+/**
+ * The columnar SHOW/echo envelope — the flagged-door twin of
+ * buildRecordEnvelope, and the ONE place every columnar echo path factors
+ * through (defaultGet, create/update echoes, 409 conflict envelopes,
+ * base.ts's `this.envelope(record)` for @mutation / state-event responses —
+ * proof A3: door totality).
+ *
+ * Same verdicts (computeEnvelopeVerdicts), same version token, same issues
+ * reporting; the record graph flattens into entity tables instead of a
+ * nested `record`, and `_key` stitching moves off the rows into
+ * meta.nestedKeys.
+ */
+export function buildColumnarRecordEnvelope(
+  record: any,
+  model: any,
+  config: CrudConfig,
+  ctx: any,
+  ctrl: any,
+  issues?: Array<{ field: string; code: string }>,
+): ColumnarEnvelope {
+  const { abilities, can, why } = computeEnvelopeVerdicts(record, model, config, ctx, ctrl)
+  const extras: ColumnarExtras = {
+    includeSpecs: config.get?.include ?? [],
+    abilities,
+    can,
+    why,
+  }
+  if (issues && issues.length > 0) extras.issues = issues
+  const nestedKeys: Record<string, Record<string, string>> | undefined = (record as any)?._lastNestedKeys
+  if (nestedKeys && Object.keys(nestedKeys).length > 0) extras.nestedKeys = nestedKeys
+  const feCtx = computeFrontendContext(ctrl, ctx)
+  if (feCtx) extras.ctx = feCtx
+  // Optimistic lock: same opaque token as the nested envelope — lockField
+  // throws on config bugs, reads fail loud (a misconfigured lock door must
+  // not serve token-less envelopes).
+  const lock = lockField(config, model, record)
+  if (lock) {
+    const token = versionToken(record, lock, model)
+    if (token != null) extras.version = token
+  }
+  return buildColumnarEnvelope([record], model, config, extras)
 }
 
 export interface PaginationResult {
@@ -483,7 +551,7 @@ export async function defaultIndex(
   params: IndexParams,
   ctx?: any,
   ctrl?: any,
-): Promise<IndexResult> {
+): Promise<IndexResult | ColumnarEnvelope> {
   const idx = config.index ?? {}
   let rel = relation
 
@@ -768,13 +836,19 @@ export async function defaultIndex(
   const page = params.page ?? 0
   rel = rel.limit(perPage).offset(page * perPage)
 
-  // 9. Includes
-  if (dataWanted && idx.include?.length) {
+  // 9. Includes — the columnar wire loads flat (per-table batched queries,
+  // wire-identity §2) instead of the nested RQB query; both honor the same
+  // include tree.
+  const columnar = usesColumnar(config)
+  if (dataWanted && idx.include?.length && !columnar) {
     rel = rel.includes(...idx.include)
   }
 
   // 10. Execute
   const data = dataWanted ? await rel.load() : []
+  if (columnar && dataWanted && idx.include?.length) {
+    await attachFlatIncludes(data, model, idx.include)
+  }
 
   // 10.5 Empty page → say WHY (one extra COUNT, only here): records exist
   // but narrowing excluded them ('no-matches', → offer "clear filters") vs
@@ -783,6 +857,35 @@ export async function defaultIndex(
   if (dataWanted && totalCount === 0) {
     const narrowed = q !== '' || Object.keys(rawFilters).length > 0 || (params.scopes?.length ?? 0) > 0
     emptyReason = narrowed && (await scopedRel.count()) > 0 ? 'no-matches' : 'no-records'
+  }
+
+  // ONE pagination truth for both wire lanes — a drift here would be
+  // invisible to the parity suite exactly long enough to hurt.
+  const pagination: PaginationResult = {
+    page,
+    perPage,
+    totalCount,
+    totalPages: perPage > 0 ? Math.ceil(totalCount / perPage) : 0,
+    hasMore: perPage > 0 && (page + 1) * perPage < totalCount,
+  }
+
+  // 11a. Columnar wire: membership (server-only truth — pagination, facets,
+  // chart, metric, options, emptyReason) separates from entity values; ctx
+  // rides top-level. ONE serializer builds the tables (A3).
+  if (columnar) {
+    const feCtx = computeFrontendContext(ctrl, ctx)
+    return buildColumnarEnvelope(data, model, config, {
+      includeSpecs: idx.include ?? [],
+      membership: {
+        pagination,
+        ...(facets !== undefined ? { facets } : {}),
+        ...(chart !== undefined ? { chart } : {}),
+        ...(metric !== undefined ? { metric } : {}),
+        ...(options !== undefined ? { options } : {}),
+        ...(emptyReason !== undefined ? { emptyReason } : {}),
+      },
+      ...(feCtx ? { ctx: feCtx } : {}),
+    }) as any
   }
 
   // 11. The read ceiling applies to index too — a list endpoint must not
@@ -802,13 +905,7 @@ export async function defaultIndex(
 
   return {
     data: serialized,
-    pagination: {
-      page,
-      perPage,
-      totalCount,
-      totalPages: perPage > 0 ? Math.ceil(totalCount / perPage) : 0,
-      hasMore: perPage > 0 && (page + 1) * perPage < totalCount,
-    },
+    pagination,
     ...(facets !== undefined ? { facets } : {}),
     ...(chart !== undefined ? { chart } : {}),
     ...(metric !== undefined ? { metric } : {}),
@@ -831,15 +928,18 @@ export async function defaultGet(
   ctrl?: any,
 ): Promise<any> {
   const includes = config.get?.include ?? []
+  const columnar = usesColumnar(config)
   let rel = relation.where({ id })
-  if (includes.length) rel = rel.includes(...includes)
+  if (includes.length && !columnar) rel = rel.includes(...includes)
   const record = await rel.first()
   if (!record) throw new NotFound(modelClassName(model))
+  if (columnar && includes.length) await attachFlatIncludes([record], model, includes)
   // FIXES-NEEDED #9: @after hooks on get read this.record (audit trails —
   // "record who read this"); it was silently null forever
   if (ctrl) ctrl.record = record
   await hydrateHabtmIds(record, model, config)
 
+  if (columnar) return buildColumnarRecordEnvelope(record, model, config, ctx, ctrl)
   if (usesEnvelope(config)) return buildRecordEnvelope(record, model, config, ctx, ctrl)
   if (config.get?.expose?.length && typeof record.toJSON === 'function') {
     return applyProjectionSlice(
@@ -874,7 +974,7 @@ export async function defaultCreate(
     ? config.create.permit(ctx, ctrl, draft)
     : config.create?.permit
   await _autoAttach(record, model, rawInput, createPermit)
-  if (usesEnvelope(config)) {
+  if (usesEnvelope(config) || usesColumnar(config)) {
     // Same stripped-field reporting as update — a create that silently drops
     // notesAttributes is exactly as invisible as an update that does
     const editable = new Set(Object.keys(permitted))
@@ -883,9 +983,10 @@ export async function defaultCreate(
       .map(field => ({ field, code: 'forbidden' }))
     const pk = typeof model?.primaryKey === 'string' ? model.primaryKey : 'id'
     const pkVal = (record as any)[pk] ?? record._attributes?.[pk]
-    return buildRecordEnvelope(
-      await reloadWithIncludes(relation, config, pkVal, record, model), model, config, ctx, ctrl, issues,
-    )
+    const fresh = await reloadWithIncludes(relation, config, pkVal, record, model)
+    return usesColumnar(config)
+      ? buildColumnarRecordEnvelope(fresh, model, config, ctx, ctrl, issues)
+      : buildRecordEnvelope(fresh, model, config, ctx, ctrl, issues)
   }
   return record
 }
@@ -905,7 +1006,13 @@ export async function defaultUpdate(
   const record = await relation.where({ id }).first()
   if (!record) throw new NotFound(modelClassName(model))
 
-  const envelope = usesEnvelope(config)
+  const columnar = usesColumnar(config)
+  const envelope = usesEnvelope(config) || columnar
+  // The flagged door's serializer, in one place — every echo below (success,
+  // pre-check 409, CAS-race 409) goes through the SAME function (A3).
+  const emitEnvelope = (rec: any, issues?: Array<{ field: string; code: string }>) => columnar
+    ? buildColumnarRecordEnvelope(rec, model, config, ctx, ctrl, issues)
+    : buildRecordEnvelope(rec, model, config, ctx, ctrl, issues)
 
   // `_event` (state-machine instruction) and `_version` (optimistic-lock
   // echo) ride the PATCH but are protocol, not fields
@@ -924,7 +1031,7 @@ export async function defaultUpdate(
     const current = versionToken(record, lock, model)
     if (current != null && String(_version) !== current) {
       throw new Conflict(envelope
-        ? buildRecordEnvelope(await reloadWithIncludes(relation, config, id, record, model), model, config, ctx, ctrl)
+        ? emitEnvelope(await reloadWithIncludes(relation, config, id, record, model))
         : undefined)
     }
   }
@@ -972,7 +1079,7 @@ export async function defaultUpdate(
     // rejected values, not the server truth the reload/overwrite UI needs.
     const fresh = envelope ? await relation.where({ id }).first() : null
     throw new Conflict(fresh
-      ? buildRecordEnvelope(await reloadWithIncludes(relation, config, id, fresh, model), model, config, ctx, ctrl)
+      ? emitEnvelope(await reloadWithIncludes(relation, config, id, fresh, model))
       : undefined)
   }
   if (!saved) throw toValidationError(record.errors)
@@ -999,9 +1106,7 @@ export async function defaultUpdate(
     // same JSX read-only (post-transition self-locking). The GET includes
     // ride too: without them, freshly created nested rows come back without
     // ids and the client can never settle them (next save = duplicates).
-    return buildRecordEnvelope(
-      await reloadWithIncludes(relation, config, id, record, model), model, config, ctx, ctrl, issues,
-    )
+    return emitEnvelope(await reloadWithIncludes(relation, config, id, record, model), issues)
   }
   return record
 }
@@ -1018,7 +1123,13 @@ async function reloadWithIncludes(relation: any, config: CrudConfig, id: any, re
     return record
   }
   try {
-    const fresh = (await relation.where({ id }).includes(...includes).first()) ?? record
+    // Columnar doors load flat (batched per-table queries) — same include
+    // tree, same rows, no nested graph materialized.
+    const columnar = usesColumnar(config)
+    const fresh = columnar
+      ? ((await relation.where({ id }).first()) ?? record)
+      : ((await relation.where({ id }).includes(...includes).first()) ?? record)
+    if (columnar && fresh && model) await attachFlatIncludes([fresh], model, includes)
     // The saved instance carries this save's created-child id↔_key pairs;
     // the reloaded instance is what serializes — carry the map across so
     // buildRecordEnvelope can stitch _key onto the echoed child rows.
@@ -1066,10 +1177,28 @@ export async function defaultDestroy(
   relation: any,
   model: any,
   id: number | string,
-): Promise<void> {
+  config?: CrudConfig,
+): Promise<{ success: true; touched: NonNullable<ColumnarEnvelope['touched']> } | void> {
   const record = await relation.where({ id }).first()
   if (!record) throw new NotFound(modelClassName(model))
+  // Columnar doors echo a DESTROY-COMMIT token D = lock + 1 (proof A1/A2: the
+  // token chain is strictly increasing across ALL commits, destroys included;
+  // a destroy at the read token T would set the client floor to T while a
+  // concurrent update's T+1 cells stay visible forever — the destroyed record
+  // renders live with nothing to correct it). D = T+1 closes that window: any
+  // payload the destroyer could have raced sits at ≤ D, and floor semantics
+  // hide cells at lastSeen ≤ floor. The generated hook calls
+  // store.destroy(D) instead of guessing.
+  const lockCol = resolveLockColumnName((model as any)?.lockingColumn)
+  const tokRaw = lockCol ? (record as any)?._attributes?.[lockCol] ?? (record as any)?.[lockCol] : null
   await record.destroy()
+  if (config && usesColumnar(config)) {
+    const resource = (model as any)?._activeDrizzleTableName ?? (model as any)?.tableName ?? modelClassName(model)
+    return {
+      success: true,
+      touched: [{ resource, id, op: 'destroy', version: typeof tokRaw === 'number' ? tokRaw + 1 : null }],
+    }
+  }
 }
 
 // ── Permit / restrict helpers ─────────────────────────────────────────────────

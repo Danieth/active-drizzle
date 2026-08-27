@@ -127,6 +127,12 @@ Deep-merged by NODE_ENV at boot (objects merge, arrays/scalars replace).
 Secrets are `process.env` REFERENCES — the file commits, values deploy.
 Missing file = all defaults.
 
+Advanced, per-door: `wire: 'columnar'` on a `@crud` config flips that one
+door (server + its generated hooks together) onto the normalized columnar
+envelope — entity-store-backed live rows, per-row version tokens, smaller
+raw payloads (compressed sizes are ~parity), same hook API.
+Default is `'nested'`; migrate door by door. Details: LLM-GUIDE §3.5.
+
 ## 6. The loop
 
 1. Edit schema/model/controller → save → codegen runs → typed client is

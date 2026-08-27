@@ -5,9 +5,11 @@
  * Subclasses define @before hooks, override default CRUD methods,
  * and add @mutation / @action methods.
  */
+import { attachFlatIncludes } from '@active-drizzle/core'
 import { BadRequest } from './errors.js'
 import { collectBeforeHooks, collectAfterHooks, collectRescueHandlers, getCrudMeta } from './metadata.js'
-import { buildRecordEnvelope, type RecordEnvelope } from './crud-handlers.js'
+import { buildRecordEnvelope, buildColumnarRecordEnvelope, type RecordEnvelope } from './crud-handlers.js'
+import { usesColumnar, type ColumnarEnvelope } from './columnar-envelope.js'
 
 /** Sentinel returned by _handleError when no rescue handler matched. */
 const UNHANDLED = Symbol('ad:unhandled')
@@ -53,10 +55,27 @@ export class ActiveController<
    * under THIS controller's @crud config. Return it from @mutation methods
    * so the generated action button folds fresh verdicts/fields straight
    * into the live form session — no refetch round-trip.
+   *
+   * Async since transport WS2: on a columnar door the record's GET includes
+   * are flat-loaded first (custom @mutation bodies typically load with no
+   * includes, and serializing an unloaded hasMany would either drop the
+   * pk-array column or — worse, the pre-fix behavior — certify an EMPTY
+   * membership at the current token and wipe the client store). `return
+   * this.envelope(record)` from an async method is unchanged.
    */
-  protected envelope(record: any): RecordEnvelope {
+  protected async envelope(record: any): Promise<RecordEnvelope | ColumnarEnvelope> {
     const meta = getCrudMeta(this.constructor)
     if (!meta) throw new Error('[active-drizzle] envelope() requires a @crud controller')
+    // Flagged doors speak columnar EVERYWHERE — @mutation / state-event
+    // echoes included (proof A3: one serializer per door, no byte path
+    // around it).
+    if (usesColumnar(meta.config)) {
+      const includes = (meta.config as any)?.get?.include ?? []
+      if (record && includes.length) {
+        await attachFlatIncludes([record], meta.model, includes)
+      }
+      return buildColumnarRecordEnvelope(record, meta.model, meta.config, this.context, this)
+    }
     return buildRecordEnvelope(record, meta.model, meta.config, this.context, this)
   }
 

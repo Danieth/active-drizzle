@@ -79,6 +79,8 @@ export {
   singletonFindOrCreate,
   convertFilterValue,
   buildRecordEnvelope,
+  buildColumnarRecordEnvelope,
+  computeEnvelopeVerdicts,
   enforceMutationRules,
   buildSearchDoc,
   type RecordEnvelope,
@@ -86,3 +88,13 @@ export {
   type IndexParams,
   type PaginationResult,
 } from './crud-handlers.js'
+
+// Columnar wire (transport WS2 — the per-door flagged envelope)
+export {
+  usesColumnar,
+  buildColumnarEnvelope,
+  type ColumnarEnvelope,
+  type ColumnarTableSection,
+  type ColumnarMembership,
+  type ColumnarExtras,
+} from './columnar-envelope.js'

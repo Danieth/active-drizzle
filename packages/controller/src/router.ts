@@ -282,8 +282,10 @@ export function buildRouter<TContext = Record<string, any>>(
       return dispatch(ControllerClass, context as TContext, input as any, rel, 'destroy',
         async (ctrl) => {
           if (typeof ctrl.destroy === 'function') return ctrl.destroy()
-          await defaultDestroy(ctrl.relation, model, (input as any).id)
-          return { success: true }
+          // Columnar doors return a destroy echo ({ success, touched }) so
+          // the generated hook can raise the store's floor with a real token
+          const echo = await defaultDestroy(ctrl.relation, model, (input as any).id, config)
+          return echo ?? { success: true }
         },
         undefined,
         config.scopeBy,

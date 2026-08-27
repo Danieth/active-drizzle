@@ -174,7 +174,122 @@ WS2/WS3 when real destroy tokens exist at the call site.
   handlers wire store.mergeRows + membership→RQ; per-table batched
   include-loading with the parity checklist (`wire-identity §2`).
 - Acceptance: parity tests per door (same rows/order/ceilings/codecs);
-  measured payload ≤ ~40% of nested baseline (bench: 19.6K vs 55.2K).
+  payload measured and recorded per door. (The original "≤ ~40% of nested"
+  target came from a deeper synthetic graph and did NOT reproduce — see the
+  measured finding below: raw ~50%, post-brotli ~parity. The bench pins
+  raw ≤ 0.55 and brotli ≤ nested; the wins are decode cost + identity/token
+  semantics, not compressed bytes.)
+- ⏳ **SERVER + CODEGEN half LANDED 2026-08-27**; **CLIENT RUNTIME half
+  LANDED 2026-08-27** — `packages/react/src/wire-envelope.ts` is the ONE
+  decoder for the ONE serializer: `mergeEnvelope` (k/v/r zip → per-row
+  Rule-M1 merges with `{version: v[i]}`, v null = untracked lane;
+  `touched` destroy → store.destroy(floor) / legacy remove when
+  token-less), `mergeRecordEnvelope` (merge + PURE recompose of the
+  nested RecordEnvelope — hasMany via idsColumn in order with the
+  idsColumn key removed, belongsTo via FK, hasOne via child-side FK scan,
+  `_key` stitched from meta.nestedKeys — P6: FormSession untouched),
+  `mergeIndexEnvelope` (IndexResult shape in membership order), and
+  `useProjectedRows` (useSyncExternalStore-live door-masked rows from the
+  store, re-nested per spec, self-rewiring child subscriptions which
+  double as eviction pins; hasOne omitted from STORE projection — no FK
+  index — reaches app code via the recomposed get/echo shapes). Contract
+  suite: `packages/react/tests/wire-envelope.test.tsx` (17 green; full
+  react suite 332+ green, tsc clean). Landed: `wire: 'columnar' | 'nested'`
+  top-level CrudConfig flag; ONE serializer
+  (`packages/controller/src/columnar-envelope.ts` — buildColumnarEnvelope)
+  branched at every usesEnvelope seam incl. 409s, `this.envelope()`, and a
+  destroy `{success, touched:[{resource,id,op,version}]}` echo; flat
+  include-loading (`packages/core/src/runtime/flat-loader.ts`, 1 root query
+  + one per included table, association order honored, loader-agnostic
+  serializer); the columnar-doors codegen gate
+  (`packages/core/src/codegen/wire-columnar.ts`: expose required,
+  hasMany-include ⇒ optimisticLock, STI-divergence + habtm/through/
+  polymorphic refusals) in both vite lanes; `_entities.gen.ts`
+  registerFieldKinds; flagged hook/wire-spec emission in react-generator.
+  Parity suite: `packages/controller/tests/columnar-parity.test.ts` (real
+  PG, flag-on vs flag-off, §2 checklist as tests — 24 green, incl.
+  Attr-kind codec parity: money/dates/jsonb cells JSON-round-trip
+  identical across lanes, explicit-null vs absence pinned per kind).
+  **Acceptance evidence complete 2026-08-27:** the Rule M handshake —
+  `packages/react/tests/columnar-handshake.test.ts` (real PG → real
+  handlers → the GENERATED `_MergeEcho` funnel verbatim → EntityStore):
+  every wire field lands at per-field lastSeen == the row's ACTUAL
+  lock int (distinct per-row child tokens prove no record-level
+  stamping), update echoes re-thread the bumped token and a replayed
+  stale GET regresses nothing, projFreshAt over the door's fields
+  equals the DB lock (304-able) and certify() at a newer token
+  re-freshens every field (M4), and a destroy echo's floor survives a
+  stale-GET replay (T2). Full suites green: controller 384, react 336,
+  core 1305.
+  **Measured finding (recorded):** on the 2-level 20×40×8 fixture the raw
+  payload is 50.3% of nested, but POST-BROTLI the lanes converge (~98%) —
+  brotli erases repeated keys and duplicated embedded objects; the ~40%
+  compressed target did not reproduce on a 2-level door (the risks section
+  predicted this: record per-door numbers at flip time; the raw ratio and
+  decode-cost win are the structural invariants). Two pre-existing
+  nested-lane gaps pinned by the suite: (a) toJSON only-mode serves
+  included child rows RAW — child Attr codecs bypassed AND the child's
+  lockVersion ships in the payload (columnar hydrates children through the
+  model class per A0 and keeps tokens out of k); (b) drizzle RQB include
+  loading ignores the association's declared `order` (pk order); the flat
+  loader honors it.
+  **Review hardening (2026-08-27 overnight, pre-commit):** applied the
+  external review's findings to the WS2 diff —
+  (1) *Ceiling totality:* on an explicit `access:` door the serializer now
+  REFUSES any include absent from the access tree (it previously defaulted
+  the child to a STAR node — every column of the child table shipped past a
+  ceiling the nested lane enforced). Gate clauses W7/W8 catch the same
+  (plus access/expose divergence) at build time.
+  (2) *Absence ≠ []:* an unloaded hasMany now OMITS the pk-array column
+  instead of emitting `[]` at the owner's current token (which certified an
+  empty membership and wiped the client store's true pk-array on every
+  custom-@mutation echo). `ActiveController#envelope()` is now async and
+  flat-attaches the door's GET includes first, so custom echoes carry the
+  TRUE membership. The belongsTo FK cell likewise never coerces
+  undefined→null.
+  (3) *Destroy-commit token:* `defaultDestroy` echoes D = lock + 1 (A1/A2 —
+  the read token left a same-token race window where a concurrent update's
+  cells outlived the floor).
+  (4) *Child masks client-side:* wire specs now carry per-child `fields`
+  (from the access node) and `useProjectedRows` masks re-nested children
+  with them (§3a corollary — union storage, per-door projection, children
+  included). Expose-only doors keep whole-row children — now PINNED as an
+  exact k-list in the parity suite so accidental widening fails loudly.
+  (5) *Flat-loader semantics decided + pinned:* child loading is
+  `.unscoped()` — the nested RQB lane never ran child default scopes, and a
+  row-set/membership change must not ride a transport flag (a
+  default-scoped-child parity test enforces it). Polymorphic-inverse type
+  scoping now matches the loaded roots' actual class names (STI subclass
+  rows keep their children) and is PG-tested, as are hasOne first-per-parent
+  and the pk-order tiebreaker.
+  (6) *Gate tightened:* W5 requires `get.abilities` (a bare-record door
+  flipping to the envelope shape was a silent P6 break — runtime backstop
+  too); W6 refuses hasOne in the INDEX include tree (list rows cannot
+  re-nest it); W2/W4 now recurse the include tree, and a depth≥2 hasMany
+  requires the OWNING model's own lock column (untracked pk-array = the
+  silent-LWW W2 exists to refuse).
+  (7) *Flag-off extractor fixes:* `resolveIncludeArray` resolves
+  SpreadElements (`include: [...SHARED]` silently lost its entries — a
+  flag-off codegen regression). SIGN-OFF NOTE: the new include extractor
+  also SURFACES object-form entries (`{ notes: [...] }`) that the old
+  string-only parser dropped — generated projections/imports for unflagged
+  doors using that form now include those associations. This is a bugfix
+  (the runtime always served them) but it does change flag-off generated
+  output for exactly those doors.
+  (8) *Coverage the review demanded:* columnar pagination across pages
+  (hasMore true→false), non-pk asc/desc sort parity, defaultCreate echo
+  (issues + _key adoption), `envelope()` echo path, emptyReason/chart/
+  metric passengers, `_entities.gen` emitted for zero-kind columnar
+  projects, generated-string assertions for the touched-lane decoder /
+  infiniteIndex / 409 mapper / index queryFn, and a handshake assertion
+  pinning the emitted wire spec against runtime `resolveWireAssociation`
+  (the "cannot drift" comment is now a test). React's PG test deps are now
+  declared in its own package.json (no more hoisting luck).
+  Deferred (recorded, not fixed): compiling/executing a generated hook file
+  end-to-end (string assertions cover the named mutant class); child-codec
+  parity beyond enums (money/date/jsonb child cells) and encrypted Attrs on
+  the columnar wire; a k-divergence (two-slices-one-table) runtime trigger
+  test; STI-door runtime serialization tests.
 
 ### WS3 — Validation path (the 304 machinery)
 Discharges: **O10, O5, O15** (server side).

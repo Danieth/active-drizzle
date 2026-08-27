@@ -33,6 +33,9 @@ import type { CtrlProjectMeta, CtrlMeta, CtrlActionMeta, CtrlAttachmentMeta } fr
 import type { ProjectMeta, ModelMeta, ColumnMeta } from './types.js'
 import { depsFitProjection } from './validation-deps.js'
 import { renderFieldMeta, jsString, COLUMN_TS_TYPE } from './generator.js'
+// The ONE include-shape walker + effective-ceiling rule, shared with the
+// columnar gate (drift between the two was a reported near-miss).
+import { includeTopNames, effectiveExpose } from './wire-columnar.js'
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -152,10 +155,20 @@ export function generateReactHooks(
     files.push({ filePath: join(outputDir, '_coherence.gen.ts'), content: lines.join('\n') })
   }
 
+  // Entity field kinds — the store's kind-equality contract (transport WS1
+  // acceptance): jsonb/json/array columns compare structurally, pk-array
+  // columns (habtm ids + columnar hasMany includes) compare as ordered id
+  // lists, everything unregistered stays scalar `!==`. One generated module
+  // registers every model at client boot.
+  const entitiesModule = projectMeta ? generateEntityKinds(ctrlProject, projectMeta) : null
+  if (entitiesModule) {
+    files.push({ filePath: join(outputDir, '_entities.gen.ts'), content: entitiesModule })
+  }
+
   // Barrel index — always regenerated
   files.push({
     filePath: join(outputDir, 'index.ts'),
-    content: generateBarrel(ctrlProject, outputDir),
+    content: generateBarrel(ctrlProject, outputDir, Boolean(entitiesModule)),
   })
 
   // Client stub — only written once
@@ -317,6 +330,15 @@ function generateControllerFile(
     && Boolean(ctrl.crudConfig?.get?.abilities)
     && Boolean(ctrl.crudConfig?.get?.expose?.length)
 
+  // Columnar wire (transport WS2): this door's responses are the normalized
+  // columnar envelope — generated hooks decode + merge through the
+  // EntityStore and recompose the app-visible shapes (P6: the hook API is
+  // byte-for-byte unchanged; flag-on list rows additionally update LIVE from
+  // store merges — the point, not a parity bug).
+  const wireColumnar = ctrl.kind === 'crud'
+    && ctrl.crudConfig?.wire === 'columnar'
+    && Boolean(model)
+
   // Nested form members the typed handle must declare — same permit gate as
   // the nested-meta emission (an unpermitted array never becomes a handle,
   // so it must not be typed as one either)
@@ -394,9 +416,15 @@ import type { FC, ReactNode } from 'react'`)
     }
     if (needsValidates) adImports.push('Validates')
     if (needsCoherence) adImports.push('applyEntityChange')
+    if (wireColumnar) {
+      adImports.push('entityStore', 'mergeEnvelope', 'mergeRecordEnvelope', 'mergeIndexEnvelope', 'useProjectedRows')
+    }
     L.push(`import { ${adImports.join(', ')} } from '@active-drizzle/react'`)
     L.push(`import type { ${adTypeImports.join(', ')} } from '@active-drizzle/react'`)
     if (needsCoherence) L.push(`import { coherenceEdges } from './_coherence.gen'`)
+    // Field kinds must be registered before the first merge — import for the
+    // side effect (jsonb/pkArray equality + the flat-row contract).
+    if (wireColumnar) L.push(`import './_entities.gen'`)
   }
 
   if (ctrl.attachable) {
@@ -414,8 +442,8 @@ import type { FC, ReactNode } from 'react'`)
   const inlineAttrs: string[] = []
   if (!isPlain && model && projectMeta) {
     const allIncludes = new Set([
-      ...(ctrl.crudConfig?.get?.include ?? []),
-      ...(ctrl.crudConfig?.index?.include ?? []),
+      ...includeTopNames(ctrl.crudConfig?.get?.include),
+      ...includeTopNames(ctrl.crudConfig?.index?.include),
     ])
     const assocImports = resolveAssocImports(allIncludes, model, projectMeta)
     const seen = new Set<string>()
@@ -454,8 +482,8 @@ import type { FC, ReactNode } from 'react'`)
     }
 
     const allIncludes = new Set([
-      ...(ctrl.crudConfig?.get?.include ?? []),
-      ...(ctrl.crudConfig?.index?.include ?? []),
+      ...includeTopNames(ctrl.crudConfig?.get?.include),
+      ...includeTopNames(ctrl.crudConfig?.index?.include),
     ])
     const assocImports = resolveAssocImports(allIncludes, model, projectMeta)
 
@@ -810,9 +838,14 @@ import type { FC, ReactNode } from 'react'`)
     L.push(`export const ${lcFirst(ctrl.modelClass!)}Keys = modelCacheKeys<${scopeType}>('${resourceName}')`)
     L.push('')
 
+    // ── Columnar wire spec + echo decoder (flagged doors only) ─────────────
+    if (wireColumnar) {
+      emitWireSpec(L, ctrl, model, projectMeta!, modelName)
+    }
+
     // ── Typed form handle + wired hooks (envelope controllers only) ────────
     if (envelopeEnabled) {
-      emitFormHooks(L, ctrl, model, projectMeta!, stateProjection, modelName, scopeFields, scopeType, instantResources, nestedHandleMembers)
+      emitFormHooks(L, ctrl, model, projectMeta!, stateProjection, modelName, scopeFields, scopeType, instantResources, nestedHandleMembers, wireColumnar)
     }
   }
 
@@ -852,7 +885,7 @@ import type { FC, ReactNode } from 'react'`)
   // reference the SAME functions; prefer the use* names in new code.
   L.push(`  use: (${scopeParam}) => {`)
   L.push(`    const h = {`)
-  emitUse(L, ctrl, clientKey, model?.tableName ?? null)
+  emitUse(L, ctrl, clientKey, model?.tableName ?? null, wireColumnar)
   L.push(`    }`)
   L.push(`    const aliases = Object.fromEntries(`)
   L.push(`      Object.entries(h).map(([k, v]) => ['use' + k[0]!.toUpperCase() + k.slice(1), v]),`)
@@ -866,7 +899,7 @@ import type { FC, ReactNode } from 'react'`)
   L.push(`   * Call outside React for direct async calls — event handlers, SSR, tests.`)
   L.push(`   */`)
   L.push(`  with: (${scopeParam}) => ({`)
-  emitWith(L, ctrl, clientKey)
+  emitWith(L, ctrl, clientKey, wireColumnar)
   L.push(`  }),`)
   L.push(`}`)
   L.push('')
@@ -912,10 +945,11 @@ function toBulkMutateName(methodName: string): string {
 
 // ── .use() body ───────────────────────────────────────────────────────────────
 
-function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string, tableName: string | null = null): void {
+function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string, tableName: string | null = null, wireColumnar = false): void {
   const modelName   = ctrl.modelClass
   const scopeSpread = ctrl.scopes.length > 0 ? '...scopes, ' : ''
   const keysRef     = modelName ? `${lcFirst(modelName)}Keys` : null
+  const lc          = modelName ? lcFirst(modelName) : ''
   // Coherence fan-out on success — every door embedding this model (or a
   // write-effect downstream of it) refetches; live forms absorb via rehydrate
   const cohere = (op: string) => tableName
@@ -924,7 +958,76 @@ function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string, tableName: stri
   const qcOpen  = tableName ? `{ const qc = useQueryClient(); return ` : ''
   const qcClose = tableName ? ` }` : ''
 
-  if (ctrl.kind === 'crud' && modelName) {
+  if (ctrl.kind === 'crud' && modelName && wireColumnar) {
+    // ── Columnar wire (transport WS2): fetch → mergeEnvelope → membership
+    // as query data; rows materialize from the EntityStore (P6: same hook
+    // shapes — and flag-on rows update LIVE from store merges, the accepted
+    // documented deviation).
+    L.push(`    /** Paginated list. RETURNS { data: rows, pagination, facets?, ctx? } — NOT bare rows`)
+    L.push(`     *  (read \\\`query.data?.data ?? []\\\`). Columnar door: rows come from the entity`)
+    L.push(`     *  store and keep updating live as fresher merges land. */`)
+    L.push(`    index: (params?: ${modelName}SearchState) => {`)
+    L.push(`      const query = useQuery({`)
+    L.push(`        queryKey: ${keysRef}!.list(scopes, params),`)
+    L.push(`        queryFn:  async () => {`)
+    L.push(`          const env: any = await client.${clientKey}.index({ ${scopeSpread}...params })`)
+    L.push(`          mergeEnvelope(entityStore, env)   // values → store; membership stays query data`)
+    L.push(`          return { membership: env.membership, ...(env.ctx !== undefined ? { ctx: env.ctx } : {}) }`)
+    L.push(`        },`)
+    L.push(`        placeholderData: keepPreviousData,   // search/filter changes keep rows mounted`)
+    L.push(`      })`)
+    L.push(`      const _m: any = (query.data as any)?.membership`)
+    L.push(`      const rows = useProjectedRows('${tableName}', _m?.pks ?? [], _${lc}WireFields, _${lc}WireSpecIndex)`)
+    L.push(`      const data = query.data === undefined ? undefined : {`)
+    L.push(`        data: rows,`)
+    L.push(`        pagination: _m?.pagination,`)
+    L.push(`        ...(_m?.facets !== undefined ? { facets: _m.facets } : {}),`)
+    L.push(`        ...(_m?.chart !== undefined ? { chart: _m.chart } : {}),`)
+    L.push(`        ...(_m?.metric !== undefined ? { metric: _m.metric } : {}),`)
+    L.push(`        ...(_m?.options !== undefined ? { options: _m.options } : {}),`)
+    L.push(`        ...(_m?.emptyReason !== undefined ? { emptyReason: _m.emptyReason } : {}),`)
+    L.push(`        ...((query.data as any)?.ctx !== undefined ? { ctx: (query.data as any).ctx } : {}),`)
+    L.push(`      }`)
+    L.push(`      return { ...query, data } as any`)
+    L.push(`    },`)
+    L.push(`    /** Infinite-scroll list. Pages recompose from the entity store (live rows). */`)
+    L.push(`    infiniteIndex: (params?: Omit<${modelName}SearchState, 'page'>) => {`)
+    L.push(`      const query = useInfiniteQuery({`)
+    L.push(`        queryKey:         ${keysRef}!.list(scopes, params),`)
+    L.push(`        queryFn:          async ({ pageParam = 0 }) => {`)
+    L.push(`          const env: any = await client.${clientKey}.index({ ${scopeSpread}...params, page: pageParam as number })`)
+    L.push(`          mergeEnvelope(entityStore, env)`)
+    L.push(`          return { membership: env.membership, ...(env.ctx !== undefined ? { ctx: env.ctx } : {}) }`)
+    L.push(`        },`)
+    L.push(`        initialPageParam: 0,`)
+    L.push(`        getNextPageParam:  (last: any) => last?.membership?.pagination?.hasMore ? (last.membership.pagination.page + 1) : undefined,`)
+    L.push(`      })`)
+    L.push(`      const _pages: any[] = (query.data as any)?.pages ?? []`)
+    L.push(`      const _allPks = _pages.flatMap((p: any) => p?.membership?.pks ?? [])`)
+    L.push(`      const _rows = useProjectedRows('${tableName}', _allPks, _${lc}WireFields, _${lc}WireSpecIndex)`)
+    L.push(`      const _byPk = new Map(_allPks.map((pk: any, i: number) => [pk, _rows[i]]))`)
+    L.push(`      const data = query.data === undefined ? undefined : {`)
+    L.push(`        ...(query.data as any),`)
+    L.push(`        pages: _pages.map((p: any) => ({`)
+    L.push(`          data: (p?.membership?.pks ?? []).map((pk: any) => _byPk.get(pk)),`)
+    L.push(`          pagination: p?.membership?.pagination,`)
+    L.push(`          ...(p?.membership?.facets !== undefined ? { facets: p.membership.facets } : {}),`)
+    L.push(`          ...(p?.ctx !== undefined ? { ctx: p.ctx } : {}),`)
+    L.push(`        })),`)
+    L.push(`      }`)
+    L.push(`      return { ...query, data } as any`)
+    L.push(`    },`)
+    L.push(`    /** Single-record query. Pass null/undefined to disable fetching. The columnar`)
+    L.push(`     *  envelope merges into the store and recomposes to { record, abilities, can, version, ... }. */`)
+    L.push(`    get: (id: number | string | null | undefined) => useQuery({`)
+    L.push(`      queryKey: ${keysRef}!.detail(id ?? 0, scopes),`)
+    L.push(`      queryFn:  async () => mergeRecordEnvelope(entityStore, await client.${clientKey}.get({ ${scopeSpread}id }), _${lc}WireSpec),`)
+    L.push(`      enabled:  id != null,`)
+    L.push(`    }),`)
+    L.push(`    mutateCreate:  () => ${qcOpen}useMutation({ mutationFn: (data: ${modelName}Write) => client.${clientKey}.create({ ${scopeSpread}data }).then(_${lc}MergeEcho)${cohere('create')} })${qcClose},`)
+    L.push(`    mutateUpdate:  () => ${qcOpen}useMutation({ mutationFn: ({ id, ...data }: { id: number | string } & Partial<${modelName}Write>) => client.${clientKey}.update({ ${scopeSpread}id, data }).then(_${lc}MergeEcho)${cohere('update')} })${qcClose},`)
+    L.push(`    mutateDestroy: () => ${qcOpen}useMutation({ mutationFn: (id: number | string) => client.${clientKey}.destroy({ ${scopeSpread}id }).then(_${lc}MergeEcho)${cohere('destroy')} })${qcClose},`)
+  } else if (ctrl.kind === 'crud' && modelName) {
     L.push(`    /** Paginated list. RETURNS { data: rows, pagination, facets?, ctx? } — NOT bare rows`)
     L.push(`     *  (read \\\`query.data?.data ?? []\\\`). Params: ${modelName}SearchState`)
     L.push(`     *  (filters/q/sort/page — nest filters: { filters: { stage: 'won' } }). */`)
@@ -958,16 +1061,17 @@ function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string, tableName: stri
     L.push(`    mutateUpdate: () => ${qcOpen}useMutation({ mutationFn: (data: ${modelName}Write) => client.${clientKey}.update({ ${scopeSpread}data })${cohere('update')} })${qcClose},`)
   }
 
-  // @mutation
+  // @mutation — flagged doors decode columnar echoes through the store first
+  const echoWrap = wireColumnar ? `.then(_${lc}MergeEcho)` : ''
   for (const mut of ctrl.mutations) {
     const hookName = mut.bulk ? toBulkMutateName(mut.method) : toMutateName(mut.method)
     if (mut.bulk) {
-      L.push(`    ${hookName}: () => ${qcOpen}useMutation({ mutationFn: (ids: (number | string)[]) => client.${clientKey}.${mut.method}({ ${scopeSpread}ids })${cohere('update')} })${qcClose},`)
+      L.push(`    ${hookName}: () => ${qcOpen}useMutation({ mutationFn: (ids: (number | string)[]) => client.${clientKey}.${mut.method}({ ${scopeSpread}ids })${echoWrap}${cohere('update')} })${qcClose},`)
     } else if (mut.params?.length) {
       const dataType = `{ ${mut.params.map(pp => `${pp}?: any`).join('; ')} }`
-      L.push(`    ${hookName}: () => ${qcOpen}useMutation({ mutationFn: ({ id, data }: { id: number | string; data?: ${dataType} }) => client.${clientKey}.${mut.method}({ ${scopeSpread}id, data })${cohere('update')} })${qcClose},`)
+      L.push(`    ${hookName}: () => ${qcOpen}useMutation({ mutationFn: ({ id, data }: { id: number | string; data?: ${dataType} }) => client.${clientKey}.${mut.method}({ ${scopeSpread}id, data })${echoWrap}${cohere('update')} })${qcClose},`)
     } else {
-      L.push(`    ${hookName}: () => ${qcOpen}useMutation({ mutationFn: (id: number | string) => client.${clientKey}.${mut.method}({ ${scopeSpread}id })${cohere('update')} })${qcClose},`)
+      L.push(`    ${hookName}: () => ${qcOpen}useMutation({ mutationFn: (id: number | string) => client.${clientKey}.${mut.method}({ ${scopeSpread}id })${echoWrap}${cohere('update')} })${qcClose},`)
     }
   }
 
@@ -1029,11 +1133,21 @@ function emitUse(L: string[], ctrl: CtrlMeta, clientKey: string, tableName: stri
 
 // ── .with() body ──────────────────────────────────────────────────────────────
 
-function emitWith(L: string[], ctrl: CtrlMeta, clientKey: string): void {
+function emitWith(L: string[], ctrl: CtrlMeta, clientKey: string, wireColumnar = false): void {
   const modelName   = ctrl.modelClass
   const scopeSpread = ctrl.scopes.length > 0 ? '...scopes, ' : ''
+  const lc          = modelName ? lcFirst(modelName) : ''
 
-  if (ctrl.kind === 'crud' && modelName) {
+  if (ctrl.kind === 'crud' && modelName && wireColumnar) {
+    // Columnar door: responses decode through the store and recompose to the
+    // nested shapes app code reads (P6) — same signatures as the unflagged form.
+    L.push(`    index:         (params?: ${modelName}SearchState) => client.${clientKey}.index({ ${scopeSpread}...params }).then((env: any) => mergeIndexEnvelope(entityStore, env, _${lc}WireSpecIndex)),`)
+    L.push(`    infiniteIndex: (params?: Omit<${modelName}SearchState, 'page'>) => client.${clientKey}.index({ ${scopeSpread}...params }).then((env: any) => mergeIndexEnvelope(entityStore, env, _${lc}WireSpecIndex)),`)
+    L.push(`    get:           (id: number | string) => client.${clientKey}.get({ ${scopeSpread}id }).then(_${lc}MergeEcho),`)
+    L.push(`    mutateCreate:  (data: ${modelName}Write) => client.${clientKey}.create({ ${scopeSpread}data }).then(_${lc}MergeEcho),`)
+    L.push(`    mutateUpdate:  (id: number | string, data: Partial<${modelName}Write>) => client.${clientKey}.update({ ${scopeSpread}id, data }).then(_${lc}MergeEcho),`)
+    L.push(`    mutateDestroy: (id: number | string) => client.${clientKey}.destroy({ ${scopeSpread}id }).then(_${lc}MergeEcho),`)
+  } else if (ctrl.kind === 'crud' && modelName) {
     L.push(`    index:         (params?: ${modelName}SearchState) => client.${clientKey}.index({ ${scopeSpread}...params }),`)
     L.push(`    infiniteIndex: (params?: Omit<${modelName}SearchState, 'page'>) => client.${clientKey}.index({ ${scopeSpread}...params }),`)
     L.push(`    get:           (id: number | string) => client.${clientKey}.get({ ${scopeSpread}id }),`)
@@ -1047,16 +1161,17 @@ function emitWith(L: string[], ctrl: CtrlMeta, clientKey: string): void {
     L.push(`    mutateUpdate: (data: ${modelName}Write) => client.${clientKey}.update({ ${scopeSpread}data }),`)
   }
 
-  // @mutation
+  // @mutation — flagged doors decode columnar echoes through the store first
+  const echoWrap = wireColumnar ? `.then(_${lc}MergeEcho)` : ''
   for (const mut of ctrl.mutations) {
     const fnName = mut.bulk ? toBulkMutateName(mut.method) : toMutateName(mut.method)
     if (mut.bulk) {
-      L.push(`    ${fnName}: (ids: (number | string)[]) => client.${clientKey}.${mut.method}({ ${scopeSpread}ids }),`)
+      L.push(`    ${fnName}: (ids: (number | string)[]) => client.${clientKey}.${mut.method}({ ${scopeSpread}ids })${echoWrap},`)
     } else if (mut.params?.length) {
       const dataType = `{ ${mut.params.map(pp => `${pp}?: any`).join('; ')} }`
-      L.push(`    ${fnName}: (id: number | string, data?: ${dataType}) => client.${clientKey}.${mut.method}({ ${scopeSpread}id, data }),`)
+      L.push(`    ${fnName}: (id: number | string, data?: ${dataType}) => client.${clientKey}.${mut.method}({ ${scopeSpread}id, data })${echoWrap},`)
     } else {
-      L.push(`    ${fnName}: (id: number | string) => client.${clientKey}.${mut.method}({ ${scopeSpread}id }),`)
+      L.push(`    ${fnName}: (id: number | string) => client.${clientKey}.${mut.method}({ ${scopeSpread}id })${echoWrap},`)
     }
   }
 
@@ -1086,7 +1201,7 @@ function emitWith(L: string[], ctrl: CtrlMeta, clientKey: string): void {
 
 // ── Barrel index ──────────────────────────────────────────────────────────────
 
-function generateBarrel(ctrlProject: CtrlProjectMeta, _outputDir: string): string {
+function generateBarrel(ctrlProject: CtrlProjectMeta, _outputDir: string, hasEntities = false): string {
   const L: string[] = ['// AUTO-GENERATED — DO NOT EDIT', '']
   for (const ctrl of ctrlProject.controllers) {
     L.push(`export * from './${toFileName(ctrl.className)}.gen'`)
@@ -1094,7 +1209,94 @@ function generateBarrel(ctrlProject: CtrlProjectMeta, _outputDir: string): strin
   // the coherence edge table rides the barrel too:
   // import { coherenceEdges } from '@gen/controllers'
   L.push(`export { coherenceEdges } from './_coherence.gen'`)
+  if (hasEntities) L.push(`export { registerEntityFieldKinds } from './_entities.gen'`)
   return L.join('\n') + '\n'
+}
+
+// ── Entity field kinds (_entities.gen.ts) ────────────────────────────────────
+
+/**
+ * Field-kind registration per model, keyed by TABLE name (the store's
+ * identity space — same key the columnar envelope's tables and signal
+ * `resource` use):
+ *   - json/jsonb columns and `.array()` columns → 'jsonb' (structural equality)
+ *   - habtm `<singular>Ids` keys → 'pkArray'
+ *   - `<singular>Ids` pk-array columns emitted for hasMany includes on
+ *     columnar doors → 'pkArray'
+ * Scalars stay unregistered (`!==` is already correct). Registration runs at
+ * module load — flagged controller files import this module for the side
+ * effect, so kinds are live before the first merge.
+ */
+function generateEntityKinds(ctrlProject: CtrlProjectMeta, projectMeta: ProjectMeta): string | null {
+  // hasMany pk-array columns contributed by columnar doors, per model class
+  const columnarIdsByModel = new Map<string, Set<string>>()
+  for (const ctrl of ctrlProject.controllers) {
+    if (ctrl.crudConfig?.wire !== 'columnar' || !ctrl.modelClass) continue
+    const model = projectMeta.models.find(m => m.className === ctrl.modelClass)
+    if (!model) continue
+    const names = new Set([
+      ...includeTopNames(ctrl.crudConfig?.get?.include),
+      ...includeTopNames(ctrl.crudConfig?.index?.include),
+    ])
+    for (const name of names) {
+      const assoc = model.associations.find(a => a.propertyName === name)
+      if (assoc?.kind !== 'hasMany') continue
+      const set = columnarIdsByModel.get(model.className) ?? new Set<string>()
+      set.add(`${singularize(name)}Ids`)
+      columnarIdsByModel.set(model.className, set)
+    }
+  }
+
+  const perTable: Array<{ table: string; kinds: Array<[string, string]> }> = []
+  for (const model of projectMeta.models) {
+    if (model.isSti) continue // subclasses share the parent's table entry
+    const kinds: Array<[string, string]> = []
+    for (const col of projectMeta.schema.tables[model.tableName]?.columns ?? []) {
+      if (col.type === 'json' || col.type === 'jsonb' || col.isArray) kinds.push([col.name, 'jsonb'])
+    }
+    for (const assoc of model.associations) {
+      if (assoc.kind === 'habtm') kinds.push([`${singularize(assoc.propertyName)}Ids`, 'pkArray'])
+    }
+    // columnar-door pk-arrays from this model AND its STI subclasses (one
+    // table, one kinds entry)
+    const classNames = [model.className,
+      ...projectMeta.models.filter(m => m.stiParent === model.className).map(m => m.className)]
+    for (const cn of classNames) {
+      for (const idsKey of columnarIdsByModel.get(cn) ?? []) {
+        if (!kinds.some(([k]) => k === idsKey)) kinds.push([idsKey, 'pkArray'])
+      }
+    }
+    if (kinds.length) perTable.push({ table: model.tableName, kinds })
+  }
+  // Flagged controller files unconditionally `import './_entities.gen'` for
+  // the side effect — a columnar project with zero non-scalar kinds must
+  // still get the module (empty registration), or the generated import
+  // points at nothing and the USER'S build breaks with a resolution error
+  // instead of a teaching one. Unflagged projects keep today's behavior
+  // (no file unless something registers) — flag-off output stays identical.
+  const anyColumnar = ctrlProject.controllers.some(c => c.crudConfig?.wire === 'columnar')
+  if (perTable.length === 0 && !anyColumnar) return null
+
+  const L: string[] = [
+    '// AUTO-GENERATED — DO NOT EDIT',
+    '// Entity field kinds (transport WS1/WS2): per-table non-scalar field',
+    '// declarations for the EntityStore — jsonb/array columns compare',
+    '// structurally, pk-array columns as ordered id lists. Registration runs',
+    '// at module load; flagged controller files import this module for the',
+    '// side effect.',
+    "import { entityStore, type EntityStore } from '@active-drizzle/react'",
+    '',
+    'export function registerEntityFieldKinds(store: EntityStore = entityStore): void {',
+  ]
+  for (const { table, kinds } of perTable) {
+    const body = kinds.map(([k, v]) => `${k}: '${v}'`).join(', ')
+    L.push(`  store.registerFieldKinds('${table}', { ${body} })`)
+  }
+  L.push('}')
+  L.push('')
+  L.push('registerEntityFieldKinds()')
+  L.push('')
+  return L.join('\n')
 }
 
 // ── _client.ts stub ───────────────────────────────────────────────────────────
@@ -1294,9 +1496,15 @@ function emitFormHooks(
   scopeType: string,
   instantResources: Set<string> = new Set(),
   nestedHandleMembers: Array<{ name: string; handleType: string }> = [],
+  wireColumnar = false,
 ): void {
   const clientKey = toClientKey(ctrl)
   const keysName = `${lcFirst(modelName)}Keys`
+  const lc = lcFirst(modelName)
+  // Columnar doors funnel every response through the echo decoder — the
+  // FormSession keeps consuming the nested envelope shape (P6).
+  const echoOpen  = wireColumnar ? `_${lc}MergeEcho(` : ''
+  const echoClose = wireColumnar ? `)` : ''
   // Non-bulk @mutations become PascalCase action members on the handle
   // (<deal.Archive/>). Reserved component names can't be shadowed.
   const RESERVED_HANDLE_MEMBERS = new Set(['Form', 'Submit', 'SaveStatus', 'BaseErrors', 'Conflict', 'Changes', 'Can'])
@@ -1309,9 +1517,10 @@ function emitFormHooks(
       if (mut.label) parts.push(`label: ${JSON.stringify(mut.label)}`)
       if (mut.params?.length) parts.push(`params: [${mut.params.map(pp => `'${pp}'`).join(', ')}]`)
       if (mut.required?.length) parts.push(`required: [${mut.required.map(pp => `'${pp}'`).join(', ')}]`)
+      const echoTail = wireColumnar ? `.then(_${lc}MergeEcho)` : ''
       parts.push(guardCreatedId
-        ? `transport: (data?: any) => { if (${idExpr} == null) return Promise.reject(new Error('[active-drizzle] save the record before running ${mut.method}')); return client.${clientKey}.${mut.method}({ ${scopePrefix}id: ${idExpr}, data }) }`
-        : `transport: (data?: any) => client.${clientKey}.${mut.method}({ ${scopePrefix}id: ${idExpr}, data })`)
+        ? `transport: (data?: any) => { if (${idExpr} == null) return Promise.reject(new Error('[active-drizzle] save the record before running ${mut.method}')); return client.${clientKey}.${mut.method}({ ${scopePrefix}id: ${idExpr}, data })${echoTail} }`
+        : `transport: (data?: any) => client.${clientKey}.${mut.method}({ ${scopePrefix}id: ${idExpr}, data })${echoTail}`)
       parts.push(`onSuccess: () => _adCohere('${model.tableName}', 'update')`)
       out.push(`${indent}  ${mut.method}: { ${parts.join(', ')} },`)
     }
@@ -1377,7 +1586,13 @@ function emitFormHooks(
   L.push(`    : parsed?.isForbidden ? 403`)
   L.push(`    : parsed?.isConflict ? 409`)
   L.push(`    : 500`)
-  L.push(`  return { ok: false, status, ...(parsed?.fields ? { errors: parsed.fields } : {}), ...(parsed?.envelope ? { envelope: parsed.envelope } : {}) }`)
+  if (wireColumnar) {
+    // A 409's fresh-envelope payload is columnar on a flagged door — it is a
+    // real payload at its token: merge it, hand the session the nested shape.
+    L.push(`  return { ok: false, status, ...(parsed?.fields ? { errors: parsed.fields } : {}), ...(parsed?.envelope ? { envelope: _${lc}MergeEcho(parsed.envelope) } : {}) }`)
+  } else {
+    L.push(`  return { ok: false, status, ...(parsed?.fields ? { errors: parsed.fields } : {}), ...(parsed?.envelope ? { envelope: parsed.envelope } : {}) }`)
+  }
   L.push(`}`)
   L.push('')
 
@@ -1418,7 +1633,9 @@ function emitFormHooks(
   L.push(`  const _scopes = ${scopesArg}`)
   L.push(`  const query = useQuery({`)
   L.push(`    queryKey: ${keysName}.detail(id, _scopes as any),`)
-  L.push(`    queryFn: () => client.${clientKey}.get({ ${scopeSpread}id }),`)
+  L.push(wireColumnar
+    ? `    queryFn: async () => ${echoOpen}await client.${clientKey}.get({ ${scopeSpread}id })${echoClose},`
+    : `    queryFn: () => client.${clientKey}.get({ ${scopeSpread}id }),`)
   L.push(`    ...(opts?.poll ? { refetchInterval: (q: any) => {`)
   L.push(`      const d: any = q.state.data`)
   L.push(`      const rec = d && typeof d === 'object' && 'record' in d ? d.record : d`)
@@ -1437,7 +1654,7 @@ function emitFormHooks(
   L.push(`    submit: async ({ data, _event, _version }) => {`)
   L.push(`      try {`)
   L.push(`        // _event / _version are protocol keys, not fields — the controller peels them off`)
-  L.push(`        const res: any = await client.${clientKey}.update({ ${scopeSpread}id, data: { ...data, ...(_event ? { _event } : {}), ...(_version != null ? { _version } : {}) } })`)
+  L.push(`        const res: any = ${echoOpen}await client.${clientKey}.update({ ${scopeSpread}id, data: { ...data, ...(_event ? { _event } : {}), ...(_version != null ? { _version } : {}) } })${echoClose}`)
   L.push(`        applyEntityChange(qc, coherenceEdges, { resource: '${model.tableName}', op: 'update' })`)
   L.push(`        // Envelope responses always flow through so abilities/can re-mask`)
   L.push(`        return { ok: true, ...(res && typeof res === 'object' && 'record' in res ? { envelope: res } : {}) }`)
@@ -1474,9 +1691,9 @@ function emitFormHooks(
   if (actionMuts.length > 0) for (const line of emitActionsOption('    ', 'createdId.current', scopeSpread, true)) L.push(line)
   L.push(`    submit: async ({ data, _event, _version }) => {`)
   L.push(`      try {`)
-  L.push(`        const res: any = createdId.current == null`)
+  L.push(`        const res: any = ${echoOpen}createdId.current == null`)
   L.push(`          ? await client.${clientKey}.create({ ${scopeSpread}data })`)
-  L.push(`          : await client.${clientKey}.update({ ${scopeSpread}id: createdId.current, data: { ...data, ...(_event ? { _event } : {}), ...(_version != null ? { _version } : {}) } })`)
+  L.push(`          : await client.${clientKey}.update({ ${scopeSpread}id: createdId.current, data: { ...data, ...(_event ? { _event } : {}), ...(_version != null ? { _version } : {}) } })${echoClose}`)
   L.push(`        if (createdId.current == null) {`)
   L.push(`          const rid = res && typeof res === 'object' ? ('record' in res ? res.record?.id : res.id) : null`)
   L.push(`          if (rid != null) createdId.current = rid`)
@@ -1544,7 +1761,9 @@ function emitFormHooks(
     // context) can fan coherence invalidation
     L.push(`  useIndexQuery: (params) => { _adQc = useQueryClient(); return useQuery({`)
     L.push(`    queryKey: ${keysName}.list({} as Record<string, never>, params as any),`)
-    L.push(`    queryFn: () => client.${clientKey}.index(params as any),`)
+    L.push(wireColumnar
+      ? `    queryFn: async () => mergeIndexEnvelope(entityStore, await client.${clientKey}.index(params as any), _${lc}WireSpecIndex),`
+      : `    queryFn: () => client.${clientKey}.index(params as any),`)
     L.push(`    // a filter change = a NEW query key; without this the previous`)
     L.push(`    // rows unmount and the page collapses to zero height (bug #7)`)
     L.push(`    placeholderData: keepPreviousData,`)
@@ -1581,7 +1800,9 @@ function emitFormHooks(
       return `{ name: '${f}', kind: '${kind}', label: ${label} }`
     })
     if (fieldEntries.length) L.push(`  fields: [${fieldEntries.join(', ')}],`)
-    L.push(`  mutateRow: (id: number | string, data: Record<string, any>) => client.${clientKey}.update({ id, data }).then((r: any) => { _adCohere('${model.tableName}', 'update'); return r }),`)
+    L.push(wireColumnar
+      ? `  mutateRow: (id: number | string, data: Record<string, any>) => client.${clientKey}.update({ id, data }).then((r: any) => { const out = _${lc}MergeEcho(r); _adCohere('${model.tableName}', 'update'); return out }),`
+      : `  mutateRow: (id: number | string, data: Record<string, any>) => client.${clientKey}.update({ id, data }).then((r: any) => { _adCohere('${model.tableName}', 'update'); return r }),`)
     L.push(`  useEditForm: use${modelName}EditForm,`)
     // Aggregation GET @actions become first-class surface members —
     // <Deals.Stats>{(data) => …}. Keys live under the family root, so the
@@ -1598,6 +1819,115 @@ function emitFormHooks(
     L.push(`}) as unknown as ${surfaceTypeName}`)
     L.push('')
   }
+}
+
+// ── Columnar wire spec emission (flagged doors) ──────────────────────────────
+
+/**
+ * One include-tree node of the wire spec: the compiled reassembly knowledge
+ * a flagged door's client needs to re-nest columnar tables into the nested
+ * shapes app code reads (P6). Names/fks/ids-columns MIRROR the server
+ * serializer's conventions (resolveWireAssociation) — the two are separate
+ * implementations, so the mirroring is pinned by the handshake suite's
+ * spec-vs-runtime assertion rather than merely asserted here.
+ *
+ * `accessInclude` is the door's explicit `access:` include subtree for this
+ * level (when declared): each child node's viewable∪editable becomes the
+ * spec's per-child `fields` mask, which useProjectedRows threads into child
+ * projection (§3a corollary — the store holds the UNION of every door's
+ * fields; each door's read path masks back down to ITS ceiling, children
+ * included).
+ */
+function renderWireSpecIncludes(
+  model: ModelMeta,
+  projectMeta: ProjectMeta,
+  includeSpecs: any[],
+  accessInclude?: Record<string, any>,
+): string {
+  const parts: string[] = []
+  for (const spec of includeSpecs ?? []) {
+    const entries: Array<[string, any[]]> = typeof spec === 'string'
+      ? [[spec, []]]
+      : spec && typeof spec === 'object'
+        ? Object.entries(spec).map(([k, v]) => [k, Array.isArray(v) ? v : []] as [string, any[]])
+        : []
+    for (const [name, children] of entries) {
+      const assoc = model.associations.find(a => a.propertyName === name)
+      if (!assoc) continue // the runtime serializer teaches this one
+      const childTable = assoc.resolvedTable ?? assoc.explicitTable ?? pluralize(name)
+      const childModel = projectMeta.models.find(m => m.tableName === childTable) ?? null
+      const asName = (assoc.options as any)?.as as string | undefined
+      const fk = assoc.kind === 'belongsTo'
+        ? (assoc.foreignKey ?? `${name}Id`)
+        : (assoc.foreignKey ?? (asName ? `${asName}Id` : `${singularize(model.tableName)}Id`))
+      const fields: string[] = [`name: '${name}'`, `table: '${childTable}'`, `kind: '${assoc.kind}'`, `fk: '${fk}'`]
+      if (assoc.kind === 'hasMany') fields.push(`idsColumn: '${singularize(name)}Ids'`)
+      const accessNode = accessInclude?.[name]
+      if (accessNode && (Array.isArray(accessNode.editable) || Array.isArray(accessNode.viewable))) {
+        const childPk = projectMeta.schema.tables[childTable]?.columns.find(c => c.primaryKey)?.name ?? 'id'
+        const mask = [...new Set([childPk, ...(accessNode.editable ?? []), ...(accessNode.viewable ?? [])])]
+        fields.push(`fields: [${mask.map(f => `'${f}'`).join(', ')}]`)
+      }
+      if (children.length && childModel) {
+        fields.push(`includes: ${renderWireSpecIncludes(childModel, projectMeta, children, accessNode?.include)}`)
+      }
+      parts.push(`{ ${fields.join(', ')} }`)
+    }
+  }
+  return `[${parts.join(', ')}]`
+}
+
+/**
+ * Emits the flagged door's wire specs (get + index include trees), the
+ * projected column list for store-materialized list rows, and the echo
+ * decoder every mutation response funnels through.
+ */
+function emitWireSpec(
+  L: string[],
+  ctrl: CtrlMeta,
+  model: ModelMeta,
+  projectMeta: ProjectMeta,
+  modelName: string,
+): void {
+  const lc = lcFirst(modelName)
+  const access = ctrl.crudConfig?.access
+  // access-declared doors may omit get.include in source (the decorator
+  // desugars the access tree into it) — derive the trees the way the runtime
+  // does so the spec matches what the server actually serves.
+  const accessToSpecs = (inc: Record<string, any>): any[] => Object.entries(inc).map(([n, node]) => {
+    const kids = node?.include
+    return kids && Object.keys(kids).length ? { [n]: accessToSpecs(kids) } : n
+  })
+  const accessIncludeSpecs = access?.include && typeof access.include === 'object'
+    ? accessToSpecs(access.include)
+    : []
+  const getIncludes = (ctrl.crudConfig?.get?.include as any[]) ?? (access ? accessIncludeSpecs : [])
+  const idxIncludes = (ctrl.crudConfig?.index?.include as any[]) ?? []
+  // The SAME ceiling source the server's k header uses (get.expose, or the
+  // access node's viewable∪editable) — deriving from expose alone made an
+  // access-narrower-than-expose door render silent undefineds.
+  const expose = effectiveExpose(ctrl.crudConfig) ?? []
+  const idxIdsCols = includeTopNames(idxIncludes)
+    .filter(n => model.associations.find(a => a.propertyName === n)?.kind === 'hasMany')
+    .map(n => `${singularize(n)}Ids`)
+  // The schema's actual pk column — matches the server's k[0] (custom pks included)
+  const pkCol = projectMeta.schema.tables[model.tableName]?.columns.find(c => c.primaryKey)?.name ?? 'id'
+  const fields = [pkCol, ...expose.filter(f => f !== pkCol), ...idxIdsCols.filter(c => !expose.includes(c))]
+
+  L.push(`/** Columnar wire spec — compiled reassembly knowledge for this door's SHOW/echo responses (get include tree). */`)
+  L.push(`const _${lc}WireSpec = { table: '${model.tableName}', pk: '${pkCol}', includes: ${renderWireSpecIncludes(model, projectMeta, getIncludes, access?.include)} }`)
+  L.push(`/** Columnar wire spec for INDEX rows (index include tree). */`)
+  L.push(`const _${lc}WireSpecIndex = { table: '${model.tableName}', pk: '${pkCol}', includes: ${renderWireSpecIncludes(model, projectMeta, idxIncludes, access?.include)} }`)
+  L.push(`/** This door's projected columns — the mask store-materialized list rows read through (§3a corollary: union storage, per-door projection). */`)
+  L.push(`const _${lc}WireFields = [${fields.map(f => `'${f}'`).join(', ')}]`)
+  L.push(`/** Columnar echo decode (P6): entities merge into the EntityStore (per-field M1, version-gated); destroy echoes raise floors via touched; the nested envelope shape app code reads is recomposed. */`)
+  L.push(`const _${lc}MergeEcho = (res: any): any =>`)
+  L.push(`  res && typeof res === 'object' && res.entities`)
+  L.push(`    ? mergeRecordEnvelope(entityStore, res, _${lc}WireSpec)`)
+  L.push(`    : res && typeof res === 'object' && res.touched`)
+  L.push(`      ? (mergeEnvelope(entityStore, res), res)`)
+  L.push(`      : res`)
+  L.push('')
 }
 
 /**
@@ -1628,15 +1958,15 @@ function controllerProjectionFields(
   const expose = ctrl.crudConfig?.get?.expose
   if (expose?.length) {
     const fields = new Set<string>(['id', ...expose])
-    for (const inc of ctrl.crudConfig?.get?.include ?? []) fields.add(inc)
-    for (const inc of ctrl.crudConfig?.index?.include ?? []) fields.add(inc)
+    for (const inc of includeTopNames(ctrl.crudConfig?.get?.include)) fields.add(inc)
+    for (const inc of includeTopNames(ctrl.crudConfig?.index?.include)) fields.add(inc)
     return fields
   }
 
   // Legacy fallback (no expose declared): permit ∪ includes
   const fields = new Set<string>(['id', ...writableFields])
-  for (const inc of ctrl.crudConfig?.get?.include ?? []) fields.add(inc)
-  for (const inc of ctrl.crudConfig?.index?.include ?? []) fields.add(inc)
+  for (const inc of includeTopNames(ctrl.crudConfig?.get?.include)) fields.add(inc)
+  for (const inc of includeTopNames(ctrl.crudConfig?.index?.include)) fields.add(inc)
   return fields
 }
 

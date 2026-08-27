@@ -273,7 +273,7 @@ const EDITABLE = ['name', 'amount', 'notesAttributes', 'briefAttributes'] as con
     nestedAutoSet: { 'notes.reactions': { userId: (ctx) => Number(ctx.userId) } },
   },
   update: {
-    optimisticLock: true,                   // 409 conflicts; true = updatedAt (model must touch it), or 'lockVersion' (numeric auto-increments)
+    optimisticLock: true,                   // 409 conflicts; true = the model's INTEGER locking column (`lockVersion: integer('lock_version').notNull().default(0)` by convention, `static lockingColumn` to rename) — timestamps are refused (WS0)
     permit: (_ctx, ctrl, deal) =>           // record- and role-aware
       ctrl.state.user.isAdmin() ? [...EDITABLE, 'ownerId'] : deal.isDraft() ? [...EDITABLE] : [],
   },
@@ -291,6 +291,61 @@ RULES:
 - `apply` in named filters gets the ALREADY-SCOPED relation: narrowing only.
 - Custom endpoints: `@mutation() async archive() {...}` (writes; POST) and
   `@action('GET') async stats() {...}` (reads; GET aggregation route, §3).
+
+### 3.5 The columnar wire flag (`wire: 'columnar'`) — per-door, default off
+
+```ts
+@crud(Deal, {
+  wire: 'columnar',          // ← the door is the migration unit
+  get: { expose: [...], abilities: true, include: [{ notes: ['author'] }] },
+  update: { optimisticLock: true, permit: [...] },   // REQUIRED with a hasMany include
+})
+```
+
+Flips THIS door (server responses AND its generated hooks — one extracted
+source drives both, they cannot disagree) onto the normalized columnar
+envelope (DESIGN-wire-identity §1/§2): entity tables keyed by TABLE name
+with a self-describing `k` header (`k[0]` = pk), a parallel per-row `v`
+token array (the lock int; `null` = untracked), membership
+(pks/pagination/facets/chart/metric/options/emptyReason) separated from
+entity values, included hasMany as an ordered pk-array column on the owner
+plus child rows in their own table, `_key` stitching in `meta.nestedKeys`.
+Every echo path — get, create/update, 409 conflicts, `this.envelope()` in
+@mutations, destroy (`{ success, touched }`) — speaks the same serializer.
+Flagged doors also load includes FLAT: one batched query per included table
+instead of the nested RQB query.
+
+App code sees none of it (P6): generated hooks still return
+`{ data, pagination, facets?, ctx? }` / `{ record, abilities, can, version }`
+— but flag-on list rows materialize from the EntityStore and update LIVE as
+fresher merges land (deliberate, not a parity bug; `keepPreviousData` rows
+keep updating during page transitions).
+
+The codegen gate refuses (teaching errors, build time): no `get.expose`
+(the k header IS the column picking); no `get.abilities` (flagged doors
+always serve the record envelope — a bare-record door would change its hook
+shape on flip); a hasMany include without `update.optimisticLock` (the
+pk-array is versioned with the owner — no CAS, no array), and at depth ≥ 2
+the OWNING model must carry its own lock column; a hasOne in the INDEX
+include tree (list rows cannot re-nest it); STI-parent doors whose
+subclasses diverge in exposed fields (columnar JSON cannot express per-row
+absence); habtm / hasMany-through / polymorphic-belongsTo includes (give
+them their own doors); and on `access:` doors, any include outside the
+access tree (the explicit ceiling is total — the runtime serializer throws
+the same refusal).
+
+CUSTOM `destroy()` on a flagged door: the default destroy echoes
+`{ success, touched: [{ resource, id, op: 'destroy', version }] }` — the
+token the client store needs to raise its deletion floor. A hand-written
+`destroy()` that returns anything else leaves the destroyed record LIVE in
+the EntityStore (lists hide it on refetch; detail/projected surfaces keep
+rendering it). Return the same `touched` shape (`version` = lock + 1), or
+don't override destroy on a columnar door.
+
+Migration story: flip ONE door, run its parity tests
+(`packages/controller/tests/columnar-parity.test.ts` is the template),
+record its measured payload numbers, move on. `'nested'` stays the default
+until the tracker says flip.
 
 ## 4. Frontend — forms (generated)
 
