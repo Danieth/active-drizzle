@@ -242,7 +242,7 @@ export function buildRouter<TContext = Record<string, any>>(
     // (hono registers routes[] in array order) would otherwise match
     // GET /splice as GET /:id with id='splice' and 400 on the id parse.
     if (usesColumnar(config)) {
-      registerColumnarDoorTransport(model, config, basePath)
+      registerColumnarDoorTransport(model, config, basePath, { scopes })
 
       // The two procedure names are RESERVED on a columnar door: a custom
       // @mutation/@action of the same name would silently overwrite the

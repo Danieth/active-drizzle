@@ -4,6 +4,7 @@ import { getExecutor, getSchema, MODEL_REGISTRY, transaction, transactionContext
 import { modelClassName } from './class-name.js'
 import { lockingColumnFor } from './optimistic-lock.js'
 import { isWriteLogged, writeLogRows, softDeleteColumnFor, LIFECYCLE } from './write-log.js'
+import { emitCommitEvents, lifecycleToOp } from './transport-events.js'
 import { reportError } from './error-reporting.js'
 import type { ApplicationRecord } from './application-record.js'
 
@@ -1185,7 +1186,7 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
         // ONE multi-row log INSERT + at most ONE tag bump per door for the
         // whole call (writeLogRows) — a bulk soft-delete must not issue 2N
         // sequential statements while holding the hot counter row.
-        await writeLogRows(db, this._tableName, rows
+        const loggedRows = rows
           .filter(row => typeof row.token === 'number' && row.pk != null)
           .map(row => {
             // Lifecycle from the NEW soft-delete value when the bulk write
@@ -1196,7 +1197,14 @@ export class Relation<TModel extends ApplicationRecord = any, TRelations = Recor
               lifecycle = row.soft != null ? LIFECYCLE.destroy : LIFECYCLE.undelete
             }
             return { pk: row.pk, token: row.token, changed: changedKeys, lifecycle }
-          }))
+          })
+        await writeLogRows(db, this._tableName, loggedRows)
+        // WS4 commit-event tap: bulk updates are ids-only events (no live
+        // instances — the emitter's SIGNAL lane; C1 heals via pull).
+        emitCommitEvents(loggedRows.map(r => ({
+          table: this._tableName, pk: r.pk, token: r.token,
+          op: lifecycleToOp(r.lifecycle), changedKeys,
+        })))
         return rows.length
       }
       const inSameDbTx = transactionContext.getStore() !== undefined

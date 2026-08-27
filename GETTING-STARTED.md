@@ -116,7 +116,7 @@ options pickers, @mutation buttons, `<Can>`, skeletons, contract probes).
 // trails.config.ts — JS, not JSON; ONE file; envs are inline overrides
 export default defineConfig({
   server:   { port: 8787 },
-  channels: { bus: process.env.REDIS_URL ? 'redis' : 'memory' },
+  channels: { bus: 'memory' },   // multi-process: opt into 'pg-notify'
   environments: {
     production: { channels: { revalidate: 'always' } },
   },
@@ -133,7 +133,42 @@ envelope — entity-store-backed live rows, per-row version tokens, smaller
 raw payloads (compressed sizes are ~parity), same hook API.
 Default is `'nested'`; migrate door by door. Details: LLM-GUIDE §3.5.
 
-## 6. The loop
+## 6. Live channels (WebSocket)
+
+Doors with `wire: 'columnar'` also push live updates: the scaffold
+attaches a WebSocket gateway to the **same** HTTP server at `/cable`
+(configurable via `channels.path`) and mounts `POST /cable/token` — a
+one-time, ~10s upgrade token minted through your own auth (the same
+`contextFor` the `/rpc` handler uses; there is no second auth system).
+You enable nothing: `trails new` boots with channels live on the
+in-memory bus.
+
+What operators must know, compressed (full manual: `docs/guide/channels.md`):
+
+- **Push is latency, pull is correctness.** Delivery is best-effort, no
+  outbox — a lost frame heals on the client's next revalidation pull.
+  Killing the socket layer loses liveness, never data.
+- **`bus: 'memory'` (default) is single-process.** Two API processes on
+  it means a write on one is not pushed to sockets on the other (they
+  stay eventually-fresh via pull). Multi-process: `bus: 'pg-notify'` —
+  ids-only over Postgres NOTIFY, needs a session-mode connection
+  (PgBouncer transaction pooling breaks LISTEN; a boot probe refuses
+  loudly), and watch for `class 1262 … database 0` lock waits — the
+  saturation signal to move to a real broker. `'redis'`/`'nats'` are
+  teaching stubs that throw; implement `ChannelBus` and pass it to
+  `attachChannels({ bus })`.
+- **Production refuses to boot without `channels.originAllowlist`** —
+  the Origin check is what stops cross-site WebSocket hijacking.
+- Frames are door-projected with a silence rule (a change outside
+  `expose` publishes nothing); permission changes take effect within
+  `revalidate` seconds (default 30, `'always'` = paranoid) via a RESET
+  frame, never a silent drop.
+- 25s heartbeats sit under proxy idle timeouts (Cloudflare 100s,
+  ALB/nginx 60s); deploys drain with close 1001 → clients fast-reconnect
+  and revalidate. Behind a load balancer, token mint + upgrade must hit
+  the same process (sticky sessions) for now.
+
+## 7. The loop
 
 1. Edit schema/model/controller → save → codegen runs → typed client is
    current. (`npm run regen` if you ever suspect staleness.)

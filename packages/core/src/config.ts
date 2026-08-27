@@ -19,8 +19,7 @@
  *   export default defineConfig({
  *     server:   { port: 8787 },
  *     database: { url: process.env.DATABASE_URL ?? 'postgres://localhost/dev' },
- *     channels: { bus: process.env.REDIS_URL ? 'redis' : 'memory',
- *                 redisUrl: process.env.REDIS_URL },
+ *     channels: { bus: 'memory' },   // multi-process: opt into 'pg-notify'
  *     environments: {
  *       production: { channels: { revalidate: 'always' } },
  *       test:       { server: { port: 0 } },
@@ -29,18 +28,147 @@
  */
 
 export interface ChannelsConfig {
-  /** Fan-out bus. 'memory' = single process. 'redis' = multi-process:
-   *  every server publishes commits AND forwards bus frames to its own
-   *  sockets — set REDIS_URL and it works (DESIGN-ws-channels §8). */
-  bus?: 'memory' | 'redis'
+  /**
+   * Fan-out bus tier (transport WS4). 'memory' (default) = single process,
+   * zero infrastructure. 'pg-notify' = multi-process FALLBACK over Postgres
+   * LISTEN/NOTIFY — deliberately opt-in, never a silent default: NOTIFY
+   * takes a global commit-order lock (the `class 1262 … database 0`
+   * lock-wait is the overload signal) and needs a session-mode connection
+   * (PgBouncer transaction pooling breaks LISTEN). 'redis' / 'nats' are
+   * typed adapter stubs today (their constructors teach).
+   */
+  bus?: 'memory' | 'pg-notify' | 'redis' | 'nats'
   redisUrl?: string | undefined
-  /** WS mount path on the HTTP server. */
+  /** WS mount path on the HTTP server. Default '/cable'. */
   path?: string
-  /** Door re-verification on emit: seconds of TTL cache, or 'always'. */
+  /**
+   * Browser Origins allowed to open the WebSocket (CSWSH — the upgrade
+   * request rides ambient cookies, so Origin is the ONLY thing separating
+   * your app from evil.example embedding a socket to it; landmine 6).
+   * REQUIRED in production when serving; development defaults to localhost.
+   */
+  originAllowlist?: string[]
+  /**
+   * Server heartbeat interval, ms (default 25000). Protocol-level ws pings —
+   * values above 55000 outlive common proxy idle timeouts (Cloudflare 100s,
+   * ALB/nginx 60s default) and are warned about at boot.
+   */
+  heartbeatMs?: number
+  /**
+   * Frame coalescing window per channel, ms (default 25, clamped 20–50):
+   * same-pk commits inside the window supersede; multi-row batches share
+   * one CHANGE frame. Safe ONLY because frames are absolute values with
+   * tokens under Rule M (C1) — a future delta lane must bypass coalescing.
+   */
+  coalesceMs?: number
+  /**
+   * Door re-verification on emit: seconds of TTL cache (default 30), or
+   * 'always' (the paranoid tier). Gates BOTH lanes: record subs re-check by
+   * reloading through the door; index subs re-run the index dry-run; an
+   * expired-pass destroy frame downgrades to RESET (the re-SUB re-answers
+   * it through the door's validate/tombstone fences). Inside the TTL a
+   * just-revoked subscriber can receive up to this many seconds of frames —
+   * the T9 bounded leak, accepted and stated here rather than discovered.
+   */
   revalidate?: number | 'always'
+  /**
+   * Resource caps per gateway process (authenticated-DoS bounds; every SUB
+   * dry-run is a real DB query and every connection holds buffers):
+   * maxConnections refuses upgrades with 503 at the cap (default 10000);
+   * maxSubsPerConnection refuses further SUBs with SUB_LIMIT (default 256)
+   * — it is also the SUB rate-limiter's burst size (a reconnect re-SUBs
+   * everything at once; sustained abuse beyond ~20 SUB/s answers
+   * RATE_LIMITED). Client payload frames are capped at 64KB (`ws`
+   * maxPayload — control frames are tiny; CHANGE is server→client only).
+   */
+  maxConnections?: number
+  maxSubsPerConnection?: number
   /** 'serve' = hold sockets here (default). 'publish-only' = API processes
    *  in the dedicated channels-role topology (tier 3). */
   role?: 'serve' | 'publish-only'
+  /**
+   * One-time WS upgrade token TTL, ms (default 10000). Minted over authed
+   * HTTP, consumed once at upgrade — short + single-use is why a
+   * query-string token is acceptable here (browsers cannot set upgrade
+   * headers; the never-in-query-strings rule targets long-lived
+   * credentials). NOTE: the token map is in-memory — mint and upgrade must
+   * hit the SAME process (sticky LB) until a shared store ships.
+   */
+  tokenTtlMs?: number
+}
+
+/** ChannelsConfig with every default applied — what the gateway/bus read. */
+export interface ResolvedChannelsConfig {
+  bus: 'memory' | 'pg-notify' | 'redis' | 'nats'
+  redisUrl: string | undefined
+  path: string
+  originAllowlist: string[] | undefined
+  heartbeatMs: number
+  coalesceMs: number
+  revalidate: number | 'always'
+  role: 'serve' | 'publish-only'
+  tokenTtlMs: number
+  maxConnections: number
+  maxSubsPerConnection: number
+}
+
+/**
+ * Apply the channel defaults (transport WS4 — ChannelsConfig's first
+ * consumer). Pure: refusals live in assertChannelsServable so read-only
+ * tooling can resolve without booting a gateway.
+ */
+export function resolveChannelsConfig(channels: ChannelsConfig = {}): ResolvedChannelsConfig {
+  const coalesceRaw = channels.coalesceMs ?? 25
+  return {
+    bus: channels.bus ?? 'memory',
+    redisUrl: channels.redisUrl,
+    path: channels.path ?? '/cable',
+    originAllowlist: channels.originAllowlist,
+    heartbeatMs: channels.heartbeatMs ?? 25_000,
+    // Clamp 20–50: below 20ms coalescing stops paying for itself (frame per
+    // keystroke), above 50ms typing latency is human-visible.
+    coalesceMs: Math.min(50, Math.max(20, coalesceRaw)),
+    revalidate: channels.revalidate ?? 30,
+    role: channels.role ?? 'serve',
+    tokenTtlMs: channels.tokenTtlMs ?? 10_000,
+    maxConnections: channels.maxConnections ?? 10_000,
+    maxSubsPerConnection: channels.maxSubsPerConnection ?? 256,
+  }
+}
+
+/**
+ * Boot-time teaching gates for a SERVING gateway. Throws (never warns) on
+ * configurations that would run while silently broken; warns on the
+ * heartbeat foot-gun. `env` defaults to NODE_ENV.
+ */
+export function assertChannelsServable(
+  resolved: ResolvedChannelsConfig,
+  env: string = process.env.NODE_ENV || 'development',
+): void {
+  if (resolved.role === 'publish-only' && resolved.bus === 'memory') {
+    throw new Error(
+      `trails.config channels: role 'publish-only' with bus 'memory' publishes frames to nowhere — ` +
+      `an in-memory bus never leaves this process, and a publish-only process holds no sockets. ` +
+      `Set a cross-process bus (bus: 'pg-notify') or drop role: 'publish-only'.`,
+    )
+  }
+  if (env === 'production' && resolved.role === 'serve'
+      && (!resolved.originAllowlist || resolved.originAllowlist.length === 0)) {
+    throw new Error(
+      `trails.config channels: originAllowlist is required in production. The WS upgrade request ` +
+      `carries the browser's ambient cookies, so WITHOUT an Origin check any site the user visits ` +
+      `can open an authenticated socket to your app (cross-site WebSocket hijacking). List your ` +
+      `app origins: channels: { originAllowlist: ['https://app.example.com'] }.`,
+    )
+  }
+  if (resolved.heartbeatMs > 55_000) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[active-drizzle] channels.heartbeatMs = ${resolved.heartbeatMs} outlives common proxy idle ` +
+      `timeouts (Cloudflare 100s fixed, ALB and nginx 60s default) — idle sockets will be severed ` +
+      `by infrastructure between heartbeats. 25000 (the default) is a safe ceiling.`,
+    )
+  }
 }
 
 export interface TrailsConfig {

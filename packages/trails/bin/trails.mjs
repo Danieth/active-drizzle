@@ -195,9 +195,12 @@ export default defineConfig({
   // zero setup, data resets on restart, loudly announced at boot.
   database: { url: process.env.DATABASE_URL },
   channels: {
-    // memory = single process. Set REDIS_URL and multi-process just works.
-    bus: process.env.REDIS_URL ? 'redis' : 'memory',
-    redisUrl: process.env.REDIS_URL,
+    // memory = single process, zero infrastructure (the default). Running
+    // multiple processes? Opt into bus: 'pg-notify' (Postgres LISTEN/NOTIFY
+    // over database.url — needs a session-mode connection; boot probes and
+    // teaches if a pooler breaks it). Non-memory tiers are ALWAYS explicit
+    // opt-ins — never keyed off ambient env vars.
+    bus: 'memory',
   },
   environments: {
     production: {},
@@ -381,12 +384,17 @@ export class PostController extends ApplicationController {}
   'server/main.ts': `/**
  * Boot: db (real PG or dev PGlite — see server/db/index.ts) → models →
  * router → RPCHandler at /rpc. Port from trails.config.ts.
+ *
+ * Channels (live frames over WebSocket) attach to the SAME http server at
+ * config.channels.path (default /cable). The one-time upgrade token is
+ * minted below on your own authed HTTP surface — the app's existing auth IS
+ * the socket's identity; there is no second auth system.
  */
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
 import { RPCHandler } from '@orpc/server/fetch'
 import { boot, loadConfig } from '@active-drizzle/core'
-import { buildRouter } from '@active-drizzle/controller'
+import { buildRouter, attachChannels } from '@active-drizzle/controller'
 
 import * as schema from './db/schema.ts'
 import { db } from './db/index.ts'
@@ -404,21 +412,40 @@ if ((await Post.all().count()) === 0) {
   await Post.create({ title: 'A draft to edit', body: 'Open it and type — it autosaves.' })
 }
 
-const { router } = buildRouter(PostController)
-const rpc = new RPCHandler({ posts: router })
+const posts = buildRouter(PostController)
+const rpc = new RPCHandler({ posts: posts.router })
+
+// ONE context builder — the /rpc handler and the channel-token mint below
+// must derive identity the same way (swap the x-user-id header for your
+// real session auth in both places when you add users).
+const contextFor = (c: { req: { header(name: string): string | undefined } }) =>
+  ({ userId: Number(c.req.header('x-user-id')) || undefined })
 
 const app = new Hono()
 app.use('/rpc/*', async (c) => {
   const { matched, response } = await rpc.handle(c.req.raw, {
     prefix: '/rpc',
-    context: { userId: Number(c.req.header('x-user-id')) || undefined },
+    context: contextFor(c),
   })
   return matched ? response : c.notFound()
 })
 
 const config = await loadConfig()
 const port = config.server?.port ?? 8787
-serve({ fetch: app.fetch, port })
+
+// serve() returns the underlying node:http server — the WS upgrade rides it.
+const server = serve({ fetch: app.fetch, port })
+const channels = await attachChannels(server as any, {
+  routers: [posts],
+  config,
+})
+
+// The mint route: authed HTTP in, one-time short-lived upgrade token out.
+// Browsers cannot set headers on a WS upgrade (and cookies alone are
+// CSWSH-vulnerable), so the client fetches this token and dials
+// ws://…\${channels.path}?token=…  — single-use, ~10s TTL.
+app.post(\`\${channels.path}/token\`, (c) => c.json({ token: channels.mintToken(contextFor(c)) }))
+
 console.log(\`\${'${name}'} API on http://localhost:\${port}\`)
 `,
 
@@ -513,7 +540,8 @@ npm run dev
 - **server/models/Post.model.ts** — attributes, validations, scopes
 - **server/controllers/Post.ctrl.ts** — the door: expose/permit/search/facets
 - **trails.config.ts** — the ONE config file (env overrides inline; secrets
-  via process.env — set REDIS_URL when you run more than one process)
+  via process.env — opt into \`channels: { bus: 'pg-notify' }\` when you
+  run more than one process)
 - **src/App.tsx** — generated surface + form; register presenters to
   replace the labeled scaffolding
 

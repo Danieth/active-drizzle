@@ -7,6 +7,7 @@ import { lockingColumnFor } from './optimistic-lock.js'
 import {
   isWriteLogged, writeLogRow, writeLogRows, fieldNumberingFor, fullBitmap, softDeleteColumnFor, LIFECYCLE,
 } from './write-log.js'
+import { emitCommitEvents, hasCommitPublishers, lifecycleToOp } from './transport-events.js'
 import { runHooks, collectHooks } from './hooks.js'
 import type { AttrEnumConfig, AttrStateConfig } from './attr.js'
 import { stateCanFire, stateLegalMove } from './attr.js'
@@ -351,9 +352,14 @@ export class ApplicationRecord {
         const db = getExecutor(tableName)
         const inserted: any[] = await db.insert(table).values(rows)
           .returning({ pk: table[pkField], token: table[lockCol] })
-        await writeLogRows(db, tableName, inserted
-          .filter(r => r.pk != null && typeof r.token === 'number')
+        const logged = inserted.filter(r => r.pk != null && typeof r.token === 'number')
+        await writeLogRows(db, tableName, logged
           .map(r => ({ pk: r.pk, token: r.token, changed: full, lifecycle: LIFECYCLE.create })))
+        // WS4 commit-event tap: bulk creates are ids-only events (no live
+        // instances here) — the emitter's SIGNAL lane; C1 heals via pull.
+        emitCommitEvents(logged.map(r => ({
+          table: tableName, pk: r.pk, token: r.token, op: 'create' as const, changedKeys: [],
+        })))
         return inserted.length
       }
       return _inTransactionOn(Ctor)
@@ -936,6 +942,20 @@ export class ApplicationRecord {
             changed: [],
             lifecycle: LIFECYCLE.destroy,
           })
+          // WS4 commit-event tap (deferred via afterCommitQueue — the wrap
+          // is forced for logged models, so rollback discards this). The
+          // record snapshot carries the scope columns the emitter routes
+          // membership by (A2: frozen at the write point).
+          if (hasCommitPublishers()) {
+            emitCommitEvents([{
+              table: ctor.tableName as string,
+              pk: _getPkValue(ctor, this._attributes),
+              token: loadedVersion + 1,
+              op: 'destroy',
+              changedKeys: [],
+              record: _commitEventSnapshot(this, ctor),
+            }])
+          }
         }
       } else {
         await db.delete(table).where(where)
@@ -1928,6 +1948,12 @@ async function _adjustCounterCaches(record: any, ctor: any, delta: 1 | -1): Prom
             changed: [counterCol],
             lifecycle: LIFECYCLE.none,
           })
+          // WS4 commit-event tap: the parent moved without a live instance
+          // in hand — ids-only event (SIGNAL lane; the rumor is enough).
+          emitCommitEvents([{
+            table: parentTableName, pk: row.pk, token: row.token,
+            op: 'update', changedKeys: [counterCol],
+          }])
         }
       } else {
         await db
@@ -2070,6 +2096,25 @@ function _destroyNeedsTransaction(ctor: any): boolean {
 }
 
 /**
+ * WS4 (A2): the commit event's record is a SNAPSHOT instance frozen at the
+ * write point, never the live instance. A2 requires every frame carrying
+ * fields F at token V to be computed from ONE committed snapshot with
+ * v(r)=V — but the gateway coalesces events for 20–50ms before serializing,
+ * and app code can mutate the live record (or start a second save) inside
+ * that window, pairing uncommitted values with a committed token. The 304
+ * machinery then makes the phantom PERMANENT (the write-log says nothing
+ * changed since V, so validation certifies it). A fresh instance over a
+ * shallow copy of `_attributes` (the raw committed values; loaded
+ * associations ride by reference for belongsTo linkage) is exactly the
+ * serializer's own hydration shape and is immune to later mutation of the
+ * live record. Cost: one shallow clone per logged commit, only when a
+ * publisher is registered.
+ */
+function _commitEventSnapshot(record: any, ctor: any): any {
+  return new ctor({ ...record._attributes }, false)
+}
+
+/**
  * WS3 (O10): persist this commit's write-log row — called from inside
  * runWritePhase on the phase's own executor, right after _previousChanges
  * is populated. Skips models that are not logged, tokens that are not
@@ -2114,6 +2159,18 @@ async function _writeRecordLog(record: any, ctor: any, db: any, isNew: boolean):
     changed: isNew ? fullBitmap(fieldNumberingFor(tableName)) : changedKeys,
     lifecycle,
   })
+  // WS4 commit-event tap: same site, same facts, deferred through the
+  // afterCommitQueue (never emitted in-tx; discarded on rollback). A
+  // SNAPSHOT of the record rides along — the tier-0 CHANGE-frame
+  // short-circuit, immune to post-save mutation of the live instance (A2:
+  // the frame's values must be the committed state at `token`, and the
+  // gateway serializes at coalesce-flush time, not here).
+  if (hasCommitPublishers()) {
+    emitCommitEvents([{
+      table: tableName, pk, token, op: lifecycleToOp(lifecycle), changedKeys,
+      record: _commitEventSnapshot(record, ctor),
+    }])
+  }
 }
 
 /** First human-readable validation message off a failed nested child. */

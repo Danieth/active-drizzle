@@ -116,7 +116,14 @@ export interface ValidatableMask {
   projId: string
 }
 
-export function validatableMask(model: any, config: CrudConfig): ValidatableMask {
+/**
+ * The shared mask rule: pk + exposed columns (through columnKeyFor) + the
+ * belongsTo FK linkage columns of the given include tree, minus the lock
+ * column (the token is never a wire field — WS0). ONE rule for the validate
+ * lane (get includes) and the frame lanes (get vs index includes — the
+ * silence-rule ceiling is per VIEW, transport WS4).
+ */
+function maskColumnSet(model: any, config: CrudConfig, includeSpecs: any[] | undefined): Set<string> {
   const tableName: string = (model as any)?._activeDrizzleTableName ?? (model as any)?.tableName
   const numbering = fieldNumberingFor(tableName)
   const physical = new Set(numbering)
@@ -129,7 +136,7 @@ export function validatableMask(model: any, config: CrudConfig): ValidatableMask
   }
   // Included belongsTo FKs are linkage columns of the door's projection even
   // when expose omits them (the serializer ships them the same way).
-  for (const entry of normalizeIncludeSpecs((config.get?.include ?? []) as any[], modelClassName(model))) {
+  for (const entry of normalizeIncludeSpecs((includeSpecs ?? []) as any[], modelClassName(model))) {
     const meta = resolveWireAssociation(model, entry.name)
     if (meta?.kind === 'belongsTo' && meta.foreignKey && physical.has(meta.foreignKey)) {
       mask.add(meta.foreignKey)
@@ -137,7 +144,13 @@ export function validatableMask(model: any, config: CrudConfig): ValidatableMask
   }
   const lockCol = resolveLockColumnName((model as any)?.lockingColumn)
   if (lockCol) mask.delete(lockCol)          // the token is never a wire field (WS0)
-  const fields = [...mask]
+  return mask
+}
+
+export function validatableMask(model: any, config: CrudConfig): ValidatableMask {
+  const tableName: string = (model as any)?._activeDrizzleTableName ?? (model as any)?.tableName
+  const numbering = fieldNumberingFor(tableName)
+  const fields = [...maskColumnSet(model, config, config.get?.include as any[])]
   return {
     fields,
     indices: fields.map(f => numbering.indexOf(f)).filter(i => i >= 0),
@@ -149,12 +162,64 @@ export function validatableMask(model: any, config: CrudConfig): ValidatableMask
 //    logged set — called by buildRouter for every columnar door) ─────────────
 
 /**
+ * One retained columnar door — the shared registry the WS4 emitter and
+ * gateway read (populated by buildRouter with ZERO new app wiring; the
+ * write-log registration below is its side effect). Masks are computed
+ * LAZILY (registration can precede boot(); fieldNumberingFor needs the
+ * booted schema) and memoized.
+ */
+export interface ColumnarDoorTransportEntry {
+  /** The door id = its basePath (scope segments included) — channel key root. */
+  doorId: string
+  model: any
+  config: CrudConfig
+  tableName: string
+  pkField: string
+  /** URL @scope segments (paramName ↔ column field) — membership routing. */
+  scopes: Array<{ paramName: string; field: string; resource: string }>
+  /** Door has a scopeBy fn (ctx-dependent scope ⇒ dry-run routing only). */
+  hasScopeBy: boolean
+  /** Record-channel silence-rule mask (get projection), lazily computed. */
+  getMask(): Set<string>
+  /** Index-channel silence-rule mask (index projection), lazily computed. */
+  indexMask(): Set<string>
+}
+
+const _doorRegistry = new Map<string, ColumnarDoorTransportEntry>()
+
+/** Every retained columnar door (emitter fanout walks this). */
+export function columnarDoorRegistry(): ColumnarDoorTransportEntry[] {
+  return [..._doorRegistry.values()]
+}
+
+/** One door by id (gateway SUB resolution). */
+export function columnarDoorFor(doorId: string): ColumnarDoorTransportEntry | undefined {
+  return _doorRegistry.get(doorId)
+}
+
+/** The doors served from one table (emitter fanout). */
+export function columnarDoorsForTable(tableName: string): ColumnarDoorTransportEntry[] {
+  return [..._doorRegistry.values()].filter(e => e.tableName === tableName)
+}
+
+/** Test/boot hygiene — mirrors resetWriteLogRegistry. */
+export function resetColumnarDoorRegistry(): void {
+  _doorRegistry.clear()
+}
+
+/**
  * Registers everything a columnar door implies for the transport substrate:
  * the root model and every lock-tokened model reachable through its include
- * trees become write-logged, and the door's membership counter is bound to
- * the root table. Derived, never a knob (Rails-or-better: zero new config).
+ * trees become write-logged, the door's membership counter is bound to the
+ * root table, and the door is RETAINED in the transport registry the WS4
+ * emitter/gateway share. Derived, never a knob (zero new config).
  */
-export function registerColumnarDoorTransport(model: any, config: CrudConfig, doorId: string): void {
+export function registerColumnarDoorTransport(
+  model: any,
+  config: CrudConfig,
+  doorId: string,
+  extras: { scopes?: Array<{ paramName: string; field: string; resource: string }> } = {},
+): void {
   if (!usesColumnar(config)) return
   const seen = new Set<any>()
   const walk = (m: any, specs: any[] | undefined): void => {
@@ -170,7 +235,37 @@ export function registerColumnarDoorTransport(model: any, config: CrudConfig, do
   walk(model, config.index?.include as any[])
   seen.delete(model)                          // include trees may re-walk the root
   const tableName: string = (model as any)?._activeDrizzleTableName ?? (model as any)?.tableName
-  if (tableName && isWriteLogged(tableName)) registerMembershipDoor(tableName, doorId)
+  if (tableName && isWriteLogged(tableName)) {
+    // URL-scope columns are membership columns: a scope-column VALUE write
+    // re-tenants the row (moves it between tenants' lists), so it must bump
+    // the door's tag in-commit like a lifecycle write (O5 — WS4 consumes
+    // tag-equality as a reconnect skip, so value-driven membership moves
+    // need the bump). scopeBy doors derive scope from ctx at call time — no
+    // static column to register; their lists heal on refetch/reconnect.
+    const membershipColumns = (extras.scopes ?? [])
+      .map(s => {
+        try { return columnKeyFor(model, s.field) ?? s.field } catch { return s.field }
+      })
+    registerMembershipDoor(tableName, doorId, membershipColumns)
+  }
+
+  // ── Retain the door for the WS4 emitter/gateway (idempotent by doorId) ────
+  if (tableName) {
+    const pkRaw = (model as any)?.primaryKey
+    let getMaskMemo: Set<string> | null = null
+    let indexMaskMemo: Set<string> | null = null
+    _doorRegistry.set(doorId, {
+      doorId,
+      model,
+      config,
+      tableName,
+      pkField: typeof pkRaw === 'string' ? pkRaw : 'id',
+      scopes: extras.scopes ?? [],
+      hasScopeBy: typeof (config as any).scopeBy === 'function',
+      getMask() { return getMaskMemo ??= maskColumnSet(model, config, config.get?.include as any[]) },
+      indexMask() { return indexMaskMemo ??= maskColumnSet(model, config, config.index?.include as any[]) },
+    })
+  }
 
   // ── Mask-drift diagnostic (the ONE known codegen/runtime divergence) ──────
   // An Attr that maps a property to a DIFFERENTLY-NAMED column lands in the

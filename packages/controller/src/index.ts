@@ -104,10 +104,47 @@ export {
   defaultValidate,
   validatableMask,
   registerColumnarDoorTransport,
+  columnarDoorRegistry,
+  columnarDoorFor,
+  columnarDoorsForTable,
+  resetColumnarDoorRegistry,
   type ValidateInput,
   type ValidateResult,
   type ValidatableMask,
+  type ColumnarDoorTransportEntry,
 } from './validate-handler.js'
+
+// Channels (transport WS4 — gateway, emitter, bus tiers)
+export {
+  MemoryBus,
+  PgNotifyBus,
+  RedisBus,
+  NatsBus,
+  createBus,
+  pgBouncerTeachingError,
+  type ChannelBus,
+  type BusCommitEvent,
+  type BusListener,
+  type PgNotifyBusOptions,
+} from './channels/bus.js'
+export {
+  startChannelEmitter,
+  recordChannel,
+  indexChannel,
+  indexChannelsFor,
+  scopeHashOf,
+  changeIntersectsMask,
+  frameIncludeNames,
+  buildChangeSliceBytes,
+  destroySliceBytes,
+  sliceBytesFromEnvelope,
+  type ChangeSlice,
+} from './channels/emitter.js'
+export {
+  attachChannels,
+  type AttachChannelsOptions,
+  type ChannelsHandle,
+} from './channels/gateway.js'
 
 // Membership lane (transport WS3 — O5 counter tags, structure tokens, O15 splice)
 export {

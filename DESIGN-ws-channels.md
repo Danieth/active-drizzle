@@ -4,6 +4,20 @@
 the signal-only doctrine as the PRIMARY lane; signal-only survives as the
 degraded mode and the untrusted-transport fallback.
 
+> **PARTIALLY SUPERSEDED (2026-08-27, transport WS4 landing).**
+> DESIGN-transport-work §2 lists exactly which decisions changed; the landed
+> code wins where this doc disagrees. In particular: §3's revocation
+> drop-the-subscription is superseded by **RESET + per-subscription epochs**
+> (O16 — the epoch filter, not delivery order, is the security boundary);
+> §5's JSON text frames are superseded by the **binary fixed-9-byte-header
+> envelope** of DESIGN-transport-work Appendix A (msgpack control bodies,
+> columnar-JSON CHANGE payloads, subId interning); §6's blanket index
+> invalidation is superseded by the **two-lane tag-driven semantics**
+> (value CHANGEs re-render store-backed rows with zero refetch; membership
+> SIGNALs carry the WS3 counter tag and invalidate only when tag > known).
+> §4's `@broadcasts()` decorator never shipped: emission is DERIVED from the
+> write-log call sites via the commit-event tap (zero per-model config).
+
 ---
 
 ## 0. The one-sentence design
@@ -71,6 +85,11 @@ check — there is no second permission system to drift.
 
 ### Visibility revocation (the hard correctness rule)
 
+> **SUPERSEDED 2026-08-27:** a failed re-check now sends **RESET with a
+> bumped epoch** (never a silent drop) — landmine 11: frames legally arrive
+> after any drop on 𝒞w, so the epoch filter is the boundary. The TTL cache
+> and the reload-through-door batching below survive as stated.
+
 A subscription authorized at T0 can become illegitimate at T1 (the loan
 moves to another org). Rule: **authorization is re-verified on emission,
 with a short TTL cache (default 30s), and a failed re-check DROPS the
@@ -115,6 +134,11 @@ and this transport is authorized and server-authoritative end to end.
 
 ## 5. The wire
 
+> **SUPERSEDED 2026-08-27** by DESIGN-transport-work Appendix A (amended):
+> binary frames, fixed 9-byte header (type/subId/epoch), msgpack control
+> bodies, CHANGE payload = buildColumnarEnvelope's JSON bytes. The sketch
+> below is kept for the design lineage only.
+
 ```
 client → { type: 'subscribe', channel, id, view }        // view: 'get' | 'index'
 server → { type: 'confirmed', channel, id, envelope }    // fresh, synchronized start
@@ -130,6 +154,25 @@ unchanged: stale frame → ignored (monotonicity guard), conflicting frame →
 transport-independent; we built it that way on purpose.
 
 ## 6. Index channels (v1 semantics, deliberately coarse)
+
+> **SUPERSEDED 2026-08-27** by the tag-driven two-lane semantics (transport
+> WS4): value changes emit CHANGE frames (index-projection mask) that
+> re-render store-backed lists with ZERO refetch; membership changes emit
+> SIGNAL{tag} (the WS3 commit-ordered counter) and the client invalidates
+> the list family only when tag > known — the structure-token guard makes a
+> false alarm a no-op. Blanket publish-everything invalidation is gone.
+>
+> **Precision of "membership changes", stated honestly (review-hardened
+> same day):** the tag covers LIFECYCLE writes (create/destroy/undelete)
+> and SCOPE-COLUMN value writes (re-tenanting bumps in-commit and fans an
+> ids-only membershipHint door-wide, so the OLD tenant's lists invalidate
+> live too). A plain value write crossing an arbitrary client-side index
+> FILTER does not bump — that list is corrected by the row's own CHANGE
+> frame where the row stays visible, and otherwise heals on refetch or
+> reconnect (the client fires onTag on EVERY re-ack, tag-equal included —
+> across a gap, tag-equality is never consumed as a skip, preserving O5's
+> v1 license). The compiled scope-intersection trim remains the named
+> precision follow-up.
 
 `{ channel: 'deals', view: 'index' }` — authorized by dry-running index
 (page 0, perPage 1). Emission: every committed change to a record the door

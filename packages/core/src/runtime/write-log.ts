@@ -128,7 +128,9 @@ interface LoggedEntry {
 }
 
 const _logged = new Map<string, LoggedEntry>()          // tableName → entry
-const _membershipDoors = new Map<string, Set<string>>() // tableName → door ids
+/** tableName → doorId → membership-relevant COLUMN keys (URL-scope columns;
+ *  null = none registered — lifecycle events alone bump that door). */
+const _membershipDoors = new Map<string, Map<string, Set<string> | null>>()
 
 function schemaTableFor(tableName: string): any | undefined {
   try { return getSchema()[tableName] } catch { return undefined }
@@ -188,15 +190,68 @@ export function loggedTableNames(): string[] {
  * (create/destroy/undelete) to that table bumps the door's counter row
  * IN THE SAME COMMIT — the conservative bump: spurious bumps cost a
  * membership refetch (hundreds of bytes), never a wrong list.
+ *
+ * `membershipColumns` (WS4 hardening): COLUMN keys whose VALUE writes also
+ * move this door's membership — a URL-scoped door's scope columns (a
+ * `teamId` flip re-tenants the row: it leaves one tenant's list and enters
+ * another's without any lifecycle event). A value write touching one of
+ * them bumps the door's tag in the same commit, restoring the O5 license
+ * now that WS4 consumes tag-equality as a skip (reconnect catch-up).
+ * Bounded cost: scope columns change rarely; plain value writes still
+ * never touch the counter row. Residual, stated: membership driven by
+ * arbitrary client-side index FILTERS (a status flip crossing a
+ * `filters:` predicate) does not bump — those lists heal on refetch/
+ * reconnect (the client no longer skips on tag-equality across gaps), and
+ * the compiled scope-intersection trim remains the named precision fix.
  */
-export function registerMembershipDoor(tableName: string, doorId: string): void {
-  let set = _membershipDoors.get(tableName)
-  if (!set) { set = new Set(); _membershipDoors.set(tableName, set) }
-  set.add(doorId)
+export function registerMembershipDoor(
+  tableName: string,
+  doorId: string,
+  membershipColumns?: string[],
+): void {
+  let doors = _membershipDoors.get(tableName)
+  if (!doors) { doors = new Map(); _membershipDoors.set(tableName, doors) }
+  doors.set(doorId, membershipColumns && membershipColumns.length > 0
+    ? new Set(membershipColumns)
+    : null)
 }
 
 export function membershipDoorsFor(tableName: string): string[] {
-  return [...(_membershipDoors.get(tableName) ?? [])]
+  return [...(_membershipDoors.get(tableName)?.keys() ?? [])]
+}
+
+/**
+ * The doors whose tag a VALUE write (lifecycle=none) must bump: those with
+ * registered membership columns intersecting the write's changed keys.
+ * `changed` in either write-point shape (keys or packed bitmap).
+ */
+export function membershipDoorsForValueWrite(
+  tableName: string,
+  changedSets: Array<Iterable<string> | Buffer>,
+): string[] {
+  const doors = _membershipDoors.get(tableName)
+  if (!doors) return []
+  const withColumns = [...doors.entries()].filter((e): e is [string, Set<string>] => e[1] !== null)
+  if (withColumns.length === 0) return []
+  const out = new Set<string>()
+  let numbering: string[] | null = null
+  for (const changed of changedSets) {
+    if (Buffer.isBuffer(changed)) {
+      numbering ??= fieldNumberingFor(tableName)
+      for (const [doorId, cols] of withColumns) {
+        if (out.has(doorId)) continue
+        const indices = [...cols].map(c => numbering!.indexOf(c)).filter(i => i >= 0)
+        if (indices.length > 0 && bitmapIntersects(changed, indices)) out.add(doorId)
+      }
+    } else {
+      for (const key of changed) {
+        for (const [doorId, cols] of withColumns) {
+          if (cols.has(key)) out.add(doorId)
+        }
+      }
+    }
+  }
+  return [...out]
 }
 
 // ── Field numbering (ONE model-level numbering, door-agnostic) ──────────────
@@ -377,6 +432,12 @@ export async function writeLogRows(
   }
   if (rows.some(r => r.lifecycle !== LIFECYCLE.none)) {
     await bumpMembershipTags(db, tableName)
+  } else {
+    // Value writes bump ONLY doors whose registered membership columns
+    // (URL-scope columns) were touched — a scope-column flip re-tenants the
+    // row, which IS a membership change on both tenants' lists.
+    const doors = membershipDoorsForValueWrite(tableName, rows.map(r => r.changed))
+    if (doors.length > 0) await bumpMembershipTags(db, tableName, doors)
   }
 }
 
@@ -388,8 +449,12 @@ export async function writeLogRows(
  * the SAME executor as the data write — a sequence would survive rollback
  * and break tag-equal ⇒ same-list.
  */
-export async function bumpMembershipTags(db: any, tableName: string): Promise<void> {
-  const doors = membershipDoorsFor(tableName)
+export async function bumpMembershipTags(
+  db: any,
+  tableName: string,
+  onlyDoors?: string[],
+): Promise<void> {
+  const doors = onlyDoors ?? membershipDoorsFor(tableName)
   if (doors.length === 0) return
   try {
     const values = doors.map(door => sql`(${door}, 1)`)

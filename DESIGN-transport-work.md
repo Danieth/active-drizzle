@@ -68,8 +68,8 @@ lastSeen/last_write, membership tags, epochs.
 | Bus | one interface `publish(channel, frame)`/`subscribe`; tiers: 0 memory → 1 Postgres NOTIFY (payload = ids only, batched; fallback, NOT default — global commit lock, 8000B, PgBouncer-session-only) → 2 Redis → 3 NATS JetStream. Best-effort, NO outbox (C1 makes loss harmless) | Recall.ai outage 2025-03; DBOS 60k/s batched on 16 vCPU (db.m7i.4xlarge) |
 | Doc merge engine | Loro (loro-crdt 1.x, verified stable; export update-from-VV, shallow snapshots) as trusted kernel (O4a) | eg-walker rich text unpublished; loro-prosemirror v0.4.4 BETA — vendor + fuzz |
 | Doc serving | stateless per-request ingest under pg_advisory_xact_lock; snapshot compaction on cadence (export is O(doc) — never per save); resident worker = later optimization, same interfaces | no worker tier exists; Hocuspocus does NOT do single-owner (only persistence lock); Y-Sweet does |
-| Rows offline / green-yellow-red | classification lane is FUTURE work (separate design); transport ships with all mutations red (round-trip) semantics | invariant confluence; do not couple to transport |
-| Client live derivation (useLiveView / d2ts IVM) | future lane AFTER frames exist; membership stays server-computed (I5); IVM = derivation over held, certified data only | wire-identity §7 |
+| Rows offline / green-yellow-red | classification lane is FUTURE work (separate design); transport ships with all mutations red (round-trip) semantics | invariant confluence; do not couple to transport; the separate design now EXISTS: DESIGN-mutation-classification.md (green certificate, yellow-by-construction dynamic permits, O13 as the bar) |
+| Client live derivation (useLiveView / d2ts IVM) | future lane AFTER frames exist; membership stays server-computed (I5); IVM = derivation over held, certified data only | wire-identity §7; the lane's design now EXISTS: DESIGN-live-view.md (d2ts over the WS1 change feed; I5 held — derived collections are presentation, membership is authority) |
 
 ## 3. Workstreams
 
@@ -465,6 +465,129 @@ below and in proof §7 O5/O10/O15.
 
 ### WS4 — Channels: gateway, frames, bus
 Discharges: **O16**; consumes ChannelsConfig.
+✅ **DONE 2026-08-27** (server half + client transport + the six-scenario
+node-level acceptance suite — O16 ticked): ChannelsConfig fleshed out +
+teaching gates (`core/src/config.ts` — resolveChannelsConfig /
+assertChannelsServable: prod-without-allowlist, publish-only+memory,
+heartbeat>55s warn, coalesce clamp 20–50ms); the isomorphic frame codec
+(`core/src/transport/frame-codec.ts`, `@active-drizzle/core/frames`
+subpath, @msgpack/msgpack only — Appendix A below is amended to the landed
+fixed 9-byte header); the commit-event tap
+(`core/src/runtime/transport-events.ts`, emitted from the SAME write-log
+call sites in application-record.ts / relation.updateAll / insertAll /
+counter-cache, deferred through the EXISTING afterCommitQueue — never
+in-tx, rollback discards; save/destroy carry the live record → CHANGE,
+bulk paths ids-only → SIGNAL, C1 makes the downgrade harmless); the door
+registry (registerColumnarDoorTransport now RETAINS
+{model, config, doorId, scopes, get/index masks} — ONE registry populated
+by buildRouter, shared by emitter+gateway+WS3, zero app wiring); the bus
+(`controller/src/channels/bus.ts` — MemoryBus tier 0 with the record
+short-circuit, PgNotifyBus tier 1 opt-in with dedicated session connection
++ boot self-NOTIFY probe teaching the PgBouncer failure + batched/chunked
+<7.5KB payloads + the 1262 signal documented, Redis/NATS teaching stubs;
+ids-only events ALWAYS — epochs never ride the bus); the emitter
+(`controller/src/channels/emitter.ts` — silence rule per VIEW mask,
+tenant-hashed index lanes for URL-scoped doors, slice builders through
+buildColumnarEnvelope with a k-divergence per-row fallback); the gateway
+(`controller/src/channels/gateway.ts` — Origin gate + one-time
+mint/consume tokens (attach-guard pattern, in-memory ⇒ sticky-LB note),
+SUB dry-run via oRPC call() into validate/get/index (record SUB with
+cursor IS the WS3 three-way validation; index SUB_ACK carries the
+membership tag), per-sub epochs starting 1, RESET on re-check/REAUTH
+failure, revalidate-TTL'd reload-through-door as the emission re-check,
+coalesce+supersede per sub, CHANGE→SIGNAL soft backpressure + 1013 hard,
+both heartbeat levels, drain 1001); the trails scaffold main.ts template
+captures serve()'s http server, attaches channels, and mounts the token
+mint inside the app's own context builder. Suites: core
+channels-config/frame-codec/transport-events (unit + real PG), controller
+channels/bus + channels/emitter + channels/gateway (real PG, real routers,
+in-process ws clients — auth refusals, dry-run three-way, frame-only edit
+delivery, end-to-end silence, touched-only destroy frames, tag SIGNALs,
+revocation RESET with bumped epoch, REAUTH, drain 1001, heartbeat
+termination). CLIENT HALF: `react/src/channels.ts` (`connectChannels`
+behind the ChannelTransport seam — SharedWorker is a documented TODO on
+the interface; the O16 peekHeader epoch filter; CHANGE→mergeEnvelope, the
+ONE decoder; SIGNAL→store.signal + coalesced WS3 revalidate; RESET→adopt
+epoch, force-revalidate, re-SUB fresh; reconnect 1001-fast/1013-short/
+full-jitter with per-dial token mint + cursor re-SUB + mount-registry
+force revalidation; app heartbeat + REAUTH), pinned by
+`react/tests/channels.test.ts`. ACCEPTANCE:
+`controller/tests/channels/acceptance.test.ts` — the cross-package
+six-scenario suite, real PG → real routers over real HTTP
+(@orpc/server/node, the scaffold's serving shape incl. the POST
+/cable/token mint) → real 'ws' sockets → the REAL react client + store:
+(1) frame-only convergence <500ms with ZERO refetch (HTTP ledger +
+validator-callable counters both flat), (2) silence rule asserted at the
+socket, (3) kill + 10-write catch-up via the cursor-carrying re-SUB
+dry-run + mount revalidation, per-field lastSeen at the final token,
+(4) O16/T9(ii) epoch replay — captured AND forged pre-RESET frames
+injected post-RESET leave the store untouched, (5) upgrade auth
+(401/single-use/Origin 403), (6) heartbeat aliveness + burst coalescing
+(fewer CHANGE frames than writes, same final state).
+
+**REVIEW-HARDENED 2026-08-27 (same-day external review; two blockers +
+nine majors applied, all pinned by new tests):**
+(a) **A2 at the tap** — commit events now carry a SNAPSHOT instance
+(fresh instance over cloned `_attributes`, built at the write-log call
+sites, only when a publisher is registered) instead of the LIVE record:
+the gateway serializes at coalesce-flush time, and app code mutating the
+record (or starting a second save) inside that 20–50ms window could pair
+uncommitted values with a committed token — a phantom the 304 machinery
+would then CERTIFY permanently. Pinned by the overlapping-writes drive in
+core transport-events.test.ts.
+(b) **The tenant boundary now covers metadata** — record-less index
+events (ALL cross-process events under pg-notify) were emitted as
+SIGNAL{table,pk,token,op} door-wide with no scope check: a pk/version/op
+oracle over every other tenant's rows. Scoped doors now per-pk dry-run
+EVERY record-less event (scopeBy already did for value slices), and the
+emitter STRIPS unplaceable records before any door-wide publish.
+(c) **T9 on the index lane** — flushIndexSub consulted no pass at all
+(no RESET was ever produced for an index sub; revocation streamed
+forever). The same revalidate TTL now re-runs the index dry-run at flush;
+failure RESETs. Destroy frames on record subs are likewise gated: an
+expired-pass destroy downgrades to RESET (the re-SUB re-answers through
+the validate/tombstone fences) instead of handing a stale-authorized
+socket the tombstone triple.
+(d) **O5 license restored** — WS4 consumed tag-equality as a reconnect
+skip, which v1's lifecycle-only bump never licensed. Two-sided fix:
+scope-column VALUE writes now bump the tag in-commit
+(registerMembershipDoor carries membership columns; the emitter fans an
+ids-only membershipHint door-wide so the OLD tenant invalidates live),
+and the client fires onTag on EVERY re-ack, tag-equal included. Residual
+stated in ws-channels §6 + docs: arbitrary filter-crossings heal on
+refetch/reconnect until the compiled scope-intersection trim.
+(e) **Lane-hash agreement** — the gateway hashed ALL SUB params while the
+emitter hashes only scope columns: any extra param (filter, perPage)
+silently subscribed a lane nobody publishes. indexChannelsFor now picks
+entry.scopes' paramNames only (String()-canonicalized both sides); hash
+widened 48→128 bits (the value lane trusts it).
+(f) **Authenticated-DoS bounds** — `ws` maxPayload 64KB (default was
+100MiB/frame); maxConnections (503 at cap, before the token burns);
+maxSubsPerConnection (SUB_LIMIT) doubling as the SUB token-bucket burst
+(refill 20/s, RATE_LIMITED) — every SUB dry-run is a real DB query.
+(g) **pg-notify self-healing** — a dropped LISTEN session reconnects
+with backoff + re-LISTEN (was: permanently deaf node with
+heartbeat-healthy sockets); chunk sizing counts UTF-8 BYTES not UTF-16
+length; a single over-cap event is dropped from the wire loudly.
+(h) **Scaffold honesty** — trails.config template no longer selects the
+THROWING 'redis' stub off ambient REDIS_URL; bus tiers are explicit
+opt-ins.
+(i) Cheap hardening from the same review: client epoch table is
+max-join at RESET and SUB_ACK (a forged old-epoch RESET cannot regress
+the O16 filter — pinned by a subId-reuse drive); degraded SIGNALs carry
+their honest op (a destroy never announces as an update); backpressure
+thresholds/degrade extracted to an exported seam
+(sendFrame/sendChangeWithBackpressure) with unit tests (bufferedAmount
+never rises on loopback, so socket suites cannot execute the ladder);
+scopeBy pkPass cache pruned; coalescer supersede pinned deterministically
+via bus-injected same-pk events (keep-LATEST, record-preferring at equal
+tokens); token single-use pinned under CONCURRENT double-upgrade; REAUTH
+failure pinned (old ctx kept, both sides); reconnect fan-out pinned with
+2 record subs + 1 index sub + 2 mounts; k-divergence fallback and
+async-rejecting publishers pinned. NOT taken, stated: a bus-delivered
+per-principal revocation push (the revalidate TTL is the documented
+bound; docs now say so explicitly), and a heartbeat-tolerance pin (node
+'ws' auto-answers protocol pings — no cheap deterministic seam).
 - `ws` upgrade on the scaffold's http server at `config.channels.path`;
   upgrade-token mint endpoint (attach-guard pattern) + Origin allowlist;
   25s app-level heartbeat; reauth frame; SharedWorker tab sharing with
@@ -528,24 +651,64 @@ Discharges: **O8, O11, O7 (optional).**
 
 ## 4. Appendix A — frame envelope (v1)
 
-Binary; control bodies msgpack; CRDT payloads raw. All frames carry
-`epoch` (per-channel subscription epoch, uint32 — O16).
+**AMENDED 2026-08-27 (WS4 server landing)** — the varint-channelId sketch is
+superseded by a FIXED 9-byte header; this section now describes the landed
+wire (`packages/core/src/transport/frame-codec.ts`, the isomorphic
+`@active-drizzle/core/frames` subpath — ONE codec for server and browser).
+
+Binary; control bodies msgpack; raw payload tail on CHANGE (later DOC).
 
 ```
-byte 0: type   1=SUB 2=UNSUB 3=SUB_ACK 4=CHANGE 5=DOC 6=PRESENCE
-               7=PING 8=PONG 9=RESET 10=REAUTH 11=SIGNAL
-SUB:      channelId varint | epoch | cursor (token for row chans, seq for doc chans)
-CHANGE:   channelId | epoch | pk | token | op | columnar slice (k-header form)
-DOC:      channelId | epoch | docId | seq uint64 | loro bytes to EOF
-SIGNAL:   channelId | epoch | pk | token | op            (degraded mode: M3 only)
-RESET:    channelId | newEpoch                            (drop local, re-pull, re-sub)
-PRESENCE: channelId | epoch | senderId | ttlMs | msgpack  (not v1; spec reserved)
+byte  0      type     1=SUB 2=UNSUB 3=SUB_ACK 4=CHANGE 5=DOC(reserved)
+                      6=PRESENCE(reserved) 7=PING 8=PONG 9=RESET
+                      10=REAUTH 11=SIGNAL
+bytes 1–4    subId    uint32BE — server-interned per-connection subscription
+                      integer, assigned at SUB_ACK (0 = connection-level)
+bytes 5–8    epoch    uint32BE — per-(connection, subscription) generation
+                      (O16); 0 where n/a
+bytes 9–12   bodyLen  uint32BE
+bytes 13…    body     msgpack control body
+then…        payload  raw bytes to EOF (CHANGE only in v1)
 ```
 
-Rules: CHANGE/SIGNAL/DOC with epoch < current(channel) are DROPPED on
-arrival. A CHANGE frame's slice is byte-compatible with the validation
-endpoint's dirty-slice response (same codegen serializer — A0/A3).
-Heartbeat 25s; server closes 1001 on drain; client reconnect =
+WHY fixed instead of the original varint channelId: the epoch filter
+(landmine 11) must drop pre-epoch frames BEFORE parsing any body — a fixed
+offset makes it a 9-byte peek (`peekHeader`), no allocation, no msgpack.
+Channel STRINGS travel only inside SUB/SUB_ACK bodies; interning keeps data
+frames tiny.
+
+Control bodies (msgpack):
+
+```
+SUB      c→s  { ref, door, id?, params?, cursor?, projId? }
+              record chan: id set; cursor = projFreshAt (W) + projId invokes
+              the door's WS3 validate as the dry-run; cursor-less invokes get.
+              index chan: id absent; dry-runs index (perPage 1).
+SUB_ACK  s→c  { ref, ok:true, door, id?, cursor?, gone?, d? }   header: subId, epoch=1
+              record cursor = the lock-int watermark; index cursor = the
+              membership tag. stale ⇒ an immediate CHANGE follows the ack.
+              refusals: { ref, ok:false, code, message } (header subId 0).
+CHANGE   s→c  body {} — payload = the UTF-8 JSON BYTES of a partial
+              ColumnarEnvelope { entities, touched? }: buildColumnarEnvelope's
+              own output (the serializer is TEXT JSON, so "byte-compatible
+              with GET/validation slices" MEANS those JSON bytes framed raw —
+              A0/A3). Client decode: JSON.parse → mergeEnvelope, unchanged.
+              Destroys: payload { touched:[{resource,id,op:'destroy',version}] }.
+SIGNAL   s→c  { table, pk, token, op } (rumor lane / CHANGE degrade) or
+              { tag } (index-channel membership tag)
+RESET    s→c  { reason } — header epoch = the NEW epoch; drop local sub
+              state, revalidateProjection(force), re-SUB with cursors
+UNSUB    c→s  {} (header subId)
+PING/PONG both { …echoed } — app-level (browser-visible) liveness; the
+              server ALSO runs protocol-level ws pings
+REAUTH   c→s  { ref, token } (fresh one-time token) / s→c { ref, ok }
+```
+
+Rules: data frames with epoch < current(subId) are DROPPED at the 9-byte
+peek, before any body decode. Epoch is stamped at socket-write time by the
+serving node and NEVER rides the bus. Heartbeat 25s both levels; server
+closes 1001 on drain; backpressure: bufferedAmount >1MB ⇒ CHANGE degrades
+to SIGNAL (tokens only), >4MB ⇒ close 1013; client reconnect =
 backoff+jitter, resubscribe with cursors, revalidate mounted projections.
 
 ## 5. Appendix B — schema sketches (names bikesheddable, semantics not)

@@ -1,7 +1,7 @@
 {
   "name": "@active-drizzle/controller",
   "version": "0.1.13",
-  "description": "Rails-style controllers for active-drizzle \u2014 oRPC procedures + REST routes from model definitions",
+  "description": "Rails-style controllers for active-drizzle — oRPC procedures + REST routes from model definitions",
   "type": "module",
   "exports": {
     ".": {
@@ -46,6 +46,7 @@
     "@types/node": "^22.0.0",
     "@types/pg": "^8.18.0",
     "@types/pluralize": "^0.0.33",
+    "@types/ws": "^8.18.1",
     "drizzle-orm": "^0.40.1",
     "pg": "^8.20.0",
     "pluralize": "^8.0.0",
@@ -53,5 +54,8 @@
     "typescript": "^5.7.0",
     "vitest": "^3.0.0",
     "zod": "^4.3.6"
+  },
+  "dependencies": {
+    "ws": "^8.21.3"
   }
 }

@@ -8,7 +8,9 @@ export { AssetService, type CreateFromServiceInput } from './services/asset-serv
 export { runAssetCleanup, type AssetCleanupOptions } from './tasks/asset-cleanup-task.js'
 export {
   defineConfig, loadConfig, resolveConfig, mergeConfig, resetConfig,
+  resolveChannelsConfig, assertChannelsServable,
   type TrailsConfig, type TrailsConfigFile, type ChannelsConfig,
+  type ResolvedChannelsConfig,
 } from './config.js'
 export { processAsset, type ProcessResult } from './tasks/asset-process-task.js'
 export { scaffoldPresenterTree, collectKindsInUse, type ScaffoldResult, type KindUsage } from './codegen/presenter-scaffold.js'

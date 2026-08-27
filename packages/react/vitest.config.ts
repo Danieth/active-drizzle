@@ -5,6 +5,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@active-drizzle/core/validators': resolve(__dirname, '../core/src/runtime/validators.ts'),
+      '@active-drizzle/core/frames': resolve(__dirname, '../core/src/transport/frame-codec.ts'),
       '@active-drizzle/core': resolve(__dirname, '../core/src/index.ts'),
       '@active-drizzle/controller': resolve(__dirname, '../controller/src/index.ts'),
     },
@@ -13,13 +14,6 @@ export default defineConfig({
     },
   },
   test: {
-    coverage: {
-      // .tsx files were invisible to the report (resolution quirk) — force
-      // the full src surface so unmeasured files show as 0%, never as absent
-      include: ['src/**/*.ts', 'src/**/*.tsx'],
-      all: true,
-      extension: ['.ts', '.tsx'],
-    },
     globals: true,
     environment: 'jsdom',
     include: ['tests/**/*.test.ts', 'tests/**/*.test.tsx'],
@@ -31,7 +25,9 @@ export default defineConfig({
       provider: 'v8',
       all: true,
       extension: ['.ts', '.tsx'],
-      include: ['src/**/*.ts'],
+      // .tsx files were invisible to the report (resolution quirk) — force
+      // the full src surface so unmeasured files show as 0%, never as absent
+      include: ['src/**/*.ts', 'src/**/*.tsx'],
       exclude: ['src/**/*.d.ts', 'src/index.ts'],
       reporter: ['text', 'text-summary', 'json-summary'],
       reportsDirectory: './coverage',

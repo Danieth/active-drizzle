@@ -99,6 +99,7 @@ export default defineConfig({
             { text: 'Console', link: '/guide/console' },
             { text: 'Helpers', link: '/guide/helpers' },
             { text: 'Error Handling', link: '/guide/error-handling' },
+            { text: 'Live Channels (WebSocket)', link: '/guide/channels' },
           ],
         },
         {

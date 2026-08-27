@@ -184,3 +184,15 @@ export {
   type AdKindShapes,
   type BuiltinKindShapes,
 } from './presenters.js'
+// Channels (transport WS4, client half) — the WebSocket transport behind
+// the ChannelTransport seam (SharedWorker tab-sharing: documented TODO)
+export {
+  connectChannels,
+  type ChannelTransport,
+  type ChannelSubscription,
+  type ChannelSocketLike,
+  type ConnectChannelsOptions,
+  type RecordSubscribeOptions,
+  type IndexSubscribeOptions,
+  type SubscribeAck,
+} from './channels.js'
